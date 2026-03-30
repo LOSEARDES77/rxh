@@ -1,9 +1,8 @@
 [[server]]
 
-listen = ["127.0.0.1:8100", "192.168.0.106:8100"]
+listen = ["127.0.0.1:8100", "192.168.1.148:8100"]
 name = "rxh/main"
 
 match = [
-    { uri = "/api", forward = "127.0.0.1:8080" },
-    { uri = "/", serve = "/home/antonio/Code/Projects/rxh" },
+    { uri = "/", serve = "." },
 ]

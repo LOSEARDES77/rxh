@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>404 - Page not found</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        font-family:
+          "JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas, monospace;
+      }
+
+      body {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background:
+          radial-gradient(
+            1100px 500px at 20% -10%,
+            #3a2349 0%,
+            transparent 60%
+          ),
+          radial-gradient(900px 500px at 90% 0%, #4a2525 0%, transparent 45%),
+          #0f1118;
+      }
+
+      .container {
+        text-align: center;
+        padding: 2rem;
+        max-width: 600px;
+        border: 1px solid #352f44;
+        border-radius: 12px;
+        background: rgba(20, 18, 29, 0.82);
+        box-shadow: 0 16px 46px rgba(0, 0, 0, 0.35);
+      }
+
+      .error-code {
+        font-size: 8rem;
+        font-weight: 700;
+        color: #ffd7d7;
+        line-height: 1;
+        margin-bottom: 1rem;
+        animation: float 6s ease-in-out infinite;
+        text-shadow: 0 0 28px rgba(255, 106, 106, 0.35);
+      }
+
+      .error-text {
+        font-size: 1.5rem;
+        color: #d9cde3;
+        margin-bottom: 2rem;
+      }
+
+      .home-button {
+        display: inline-block;
+        padding: 0.75rem 1.5rem;
+        font-size: 1rem;
+        color: #ffeaea;
+        background-color: #8f3f62;
+        border-radius: 0.5rem;
+        text-decoration: none;
+        transition: background-color 0.3s ease;
+        border: 1px solid #b15d83;
+        cursor: pointer;
+      }
+
+      .home-button:hover {
+        background-color: #a84871;
+      }
+
+      @keyframes float {
+        0% {
+          transform: translateY(0);
+        }
+
+        50% {
+          transform: translateY(-20px);
+        }
+
+        100% {
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 640px) {
+        .error-code {
+          font-size: 6rem;
+        }
+
+        .error-text {
+          font-size: 1.25rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="error-code">404</div>
+      <div class="error-text">
+        Oops! The page you are looking for does not exist.
+      </div>
+      <button id="back-btn" class="home-button">Go Back</button>
+    </div>
+    <script type="text/javascript">
+      const homePath = "{home}";
+
+      window.onload = () => {
+        const lastVisitedPage = document.referrer;
+        document.getElementById("back-btn").innerHTML = lastVisitedPage
+          ? "Go Back"
+          : "Go Home";
+      };
+
+      document.getElementById("back-btn").addEventListener("click", () => {
+        const lastVisitedPage = document.referrer;
+        if (lastVisitedPage) {
+          window.location.href = lastVisitedPage;
+        } else {
+          window.location.href = homePath;
+        }
+      });
+    </script>
+  </body>
+</html>

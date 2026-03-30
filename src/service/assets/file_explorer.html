@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Directory Explorer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        font-family:
+          "JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas, monospace;
+      }
+
+      body {
+        background:
+          radial-gradient(
+            1200px 600px at 20% -10%,
+            #273151 0%,
+            transparent 55%
+          ),
+          radial-gradient(900px 500px at 90% 0%, #1b3b36 0%, transparent 45%),
+          #0e1118;
+        color: #dbe4ff;
+        line-height: 1.5;
+        padding: 2rem;
+        min-height: 100vh;
+      }
+
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+        background: rgba(17, 22, 34, 0.82);
+        backdrop-filter: blur(10px);
+        border: 1px solid #2f3850;
+        border-radius: 12px;
+        box-shadow: 0 16px 46px rgba(0, 0, 0, 0.35);
+        padding: 2rem;
+      }
+
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 1.25rem;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid #2f3850;
+      }
+
+      .header h1 {
+        font-size: 1.15rem;
+        letter-spacing: 0.04em;
+        color: #f0f6ff;
+      }
+
+      .home-button {
+        display: inline-block;
+        padding: 0.52rem 0.8rem;
+        border: 1px solid #3a4564;
+        border-radius: 8px;
+        text-decoration: none;
+        color: #c5d6ff;
+        background: #151b2a;
+        font-size: 0.8rem;
+        font-weight: 600;
+      }
+
+      .home-button:hover {
+        background: #1c2437;
+      }
+
+      .current-path {
+        color: #9fb1d9;
+        font-size: 0.875rem;
+        margin-bottom: 1rem;
+        padding: 0.65rem 0.75rem;
+        background: #141b2b;
+        border: 1px solid #2d3855;
+        border-radius: 8px;
+      }
+
+      .file-list {
+        list-style: none;
+      }
+
+      .file-item {
+        display: flex;
+        align-items: center;
+        padding: 0.75rem;
+        border-bottom: 1px solid #232b3f;
+        transition: background-color 0.2s;
+      }
+
+      .file-item:hover {
+        background-color: #182237;
+      }
+
+      .file-item a {
+        color: #dbe4ff;
+        text-decoration: none;
+        flex-grow: 1;
+        display: flex;
+        align-items: center;
+      }
+
+      .file-icon {
+        width: 20px;
+        height: 20px;
+        margin-right: 0.75rem;
+        fill: #8aa7ff;
+      }
+
+      .file-info {
+        display: flex;
+        align-items: center;
+        color: #a0b1d5;
+        font-size: 0.875rem;
+      }
+
+      .file-size {
+        margin-left: 1rem;
+        color: #8ca1ce;
+      }
+
+      @media (max-width: 640px) {
+        body {
+          padding: 1rem;
+        }
+
+        .container {
+          padding: 1rem;
+        }
+
+        .file-info {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>Directory Explorer</h1>
+        <button id="back-btn" class="home-button" type="button">Go Back</button>
+      </div>
+      <div class="current-path">Current path: {cwd}</div>
+      <ul class="file-list">
+        {list}
+      </ul>
+    </div>
+    <script type="text/javascript">
+      const homePath = "{home}";
+
+      window.onload = () => {
+        const from = document.referrer;
+        const btn = document.getElementById("back-btn");
+        btn.textContent = from ? "Go Back" : "Go Home";
+      };
+
+      document.getElementById("back-btn").addEventListener("click", () => {
+        const from = document.referrer;
+        if (from) {
+          window.location.href = from;
+        } else {
+          window.location.href = homePath;
+        }
+      });
+    </script>
+  </body>
+</html>

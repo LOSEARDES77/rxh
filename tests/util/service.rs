@@ -5,11 +5,12 @@ use std::{convert::Infallible, future::Future, pin::Pin};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{
-    body::{Body, Incoming},
-    service::Service,
     Request,
     Response,
+    body::{Body, Incoming},
+    service::Service,
 };
+use hyper_util::rt::TokioIo;
 use tokio::{self, net::TcpStream, sync::mpsc};
 
 /// Backend server that can run on different tasks and shares every request that
@@ -32,7 +33,7 @@ impl Service<Request<Incoming>> for RequestInterceptor {
 
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
         let tx = self.tx.clone();
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -41,7 +42,6 @@ impl Service<Request<Incoming>> for RequestInterceptor {
                 .await
                 .unwrap();
 
-            // TODO: Make response customizable.
             Ok(Response::new(Full::<Bytes>::from("Hello world")))
         })
     }
@@ -59,7 +59,7 @@ where
     hyper::server::conn::http1::Builder::new()
         .preserve_header_case(true)
         .title_case_headers(true)
-        .serve_connection(stream, service)
+        .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
         .await
         .unwrap();

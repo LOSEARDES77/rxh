@@ -58,7 +58,7 @@ impl Service<Request<Incoming>> for Rxh {
 
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+    fn call(&self, request: Request<Incoming>) -> Self::Future {
         let Rxh {
             client_addr,
             server_addr,
@@ -82,18 +82,26 @@ impl Service<Request<Incoming>> for Rxh {
 
             let response = match &pattern.action {
                 Action::Forward(Forward { scheduler, .. }) => {
-                    let by = config.name.as_ref().map(|name| name.clone());
-                    let request = ProxyRequest::new(request, client_addr, server_addr, by);
-                    proxy::forward(request, scheduler.next_server()).await
+                    let by = config.name.clone();
+                    let request = ProxyRequest::new(
+                        request,
+                        client_addr,
+                        server_addr,
+                        by,
+                        pattern.request.headers.clone(),
+                    );
+                    proxy::forward(
+                        request,
+                        scheduler.next_server(),
+                        pattern.response.headers.clone(),
+                        config.name.clone().unwrap_or(server_addr.to_string()),
+                        pattern.cache.clone(),
+                    )
+                    .await
                 }
 
                 Action::Serve(directory) => {
-                    let path = if request.uri().path().starts_with("/") {
-                        &request.uri().path()[1..]
-                    } else {
-                        request.uri().path()
-                    };
-                    files::transfer(path, directory).await
+                    files::transfer(request.uri().path(), directory, pattern.uri.as_str()).await
                 }
             };
 

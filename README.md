@@ -68,13 +68,13 @@ cargo run
 - [x] HTTP `Forwarded` header ([RFC 7239](https://www.rfc-editor.org/rfc/rfc7239)).
 - [x] Graceful shutdown (don't kill the process until all sockets are closed).
 - [x] HTTP/1.1 upgraded connections (works like a TCP tunnel).
-- [ ] HTTP `Via` header ([Section 3.6.7 of RFC 5322](https://httpwg.org/specs/rfc9110.html#field.via))
-- [ ] HTTP/2
+- [x] HTTP `Via` header ([Section 7.6.3 of RFC 9110](https://httpwg.org/specs/rfc9110.html#field.via))
+- [x] HTTP/2
 - [x] Static files server.
 - [x] Multiple servers on different ports, both static and proxy.
-- [ ] Header customization configs (see [`config.sketch.toml`](config.sketch.toml)).
-- [ ] Hot reloading (switch the config on the fly without stopping).
-- [ ] Cache.
+- [x] Header customization configs (see [`config.sketch.toml`](config.sketch.toml)).
+- [x] Hot reloading (switch the config on the fly without stopping).
+- [x] Cache.
 - [x] Load balancing.
-- [ ] Dameonize process.
-- [ ] TLS.
+- [x] Daemonize process.
+- [x] TLS.

@@ -1,9 +1,24 @@
-use std::{future::Future, io, net::SocketAddr, pin::Pin, ptr, sync::Arc};
-
-use tokio::{
-    net::{TcpListener, TcpSocket},
-    sync::{watch, Semaphore},
+use std::{
+    error::Error as StdError,
+    fs::File,
+    future::Future,
+    io::{self, BufReader},
+    net::SocketAddr,
+    pin::Pin,
+    ptr,
+    sync::Arc,
 };
+
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpSocket},
+    sync::{Semaphore, watch},
+};
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 
 use crate::{
     config,
@@ -210,6 +225,7 @@ impl Server {
             listener,
             notifier: &notifier,
             state: &state,
+            tls_acceptor: load_tls_acceptor(config.tls.as_ref())?,
         };
 
         tokio::select! {
@@ -273,6 +289,9 @@ struct Listener<'a> {
 
     /// Connections permits.
     connections: Arc<Semaphore>,
+
+    /// Optional TLS acceptor configured for this listener.
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl<'a> Listener<'a> {
@@ -307,14 +326,24 @@ impl<'a> Listener<'a> {
             let (stream, client_addr) = self.listener.accept().await?;
             let mut subscription = self.notifier.subscribe();
             let server_addr = stream.local_addr()?;
+            let tls_acceptor = self.tls_acceptor.clone();
+            let http2 = config.http2;
 
             tokio::task::spawn(async move {
-                if let Err(err) = hyper::server::conn::http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
-                    .serve_connection(stream, Rxh::new(config, client_addr, server_addr))
-                    .with_upgrades()
-                    .await
+                if let Some(tls_acceptor) = tls_acceptor {
+                    match tls_acceptor.accept(stream).await {
+                        Ok(stream) => {
+                            if let Err(err) =
+                                serve_connection(stream, config, client_addr, server_addr, http2)
+                                    .await
+                            {
+                                println!("Failed to serve TLS connection: {:?}", err);
+                            }
+                        }
+                        Err(err) => println!("Failed TLS handshake: {:?}", err),
+                    }
+                } else if let Err(err) =
+                    serve_connection(stream, config, client_addr, server_addr, http2).await
                 {
                     println!("Failed to serve connection: {:?}", err);
                 }
@@ -329,4 +358,62 @@ impl<'a> Listener<'a> {
             });
         }
     }
+}
+
+async fn serve_connection<T>(
+    stream: T,
+    config: &'static config::Server,
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
+    http2: bool,
+) -> Result<(), Box<dyn StdError + Send + Sync>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if http2 {
+        auto::Builder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(
+                TokioIo::new(stream),
+                Rxh::new(config, client_addr, server_addr),
+            )
+            .await
+    } else {
+        hyper::server::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(
+                TokioIo::new(stream),
+                Rxh::new(config, client_addr, server_addr),
+            )
+            .with_upgrades()
+            .await
+            .map_err(|err| Box::new(err) as Box<dyn StdError + Send + Sync>)
+    }
+}
+
+fn load_tls_acceptor(tls: Option<&config::Tls>) -> io::Result<Option<TlsAcceptor>> {
+    let Some(tls) = tls else {
+        return Ok(None);
+    };
+
+    let cert_file = File::open(&tls.cert)?;
+    let key_file = File::open(&tls.key)?;
+
+    let mut cert_reader = BufReader::new(cert_file);
+    let mut key_reader = BufReader::new(key_file);
+
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)?;
+
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("private key not found"))?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(io::Error::other)?;
+
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }

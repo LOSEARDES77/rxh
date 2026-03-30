@@ -2,7 +2,7 @@
 
 mod deser;
 
-use std::{fmt::Debug, net::SocketAddr};
+use std::{collections::HashMap, fmt::Debug, net::SocketAddr};
 
 use deser::{BackendOption, ForwardOption};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,13 @@ pub struct Server {
     /// Optional server name to show in logs and forwarded requests.
     pub name: Option<String>,
 
+    /// Optional TLS configuration for incoming client connections.
+    pub tls: Option<Tls>,
+
+    /// Enables HTTP/2 support for incoming client connections.
+    #[serde(default = "default::http2")]
+    pub http2: bool,
+
     /// Log name inlcudes the IP address of the listening socket and also the
     /// optional name set by the user.
     #[serde(skip)]
@@ -104,6 +111,147 @@ pub struct Pattern {
     /// Action to execute if this pattern matches the request.
     #[serde(flatten)]
     pub action: Action,
+
+    /// Request header customization.
+    #[serde(default)]
+    pub request: RequestConfig,
+
+    /// Response header customization.
+    #[serde(default)]
+    pub response: ResponseConfig,
+
+    /// Optional cache configuration for this pattern.
+    #[serde(default)]
+    pub cache: Cache,
+}
+
+/// TLS certificates and keys for incoming connections.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Tls {
+    /// Path to PEM encoded certificate chain.
+    pub cert: String,
+
+    /// Path to PEM encoded private key.
+    pub key: String,
+}
+
+/// Per-pattern request customization.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RequestConfig {
+    #[serde(default)]
+    pub headers: RequestHeaders,
+}
+
+/// Per-pattern response customization.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ResponseConfig {
+    #[serde(default)]
+    pub headers: ResponseHeaders,
+}
+
+/// Request header settings.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RequestHeaders {
+    #[serde(default)]
+    pub forwarded: ForwardedHeader,
+
+    /// Replaces header values.
+    #[serde(default)]
+    pub set: HashMap<String, String>,
+
+    /// Removes headers by name.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// Response header settings.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ResponseHeaders {
+    #[serde(default)]
+    pub via: ViaHeader,
+
+    #[serde(default)]
+    pub server: ServerHeader,
+
+    /// Replaces header values.
+    #[serde(default)]
+    pub set: HashMap<String, String>,
+
+    /// Removes headers by name.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// Customization for the forwarded header behavior.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ForwardedHeader {
+    /// Appends to existing client-provided `Forwarded` values.
+    #[serde(default = "default::true_value")]
+    pub extend: bool,
+
+    /// Overrides `by=` value.
+    pub by: Option<String>,
+}
+
+impl Default for ForwardedHeader {
+    fn default() -> Self {
+        Self {
+            extend: true,
+            by: None,
+        }
+    }
+}
+
+/// Customization for the via header behavior.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ViaHeader {
+    /// Appends this proxy as a new Via member when true.
+    #[serde(default)]
+    pub extend: bool,
+}
+
+/// Customization for the server header behavior.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ServerHeader {
+    /// Whether to override the upstream Server header.
+    #[serde(rename = "override", default = "default::true_value")]
+    pub should_override: bool,
+
+    /// Whether to append the RXH version in the Server value.
+    #[serde(default = "default::true_value")]
+    pub version: bool,
+}
+
+impl Default for ServerHeader {
+    fn default() -> Self {
+        Self {
+            should_override: true,
+            version: true,
+        }
+    }
+}
+
+/// Minimal per-pattern cache configuration.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Cache {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default::cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+
+    #[serde(default = "default::cache_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_seconds: default::cache_ttl_seconds(),
+            max_entries: default::cache_max_entries(),
+        }
+    }
 }
 
 /// One element in the "forward" list. This represents an upstream server and
@@ -198,7 +346,7 @@ impl Clone for Forward {
     fn clone(&self) -> Self {
         Self {
             backends: self.backends.clone(),
-            algorithm: self.algorithm.clone(),
+            algorithm: self.algorithm,
             scheduler: sched::make(self.algorithm, &self.backends),
         }
     }
@@ -238,5 +386,21 @@ mod default {
 
     pub fn max_connections() -> usize {
         1024
+    }
+
+    pub fn cache_ttl_seconds() -> u64 {
+        30
+    }
+
+    pub fn cache_max_entries() -> usize {
+        1024
+    }
+
+    pub fn true_value() -> bool {
+        true
+    }
+
+    pub fn http2() -> bool {
+        true
     }
 }

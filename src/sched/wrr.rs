@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn weighted_round_robin() {
-        let backends = vec![
+        let backends = [
             ("127.0.0.1:8080", 1),
             ("127.0.0.1:8081", 3),
             ("127.0.0.1:8082", 2),

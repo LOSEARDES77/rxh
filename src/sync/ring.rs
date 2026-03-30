@@ -27,7 +27,7 @@ impl<T> Ring<T> {
     /// beginning. Note that `values` must have a length greater than 0, in
     /// other words it cannot be an empty [`Vec`].
     pub fn new(values: Vec<T>) -> Self {
-        assert!(values.len() > 0, "Ring<T> doesn't work with empty Vec<T>");
+        assert!(!values.is_empty(), "Ring<T> doesn't work with empty Vec<T>");
         Self {
             values,
             next: AtomicUsize::new(0),

@@ -3,13 +3,24 @@
 use std::net::SocketAddr;
 
 use serde::{
-    de::{self, Visitor},
     Deserialize,
     Deserializer,
     Serialize,
+    de::{self, Visitor},
 };
 
-use super::{Action, Algorithm, Backend, Forward, Pattern, Server};
+use super::{
+    Action,
+    Algorithm,
+    Backend,
+    Cache,
+    Forward,
+    Pattern,
+    RequestConfig,
+    ResponseConfig,
+    Server,
+    Tls,
+};
 use crate::sched;
 
 /// See [`one_or_many`] for details.
@@ -188,7 +199,12 @@ enum Field {
     Forward,
     Serve,
     Uri,
+    Request,
+    Response,
+    Cache,
     Name,
+    Tls,
+    Http2,
     Connections,
 }
 
@@ -281,8 +297,13 @@ impl<'de> Visitor<'de> for ServerVisitor {
         let mut patterns: Vec<Pattern> = vec![];
         let mut simple_pattern: Option<Pattern> = None;
         let mut name = None;
+        let mut tls = None;
+        let mut http2 = super::default::http2();
         let mut max_connections = super::default::max_connections();
         let mut uri = super::default::uri();
+        let mut request = RequestConfig::default();
+        let mut response = ResponseConfig::default();
+        let mut cache = Cache::default();
 
         while let Some(key) = map.next_key()? {
             match key {
@@ -321,6 +342,9 @@ impl<'de> Visitor<'de> for ServerVisitor {
                     simple_pattern = Some(Pattern {
                         uri: super::default::uri(),
                         action: Action::Forward(map.next_value()?),
+                        request: RequestConfig::default(),
+                        response: ResponseConfig::default(),
+                        cache: Cache::default(),
                     });
                 }
 
@@ -339,6 +363,9 @@ impl<'de> Visitor<'de> for ServerVisitor {
                     simple_pattern = Some(Pattern {
                         uri: super::default::uri(),
                         action: Action::Serve(map.next_value()?),
+                        request: RequestConfig::default(),
+                        response: ResponseConfig::default(),
+                        cache: Cache::default(),
                     });
                 }
 
@@ -350,6 +377,30 @@ impl<'de> Visitor<'de> for ServerVisitor {
                     uri = map.next_value()?;
                 }
 
+                Field::Request => {
+                    if !patterns.is_empty() {
+                        return Err(de::Error::custom(Error::MixedSimpleAndMatch));
+                    }
+
+                    request = map.next_value()?;
+                }
+
+                Field::Response => {
+                    if !patterns.is_empty() {
+                        return Err(de::Error::custom(Error::MixedSimpleAndMatch));
+                    }
+
+                    response = map.next_value()?;
+                }
+
+                Field::Cache => {
+                    if !patterns.is_empty() {
+                        return Err(de::Error::custom(Error::MixedSimpleAndMatch));
+                    }
+
+                    cache = map.next_value()?;
+                }
+
                 Field::Name => {
                     if name.is_some() {
                         return Err(de::Error::duplicate_field("name"));
@@ -358,12 +409,25 @@ impl<'de> Visitor<'de> for ServerVisitor {
                     name = Some(map.next_value()?);
                 }
 
+                Field::Tls => {
+                    if tls.is_some() {
+                        return Err(de::Error::duplicate_field("tls"));
+                    }
+
+                    tls = Some(map.next_value::<Tls>()?);
+                }
+
+                Field::Http2 => http2 = map.next_value()?,
+
                 Field::Connections => max_connections = map.next_value()?,
             }
         }
 
         if let Some(mut pattern) = simple_pattern {
             pattern.uri = uri;
+            pattern.request = request;
+            pattern.response = response;
+            pattern.cache = cache;
             patterns.push(pattern);
         }
 
@@ -380,6 +444,8 @@ impl<'de> Visitor<'de> for ServerVisitor {
             patterns,
             max_connections,
             name,
+            tls,
+            http2,
             log_name: String::from("unnamed"),
         })
     }

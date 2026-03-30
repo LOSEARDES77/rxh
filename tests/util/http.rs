@@ -4,20 +4,21 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::{
-    body::Incoming,
-    client::conn::http1::SendRequest,
-    service::{service_fn, Service},
     Request,
     Response,
+    body::Incoming,
+    client::conn::http1::SendRequest,
+    service::{Service, service_fn},
 };
+use hyper_util::rt::TokioIo;
 use rxh::config::Backend;
 use tokio::{
     self,
@@ -27,7 +28,7 @@ use tokio::{
 };
 
 use super::{
-    service::{serve_connection, AsyncBody},
+    service::{AsyncBody, serve_connection},
     tcp::{ping_tcp_server, usable_socket, usable_tcp_listener},
 };
 
@@ -146,7 +147,9 @@ pub fn spawn_master(config: rxh::config::Config) -> (Vec<SocketAddr>, JoinHandle
 /// Provides an HTTP client that spawns a connection object in the background
 /// to manage request transmissions.
 pub async fn http_client<B: AsyncBody>(stream: TcpStream) -> SendRequest<B> {
-    let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
     tokio::task::spawn(async move { conn.await.unwrap() });
 
     sender

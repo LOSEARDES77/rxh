@@ -45,9 +45,14 @@ pub mod proxy {
             log_name: String::from("unnamed"),
             listen: vec!["127.0.0.1:0".parse().unwrap()],
             max_connections: 1024,
+            tls: None,
+            http2: true,
             patterns: vec![Pattern {
                 uri: String::from(uri),
                 action: Action::Forward(forward),
+                request: Default::default(),
+                response: Default::default(),
+                cache: Default::default(),
             }],
         }
     }
@@ -70,9 +75,14 @@ pub mod files {
             log_name: String::from("unnamed"),
             listen: vec!["127.0.0.1:0".parse().unwrap()],
             max_connections: 1024,
+            tls: None,
+            http2: true,
             patterns: vec![Pattern {
                 uri: String::from(uri),
                 action: Action::Serve(String::from(root)),
+                request: Default::default(),
+                response: Default::default(),
+                cache: Default::default(),
             }],
         }
     }

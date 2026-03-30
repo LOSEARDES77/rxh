@@ -195,7 +195,7 @@ impl Master {
 
         match first_error {
             None => Ok(()),
-            Some(err) => Err(crate::Error::from(err)),
+            Some(err) => Err(err),
         }
     }
 

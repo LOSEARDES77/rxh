@@ -4,11 +4,17 @@
 
 use std::net::SocketAddr;
 
-use http::{Extensions, HeaderMap};
+use http::HeaderMap;
 use hyper::{
-    header::{self, HeaderValue},
+    Method,
+    Uri,
+    Version,
     Request,
+    header::{self, HeaderValue},
+    upgrade::OnUpgrade,
 };
+
+use crate::config;
 
 /// Request received by this proxy from a client.
 pub(crate) struct ProxyRequest<T> {
@@ -24,6 +30,9 @@ pub(crate) struct ProxyRequest<T> {
     /// Optional ID to use in the "by" parameter of the "Forwarded" header
     /// instead of the IP address.
     proxy_id: Option<String>,
+
+    /// Configurable request header behavior.
+    headers_config: config::RequestHeaders,
 }
 
 impl<T> ProxyRequest<T> {
@@ -33,12 +42,14 @@ impl<T> ProxyRequest<T> {
         client_addr: SocketAddr,
         server_addr: SocketAddr,
         proxy_id: Option<String>,
+        headers_config: config::RequestHeaders,
     ) -> Self {
         Self {
             request,
             client_addr,
             server_addr,
             proxy_id,
+            headers_config,
         }
     }
 
@@ -46,8 +57,21 @@ impl<T> ProxyRequest<T> {
         self.request.headers()
     }
 
-    pub fn extensions_mut(&mut self) -> &mut Extensions {
-        self.request.extensions_mut()
+    pub fn method(&self) -> &Method {
+        self.request.method()
+    }
+
+    pub fn uri(&self) -> &Uri {
+        self.request.uri()
+    }
+
+    pub fn version(&self) -> Version {
+        self.request.version()
+    }
+
+    /// Extracts the request upgrade future.
+    pub fn on_upgrade(&mut self) -> OnUpgrade {
+        hyper::upgrade::on(&mut self.request)
     }
 
     /// Consumes the [`ProxyRequest`] returning a [`hyper::Request`] that
@@ -73,16 +97,16 @@ impl<T> ProxyRequest<T> {
     /// ### HTTP `Forwarded` header parameters:
     ///
     /// - `for`: Identifies the client that initiated the request. This may be
-    /// an obfuscated ID or IP + optional TCP port.
+    ///   an obfuscated ID or IP + optional TCP port.
     ///
-    /// - `by`: Identifies the interface where the request came in to the
-    /// proxy server. This may be an obfuscated ID, IP or IP and TCP port.
+    /// - `by`: Identifies the interface where the request came in to the proxy
+    ///   server. This may be an obfuscated ID, IP or IP and TCP port.
     ///
-    /// - `host`: Original value of the `Host` HTTP header, as received by
-    /// the proxy.
+    /// - `host`: Original value of the `Host` HTTP header, as received by the
+    ///   proxy.
     ///
     /// - `proto`: Protocol used to make the request. For example, `http` or
-    /// `https`.
+    ///   `https`.
     ///
     /// All parameters are optional. IP addresses may be IPv4 or IPv6. If the
     /// address is IPv6 it must be enclosed in square brackets.
@@ -126,15 +150,26 @@ impl<T> ProxyRequest<T> {
             self.server_addr.to_string()
         };
 
-        let by = self.proxy_id.unwrap_or(self.server_addr.to_string());
+        let by = self
+            .headers_config
+            .forwarded
+            .by
+            .clone()
+            .or(self.proxy_id.clone())
+            .unwrap_or(self.server_addr.to_string());
 
-        // TODO: Proto
-        let mut forwarded = format!("for={};by={};host={}", self.client_addr, by, host);
+        let proto = if self.request.version() == Version::HTTP_2 {
+            "https"
+        } else {
+            "http"
+        };
 
-        if let Some(value) = self.request.headers().get(header::FORWARDED) {
-            if let Ok(previous_proxies) = value.to_str() {
-                forwarded = format!("{previous_proxies}, {forwarded}");
-            }
+        let mut forwarded = format!("for={};by={};host={};proto={}", self.client_addr, by, host, proto);
+
+        if self.headers_config.forwarded.extend
+            && let Some(previous) = combine_header_values(self.request.headers(), header::FORWARDED)
+        {
+            forwarded = format!("{previous}, {forwarded}");
         }
 
         self.request.headers_mut().insert(
@@ -142,8 +177,62 @@ impl<T> ProxyRequest<T> {
             HeaderValue::from_str(&forwarded).unwrap(),
         );
 
+        let via_member = format!("{} {}", version_token(self.request.version()), by);
+        append_list_header(self.request.headers_mut(), header::VIA, &via_member);
+
+        for (name, value) in &self.headers_config.set {
+            if let Ok(name) = header::HeaderName::from_bytes(name.as_bytes())
+                && let Ok(value) = HeaderValue::from_str(value)
+            {
+                self.request.headers_mut().insert(name, value);
+            }
+        }
+
+        for name in &self.headers_config.remove {
+            if let Ok(name) = header::HeaderName::from_bytes(name.as_bytes()) {
+                self.request.headers_mut().remove(name);
+            }
+        }
+
         self.request
     }
+}
+
+fn version_token(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_11 => "1.1",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "1.1",
+    }
+}
+
+fn combine_header_values(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    let mut values = vec![];
+
+    for value in headers.get_all(name) {
+        if let Ok(value) = value.to_str() {
+            values.push(value.trim().to_string());
+        }
+    }
+
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(", "))
+    }
+}
+
+fn append_list_header(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
+    let new_value = if let Some(previous) = combine_header_values(headers, name.clone()) {
+        format!("{previous}, {value}")
+    } else {
+        value.to_string()
+    };
+
+    headers.insert(name, HeaderValue::from_str(&new_value).unwrap());
 }
 
 #[cfg(test)]
@@ -171,10 +260,11 @@ mod tests {
             client,
             proxy,
             None,
+            Default::default(),
         );
 
         let forwarded = request.into_forwarded();
-        let expected = format!("for={client};by={proxy};host={proxy}");
+        let expected = format!("for={client};by={proxy};host={proxy};proto=http");
 
         assert!(forwarded.headers().contains_key(header::FORWARDED));
         assert_eq!(forwarded_header(&forwarded), expected.as_str());
@@ -191,10 +281,11 @@ mod tests {
             client,
             proxy,
             Some(proxy_id.clone()),
+            Default::default(),
         );
 
         let forwarded = request.into_forwarded();
-        let expected = format!("for={client};by={proxy_id};host={proxy}");
+        let expected = format!("for={client};by={proxy_id};host={proxy};proto=http");
 
         assert!(forwarded.headers().contains_key(header::FORWARDED));
         assert_eq!(forwarded_header(&forwarded), expected.as_str());

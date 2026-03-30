@@ -119,16 +119,16 @@ impl Subscription {
     /// misuse the [`Notifier`] struct:
     ///
     /// - [`broadcast::error::TryRecvError::Closed`]: can't happen because the
-    /// [`Notifier`] won't close it's sender half until acks are collected, see
-    /// [`Notifier::collect_acknowledgements`]. If that function is not called,
-    /// this error is possible and would be discarded.
+    ///   [`Notifier`] won't close its sender half until acks are collected, see
+    ///   [`Notifier::collect_acknowledgements`]. If that function is not
+    ///   called, this error is possible and would be discarded.
     ///
     /// - [`broadcast::error::TryRecvError::Lagged`]: can't happen because the
-    /// sender will wait for acks before sending new values to the channel. If
-    /// the sender doesn't wait, then again, this error is possible.
+    ///   sender will wait for acks before sending new values to the channel. If
+    ///   the sender doesn't wait, then again, this error is possible.
     ///
     /// - [`broadcast::error::TryRecvError::Empty`]: we don't even care about
-    /// empty buffers, if no notification was sent then return `None`.
+    ///   empty buffers, if no notification was sent then return `None`.
     pub fn receive_notification(&mut self) -> Option<Notification> {
         self.notification_receiver.try_recv().ok()
     }
@@ -138,7 +138,7 @@ impl Subscription {
     /// read notification". Errors as discarded here as well:
     ///
     /// - [`mpsc::error::SendError<T>`]: can't happen unless all receivers
-    /// closed their channel, which they don't until sending the ack.
+    ///   closed their channel, which they don't until sending the ack.
     pub async fn acknowledge_notification(&self) {
         self.acknowledge_sender.send(()).await.unwrap();
     }

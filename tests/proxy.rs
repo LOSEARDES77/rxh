@@ -1,6 +1,5 @@
 //! RXH proxy integration tests.
 
-#![feature(associated_type_bounds)]
 #![feature(trait_alias)]
 
 mod util;
@@ -10,7 +9,8 @@ use std::{io, sync::atomic::Ordering};
 use bytes::Bytes;
 use http::HeaderValue;
 use http_body_util::{Empty, Full};
-use hyper::{header, service::service_fn, Request, Response};
+use hyper::{Response, header, service::service_fn};
+use hyper_util::rt::TokioIo;
 use rxh::{ShutdownState, State};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -20,7 +20,6 @@ use tokio::{
 use crate::util::{
     config,
     http::{
-        http_client,
         request,
         send_http_request,
         spawn_backend_server,
@@ -30,7 +29,7 @@ use crate::util::{
         spawn_reverse_proxy,
         spawn_reverse_proxy_with_controllers,
     },
-    service::{serve_connection, RequestInterceptor},
+    service::{RequestInterceptor, serve_connection},
     tcp::{ping_all, ping_tcp_server, usable_socket, usable_tcp_listener},
 };
 
@@ -102,7 +101,7 @@ async fn reverse_proxy_backend() {
 
     assert_eq!(
         forwarded,
-        format!("for={client_addr};by={proxy_addr};host={proxy_addr}")
+        format!("for={client_addr};by={proxy_addr};host={proxy_addr};proto=http")
     );
 }
 
@@ -214,7 +213,8 @@ async fn limited_connections() {
 async fn upgraded_connection() {
     let (server_addr, _) = spawn_backend_server(service_fn(|req| async {
         tokio::task::spawn(async move {
-            let mut upgraded = hyper::upgrade::on(req).await.unwrap();
+            let upgraded = hyper::upgrade::on(req).await.unwrap();
+            let mut upgraded = TokioIo::new(upgraded);
             let mut buff = [0; 1024];
             let bytes = upgraded.read(&mut buff).await.unwrap();
             upgraded.write_all(&buff[0..bytes]).await.unwrap();
@@ -223,6 +223,7 @@ async fn upgraded_connection() {
 
         Ok(Response::builder()
             .status(http::StatusCode::SWITCHING_PROTOCOLS)
+            .header(header::CONNECTION, HeaderValue::from_static("upgrade"))
             .header(header::UPGRADE, HeaderValue::from_static("testproto"))
             .body(Empty::<Bytes>::new())
             .unwrap())
@@ -233,23 +234,32 @@ async fn upgraded_connection() {
     ping_all(&[server_addr, proxy_addr]).await;
 
     let (socket, _) = usable_socket();
-    let stream = socket.connect(proxy_addr).await.unwrap();
-    let mut sender = http_client(stream).await;
+    let mut stream = socket.connect(proxy_addr).await.unwrap();
 
-    let req = Request::builder()
-        .header(header::CONNECTION, HeaderValue::from_static("upgrade"))
-        .header(header::UPGRADE, HeaderValue::from_static("testproto"))
-        .body(Empty::<Bytes>::new())
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: testproto\r\n\r\n",
+        )
+        .await
         .unwrap();
 
-    let res = sender.send_request(req).await.unwrap();
+    let mut head = [0; 4096];
+    let bytes = stream.read(&mut head).await.unwrap();
+    let response = std::str::from_utf8(&head[..bytes]).unwrap();
 
-    let mut upgraded = hyper::upgrade::on(res).await.unwrap();
-    upgraded.write(b"Test String").await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 101"));
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("connection: upgrade")
+    );
+    assert!(response.to_ascii_lowercase().contains("upgrade: testproto"));
+
+    stream.write_all(b"Test String").await.unwrap();
 
     let mut buff = [0; 1024];
-    let bytes = upgraded.read(&mut buff).await.unwrap();
-    upgraded.shutdown().await.unwrap();
+    let bytes = stream.read(&mut buff).await.unwrap();
+    stream.shutdown().await.unwrap();
 
     assert_eq!(&buff[0..bytes], b"Test String");
 }
@@ -298,11 +308,11 @@ async fn static_files() {
         </html>
     "#;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = util::temp_test_dir();
     let mut file = tokio::fs::File::create(dir.path().join("index.html"))
         .await
         .unwrap();
-    file.write(html.as_bytes()).await.unwrap();
+    file.write_all(html.as_bytes()).await.unwrap();
 
     let (addr, _) = spawn_reverse_proxy(config::files::serve(dir.path().to_str().unwrap()));
 
@@ -316,7 +326,7 @@ async fn static_files() {
 
 #[tokio::test]
 async fn client_receives_404_if_file_not_found() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = util::temp_test_dir();
 
     let (addr, _) = spawn_reverse_proxy(config::files::serve(dir.path().to_str().unwrap()));
 
@@ -327,17 +337,105 @@ async fn client_receives_404_if_file_not_found() {
     for file in doesnt_exist {
         let (parts, body) = send_http_request(addr, request::empty_with_uri(file)).await;
         assert_eq!(parts.status, http::StatusCode::NOT_FOUND);
-        assert!(body.starts_with(b"HTTP 404 NOT FOUND"));
+        let body_text = String::from_utf8_lossy(&body).to_ascii_lowercase();
+        assert_eq!(
+            parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/html"
+        );
+        assert!(body_text.contains("404"));
+        assert!(body_text.contains("back-btn"));
     }
 }
 
 #[tokio::test]
-async fn multi_server() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut file = tokio::fs::File::create(dir.path().join("test.txt"))
+async fn directory_without_index_serves_file_explorer() {
+    let dir = util::temp_test_dir();
+    let mut file = tokio::fs::File::create(dir.path().join("hello.txt"))
         .await
         .unwrap();
-    file.write(b"Hello World File").await.unwrap();
+    file.write_all(b"hello").await.unwrap();
+
+    let (addr, _) = spawn_reverse_proxy(config::files::serve(dir.path().to_str().unwrap()));
+
+    ping_tcp_server(addr).await;
+
+    let (parts, body) = send_http_request(addr, request::empty_with_uri("/")).await;
+
+    assert_eq!(parts.status, http::StatusCode::OK);
+    assert_eq!(
+        parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/html"
+    );
+
+    assert!(
+        body.windows("Directory Explorer".len())
+            .any(|window| window == b"Directory Explorer")
+    );
+    assert!(
+        body.windows("hello.txt".len())
+            .any(|window| window == b"hello.txt")
+    );
+}
+
+#[tokio::test]
+async fn static_files_respect_mount_uri_prefix() {
+    let dir = util::temp_test_dir();
+    let mut file = tokio::fs::File::create(dir.path().join("index.txt"))
+        .await
+        .unwrap();
+    file.write_all(b"prefixed-file").await.unwrap();
+
+    let (addr, _) =
+        spawn_reverse_proxy(config::files::serve_at_uri(dir.path().to_str().unwrap(), "/site"));
+
+    ping_tcp_server(addr).await;
+
+    let (parts, body) = send_http_request(addr, request::empty_with_uri("/site/index.txt")).await;
+
+    assert_eq!(parts.status, http::StatusCode::OK);
+    assert_eq!(body, b"prefixed-file".as_slice());
+}
+
+#[tokio::test]
+async fn file_explorer_links_include_mount_uri_prefix() {
+    let dir = util::temp_test_dir();
+    let mut file = tokio::fs::File::create(dir.path().join("hello.txt"))
+        .await
+        .unwrap();
+    file.write_all(b"hello").await.unwrap();
+
+    let (addr, _) =
+        spawn_reverse_proxy(config::files::serve_at_uri(dir.path().to_str().unwrap(), "/site"));
+
+    ping_tcp_server(addr).await;
+
+    let (parts, body) = send_http_request(addr, request::empty_with_uri("/site")).await;
+
+    assert_eq!(parts.status, http::StatusCode::OK);
+    assert!(
+        body.windows("href=\"/site/hello.txt\"".len())
+            .any(|window| window == b"href=\"/site/hello.txt\"")
+    );
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(body_text.contains("homePath"));
+    assert!(body_text.contains("/site"));
+}
+
+#[tokio::test]
+async fn multi_server() {
+    let dir = util::temp_test_dir();
+    let mut file = tokio::fs::File::create(dir.path().join("test.txt")).await.unwrap();
+    file.write_all(b"Hello World File").await.unwrap();
 
     let (server_addr, _) = spawn_backend_server(service_fn(|_| async {
         Ok(Response::new(Full::<Bytes>::from("Hello World Response")))
