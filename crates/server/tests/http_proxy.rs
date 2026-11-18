@@ -234,3 +234,46 @@ async fn http2_clients_reach_http1_backends() {
     assert_eq!(upstream.uri, "/h2?x=1");
     assert_eq!(upstream.headers[header::HOST], "example.com:8080");
 }
+
+#[tokio::test]
+async fn routes_by_host_method_and_header() {
+    let a = util::backend("a").await;
+    let b = util::backend("b").await;
+    let c = util::backend("c").await;
+    let d = util::backend("d").await;
+    let address = util::spawn(&format!(
+        r#"
+[[server]]
+listen = "127.0.0.1:0"
+match = [
+    {{ host = "a.test", forward = "{a}" }},
+    {{ host = "*.b.test", forward = "{b}" }},
+    {{ host = "c.test", method = "POST", forward = "{c}" }},
+    {{ host = "c.test", header = {{ x-beta = "*" }}, forward = "{d}" }},
+]
+"#
+    ))[0];
+
+    let send = async |method: &str, host: &str, extra: &[(&str, &str)]| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/")
+            .header("host", host);
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
+        let (status, _, body) = util::send(address, request.body(Empty::new()).unwrap()).await;
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    };
+
+    assert_eq!(send("GET", "a.test", &[]).await.1, "a");
+    assert_eq!(send("GET", "A.TEST:8080", &[]).await.1, "a");
+    assert_eq!(send("GET", "x.b.test", &[]).await.1, "b");
+    assert_eq!(send("POST", "c.test", &[]).await.1, "c");
+    assert_eq!(send("GET", "c.test", &[("x-beta", "1")]).await.1, "d");
+    assert_eq!(send("GET", "c.test", &[]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send("GET", "unknown.test", &[]).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

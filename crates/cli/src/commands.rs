@@ -433,6 +433,7 @@ async fn service(cli: &Cli, client: &AdminClient, command: ServiceCommand) -> Re
             serve,
             name,
             uri,
+            host,
         } => {
             let mut file = ConfigFile::open(&editable_config(cli, client).await)?;
             let protocol = match protocol {
@@ -456,6 +457,7 @@ async fn service(cli: &Cli, client: &AdminClient, command: ServiceCommand) -> Re
                 serve,
                 name,
                 uri,
+                host,
             };
             file.add_service(&spec)?;
             file.save()?;

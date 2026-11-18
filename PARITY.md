@@ -121,9 +121,9 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Caddy | RXH | Status | Notes |
 |---|---|---|---|
 | Multiple sites and listeners | `[[server]]`, `listen = [...]` | ✅ | |
-| Path matchers | `uri` prefix | 🟡 | Prefix only. |
-| Host matchers (virtual hosts) | | ❌ | High priority. |
-| Header, method, query, remote IP matchers | | ❌ | |
+| Path matchers | `uri` prefix, `path` patterns | ✅ | Exact, prefix, suffix and middle `*`. Case sensitive, `*` also crosses `/`. |
+| Host matchers (virtual hosts) | `host`, server level `host` | ✅ | Exact and `*.domain`. SNI certificate selection is not done yet. |
+| Header, method, query, remote IP matchers | `header`, `method`, `query`, `remote_ip` | ✅ | AND across matchers, OR inside lists. No regex or percent decoding. |
 | Manual TLS certificates | `tls = { cert, key }` | ✅ | |
 | Automatic HTTPS (ACME) | | ❌ | Large feature. |
 | SNI with many certificates, mTLS | | ❌ | |
@@ -172,13 +172,12 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 
 Ordered by value for a load balancer:
 
-1. Host based routing (virtual hosts) and richer matchers.
-2. HTTPS upstreams (`transport http { tls }`) and unix socket upstreams.
-3. Dynamic upstreams from DNS (`A`/`AAAA`, `SRV`).
-4. Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`, `stream_timeout`.
-5. Prometheus metrics and JSON access logs.
-6. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
-7. Compression (`encode`), range requests and ETags for the file server.
-8. Automatic HTTPS with ACME.
-9. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-10. HTTP/3.
+1. HTTPS upstreams (`transport http { tls }`) and unix socket upstreams.
+2. Dynamic upstreams from DNS (`A`/`AAAA`, `SRV`).
+3. Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`, `stream_timeout`.
+4. Prometheus metrics and JSON access logs.
+5. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
+6. Compression (`encode`), range requests and ETags for the file server.
+7. Automatic HTTPS with ACME.
+8. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
+9. HTTP/3.

@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyper::Request;
 use hyper::body::Incoming;
-use rxh_core::config::{self, Action, RequestHeaders, ResponseHeaders};
+use rxh_core::config::{self, Action, ConfigError, RequestHeaders, ResponseHeaders};
+use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::IpNet;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -45,6 +46,7 @@ pub(crate) struct Site {
 #[derive(Debug)]
 pub(crate) struct Route {
     pub(crate) uri: String,
+    pub(crate) matcher: RequestMatcher,
     pub(crate) action: RouteAction,
     pub(crate) request: RequestHeaders,
     pub(crate) response: ResponseHeaders,
@@ -84,6 +86,11 @@ impl Site {
 
             routes.push(Route {
                 uri: pattern.uri.clone(),
+                matcher: RequestMatcher::new(pattern, &server.host).map_err(|err| {
+                    Error::Config(ConfigError::Invalid(format!(
+                        "match[{pattern_index}]: {err}"
+                    )))
+                })?,
                 action,
                 request: pattern.request.headers.clone(),
                 response: pattern.response.headers.clone(),
@@ -149,11 +156,17 @@ impl Service {
         let uri = request.uri().clone();
         let path = uri.path().to_owned();
 
+        let input = MatchInput {
+            method: &method,
+            uri: &uri,
+            headers: request.headers(),
+            peer: self.peer.ip(),
+        };
         let route = self
             .site
             .routes
             .iter()
-            .find(|route| path.starts_with(route.uri.as_str()));
+            .find(|route| route.matcher.matches(&input));
 
         let response = match route {
             None => response::not_found(),

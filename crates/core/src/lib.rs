@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod duration;
+pub mod matcher;
 pub mod net;
 pub mod pool;
 pub mod status;

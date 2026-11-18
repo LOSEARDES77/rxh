@@ -29,6 +29,7 @@ use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::duration;
+use crate::matcher::RequestMatcher;
 use crate::net::IpNet;
 use crate::status::StatusMatcher;
 
@@ -110,7 +111,10 @@ impl Config {
         for (index, server) in self.servers.iter().enumerate() {
             let label = server.label(index);
 
-            for pattern in &server.patterns {
+            for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+                RequestMatcher::new(pattern, &server.host).map_err(|err| {
+                    ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
+                })?;
                 let Action::Forward(forward) = &pattern.action else {
                     continue;
                 };
@@ -244,6 +248,10 @@ pub struct Server {
     #[serde(rename = "match")]
     pub patterns: Vec<Pattern>,
 
+    /// Default `host` matcher of the entries that have none of their own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub host: Vec<String>,
+
     /// Maximum number of concurrent client connections.
     pub max_connections: usize,
 
@@ -295,6 +303,18 @@ struct RawServer {
     forward: Option<Forward>,
     serve: Option<String>,
     uri: Option<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    host: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    path: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    method: Vec<String>,
+    #[serde(default)]
+    header: BTreeMap<String, String>,
+    #[serde(default)]
+    query: BTreeMap<String, String>,
+    #[serde(default)]
+    remote_ip: Vec<IpNet>,
     request: Option<RequestConfig>,
     response: Option<ResponseConfig>,
     cache: Option<Cache>,
@@ -331,6 +351,11 @@ impl TryFrom<RawServer> for Server {
         };
 
         let has_inline_options = raw.uri.is_some()
+            || !raw.path.is_empty()
+            || !raw.method.is_empty()
+            || !raw.header.is_empty()
+            || !raw.query.is_empty()
+            || !raw.remote_ip.is_empty()
             || raw.request.is_some()
             || raw.response.is_some()
             || raw.cache.is_some();
@@ -343,12 +368,19 @@ impl TryFrom<RawServer> for Server {
             }
             (Some(_), None) if has_inline_options => {
                 return Err(String::from(
-                    "'uri', 'request', 'response' and 'cache' go inside each 'match' entry",
+                    "'uri', 'path', 'method', 'header', 'query', 'remote_ip', 'request', \
+                     'response' and 'cache' go inside each 'match' entry",
                 ));
             }
             (Some(patterns), None) if !patterns.is_empty() => patterns,
             (None, Some(action)) => vec![Pattern {
                 uri: raw.uri.unwrap_or_else(default::uri),
+                host: Vec::new(),
+                path: raw.path,
+                method: raw.method,
+                header: raw.header,
+                query: raw.query,
+                remote_ip: raw.remote_ip,
                 action,
                 request: raw.request.unwrap_or_default(),
                 response: raw.response.unwrap_or_default(),
@@ -370,6 +402,7 @@ impl TryFrom<RawServer> for Server {
             listen: raw.listen,
             protocol: raw.protocol,
             patterns,
+            host: raw.host,
             max_connections: raw.max_connections,
             name: raw.name,
             tls: raw.tls,
@@ -388,6 +421,43 @@ pub struct Pattern {
     /// Path prefix to match against.
     #[serde(default = "default::uri")]
     pub uri: String,
+
+    /// Host names, exact or `*.example.com`. Empty means any host (or the
+    /// server's `host`).
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub host: Vec<String>,
+
+    /// Path patterns: `/exact`, `/prefix/*`, `*.suffix`, `/a/*/b`.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub path: Vec<String>,
+
+    /// HTTP methods, case insensitive.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub method: Vec<String>,
+
+    /// Required request headers. The value `*` only requires presence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub header: BTreeMap<String, String>,
+
+    /// Required query parameters. The value `*` only requires presence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub query: BTreeMap<String, String>,
+
+    /// Client networks allowed to match (the directly connected peer).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_ip: Vec<IpNet>,
 
     /// What to do when the pattern matches.
     #[serde(flatten)]

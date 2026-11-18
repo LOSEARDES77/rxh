@@ -77,6 +77,16 @@ response.headers.server = { override = true, version = false }
 response.headers.remove = ["x-powered-by"]
 cache = { enabled = true, ttl_seconds = 30, max_entries = 1024, max_body_bytes = 1048576 }
 
+# Matchers are ANDed: host, path, method, header, query and remote_ip.
+[[server.match]]
+host = ["admin.example.com", "*.internal.example.com"]
+path = ["/admin/*", "*.php"]
+method = ["GET", "POST"]
+header = { "x-env" = "prod", "authorization" = "*" }
+query = { "debug" = "*" }
+remote_ip = ["10.0.0.0/8", "::1/128"]
+forward = "@api"
+
 [[server.match]]
 uri = "/"
 serve = "/var/www"

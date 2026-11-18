@@ -30,6 +30,7 @@ pub(crate) struct ServiceSpec {
     pub(crate) serve: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) uri: Option<String>,
+    pub(crate) host: Vec<String>,
 }
 
 /// A configuration file loaded for editing.
@@ -207,6 +208,15 @@ impl ConfigFile {
         server.insert("listen", strings(&listen));
         if spec.protocol != "http" {
             server.insert("protocol", value(spec.protocol));
+        }
+        match spec.host.as_slice() {
+            [] => {}
+            [host] => {
+                server.insert("host", value(host.as_str()));
+            }
+            hosts => {
+                server.insert("host", strings(hosts));
+            }
         }
         if let Some(uri) = &spec.uri {
             server.insert("uri", value(uri.as_str()));
@@ -408,5 +418,21 @@ forward = "@api"
         .unwrap();
         let text = file.document.to_string();
         Config::from_toml(&text).unwrap_or_else(|err| panic!("{err}\n{text}"));
+    }
+
+    #[test]
+    fn service_hosts_are_written() {
+        let mut file = ConfigFile::from_text("");
+        file.add_service(&ServiceSpec {
+            listen: vec!["127.0.0.1:9000".parse().unwrap()],
+            protocol: "http",
+            to: vec![String::from("a:1")],
+            host: vec![String::from("a.test"), String::from("*.b.test")],
+            ..ServiceSpec::default()
+        })
+        .unwrap();
+        let text = file.document.to_string();
+        let config = Config::from_toml(&text).unwrap_or_else(|err| panic!("{err}\n{text}"));
+        assert_eq!(config.servers[0].host, ["a.test", "*.b.test"]);
     }
 }

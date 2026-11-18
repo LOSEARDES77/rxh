@@ -212,6 +212,10 @@ pub(crate) enum ServiceCommand {
         /// Path prefix (http only).
         #[arg(short, long)]
         uri: Option<String>,
+
+        /// Host name or `*.domain` to answer to (http only). Repeatable.
+        #[arg(long, value_name = "NAME")]
+        host: Vec<String>,
     },
 
     /// Remove a service by name or listen address and reload the daemon.

@@ -125,6 +125,8 @@ socket.
 | `forward` | | Proxy target: `"@pool"`, `"host:port"`, a list of backends, or an inline pool table. |
 | `serve` | | Serve static files from this directory (http only). |
 | `uri` | `"/"` | Path prefix for the single `forward` or `serve` of this server (http only). |
+| `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. |
+| `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
 | `match` | | List of patterns instead of `forward`/`serve`/`uri`, see below (http only). |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. |
@@ -138,8 +140,9 @@ A `tcp` or `udp` server takes exactly one `forward` and no `match`.
 
 ### `match` entries (HTTP routes)
 
-Routes are tried in order; the first whose `uri` prefixes the request path
-wins. No match means `404`.
+Routes are tried in order; the first one whose matchers all accept the
+request wins. Every matcher given on an entry must match (AND). No match
+means `404`.
 
 ```toml
 [[server]]
@@ -152,7 +155,13 @@ match = [
 
 | Key | Description |
 |---|---|
-| `uri` | Path prefix. Default `"/"`. |
+| `uri` | Path prefix. Default `"/"`. Combined (AND) with the matchers below. |
+| `host` | Host name or list: exact (`"example.com"`) or leading wildcard (`"*.example.com"`, one or more labels, not `example.com` itself). Case insensitive, the port is ignored. Uses the `Host` header, or the `:authority` of HTTP/2. |
+| `path` | Pattern or list; any may match. Exact (`"/health"`), prefix (`"/api/*"`), suffix (`"*.php"`) or with `*` in the middle (`"/user/*/profile"`). Must start with `/` or `*`. `*` matches any run of characters, `/` included. Case sensitive. |
+| `method` | Method or list, case insensitive. |
+| `header` | `{ name = "value" }`: the header must have this exact value (one of its values); `"*"` only requires the header. |
+| `query` | `{ key = "value" }`: same for query parameters (not percent decoded); `"*"` only requires the key. |
+| `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
 | `forward` / `serve` | Action, exactly one. |
 | `request.headers.set` | Headers to set on the upstream request, `{ name = "value" }`. |
 | `request.headers.remove` | Headers to remove from the upstream request. |
@@ -161,6 +170,20 @@ match = [
 | `response.headers.via` | `{ extend = true }` appends this proxy to `Via`. |
 | `response.headers.server` | `{ override = true, version = true }`: replace the backend `Server` header with `rxh/VERSION`. |
 | `cache` | `{ enabled = true, ttl_seconds = 30, max_entries = 1024, max_body_bytes = 1048576 }`: cache `200` responses to `GET` requests that have a `Content-Length` up to `max_body_bytes` and no `Set-Cookie`, `no-store` or `private`. |
+
+Virtual hosts on one listener:
+
+```toml
+[[server]]
+listen = "0.0.0.0:80"
+host = "example.com"          # default for entries without `host`
+match = [
+    { host = "api.example.com", forward = "@api" },
+    { path = ["/admin/*"], remote_ip = ["10.0.0.0/8"], forward = "@admin" },
+    { method = ["GET", "HEAD"], header = { x-beta = "*" }, forward = "@beta" },
+    { forward = "@web" },
+]
+```
 
 ### Headers RXH sets on proxied requests
 
