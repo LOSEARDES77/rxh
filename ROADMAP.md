@@ -11,6 +11,8 @@ This file orders the work into milestones. The detail lives elsewhere:
   tables of features taken from other proxies (config sketches, sources).
 - [docs/benchmarks.md](docs/benchmarks.md): how RXH compares with Caddy,
   NGINX and Traefik today.
+- [docs/profiling.md](docs/profiling.md): where the HTTP hot path spends CPU
+  time and allocations.
 - [docs/test-coverage.md](docs/test-coverage.md): coverage numbers and the
   list of untested code.
 
@@ -73,8 +75,10 @@ The remaining rows of PARITY.md that a load balancer needs every day.
 NGINX serves more than twice the requests of RXH in the same scenarios. The
 goal of this milestone is to close most of that gap and to keep it closed.
 
-- [ ] Profile the HTTP hot path (flamegraphs, allocation counts) and write
-      down the findings before changing code.
+- [x] Profile the HTTP hot path (flamegraphs, allocation counts) and write
+      down the findings before changing code: docs/profiling.md. A request
+      costs 14 µs of CPU with one worker and 41 µs with 32, makes 84
+      allocator calls, and the access log takes 13% of the CPU.
 - [ ] One runtime per core with `SO_REUSEPORT` listeners, instead of one
       work-stealing runtime, if profiling shows contention.
 - [ ] Fewer allocations per request: reuse header maps and buffers, avoid

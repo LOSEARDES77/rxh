@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="470" onload="init(evt)" viewBox="0 0 1200 470" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eef2ee" offset="5%"/><stop stop-color="#e0ffe0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="470" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">rxh HTTP/1.1 proxy: malloc and realloc calls by call stack (83 per request)</text><text id="details" fill="rgb(0,0,0)" x="10" y="453.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="453.00"> </text><svg id="frames" x="10" width="1180" total_samples="4455455"><g><title>&lt;hyper::proto::h1::conn::Conn&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Timed&lt;rxh_server::stream::UpstreamStream&gt;&gt;, bytes::bytes::Bytes, hyper::proto::h1::role::Client&gt;&gt;::poll_read_body (53,688 calls, 1.20%)</title><rect x="0.0000%" y="277" width="1.2050%" height="15" fill="rgb(0,196,0)" fg:x="0" fg:w="53688"/><text x="0.2500%" y="287.50"></text></g><g><title>&lt;hyper::proto::h1::conn::Conn&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Timed&lt;rxh_server::stream::UpstreamStream&gt;&gt;, bytes::bytes::Bytes, hyper::proto::h1::role::Client&gt;&gt;::maybe_notify (53,688 calls, 1.20%)</title><rect x="0.0000%" y="261" width="1.2050%" height="15" fill="rgb(0,212,0)" fg:x="0" fg:w="53688"/><text x="0.2500%" y="271.50"></text></g><g><title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Timed&lt;rxh_server::stream::UpstreamStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt;::poll_read_from_io (53,688 calls, 1.20%)</title><rect x="0.0000%" y="245" width="1.2050%" height="15" fill="rgb(0,239,176)" fg:x="0" fg:w="53688"/><text x="0.2500%" y="255.50"></text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::reserve_inner (53,688 calls, 1.20%)</title><rect x="0.0000%" y="229" width="1.2050%" height="15" fill="rgb(0,195,194)" fg:x="0" fg:w="53688"/><text x="0.2500%" y="239.50"></text></g><g><title>malloc (53,688 calls, 1.20%)</title><rect x="0.0000%" y="213" width="1.2050%" height="15" fill="rgb(0,222,62)" fg:x="0" fg:w="53688"/><text x="0.2500%" y="223.50"></text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::split_to (53,684 calls, 1.20%)</title><rect x="1.2050%" y="245" width="1.2049%" height="15" fill="rgb(0,190,116)" fg:x="53688" fg:w="53684"/><text x="1.4550%" y="255.50"></text></g><g><title>malloc (53,684 calls, 1.20%)</title><rect x="1.2050%" y="229" width="1.2049%" height="15" fill="rgb(0,233,146)" fg:x="53688" fg:w="53684"/><text x="1.4550%" y="239.50"></text></g><g><title>&lt;hashbrown::map::HashMap&lt;core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;, core::hash::BuildHasherDefault&lt;http::extensions::IdHasher&gt;&gt;&gt;::insert (53,688 calls, 1.20%)</title><rect x="2.4099%" y="229" width="1.2050%" height="15" fill="rgb(0,220,21)" fg:x="107372" fg:w="53688"/><text x="2.6599%" y="239.50"></text></g><g><title>&lt;hashbrown::raw::RawTable&lt;(core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;)&gt;&gt;::reserve_rehash::&lt;hashbrown::map::make_hasher&lt;core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;, core::hash::BuildHasherDefault&lt;http::extensions::IdHasher&gt;&gt;::{closure#0}&gt; (53,688 calls, 1.20%)</title><rect x="2.4099%" y="213" width="1.2050%" height="15" fill="rgb(0,213,28)" fg:x="107372" fg:w="53688"/><text x="2.6599%" y="223.50"></text></g><g><title>malloc (53,688 calls, 1.20%)</title><rect x="2.4099%" y="197" width="1.2050%" height="15" fill="rgb(0,207,111)" fg:x="107372" fg:w="53688"/><text x="2.6599%" y="207.50"></text></g><g><title>&lt;http::extensions::Extensions&gt;::insert::&lt;hyper::ext::HeaderCaseMap&gt; (161,066 calls, 3.62%)</title><rect x="2.4099%" y="245" width="3.6150%" height="15" fill="rgb(0,229,208)" fg:x="107372" fg:w="161066"/><text x="2.6599%" y="255.50">&lt;htt..</text></g><g><title>malloc (107,378 calls, 2.41%)</title><rect x="3.6149%" y="229" width="2.4100%" height="15" fill="rgb(0,216,177)" fg:x="161060" fg:w="107378"/><text x="3.8649%" y="239.50">ma..</text></g><g><title>bytes::bytes::promotable_even_clone (53,686 calls, 1.20%)</title><rect x="6.0249%" y="229" width="1.2049%" height="15" fill="rgb(0,224,18)" fg:x="268438" fg:w="53686"/><text x="6.2749%" y="239.50"></text></g><g><title>bytes::bytes::shallow_clone_vec (53,686 calls, 1.20%)</title><rect x="6.0249%" y="213" width="1.2049%" height="15" fill="rgb(0,225,171)" fg:x="268438" fg:w="53686"/><text x="6.2749%" y="223.50"></text></g><g><title>malloc (53,686 calls, 1.20%)</title><rect x="6.0249%" y="197" width="1.2049%" height="15" fill="rgb(0,202,189)" fg:x="268438" fg:w="53686"/><text x="6.2749%" y="207.50"></text></g><g><title>&lt;http::header::map::HeaderMap&lt;bytes::bytes::Bytes&gt;&gt;::try_append2::&lt;&amp;http::header::name::HeaderName&gt; (161,053 calls, 3.61%)</title><rect x="6.0249%" y="245" width="3.6147%" height="15" fill="rgb(0,225,66)" fg:x="268438" fg:w="161053"/><text x="6.2749%" y="255.50">&lt;htt..</text></g><g><title>malloc (107,367 calls, 2.41%)</title><rect x="7.2299%" y="229" width="2.4098%" height="15" fill="rgb(0,232,18)" fg:x="322124" fg:w="107367"/><text x="7.4799%" y="239.50">ma..</text></g><g><title>&lt;hyper::proto::h1::conn::Conn&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Timed&lt;rxh_server::stream::UpstreamStream&gt;&gt;, bytes::bytes::Bytes, hyper::proto::h1::role::Client&gt;&gt;::poll_read_head (429,490 calls, 9.64%)</title><rect x="1.2050%" y="277" width="9.6396%" height="15" fill="rgb(0,228,28)" fg:x="53688" fg:w="429490"/><text x="1.4550%" y="287.50">&lt;hyper::proto:..</text></g><g><title>&lt;hyper::proto::h1::role::Client as hyper::proto::h1::Http1Transaction&gt;::parse (429,490 calls, 9.64%)</title><rect x="1.2050%" y="261" width="9.6396%" height="15" fill="rgb(0,233,183)" fg:x="53688" fg:w="429490"/><text x="1.4550%" y="271.50">&lt;hyper::proto:..</text></g><g><title>&lt;http::header::name::HeaderName&gt;::from_bytes (53,687 calls, 1.20%)</title><rect x="9.6397%" y="245" width="1.2050%" height="15" fill="rgb(0,195,24)" fg:x="429491" fg:w="53687"/><text x="9.8897%" y="255.50"></text></g><g><title>malloc (53,687 calls, 1.20%)</title><rect x="9.6397%" y="229" width="1.2050%" height="15" fill="rgb(0,214,30)" fg:x="429491" fg:w="53687"/><text x="9.8897%" y="239.50"></text></g><g><title>tokio::runtime::task::raw::poll::&lt;&lt;rxh_server::http::transport::Transport&gt;::dial_http1::{closure#0}::{closure#0}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (536,867 calls, 12.05%)</title><rect x="0.0000%" y="309" width="12.0497%" height="15" fill="rgb(0,215,167)" fg:x="0" fg:w="536867"/><text x="0.2500%" y="319.50">tokio::runtime::ta..</text></g><g><title>&lt;rxh_server::http::transport::Transport&gt;::dial_http1::{closure#0}::{closure#0} (536,867 calls, 12.05%)</title><rect x="0.0000%" y="293" width="12.0497%" height="15" fill="rgb(0,225,4)" fg:x="0" fg:w="536867"/><text x="0.2500%" y="303.50">&lt;rxh_server::http:..</text></g><g><title>malloc (53,689 calls, 1.21%)</title><rect x="10.8446%" y="277" width="1.2050%" height="15" fill="rgb(0,228,17)" fg:x="483178" fg:w="53689"/><text x="11.0946%" y="287.50"></text></g><g><title>malloc (53,686 calls, 1.20%)</title><rect x="12.0497%" y="101" width="1.2049%" height="15" fill="rgb(0,231,119)" fg:x="536867" fg:w="53686"/><text x="12.2997%" y="111.50"></text></g><g><title>&lt;rxh_server::log::Logger&gt;::write (107,371 calls, 2.41%)</title><rect x="12.0497%" y="197" width="2.4099%" height="15" fill="rgb(0,216,28)" fg:x="536867" fg:w="107371"/><text x="12.2997%" y="207.50">&lt;r..</text></g><g><title>alloc::fmt::format::format_inner (107,371 calls, 2.41%)</title><rect x="12.0497%" y="181" width="2.4099%" height="15" fill="rgb(0,238,102)" fg:x="536867" fg:w="107371"/><text x="12.2997%" y="191.50">al..</text></g><g><title>core::fmt::write (107,371 calls, 2.41%)</title><rect x="12.0497%" y="165" width="2.4099%" height="15" fill="rgb(0,205,146)" fg:x="536867" fg:w="107371"/><text x="12.2997%" y="175.50">co..</text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (107,371 calls, 2.41%)</title><rect x="12.0497%" y="149" width="2.4099%" height="15" fill="rgb(0,234,135)" fg:x="536867" fg:w="107371"/><text x="12.2997%" y="159.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (107,371 calls, 2.41%)</title><rect x="12.0497%" y="133" width="2.4099%" height="15" fill="rgb(0,234,32)" fg:x="536867" fg:w="107371"/><text x="12.2997%" y="143.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (107,371 calls, 2.41%)</title><rect x="12.0497%" y="117" width="2.4099%" height="15" fill="rgb(0,212,94)" fg:x="536867" fg:w="107371"/><text x="12.2997%" y="127.50">&lt;a..</text></g><g><title>realloc (53,685 calls, 1.20%)</title><rect x="13.2546%" y="101" width="1.2049%" height="15" fill="rgb(0,198,80)" fg:x="590553" fg:w="53685"/><text x="13.5046%" y="111.50"></text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (107,370 calls, 2.41%)</title><rect x="14.4595%" y="165" width="2.4099%" height="15" fill="rgb(0,207,165)" fg:x="644238" fg:w="107370"/><text x="14.7095%" y="175.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (107,370 calls, 2.41%)</title><rect x="14.4595%" y="149" width="2.4099%" height="15" fill="rgb(0,239,175)" fg:x="644238" fg:w="107370"/><text x="14.7095%" y="159.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (107,370 calls, 2.41%)</title><rect x="14.4595%" y="133" width="2.4099%" height="15" fill="rgb(0,224,76)" fg:x="644238" fg:w="107370"/><text x="14.7095%" y="143.50">&lt;a..</text></g><g><title>realloc (107,370 calls, 2.41%)</title><rect x="14.4595%" y="117" width="2.4099%" height="15" fill="rgb(0,226,33)" fg:x="644238" fg:w="107370"/><text x="14.7095%" y="127.50">re..</text></g><g><title>malloc (53,692 calls, 1.21%)</title><rect x="16.8694%" y="37" width="1.2051%" height="15" fill="rgb(0,239,3)" fg:x="751608" fg:w="53692"/><text x="17.1194%" y="47.50"></text></g><g><title>alloc::fmt::format::format_inner (214,747 calls, 4.82%)</title><rect x="14.4595%" y="197" width="4.8199%" height="15" fill="rgb(0,226,176)" fg:x="644238" fg:w="214747"/><text x="14.7095%" y="207.50">alloc:..</text></g><g><title>core::fmt::write (214,747 calls, 4.82%)</title><rect x="14.4595%" y="181" width="4.8199%" height="15" fill="rgb(0,216,152)" fg:x="644238" fg:w="214747"/><text x="14.7095%" y="191.50">core::..</text></g><g><title>&lt;core::net::socket_addr::SocketAddrV4 as core::fmt::Display&gt;::fmt (107,377 calls, 2.41%)</title><rect x="16.8694%" y="165" width="2.4100%" height="15" fill="rgb(0,236,166)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="175.50">&lt;c..</text></g><g><title>core::fmt::write (107,377 calls, 2.41%)</title><rect x="16.8694%" y="149" width="2.4100%" height="15" fill="rgb(0,225,55)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="159.50">co..</text></g><g><title>&lt;core::net::ip_addr::Ipv4Addr as core::fmt::Display&gt;::fmt (107,377 calls, 2.41%)</title><rect x="16.8694%" y="133" width="2.4100%" height="15" fill="rgb(0,201,63)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="143.50">&lt;c..</text></g><g><title>core::fmt::write (107,377 calls, 2.41%)</title><rect x="16.8694%" y="117" width="2.4100%" height="15" fill="rgb(0,224,84)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="127.50">co..</text></g><g><title>&lt;u8 as core::fmt::Display&gt;::fmt (107,377 calls, 2.41%)</title><rect x="16.8694%" y="101" width="2.4100%" height="15" fill="rgb(0,226,106)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="111.50">&lt;u..</text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (107,377 calls, 2.41%)</title><rect x="16.8694%" y="85" width="2.4100%" height="15" fill="rgb(0,216,189)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="95.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (107,377 calls, 2.41%)</title><rect x="16.8694%" y="69" width="2.4100%" height="15" fill="rgb(0,217,88)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="79.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (107,377 calls, 2.41%)</title><rect x="16.8694%" y="53" width="2.4100%" height="15" fill="rgb(0,194,126)" fg:x="751608" fg:w="107377"/><text x="17.1194%" y="63.50">&lt;a..</text></g><g><title>realloc (53,685 calls, 1.20%)</title><rect x="18.0745%" y="37" width="1.2049%" height="15" fill="rgb(0,203,174)" fg:x="805300" fg:w="53685"/><text x="18.3245%" y="47.50"></text></g><g><title>malloc (53,684 calls, 1.20%)</title><rect x="19.2794%" y="197" width="1.2049%" height="15" fill="rgb(0,226,55)" fg:x="858985" fg:w="53684"/><text x="19.5294%" y="207.50"></text></g><g><title>&lt;http::extensions::Extensions&gt;::insert::&lt;rxh_server::http::service::UpstreamAddress&gt; (53,688 calls, 1.20%)</title><rect x="20.4843%" y="181" width="1.2050%" height="15" fill="rgb(0,233,24)" fg:x="912669" fg:w="53688"/><text x="20.7343%" y="191.50"></text></g><g><title>malloc (53,688 calls, 1.20%)</title><rect x="20.4843%" y="165" width="1.2050%" height="15" fill="rgb(0,197,32)" fg:x="912669" fg:w="53688"/><text x="20.7343%" y="175.50"></text></g><g><title>bytes::bytes::promotable_even_clone (268,397 calls, 6.02%)</title><rect x="21.6893%" y="165" width="6.0240%" height="15" fill="rgb(0,212,195)" fg:x="966357" fg:w="268397"/><text x="21.9393%" y="175.50">bytes::b..</text></g><g><title>bytes::bytes::shallow_clone_vec (268,397 calls, 6.02%)</title><rect x="21.6893%" y="149" width="6.0240%" height="15" fill="rgb(0,210,112)" fg:x="966357" fg:w="268397"/><text x="21.9393%" y="159.50">bytes::b..</text></g><g><title>malloc (268,397 calls, 6.02%)</title><rect x="21.6893%" y="133" width="6.0240%" height="15" fill="rgb(0,225,126)" fg:x="966357" fg:w="268397"/><text x="21.9393%" y="143.50">malloc</text></g><g><title>&lt;http::header::map::HeaderMap as core::clone::Clone&gt;::clone (375,752 calls, 8.43%)</title><rect x="21.6893%" y="181" width="8.4335%" height="15" fill="rgb(0,232,133)" fg:x="966357" fg:w="375752"/><text x="21.9393%" y="191.50">&lt;http::heade..</text></g><g><title>malloc (107,355 calls, 2.41%)</title><rect x="27.7133%" y="165" width="2.4095%" height="15" fill="rgb(0,200,108)" fg:x="1234754" fg:w="107355"/><text x="27.9633%" y="175.50">ma..</text></g><g><title>&lt;rxh_core::pool::Pool&gt;::select (53,679 calls, 1.20%)</title><rect x="30.1228%" y="181" width="1.2048%" height="15" fill="rgb(0,213,134)" fg:x="1342109" fg:w="53679"/><text x="30.3728%" y="191.50"></text></g><g><title>&lt;rxh_core::pool::Pool&gt;::choose (53,679 calls, 1.20%)</title><rect x="30.1228%" y="165" width="1.2048%" height="15" fill="rgb(0,224,74)" fg:x="1342109" fg:w="53679"/><text x="30.3728%" y="175.50"></text></g><g><title>malloc (53,679 calls, 1.20%)</title><rect x="30.1228%" y="149" width="1.2048%" height="15" fill="rgb(0,225,11)" fg:x="1342109" fg:w="53679"/><text x="30.3728%" y="159.50"></text></g><g><title>&lt;rxh_server::http::transport::Transport&gt;::connect::{closure#0} (53,674 calls, 1.20%)</title><rect x="31.3276%" y="181" width="1.2047%" height="15" fill="rgb(0,198,1)" fg:x="1395788" fg:w="53674"/><text x="31.5776%" y="191.50"></text></g><g><title>&lt;[&amp;[u8]] as alloc::slice::Concat&lt;u8&gt;&gt;::concat (53,674 calls, 1.20%)</title><rect x="31.3276%" y="165" width="1.2047%" height="15" fill="rgb(0,229,43)" fg:x="1395788" fg:w="53674"/><text x="31.5776%" y="175.50"></text></g><g><title>malloc (53,674 calls, 1.20%)</title><rect x="31.3276%" y="149" width="1.2047%" height="15" fill="rgb(0,217,9)" fg:x="1395788" fg:w="53674"/><text x="31.5776%" y="159.50"></text></g><g><title>&lt;[&amp;[u8]] as alloc::slice::Concat&lt;u8&gt;&gt;::concat (53,693 calls, 1.21%)</title><rect x="32.5323%" y="165" width="1.2051%" height="15" fill="rgb(0,191,209)" fg:x="1449462" fg:w="53693"/><text x="32.7823%" y="175.50"></text></g><g><title>malloc (53,693 calls, 1.21%)</title><rect x="32.5323%" y="149" width="1.2051%" height="15" fill="rgb(0,224,135)" fg:x="1449462" fg:w="53693"/><text x="32.7823%" y="159.50"></text></g><g><title>&lt;rxh_server::http::transport::Transport&gt;::send::{closure#0} (107,369 calls, 2.41%)</title><rect x="32.5323%" y="181" width="2.4098%" height="15" fill="rgb(0,220,61)" fg:x="1449462" fg:w="107369"/><text x="32.7823%" y="191.50">&lt;r..</text></g><g><title>malloc (53,676 calls, 1.20%)</title><rect x="33.7374%" y="165" width="1.2047%" height="15" fill="rgb(0,222,90)" fg:x="1503155" fg:w="53676"/><text x="33.9874%" y="175.50"></text></g><g><title>malloc (322,101 calls, 7.23%)</title><rect x="34.9421%" y="181" width="7.2294%" height="15" fill="rgb(0,237,126)" fg:x="1556831" fg:w="322101"/><text x="35.1921%" y="191.50">malloc</text></g><g><title>rxh_server::http::body::incoming (53,678 calls, 1.20%)</title><rect x="42.1715%" y="181" width="1.2048%" height="15" fill="rgb(0,217,72)" fg:x="1878932" fg:w="53678"/><text x="42.4215%" y="191.50"></text></g><g><title>malloc (53,678 calls, 1.20%)</title><rect x="42.1715%" y="165" width="1.2048%" height="15" fill="rgb(0,211,162)" fg:x="1878932" fg:w="53678"/><text x="42.4215%" y="175.50"></text></g><g><title>malloc (107,349 calls, 2.41%)</title><rect x="43.3763%" y="69" width="2.4094%" height="15" fill="rgb(0,214,57)" fg:x="1932610" fg:w="107349"/><text x="43.6263%" y="79.50">ma..</text></g><g><title>&lt;core::net::ip_addr::Ipv4Addr as core::fmt::Display&gt;::fmt (214,690 calls, 4.82%)</title><rect x="43.3763%" y="165" width="4.8186%" height="15" fill="rgb(0,197,140)" fg:x="1932610" fg:w="214690"/><text x="43.6263%" y="175.50">&lt;core:..</text></g><g><title>core::fmt::write (214,690 calls, 4.82%)</title><rect x="43.3763%" y="149" width="4.8186%" height="15" fill="rgb(0,231,32)" fg:x="1932610" fg:w="214690"/><text x="43.6263%" y="159.50">core::..</text></g><g><title>&lt;u8 as core::fmt::Display&gt;::fmt (214,690 calls, 4.82%)</title><rect x="43.3763%" y="133" width="4.8186%" height="15" fill="rgb(0,201,105)" fg:x="1932610" fg:w="214690"/><text x="43.6263%" y="143.50">&lt;u8 as..</text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (214,690 calls, 4.82%)</title><rect x="43.3763%" y="117" width="4.8186%" height="15" fill="rgb(0,235,49)" fg:x="1932610" fg:w="214690"/><text x="43.6263%" y="127.50">&lt;alloc..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (214,690 calls, 4.82%)</title><rect x="43.3763%" y="101" width="4.8186%" height="15" fill="rgb(0,237,76)" fg:x="1932610" fg:w="214690"/><text x="43.6263%" y="111.50">&lt;alloc..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (214,690 calls, 4.82%)</title><rect x="43.3763%" y="85" width="4.8186%" height="15" fill="rgb(0,232,106)" fg:x="1932610" fg:w="214690"/><text x="43.6263%" y="95.50">&lt;alloc..</text></g><g><title>realloc (107,341 calls, 2.41%)</title><rect x="45.7856%" y="69" width="2.4092%" height="15" fill="rgb(0,226,39)" fg:x="2039959" fg:w="107341"/><text x="46.0356%" y="79.50">re..</text></g><g><title>malloc (53,679 calls, 1.20%)</title><rect x="48.1949%" y="85" width="1.2048%" height="15" fill="rgb(0,230,34)" fg:x="2147300" fg:w="53679"/><text x="48.4449%" y="95.50"></text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (161,031 calls, 3.61%)</title><rect x="48.1949%" y="133" width="3.6142%" height="15" fill="rgb(0,211,193)" fg:x="2147300" fg:w="161031"/><text x="48.4449%" y="143.50">&lt;all..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (161,031 calls, 3.61%)</title><rect x="48.1949%" y="117" width="3.6142%" height="15" fill="rgb(0,209,72)" fg:x="2147300" fg:w="161031"/><text x="48.4449%" y="127.50">&lt;all..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (161,031 calls, 3.61%)</title><rect x="48.1949%" y="101" width="3.6142%" height="15" fill="rgb(0,222,88)" fg:x="2147300" fg:w="161031"/><text x="48.4449%" y="111.50">&lt;all..</text></g><g><title>realloc (107,352 calls, 2.41%)</title><rect x="49.3996%" y="85" width="2.4095%" height="15" fill="rgb(0,226,196)" fg:x="2200979" fg:w="107352"/><text x="49.6496%" y="95.50">re..</text></g><g><title>malloc (53,677 calls, 1.20%)</title><rect x="51.8091%" y="37" width="1.2047%" height="15" fill="rgb(0,209,74)" fg:x="2308331" fg:w="53677"/><text x="52.0591%" y="47.50"></text></g><g><title>core::fmt::write (268,382 calls, 6.02%)</title><rect x="48.1949%" y="149" width="6.0237%" height="15" fill="rgb(0,225,173)" fg:x="2147300" fg:w="268382"/><text x="48.4449%" y="159.50">core::fm..</text></g><g><title>&lt;core::net::ip_addr::Ipv4Addr as core::fmt::Display&gt;::fmt (107,351 calls, 2.41%)</title><rect x="51.8091%" y="133" width="2.4094%" height="15" fill="rgb(0,225,194)" fg:x="2308331" fg:w="107351"/><text x="52.0591%" y="143.50">&lt;c..</text></g><g><title>core::fmt::write (107,351 calls, 2.41%)</title><rect x="51.8091%" y="117" width="2.4094%" height="15" fill="rgb(0,225,111)" fg:x="2308331" fg:w="107351"/><text x="52.0591%" y="127.50">co..</text></g><g><title>&lt;u8 as core::fmt::Display&gt;::fmt (107,351 calls, 2.41%)</title><rect x="51.8091%" y="101" width="2.4094%" height="15" fill="rgb(0,221,199)" fg:x="2308331" fg:w="107351"/><text x="52.0591%" y="111.50">&lt;u..</text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (107,351 calls, 2.41%)</title><rect x="51.8091%" y="85" width="2.4094%" height="15" fill="rgb(0,232,62)" fg:x="2308331" fg:w="107351"/><text x="52.0591%" y="95.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (107,351 calls, 2.41%)</title><rect x="51.8091%" y="69" width="2.4094%" height="15" fill="rgb(0,238,15)" fg:x="2308331" fg:w="107351"/><text x="52.0591%" y="79.50">&lt;a..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (107,351 calls, 2.41%)</title><rect x="51.8091%" y="53" width="2.4094%" height="15" fill="rgb(0,201,113)" fg:x="2308331" fg:w="107351"/><text x="52.0591%" y="63.50">&lt;a..</text></g><g><title>realloc (53,674 calls, 1.20%)</title><rect x="53.0138%" y="37" width="1.2047%" height="15" fill="rgb(0,200,154)" fg:x="2362008" fg:w="53674"/><text x="53.2638%" y="47.50"></text></g><g><title>alloc::fmt::format::format_inner (322,057 calls, 7.23%)</title><rect x="48.1949%" y="165" width="7.2284%" height="15" fill="rgb(0,192,151)" fg:x="2147300" fg:w="322057"/><text x="48.4449%" y="175.50">alloc::fmt..</text></g><g><title>malloc (53,675 calls, 1.20%)</title><rect x="54.2185%" y="149" width="1.2047%" height="15" fill="rgb(0,216,197)" fg:x="2415682" fg:w="53675"/><text x="54.4685%" y="159.50"></text></g><g><title>malloc (53,672 calls, 1.20%)</title><rect x="55.4232%" y="165" width="1.2046%" height="15" fill="rgb(0,214,106)" fg:x="2469357" fg:w="53672"/><text x="55.6732%" y="175.50"></text></g><g><title>malloc (107,356 calls, 2.41%)</title><rect x="56.6279%" y="149" width="2.4095%" height="15" fill="rgb(0,234,91)" fg:x="2523029" fg:w="107356"/><text x="56.8779%" y="159.50">ma..</text></g><g><title>rxh_server::http::headers::append_list (214,711 calls, 4.82%)</title><rect x="56.6279%" y="165" width="4.8191%" height="15" fill="rgb(0,196,10)" fg:x="2523029" fg:w="214711"/><text x="56.8779%" y="175.50">rxh_se..</text></g><g><title>rxh_server::http::headers::insert (107,355 calls, 2.41%)</title><rect x="59.0374%" y="149" width="2.4095%" height="15" fill="rgb(0,225,130)" fg:x="2630385" fg:w="107355"/><text x="59.2874%" y="159.50">rx..</text></g><g><title>malloc (107,355 calls, 2.41%)</title><rect x="59.0374%" y="133" width="2.4095%" height="15" fill="rgb(0,199,89)" fg:x="2630385" fg:w="107355"/><text x="59.2874%" y="143.50">ma..</text></g><g><title>rxh_server::http::headers::insert (161,023 calls, 3.61%)</title><rect x="61.4469%" y="165" width="3.6141%" height="15" fill="rgb(0,207,190)" fg:x="2737740" fg:w="161023"/><text x="61.6969%" y="175.50">rxh_..</text></g><g><title>malloc (161,023 calls, 3.61%)</title><rect x="61.4469%" y="149" width="3.6141%" height="15" fill="rgb(0,192,150)" fg:x="2737740" fg:w="161023"/><text x="61.6969%" y="159.50">mall..</text></g><g><title>&lt;str&gt;::replace::&lt;char&gt; (322,060 calls, 7.23%)</title><rect x="65.0610%" y="149" width="7.2284%" height="15" fill="rgb(0,194,117)" fg:x="2898763" fg:w="322060"/><text x="65.3110%" y="159.50">&lt;str&gt;::rep..</text></g><g><title>malloc (322,060 calls, 7.23%)</title><rect x="65.0610%" y="133" width="7.2284%" height="15" fill="rgb(0,199,16)" fg:x="2898763" fg:w="322060"/><text x="65.3110%" y="143.50">malloc</text></g><g><title>core::fmt::write (322,045 calls, 7.23%)</title><rect x="72.2894%" y="133" width="7.2281%" height="15" fill="rgb(0,190,97)" fg:x="3220823" fg:w="322045"/><text x="72.5394%" y="143.50">core::fmt:..</text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (322,045 calls, 7.23%)</title><rect x="72.2894%" y="117" width="7.2281%" height="15" fill="rgb(0,218,26)" fg:x="3220823" fg:w="322045"/><text x="72.5394%" y="127.50">&lt;alloc::st..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (322,045 calls, 7.23%)</title><rect x="72.2894%" y="101" width="7.2281%" height="15" fill="rgb(0,199,203)" fg:x="3220823" fg:w="322045"/><text x="72.5394%" y="111.50">&lt;alloc::ra..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (322,045 calls, 7.23%)</title><rect x="72.2894%" y="85" width="7.2281%" height="15" fill="rgb(0,215,19)" fg:x="3220823" fg:w="322045"/><text x="72.5394%" y="95.50">&lt;alloc::ra..</text></g><g><title>realloc (322,045 calls, 7.23%)</title><rect x="72.2894%" y="69" width="7.2281%" height="15" fill="rgb(0,209,21)" fg:x="3220823" fg:w="322045"/><text x="72.5394%" y="79.50">realloc</text></g><g><title>rxh_server::http::headers::prepare_request (1,771,289 calls, 39.76%)</title><rect x="43.3763%" y="181" width="39.7555%" height="15" fill="rgb(0,211,4)" fg:x="1932610" fg:w="1771289"/><text x="43.6263%" y="191.50">rxh_server::http::headers::prepare_request</text></g><g><title>rxh_server::http::headers::quote (805,136 calls, 18.07%)</title><rect x="65.0610%" y="165" width="18.0708%" height="15" fill="rgb(0,232,74)" fg:x="2898763" fg:w="805136"/><text x="65.3110%" y="175.50">rxh_server::http::headers::q..</text></g><g><title>alloc::fmt::format::format_inner (483,076 calls, 10.84%)</title><rect x="72.2894%" y="149" width="10.8423%" height="15" fill="rgb(0,217,64)" fg:x="3220823" fg:w="483076"/><text x="72.5394%" y="159.50">alloc::fmt::form..</text></g><g><title>malloc (161,031 calls, 3.61%)</title><rect x="79.5175%" y="133" width="3.6142%" height="15" fill="rgb(0,208,62)" fg:x="3542868" fg:w="161031"/><text x="79.7675%" y="143.50">mall..</text></g><g><title>malloc (53,690 calls, 1.21%)</title><rect x="83.1318%" y="85" width="1.2050%" height="15" fill="rgb(0,202,171)" fg:x="3703899" fg:w="53690"/><text x="83.3818%" y="95.50"></text></g><g><title>core::fmt::write (161,064 calls, 3.61%)</title><rect x="83.1318%" y="149" width="3.6150%" height="15" fill="rgb(0,214,103)" fg:x="3703899" fg:w="161064"/><text x="83.3818%" y="159.50">core..</text></g><g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (161,064 calls, 3.61%)</title><rect x="83.1318%" y="133" width="3.6150%" height="15" fill="rgb(0,192,175)" fg:x="3703899" fg:w="161064"/><text x="83.3818%" y="143.50">&lt;all..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (161,064 calls, 3.61%)</title><rect x="83.1318%" y="117" width="3.6150%" height="15" fill="rgb(0,194,99)" fg:x="3703899" fg:w="161064"/><text x="83.3818%" y="127.50">&lt;all..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (161,064 calls, 3.61%)</title><rect x="83.1318%" y="101" width="3.6150%" height="15" fill="rgb(0,234,158)" fg:x="3703899" fg:w="161064"/><text x="83.3818%" y="111.50">&lt;all..</text></g><g><title>realloc (107,374 calls, 2.41%)</title><rect x="84.3368%" y="85" width="2.4099%" height="15" fill="rgb(0,222,104)" fg:x="3757589" fg:w="107374"/><text x="84.5868%" y="95.50">re..</text></g><g><title>alloc::fmt::format::format_inner (214,752 calls, 4.82%)</title><rect x="83.1318%" y="165" width="4.8200%" height="15" fill="rgb(0,215,145)" fg:x="3703899" fg:w="214752"/><text x="83.3818%" y="175.50">alloc:..</text></g><g><title>malloc (53,688 calls, 1.20%)</title><rect x="86.7468%" y="149" width="1.2050%" height="15" fill="rgb(0,230,157)" fg:x="3864963" fg:w="53688"/><text x="86.9968%" y="159.50"></text></g><g><title>&lt;hyper::proto::h1::dispatch::Dispatcher&lt;hyper::proto::h1::dispatch::Server&lt;rxh_server::http::service::Service, hyper::body::incoming::Incoming&gt;, http_body_util::combinators::box_body::BoxBody&lt;bytes::bytes::Bytes, rxh_server::http::body::BodyError&gt;, hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Watched&lt;rxh_server::l4match::Rewind&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;&gt;&gt;, hyper::proto::h1::role::Server&gt;&gt;::poll_write (3,435,471 calls, 77.11%)</title><rect x="12.0497%" y="245" width="77.1071%" height="15" fill="rgb(0,200,21)" fg:x="536867" fg:w="3435471"/><text x="12.2997%" y="255.50">&lt;hyper::proto::h1::dispatch::Dispatcher&lt;hyper::proto::h1::dispatch::Server&lt;rxh_server::http::service::Service, hyper::body::inco..</text></g><g><title>&lt;hyper::proto::h1::dispatch::Server&lt;rxh_server::http::service::Service, hyper::body::incoming::Incoming&gt; as hyper::proto::h1::dispatch::Dispatch&gt;::poll_msg (3,435,471 calls, 77.11%)</title><rect x="12.0497%" y="229" width="77.1071%" height="15" fill="rgb(0,225,107)" fg:x="536867" fg:w="3435471"/><text x="12.2997%" y="239.50">&lt;hyper::proto::h1::dispatch::Server&lt;rxh_server::http::service::Service, hyper::body::incoming::Incoming&gt; as hyper::proto::h1::di..</text></g><g><title>&lt;rxh_server::http::service::Service as hyper::service::service::Service&lt;http::request::Request&lt;hyper::body::incoming::Incoming&gt;&gt;&gt;::call::{closure#0} (3,435,471 calls, 77.11%)</title><rect x="12.0497%" y="213" width="77.1071%" height="15" fill="rgb(0,213,66)" fg:x="536867" fg:w="3435471"/><text x="12.2997%" y="223.50">&lt;rxh_server::http::service::Service as hyper::service::service::Service&lt;http::request::Request&lt;hyper::body::incoming::Incoming&gt;&gt;..</text></g><g><title>rxh_server::http::proxy::forward::{closure#0} (3,059,669 calls, 68.67%)</title><rect x="20.4843%" y="197" width="68.6724%" height="15" fill="rgb(0,198,64)" fg:x="912669" fg:w="3059669"/><text x="20.7343%" y="207.50">rxh_server::http::proxy::forward::{closure#0}</text></g><g><title>rxh_server::http::headers::prepare_response::&lt;http_body_util::combinators::box_body::BoxBody&lt;bytes::bytes::Bytes, rxh_server::http::body::BodyError&gt;&gt; (268,439 calls, 6.02%)</title><rect x="83.1318%" y="181" width="6.0250%" height="15" fill="rgb(0,225,114)" fg:x="3703899" fg:w="268439"/><text x="83.3818%" y="191.50">rxh_serv..</text></g><g><title>rxh_server::http::headers::insert (53,687 calls, 1.20%)</title><rect x="87.9518%" y="165" width="1.2050%" height="15" fill="rgb(0,199,33)" fg:x="3918651" fg:w="53687"/><text x="88.2018%" y="175.50"></text></g><g><title>malloc (53,687 calls, 1.20%)</title><rect x="87.9518%" y="149" width="1.2050%" height="15" fill="rgb(0,233,113)" fg:x="3918651" fg:w="53687"/><text x="88.2018%" y="159.50"></text></g><g><title>&lt;hyper::proto::h1::dispatch::Server&lt;rxh_server::http::service::Service, hyper::body::incoming::Incoming&gt; as hyper::proto::h1::dispatch::Dispatch&gt;::recv_msg (53,670 calls, 1.20%)</title><rect x="89.1567%" y="245" width="1.2046%" height="15" fill="rgb(0,202,11)" fg:x="3972338" fg:w="53670"/><text x="89.4067%" y="255.50"></text></g><g><title>&lt;rxh_server::http::service::Service as hyper::service::service::Service&lt;http::request::Request&lt;hyper::body::incoming::Incoming&gt;&gt;&gt;::call (53,670 calls, 1.20%)</title><rect x="89.1567%" y="229" width="1.2046%" height="15" fill="rgb(0,198,119)" fg:x="3972338" fg:w="53670"/><text x="89.4067%" y="239.50"></text></g><g><title>malloc (53,670 calls, 1.20%)</title><rect x="89.1567%" y="213" width="1.2046%" height="15" fill="rgb(0,197,45)" fg:x="3972338" fg:w="53670"/><text x="89.4067%" y="223.50"></text></g><g><title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Watched&lt;rxh_server::l4match::Rewind&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt;::poll_read_from_io (53,675 calls, 1.20%)</title><rect x="90.3613%" y="245" width="1.2047%" height="15" fill="rgb(0,211,166)" fg:x="4026008" fg:w="53675"/><text x="90.6113%" y="255.50"></text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::reserve_inner (53,675 calls, 1.20%)</title><rect x="90.3613%" y="229" width="1.2047%" height="15" fill="rgb(0,224,12)" fg:x="4026008" fg:w="53675"/><text x="90.6113%" y="239.50"></text></g><g><title>malloc (53,675 calls, 1.20%)</title><rect x="90.3613%" y="213" width="1.2047%" height="15" fill="rgb(0,201,208)" fg:x="4026008" fg:w="53675"/><text x="90.6113%" y="223.50"></text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::split_to (53,671 calls, 1.20%)</title><rect x="91.5660%" y="229" width="1.2046%" height="15" fill="rgb(0,204,50)" fg:x="4079683" fg:w="53671"/><text x="91.8160%" y="239.50"></text></g><g><title>malloc (53,671 calls, 1.20%)</title><rect x="91.5660%" y="213" width="1.2046%" height="15" fill="rgb(0,192,8)" fg:x="4079683" fg:w="53671"/><text x="91.8160%" y="223.50"></text></g><g><title>&lt;hashbrown::map::HashMap&lt;core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;, core::hash::BuildHasherDefault&lt;http::extensions::IdHasher&gt;&gt;&gt;::insert (53,670 calls, 1.20%)</title><rect x="92.7706%" y="213" width="1.2046%" height="15" fill="rgb(0,217,54)" fg:x="4133354" fg:w="53670"/><text x="93.0206%" y="223.50"></text></g><g><title>&lt;hashbrown::raw::RawTable&lt;(core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;)&gt;&gt;::reserve_rehash::&lt;hashbrown::map::make_hasher&lt;core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;, core::hash::BuildHasherDefault&lt;http::extensions::IdHasher&gt;&gt;::{closure#0}&gt; (53,670 calls, 1.20%)</title><rect x="92.7706%" y="197" width="1.2046%" height="15" fill="rgb(0,209,111)" fg:x="4133354" fg:w="53670"/><text x="93.0206%" y="207.50"></text></g><g><title>malloc (53,670 calls, 1.20%)</title><rect x="92.7706%" y="181" width="1.2046%" height="15" fill="rgb(0,202,100)" fg:x="4133354" fg:w="53670"/><text x="93.0206%" y="191.50"></text></g><g><title>&lt;http::extensions::Extensions&gt;::insert::&lt;hyper::ext::HeaderCaseMap&gt; (161,010 calls, 3.61%)</title><rect x="92.7706%" y="229" width="3.6138%" height="15" fill="rgb(0,191,17)" fg:x="4133354" fg:w="161010"/><text x="93.0206%" y="239.50">&lt;htt..</text></g><g><title>malloc (107,340 calls, 2.41%)</title><rect x="93.9752%" y="213" width="2.4092%" height="15" fill="rgb(0,228,37)" fg:x="4187024" fg:w="107340"/><text x="94.2252%" y="223.50">ma..</text></g><g><title>&lt;hyper::proto::h1::role::Server as hyper::proto::h1::Http1Transaction&gt;::parse (322,022 calls, 7.23%)</title><rect x="91.5660%" y="245" width="7.2276%" height="15" fill="rgb(0,223,112)" fg:x="4079683" fg:w="322022"/><text x="91.8160%" y="255.50">&lt;hyper::pr..</text></g><g><title>&lt;http::header::map::HeaderMap&lt;bytes::bytes::Bytes&gt;&gt;::try_append2::&lt;&amp;http::header::name::HeaderName&gt; (107,341 calls, 2.41%)</title><rect x="96.3844%" y="229" width="2.4092%" height="15" fill="rgb(0,193,114)" fg:x="4294364" fg:w="107341"/><text x="96.6344%" y="239.50">&lt;h..</text></g><g><title>malloc (107,341 calls, 2.41%)</title><rect x="96.3844%" y="213" width="2.4092%" height="15" fill="rgb(0,236,89)" fg:x="4294364" fg:w="107341"/><text x="96.6344%" y="223.50">ma..</text></g><g><title>all (4,455,455 calls, 100%)</title><rect x="0.0000%" y="421" width="100.0000%" height="15" fill="rgb(0,224,169)" fg:x="0" fg:w="4455455"/><text x="0.2500%" y="431.50"></text></g><g><title>[unknown] (4,455,455 calls, 100.00%)</title><rect x="0.0000%" y="405" width="100.0000%" height="15" fill="rgb(0,204,189)" fg:x="0" fg:w="4455455"/><text x="0.2500%" y="415.50">[unknown]</text></g><g><title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (4,455,455 calls, 100.00%)</title><rect x="0.0000%" y="389" width="100.0000%" height="15" fill="rgb(0,229,182)" fg:x="0" fg:w="4455455"/><text x="0.2500%" y="399.50">&lt;std::sys::thread::unix::Thread&gt;::new::thread_start</text></g><g><title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt;::{closure#1} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim:vtable#0} (4,455,455 calls, 100.00%)</title><rect x="0.0000%" y="373" width="100.0000%" height="15" fill="rgb(0,200,183)" fg:x="0" fg:w="4455455"/><text x="0.2500%" y="383.50">&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt;::{closure#1} as core::ops::function::FnOnce&lt;()&gt;&gt;::ca..</text></g><g><title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt; (4,455,455 calls, 100.00%)</title><rect x="0.0000%" y="357" width="100.0000%" height="15" fill="rgb(0,200,42)" fg:x="0" fg:w="4455455"/><text x="0.2500%" y="367.50">std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, ()&gt;</text></g><g><title>tokio::runtime::task::raw::poll::&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt; (4,455,455 calls, 100.00%)</title><rect x="0.0000%" y="341" width="100.0000%" height="15" fill="rgb(0,221,32)" fg:x="0" fg:w="4455455"/><text x="0.2500%" y="351.50">tokio::runtime::task::raw::poll::&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, tokio::..</text></g><g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task (4,455,455 calls, 100.00%)</title><rect x="0.0000%" y="325" width="100.0000%" height="15" fill="rgb(0,233,29)" fg:x="0" fg:w="4455455"/><text x="0.2500%" y="335.50">&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task</text></g><g><title>tokio::runtime::task::raw::poll::&lt;rxh_server::server::handle_connection::{closure#0}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (3,918,588 calls, 87.95%)</title><rect x="12.0497%" y="309" width="87.9503%" height="15" fill="rgb(0,211,184)" fg:x="536867" fg:w="3918588"/><text x="12.2997%" y="319.50">tokio::runtime::task::raw::poll::&lt;rxh_server::server::handle_connection::{closure#0}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::han..</text></g><g><title>rxh_server::server::handle_connection::{closure#0} (3,918,588 calls, 87.95%)</title><rect x="12.0497%" y="293" width="87.9503%" height="15" fill="rgb(0,200,93)" fg:x="536867" fg:w="3918588"/><text x="12.2997%" y="303.50">rxh_server::server::handle_connection::{closure#0}</text></g><g><title>rxh_server::server::serve::&lt;rxh_server::l4match::Rewind&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;::{closure#0} (3,918,588 calls, 87.95%)</title><rect x="12.0497%" y="277" width="87.9503%" height="15" fill="rgb(0,230,101)" fg:x="536867" fg:w="3918588"/><text x="12.2997%" y="287.50">rxh_server::server::serve::&lt;rxh_server::l4match::Rewind&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;::{closure#0}</text></g><g><title>&lt;hyper_util::server::conn::auto::UpgradeableConnection&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Watched&lt;rxh_server::l4match::Rewind&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;&gt;, rxh_server::http::service::Service, hyper_util::rt::tokio::TokioExecutor&gt; as core::future::future::Future&gt;::poll (3,918,588 calls, 87.95%)</title><rect x="12.0497%" y="261" width="87.9503%" height="15" fill="rgb(0,239,67)" fg:x="536867" fg:w="3918588"/><text x="12.2997%" y="271.50">&lt;hyper_util::server::conn::auto::UpgradeableConnection&lt;hyper_util::rt::tokio::TokioIo&lt;rxh_server::timeout::Watched&lt;rxh_server::l4match::Rewind&lt;toki..</text></g><g><title>&lt;hyper_util::rt::tokio::TokioTimer as hyper::rt::timer::Timer&gt;::sleep_until (53,686 calls, 1.20%)</title><rect x="98.7951%" y="245" width="1.2049%" height="15" fill="rgb(0,201,91)" fg:x="4401769" fg:w="53686"/><text x="99.0451%" y="255.50"></text></g><g><title>malloc (53,686 calls, 1.20%)</title><rect x="98.7951%" y="229" width="1.2049%" height="15" fill="rgb(0,214,20)" fg:x="4401769" fg:w="53686"/><text x="99.0451%" y="239.50"></text></g></svg></svg>

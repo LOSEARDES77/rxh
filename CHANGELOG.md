@@ -108,6 +108,9 @@ Changed.
   `fuzz` CI job runs each target for 60 seconds.
 - CI: a `bench-gate` job runs `rxh-bench --quick` and fails when RXH fails
   or cannot run a scenario. Caddy runs alongside for information only.
+- `docs/profiling.md`: CPU flame graphs, system call and allocation counts of
+  the HTTP hot path, with the scripts to reproduce them (`docs/profiling/`).
+  No runtime change.
 - `SECURITY.md`: supported versions, private reporting through GitHub
   security advisories, scope. An `Audit` workflow runs `cargo audit` and
   `cargo deny` (policy in `deny.toml`: advisories, licenses, bans, sources)

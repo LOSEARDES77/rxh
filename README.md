@@ -109,7 +109,8 @@ is the only one of the four that runs all ten scenarios.
 ![Requests per second by scenario and proxy](docs/bench/rps.svg)
 
 Tables, latency and the limits of the measurement are in
-[docs/benchmarks.md](docs/benchmarks.md). Run it yourself:
+[docs/benchmarks.md](docs/benchmarks.md). Where the time of a request goes is
+in [docs/profiling.md](docs/profiling.md). Run it yourself:
 
 ```bash
 cargo build --release -p rxh-cli -p rxh-bench
