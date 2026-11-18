@@ -1,11 +1,8 @@
 # Test coverage
 
-Measured 2026-11-18 on the tree that includes the virtual-hosts work (details in section 2).
-
-> **Stale numbers.** The measurement predates commit `42678d1` (which recorded it,
-> on top of `2ff3cdd`) and the work after it on the `caddy-parity` branch: the
-> streaming file server, includes and quick commands, layer 4 routing and PROXY
-> input, and ACME. Re-measure with section 1 before relying on section 2.
+Measured 2026-11-18 on the tree of task 58 (section 2), after the tests for
+daemon signals, reload rollback, the admin API, the CLI commands and the
+upstream transport.
 
 ## 1. How to measure
 
@@ -31,107 +28,137 @@ Notes:
   `-C instrument-coverage` by hand: stray `*.profraw` files end up inside `crates/*`. Add `*.profraw` to `.gitignore`.
 - **Subprocess coverage is captured.** `crates/cli/tests/daemon.rs` spawns the `rxh` binary;
   cargo-llvm-cov builds it instrumented and passes `LLVM_PROFILE_FILE` through the environment, so the
-  child's counters are merged. The exception is `cli/src/process.rs::daemonize` (0%): the daemonized
-  grandchild is killed by a signal and never flushes its counters (see gap 1).
+  child's counters are merged. This includes the daemon forked by `rxh start`: the test stops it with
+  `rxh stop` (SIGTERM), the daemon exits normally and flushes its counters. A daemon killed with
+  SIGKILL (the cleanup guard of a failing test) loses them.
 - Branch coverage needs nightly: `cargo +nightly llvm-cov --branch`.
 
 ## 2. Current numbers
 
-Measured 2026-11-18 with cargo-llvm-cov 0.9.1 on the **post-"virtual hosts" tree** (includes
-`server/src/tls.rs`, `core/src/matcher.rs` and `server/tests/virtual_hosts.rs`). All test binaries pass.
+Measured 2026-11-18 with cargo-llvm-cov 0.9.1 and
+`cargo llvm-cov --workspace --ignore-filename-regex 'crates/bench/' --summary-only`. All test
+binaries pass. `crates/bench` is left out (benchmark tool without tests, see gap 12).
 
 | Scope | Lines | Regions | Functions |
 |---|---|---|---|
-| Whole workspace (incl. bench) | 71.19% (4189/5884) | 68.71% (4833/7034) | 70.90% (570/804) |
-| **Workspace without `crates/bench`** | **82.17% (4029/4903)** | **79.72% (4638/5818)** | **80.88% (550/680)** |
-
-`crates/bench` is a benchmark tool with no tests; it drags the total down about 11 points, so quote
-the second row. (An earlier measurement on the pre-virtual-hosts snapshot gave 81.65% lines without bench.)
+| **Workspace without `crates/bench`** | **92.18% (10578/11475)** | **90.30% (12080/13378)** | **88.42% (1283/1451)** |
+| Same tree before task 58 | 88.62% (10072/11365) | 86.67% (11490/13257) | 86.12% (1241/1441) |
 
 | Crate | Lines | Regions | Functions |
 |---|---|---|---|
-| core | 92.2% (1536/1666) | 91.9% | 89.5% |
-| server | 81.0% (1923/2373) | 77.0% | 80.1% |
-| cli | 66.0% (570/864) | 63.2% | 64.3% |
-| bench (separate) | 16.3% (160/981) | 16.0% | 16.1% |
+| core | 96.7% (3663/3789) | 96.7% | 95.8% |
+| server | 89.6% (5599/6246) | 87.2% | 86.5% |
+| cli | 90.9% (1221/1343) | 86.8% | 76.7% |
+| util | 97.9% (95/97) | 98.6% | 100.0% |
+
+Files covered by task 58, lines before and after:
+
+| File | Before | After |
+|---|---|---|
+| cli/src/process.rs | 0.00% (0/43) | 98.84% (85/86) |
+| cli/src/commands.rs | 62.77% (317/505) | 94.41% (540/572) |
+| cli/src/main.rs | 34.21% (26/76) | 61.84% (47/76) |
+| server/src/admin.rs | 66.93% (170/254) | 95.67% (243/254) |
+| server/src/daemon.rs | 82.94% (248/299) | 93.98% (281/299) |
+| server/src/http/transport.rs | 70.56% (127/180) | 93.89% (169/180) |
+
+The line counts of `process.rs` and `commands.rs` grew because their unit tests are in the same file.
 
 Per file, lowest first (paths relative to `crates/`):
 
 | File | Lines | Regions | Funcs |
 |---|---|---|---|
-| bench/src/backend.rs | 0.0% (0/106) | 0.0% | 0.0% |
-| bench/src/main.rs | 0.0% (0/158) | 0.0% | 0.0% |
-| cli/src/process.rs | 0.0% (0/43) | 0.0% | 0.0% |
-| bench/src/scenario.rs | 9.8% (25/254) | 10.4% | 21.1% |
-| bench/src/load.rs | 16.1% (30/186) | 17.8% | 16.7% |
-| bench/src/target.rs | 37.9% (105/277) | 35.8% | 26.5% |
-| cli/src/main.rs | 43.8% (21/48) | 38.5% | 27.3% |
-| server/src/error.rs | 46.7% (7/15) | 42.9% | 50.0% |
-| cli/src/commands.rs | 51.0% (184/361) | 52.0% | 66.7% |
-| server/src/http/transport.rs | 64.3% (81/126) | 64.2% | 75.0% |
-| server/src/health.rs | 66.4% (83/125) | 65.1% | 34.8% |
-| server/src/daemon.rs | 70.7% (111/157) | 63.2% | 69.6% |
-| server/src/admin.rs | 71.3% (186/261) | 69.0% | 75.6% |
-| server/src/files.rs | 71.3% (129/181) | 69.1% | 100.0% |
-| core/src/duration.rs | 76.1% (67/88) | 79.3% | 71.4% |
-| server/src/udp.rs | 76.3% (90/118) | 66.4% | 77.8% |
-| server/src/http/proxy.rs | 77.5% (155/200) | 76.2% | 76.9% |
-| server/src/tcp.rs | 79.2% (76/96) | 73.8% | 100.0% |
-| cli/src/client.rs | 79.8% (67/84) | 75.8% | 65.0% |
-| server/src/http/cache.rs | 81.7% (49/60) | 79.3% | 54.5% |
-| server/src/registry.rs | 84.7% (61/72) | 73.6% | 61.5% |
-| core/src/status.rs | 87.2% (41/47) | 83.3% | 70.0% |
-| core/src/net.rs | 87.9% (58/66) | 84.3% | 69.2% |
-| server/src/server.rs | 88.9% (256/288) | 79.7% | 90.3% |
-| core/src/config.rs | 90.0% (493/548) | 89.8% | 88.4% |
-| cli/src/edit.rs | 90.7% (284/313) | 83.8% | 75.0% |
-| server/src/http/service.rs | 92.6% (75/81) | 92.8% | 90.9% |
-| cli/src/cli.rs | 93.3% (14/15) | 96.7% | 100.0% |
-| server/src/tls.rs | 93.4% (114/122) | 87.6% | 90.9% |
-| core/src/pool.rs | 94.0% (592/630) | 92.8% | 92.8% |
-| server/src/master.rs | 94.3% (83/88) | 89.6% | 100.0% |
-| server/src/upstream.rs | 95.0% (38/40) | 85.7% | 80.0% |
-| server/src/http/headers.rs | 95.4% (268/281) | 94.9% | 100.0% |
-| server/src/http/body.rs | 96.4% (27/28) | 95.5% | 100.0% |
-| core/src/matcher.rs | 99.3% (274/276) | 99.5% | 100.0% |
-| core/src/random.rs | 100.0% (11/11) | 100.0% | 100.0% |
-| server/src/http/response.rs | 100.0% (34/34) | 100.0% | 100.0% |
+| cli/src/main.rs | 61.84% (47/76) | 55.56% | 44.44% |
+| server/src/dynamic.rs | 69.17% (92/133) | 71.71% | 72.00% |
+| server/src/health.rs | 69.87% (109/156) | 68.60% | 38.46% |
+| server/src/error.rs | 73.33% (11/15) | 71.43% | 75.00% |
+| server/src/acme.rs | 79.43% (560/705) | 76.68% | 76.19% |
+| server/src/http/cache.rs | 81.67% (49/60) | 79.31% | 54.55% |
+| server/src/stream.rs | 83.52% (147/176) | 71.79% | 75.00% |
+| server/src/http/body.rs | 84.23% (187/222) | 83.02% | 93.33% |
+| server/src/http/encode.rs | 84.25% (107/127) | 83.92% | 66.67% |
+| server/src/udp.rs | 84.25% (123/146) | 74.38% | 76.92% |
+| cli/src/client.rs | 84.52% (71/84) | 82.42% | 70.00% |
+| core/src/duration.rs | 85.23% (75/88) | 88.43% | 85.71% |
+| server/src/tcp.rs | 87.37% (83/95) | 82.39% | 100.00% |
+| server/src/files.rs | 87.57% (331/378) | 88.10% | 100.00% |
+| server/src/log.rs | 87.63% (85/97) | 86.82% | 85.71% |
+| core/src/net.rs | 87.88% (58/66) | 84.34% | 69.23% |
+| server/src/http/service.rs | 89.03% (211/237) | 84.91% | 74.29% |
+| server/src/hooks.rs | 89.34% (109/122) | 81.08% | 64.71% |
+| server/src/registry.rs | 89.74% (105/117) | 81.12% | 68.75% |
+| cli/src/edit.rs | 89.82% (353/393) | 83.22% | 76.47% |
+| server/src/server.rs | 90.95% (382/420) | 85.14% | 92.86% |
+| cli/src/cli.rs | 91.43% (32/35) | 94.92% | 100.00% |
+| server/src/http/proxy.rs | 91.48% (333/364) | 90.80% | 88.10% |
+| server/src/include.rs | 91.91% (125/136) | 92.22% | 89.47% |
+| server/src/http/transport.rs | 93.89% (169/180) | 92.74% | 95.24% |
+| server/src/daemon.rs | 93.98% (281/299) | 90.74% | 92.31% |
+| cli/src/commands.rs | 94.41% (540/572) | 90.57% | 82.35% |
+| server/src/tls.rs | 94.47% (188/199) | 90.91% | 93.33% |
+| server/src/http/response_handler.rs | 94.74% (54/57) | 87.04% | 85.71% |
+| server/src/master.rs | 95.00% (95/100) | 91.74% | 100.00% |
+| server/src/admin.rs | 95.67% (243/254) | 95.11% | 97.30% |
+| cli/src/quick.rs | 95.88% (93/97) | 95.37% | 85.71% |
+| server/src/http/headers.rs | 96.26% (360/374) | 95.85% | 97.73% |
+| core/src/pool.rs | 96.44% (840/871) | 96.03% | 95.90% |
+| server/src/proxy_protocol.rs | 96.63% (258/267) | 97.39% | 100.00% |
+| server/src/upstream.rs | 96.77% (30/31) | 96.30% | 100.00% |
+| core/src/config.rs | 96.89% (2117/2185) | 97.15% | 96.76% |
+| core/src/address.rs | 97.30% (72/74) | 95.70% | 100.00% |
+| core/src/status.rs | 97.87% (46/47) | 96.67% | 90.00% |
+| server/src/http/response.rs | 97.87% (46/47) | 96.30% | 100.00% |
+| util/src/flaky_backend.rs | 97.94% (95/97) | 98.57% | 100.00% |
+| server/src/timeout.rs | 98.66% (147/149) | 98.52% | 100.00% |
+| cli/src/process.rs | 98.84% (85/86) | 95.10% | 100.00% |
+| server/src/l4match.rs | 99.06% (421/425) | 97.90% | 100.00% |
+| core/src/template.rs | 99.12% (112/113) | 99.35% | 100.00% |
+| core/src/matcher.rs | 99.28% (274/276) | 99.50% | 100.00% |
+| core/src/random.rs | 100.00% (11/11) | 100.00% | 100.00% |
+| core/src/size.rs | 100.00% (58/58) | 100.00% | 100.00% |
+| server/src/metrics.rs | 100.00% (158/158) | 100.00% | 100.00% |
 
-Existing tests: unit tests in `core`, `cli/src/edit.rs` etc.; integration tests
-`server/tests/{http_proxy,layer4,lifecycle,load_balancing,virtual_hosts}.rs` and `cli/tests/daemon.rs`.
+Tests: unit tests next to the code in every crate; integration tests in `server/tests/*.rs`
+(the admin API in `admin.rs`, upstream connection handling in `upstream_pooling.rs`) and
+`cli/tests/daemon.rs` (the `rxh` binary: `run`, `start`, `stop`, `reload`, every client command).
 
 ## 3. Biggest gaps
 
-Line numbers are from the snapshot; they will shift.
+Line numbers of gaps 1 to 4 and 6 are from the measurement of section 2. The other gaps were
+written against an older snapshot: their line numbers and percentages are stale, use section 2.
 
-1. **Daemonization and signals: `cli/src/process.rs` 20-81 (0%), `cli/src/main.rs` 45-76.**
-   Untested: `daemonize` (PID file, log redirection, parent dir creation), `signal()` PID
-   parsing (`bad PID`, `pid <= 0`), SIGTERM/SIGHUP mapping, `kill` failure. Risk: `rxh start/stop/reload`
-   are the production control path; a bad PID file (0 or negative) would signal a process group.
-   Test: in `cli/tests/daemon.rs`, `rxh start` with temp PID/log paths, assert the PID file exists and
-   the pid is alive, `rxh reload` triggers a log line, `rxh stop` removes the process. Add unit
-   tests in `process.rs` for `signal()` with a missing file, `abc`, `0`, `-1`, and a stale pid (ESRCH).
-2. **CLI command output and error paths: `cli/src/commands.rs` 72-179, 200-233, 266-362, 440-492 (51.5%).**
-   Untested: `status` table rendering (`print_pool`, health column `full`/`NO`/`?`, empty pool),
-   `--json` paths, the commands that talk to the admin API for pools/upstreams, and connection-refused
-   handling. Risk: operator-facing output and exit codes regress silently. Test: split rendering into
-   pure functions taking `&Value` and unit-test them with fixtures; add `cli/tests/admin_client.rs`
-   running the `rxh` binary against a stub admin server (`rxh status`, `rxh upstream add/remove`)
-   asserting stdout and exit code, plus one test with no daemon asserting a non-zero exit and message.
-3. **Reload failure and rollback: `server/src/daemon.rs` 121-128, 152-167, 186-227.**
-   Untested: admin bind failure message, generation task ending (`Ok(Err)`/join error), reload with a
-   broken config, and the `AddrInUse` fallback (stop old, start new, restore previous on failure, 190-201).
-   Risk: a failed reload must keep traffic flowing; this is the most complex state machine in the
-   server. Test: in `server/tests/lifecycle.rs`, (a) write an invalid config, POST `/reload`, assert 400
-   and the old listener still answers; (b) a UDP/TCP config whose new listener port is taken, assert
-   rollback restores the previous one; (c) bind `[admin] listen` to a busy port, assert the startup error text.
-4. **Admin API endpoints: `server/src/admin.rs` 96-195, 213-238, 272-289, 330-342, 372-385 (71.6%).**
-   Untested: non-loopback Host/Origin rejection (403, 96-99), `PUT/POST pools/:name/upstreams`
-   validation errors, `DELETE` by `?address=` vs JSON body, 404 for unknown pool, `/stop`, and
-   `/reload` while shutting down (503). Risk: this is a control plane; the loopback check is the
-   only auth. Test: a table-driven test in `server/tests/lifecycle.rs` (or new `admin.rs`) sending each
-   route with good and bad input, asserting status code and JSON; one test with `Host: evil.example`
-   and one with a foreign `Origin` asserting 403.
+1. **Daemonization and signals: done.** `process.rs` has unit tests for `signal()` (missing PID
+   file, `abc`, empty, `0`, `-1`, a reaped PID giving `ESRCH`, SIGTERM and SIGHUP delivered to a
+   child process). `cli/tests/daemon.rs::start_reload_and_stop_through_the_pid_file` runs `rxh start`
+   with the admin API disabled and nested PID/log paths, then `rxh reload` and `rxh stop` through the
+   PID file, and checks the log file; `start_refuses_a_busy_admin_address` and a broken configuration
+   cover the foreground failures.
+   Left: `process.rs` 26 (`create_dir_all` failure) and `main.rs` 38-41, 65-94 (`reverse-proxy` and
+   `file-server` startup errors, runtime build failures).
+2. **CLI command output and error paths: done.** `status` table (version line, server row, health
+   `yes`/`NO`, `(no backends)`), `pool list`, `upstream list [pool]` with and without a daemon,
+   `--no-save` without a daemon, admin API errors (404, conflict) as a failing exit code, `stop` and
+   `reload` without daemon or PID file, `service rm` of an unknown service, `config show` from the
+   file, `validate`, `policies`; unit tests for `describe_target`, `without_nulls` and the missing-file
+   paths. No rendering refactor was needed: the tests run the binary.
+   Left (`commands.rs`): the `full` and `?` health values (174, 176), the 30 s wait of `stop` when the
+   daemon keeps draining (71-75), a non-unreachable error on `stop` (87), and `service add --serve` with
+   a missing directory (584-585).
+3. **Reload failure and rollback: done.** `server/tests/admin.rs`: invalid TOML, an invalid
+   configuration and a deleted file each give 400 while the old listener keeps answering; a UDP
+   listener on a busy port makes the reload stop the old generation, fail, and restore it (the old
+   backend answers again and `/status` lists only the old server); a UDP reload succeeds through the
+   stop-then-start path; a busy `[admin] listen` fails startup with the hint.
+   Left (`daemon.rs`): the generation task ending on its own (217-220), the old generation failing to
+   stop (129-132, 289, 308), and the `[admin]` change warning (267).
+4. **Admin API endpoints: done.** `server/tests/admin.rs` covers every route: `/` and `/status`,
+   `/pools`, `/pools/{name}` (404, percent-decoded names), `/reverse_proxy/upstreams`, `/metrics`
+   content type, `/config` with live members, `POST`/`PUT` (201, 409, 400 for mixed schemes, invalid
+   JSON and a body over 64 KiB, 404), `DELETE` by `?address=` and by JSON body (404 for unknown member
+   or pool, 400 without an address), unknown routes, `/reload` without a file, `/stop` ending the
+   daemon, and a foreign `Host` or `Origin` (403 on read and write routes).
+   Left (`admin.rs`): accept errors (99), `/reload` while the daemon shuts down (192, 197), the
+   `starting`/`max_connections_reached`/`shutting_down` state names (299-305).
 5. **Health checks, redirects and fault injection: `server/src/health.rs` 63-81, 103-114, 125-148, 161-171 (66%, 35% functions).**
    Untested: connect errors/timeouts, redirect following (`Location` parse, "without a usable
    Location", "too many redirects"), status mismatch message, body regex mismatch, and the
@@ -139,13 +166,14 @@ Line numbers are from the snapshot; they will shift.
    to dead backends or drop all backends. Test: unit tests in `health.rs` against a tiny hyper/tokio test
    server whose behavior is switchable (200, 302 loop, 500, slow, wrong body, closed socket);
    assert `pool` health flips after `fails`/`passes` thresholds. Use `tokio::time::pause` to avoid sleeps.
-6. **Upstream transport and proxy failure paths: `http/transport.rs` 82-108, 154-210; `http/proxy.rs` 89-99, 158-178, 255-292 (64%/77%).**
-   Untested: h2c upstream (connection reuse, closed sender, rewrite to `http://host/path` and
-   header stripping), stale-connection retries exhausted (502), round-trip retry on failure with
-   replay, `record_failure` on error. Risk: retries can duplicate non-idempotent requests; h2c
-   silently broken. Test: in `server/tests/http_proxy.rs`, an h2c backend (hyper `http2::Builder`) asserting
-   response and connection reuse count; a backend that closes after accept to hit the 502 path; one that
-   fails once then succeeds to assert exactly one retry and failure counted.
+6. **Upstream transport and proxy failure paths: transport done.** `server/tests/upstream_pooling.rs`:
+   h2c (one shared HTTP/2 connection with absolute URIs, redial after the backend closes it, 502 when
+   it is down), pooling disabled with `keepalive = "0s"` or `keepalive_idle_conns_per_host = 0`, idle
+   expiry after `keepalive`, idle connections closed by `read_timeout` replaced without an error, and
+   the `keepalive_idle_conns_per_host` cap.
+   Left (`transport.rs` 278, 287-293): `SendError::Stale` and `forget`, which need a pooled connection
+   that closes between the readiness check and the write; there is no deterministic way to provoke it
+   from a test backend. The proxy retry paths are covered by `retry_headers.rs` and `http_proxy.rs`.
 7. **Static file server: `server/src/files.rs` 88-128, 168-192, 234-257 (71%).**
    Untested: most of `content_type` (extension table), error branches (88-128: likely 404/403/
    method/range handling), and 234-257. Risk: path traversal and wrong MIME types are security
@@ -199,14 +227,14 @@ Line numbers are from the snapshot; they will shift.
 ## 5. Prioritized checklist
 
 - [ ] Add CI coverage job with `--fail-under-lines` (start at 80, bench excluded) and `.gitignore` for `*.profraw`.
-- [ ] Reload failure and rollback tests (gap 3).
-- [ ] Admin API route table incl. loopback 403 (gap 4).
-- [ ] `signal()` PID validation unit tests and `start`/`stop` e2e (gap 1).
+- [x] Reload failure and rollback tests (gap 3).
+- [x] Admin API route table incl. loopback 403 (gap 4).
+- [x] `signal()` PID validation unit tests and `start`/`stop` e2e (gap 1).
 - [ ] Health-check fault-injection backend and tests (gap 5).
-- [ ] Proxy retry, h2c and 502 paths (gap 6).
+- [x] Proxy retry, h2c and 502 paths (gap 6; stale-connection retry left).
 - [ ] File server traversal and MIME tests (gap 7).
 - [ ] PROXY protocol header byte tests and UDP failure/idle tests (gap 8).
-- [ ] CLI rendering and admin-client e2e tests (gap 2).
+- [x] CLI rendering and admin-client e2e tests (gap 2).
 - [ ] Config validation/edit edge cases (gap 9).
 - [ ] Small modules: error, duration, cache, net, master, registry (gap 10).
 - [ ] Decide bench policy (gap 12).

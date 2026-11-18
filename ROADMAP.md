@@ -39,8 +39,8 @@ not a promise. An item moves to [CHANGELOG.md](CHANGELOG.md) when it ships.
 - In the benchmark (measured with 0.2.0) RXH passes every scenario and is
   faster than Caddy, but clearly slower than NGINX. See docs/benchmarks.md
   for the numbers.
-- 82% line coverage without the benchmark tool, measured before most of the
-  0.3 work; docs/test-coverage.md has the details and how to re-measure.
+- 92% line coverage without the benchmark tool (measured 2026-11-18);
+  docs/test-coverage.md has the details and how to re-measure.
 
 ## 0.3: finish Caddy parity for load balancing
 
@@ -170,9 +170,10 @@ A release people can run without reading the source.
 ## Quality, in every milestone
 
 - [ ] Coverage of 85% or more without the benchmark tool, enforced in CI
-      with `cargo llvm-cov --fail-under-lines`. The gaps are listed in
+      with `cargo llvm-cov --fail-under-lines`. The level is reached (92%);
+      the CI job is missing. The remaining gaps are listed in
       docs/test-coverage.md; daemon signals, reload rollback and the admin
-      API come first.
+      API are covered.
 - [ ] Fuzzing with `cargo fuzz`: configuration parser, PROXY protocol,
       matchers, cache keys.
 - [ ] Property tests for the policies: weights respected, hashing stable

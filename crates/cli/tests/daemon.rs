@@ -411,3 +411,382 @@ async fn includes_are_edited_in_the_file_that_defines_them() {
     let included = std::fs::read_to_string(dir.join("conf.d/api.toml")).expect("read");
     assert!(!included.contains("[[server]]"), "{included}");
 }
+
+fn stdout_and_stderr(output: &Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn assert_failure(output: &Output) -> String {
+    let (stdout, stderr) = stdout_and_stderr(output);
+    assert!(
+        !output.status.success(),
+        "command succeeded\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    stderr
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_and_listings_render_tables() {
+    let live = backend("live").await;
+    let dead = free_port();
+    let spare = free_port();
+    let admin = free_port();
+    let web = free_port();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\n\
+             [upstream.api]\npolicy = \"round_robin\"\nbackends = [\"{live}\", \"{dead}\"]\n\
+             health = {{ interval = \"50ms\" }}\n\n\
+             [upstream.spare]\nbackends = [\"{spare}\"]\n\n\
+             [[server]]\nname = \"web\"\nlisten = \"{web}\"\nforward = \"@api\"\n"
+        ),
+    )
+    .expect("write config");
+    let _daemon = start_daemon(dir);
+    wait_for_body(web, "live").await;
+
+    // The dead backend fails its TCP health check and shows as `NO`.
+    let mut status = String::new();
+    for _ in 0..250 {
+        status = assert_success(&rxh(dir, admin, &["status"]));
+        if status.contains("NO") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(
+        status.starts_with(&format!("rxh {version}  pid ")),
+        "{status}"
+    );
+    assert!(status.contains(&format!("admin {admin}")), "{status}");
+    assert!(
+        status.contains("config ") && status.contains("rxh.toml"),
+        "{status}"
+    );
+    let server_line = status
+        .lines()
+        .find(|line| line.starts_with(&web.to_string()))
+        .expect("server line");
+    assert_eq!(
+        server_line.split_whitespace().collect::<Vec<_>>(),
+        [web.to_string().as_str(), "http", "web", "listening"]
+    );
+    assert!(status.contains("pool api (round_robin)"), "{status}");
+    assert!(status.contains("ADDRESS"), "{status}");
+    let health_of = |status: &str, address: SocketAddr| {
+        let line = status
+            .lines()
+            .find(|line| line.trim_start().starts_with(&address.to_string()))
+            .expect("backend line")
+            .to_owned();
+        line.split_whitespace()
+            .nth(2)
+            .expect("health column")
+            .to_owned()
+    };
+    assert_eq!(health_of(&status, live), "yes", "{status}");
+    assert_eq!(health_of(&status, dead), "NO", "{status}");
+
+    // Emptying a pool on the daemon only: `(no backends)`.
+    let removed = assert_success(&rxh(
+        dir,
+        admin,
+        &["upstream", "rm", "spare", &spare.to_string(), "--no-save"],
+    ));
+    assert!(removed.contains("on the running daemon"), "{removed}");
+    let saved = std::fs::read_to_string(dir.join("rxh.toml")).expect("read");
+    assert!(
+        saved.contains(&spare.to_string()),
+        "--no-save keeps the file"
+    );
+    let status = assert_success(&rxh(dir, admin, &["status"]));
+    assert!(
+        status.contains("pool spare (weighted_round_robin)\n  (no backends)"),
+        "{status}"
+    );
+
+    // Listings from the daemon.
+    let pools = assert_success(&rxh(dir, admin, &["pool", "list"]));
+    let api = pools
+        .lines()
+        .find(|line| line.starts_with("api"))
+        .expect("api");
+    assert_eq!(
+        api.split_whitespace().collect::<Vec<_>>(),
+        ["api", "round_robin", "2", "backends"]
+    );
+    let all = assert_success(&rxh(dir, admin, &["upstream", "list"]));
+    assert!(
+        all.contains("pool api") && all.contains("pool spare"),
+        "{all}"
+    );
+    let one = assert_success(&rxh(dir, admin, &["upstream", "list", "api"]));
+    assert!(
+        one.contains("pool api") && !one.contains("pool spare"),
+        "{one}"
+    );
+
+    // Admin API errors are reported with a failing exit code.
+    let stderr = assert_failure(&rxh(dir, admin, &["upstream", "list", "nope"]));
+    assert!(stderr.contains("no pool named nope"), "{stderr}");
+    let stderr = assert_failure(&rxh(
+        dir,
+        admin,
+        &["upstream", "add", "nope", "127.0.0.1:1", "--no-save"],
+    ));
+    assert!(stderr.contains("no pool named nope"), "{stderr}");
+    let stderr = assert_failure(&rxh(
+        dir,
+        admin,
+        &["upstream", "rm", "api", "127.0.0.1:1", "--no-save"],
+    ));
+    assert!(stderr.contains("is not in pool api"), "{stderr}");
+
+    // A reload the daemon rejects says the running configuration stays.
+    std::fs::write(dir.join("rxh.toml"), "[[server]]\nlisten = 1").expect("write");
+    let stderr = assert_failure(&rxh(dir, admin, &["reload"]));
+    assert!(
+        stderr.contains("reload rejected, the running configuration is unchanged"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn commands_fall_back_to_the_file_without_a_daemon() {
+    // Nothing listens on this address.
+    let admin = free_port();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        "[upstream.api]\npolicy = \"round_robin\"\nbackends = [\"127.0.0.1:1\"]\n\n\
+         [upstream.db]\nbackends = [\"127.0.0.1:2\"]\n\n\
+         [[server]]\nname = \"web\"\nlisten = \"127.0.0.1:0\"\nforward = \"@api\"\n",
+    )
+    .expect("write config");
+    let read_config = || std::fs::read_to_string(dir.join("rxh.toml")).expect("read");
+
+    let stderr = assert_failure(&rxh(dir, admin, &["status"]));
+    assert!(stderr.starts_with("rxh: "), "{stderr}");
+    for command in ["stop", "reload"] {
+        let stderr = assert_failure(&rxh(dir, admin, &[command, "--pid-file", "missing.pid"]));
+        assert!(
+            stderr.contains(&format!("no daemon on {admin} and no usable PID file")),
+            "{command}: {stderr}"
+        );
+    }
+
+    let listed = assert_success(&rxh(dir, admin, &["upstream", "list"]));
+    assert!(
+        listed.starts_with("(daemon not running, showing the configuration file)"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("pool api (round_robin)\n  127.0.0.1:1"),
+        "{listed}"
+    );
+    assert!(listed.contains("pool db"), "{listed}");
+    let only = assert_success(&rxh(dir, admin, &["upstream", "list", "db"]));
+    assert!(
+        only.contains("pool db") && !only.contains("pool api"),
+        "{only}"
+    );
+    let pools = assert_success(&rxh(dir, admin, &["pool", "list"]));
+    assert!(
+        pools.contains("pool api") && pools.contains("pool db"),
+        "{pools}"
+    );
+
+    // Edits are saved and applied on the next start.
+    let next_start = "Daemon not running, the change applies on the next start";
+    let added = assert_success(&rxh(dir, admin, &["upstream", "add", "api", "127.0.0.1:3"]));
+    assert!(added.contains(next_start), "{added}");
+    assert!(read_config().contains("127.0.0.1:3"));
+    let removed = assert_success(&rxh(dir, admin, &["upstream", "rm", "api", "127.0.0.1:3"]));
+    assert!(removed.contains(next_start), "{removed}");
+    assert!(!read_config().contains("127.0.0.1:3"));
+    let created = assert_success(&rxh(
+        dir,
+        admin,
+        &["pool", "add", "cache", "--backend", "127.0.0.1:4"],
+    ));
+    assert!(created.contains(next_start), "{created}");
+    let deleted = assert_success(&rxh(dir, admin, &["pool", "rm", "cache"]));
+    assert!(deleted.contains(next_start), "{deleted}");
+    assert!(!read_config().contains("cache"));
+
+    // `--no-save` needs a daemon; nothing is written.
+    let before = read_config();
+    let stderr = assert_failure(&rxh(
+        dir,
+        admin,
+        &["upstream", "add", "api", "127.0.0.1:5", "--no-save"],
+    ));
+    assert!(stderr.starts_with("rxh: "), "{stderr}");
+    assert_failure(&rxh(
+        dir,
+        admin,
+        &["upstream", "rm", "api", "127.0.0.1:1", "--no-save"],
+    ));
+    assert_eq!(read_config(), before);
+
+    let stderr = assert_failure(&rxh(dir, admin, &["service", "rm", "nothing"]));
+    assert!(
+        stderr.contains("no service named or listening on nothing"),
+        "{stderr}"
+    );
+    let services = assert_success(&rxh(dir, admin, &["service", "list"]));
+    assert!(
+        services.contains("web") && services.contains("@api"),
+        "{services}"
+    );
+
+    let shown = assert_success(&rxh(dir, admin, &["config", "show"]));
+    assert!(shown.contains("[upstream.api]"), "{shown}");
+    let shown = assert_success(&rxh(dir, admin, &["config", "show", "--json"]));
+    let shown: serde_json::Value = serde_json::from_str(&shown).expect("JSON");
+    assert!(shown["upstream"]["db"].is_object(), "{shown}");
+
+    let validated = assert_success(&rxh(dir, admin, &["validate"]));
+    assert!(
+        validated.contains("rxh.toml: OK (1 services, 1 listeners, 2 pools)"),
+        "{validated}"
+    );
+    let policies = assert_success(&rxh(dir, admin, &["policies"]));
+    for policy in ["round_robin", "least_conn", "cookie", "ip_hash"] {
+        assert!(policies.contains(policy), "{policies}");
+    }
+}
+
+/// Process of a daemon started with `rxh start`, killed on drop if a test
+/// fails before stopping it.
+#[cfg(unix)]
+struct Background(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for Background {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill runs")
+        .success()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn start_reload_and_stop_through_the_pid_file() {
+    let first = backend("backend-1").await;
+    let second = backend("backend-2").await;
+    // The admin API is disabled, so the CLI falls back to the PID file.
+    let unused_admin = free_port();
+    let web = free_port();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let config = |backend: SocketAddr| {
+        format!(
+            "[admin]\nenabled = false\n[[server]]\nlisten = \"{web}\"\nforward = \"{backend}\"\n"
+        )
+    };
+    std::fs::write(dir.join("rxh.toml"), config(first)).expect("write");
+    let pid_args = ["--pid-file", "run/nested/rxh.pid"];
+
+    // A broken configuration fails in the foreground, before forking.
+    std::fs::write(dir.join("broken.toml"), "[[server]]\nlisten = 1").expect("write");
+    let broken = ["start", "--config", "broken.toml", pid_args[0], pid_args[1]];
+    assert_failure(&rxh(dir, unused_admin, &broken));
+    assert!(
+        !dir.join("run").exists(),
+        "nothing created for a broken file"
+    );
+
+    let start = [
+        "start",
+        "--config",
+        "rxh.toml",
+        pid_args[0],
+        pid_args[1],
+        "--log-file",
+        "logs/rxh.log",
+    ];
+    let started = assert_success(&rxh(dir, unused_admin, &start));
+    assert!(
+        started.starts_with("Starting rxh in the background"),
+        "{started}"
+    );
+    wait_for_body(web, "backend-1").await;
+    let pid: u32 = std::fs::read_to_string(dir.join("run/nested/rxh.pid"))
+        .expect("PID file written in a created directory")
+        .trim()
+        .parse()
+        .expect("numeric PID");
+    let _guard = Background(Some(pid));
+    assert!(is_alive(pid));
+
+    std::fs::write(dir.join("rxh.toml"), config(second)).expect("write");
+    let mut reload_args = vec!["reload"];
+    reload_args.extend(pid_args);
+    let reloaded = assert_success(&rxh(dir, unused_admin, &reload_args));
+    assert_eq!(reloaded.trim(), format!("Sent SIGHUP to {pid}"));
+    wait_for_body(web, "backend-2").await;
+
+    let mut stop_args = vec!["stop"];
+    stop_args.extend(pid_args);
+    let stopped = assert_success(&rxh(dir, unused_admin, &stop_args));
+    assert_eq!(stopped.trim(), format!("Sent SIGTERM to {pid}"));
+    for _ in 0..250 {
+        if !is_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!is_alive(pid), "daemon exited on SIGTERM");
+    assert!(try_get(web).await.is_none(), "listener closed");
+
+    // The daemon's output went to the log file.
+    let log = std::fs::read_to_string(dir.join("logs/rxh.log")).expect("log file");
+    assert!(log.contains("Main => Reloading"), "{log}");
+    assert!(log.contains("Main => Shutting down"), "{log}");
+}
+
+#[test]
+fn start_refuses_a_busy_admin_address() {
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let admin = squatter.local_addr().expect("address");
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!("[admin]\nlisten = \"{admin}\"\n"),
+    )
+    .expect("write");
+
+    let stderr = assert_failure(&rxh(
+        dir,
+        admin,
+        &["start", "--config", "rxh.toml", "--pid-file", "rxh.pid"],
+    ));
+    assert!(
+        stderr.contains(&format!("admin address {admin} is busy")),
+        "{stderr}"
+    );
+    assert!(!dir.join("rxh.pid").exists());
+}
