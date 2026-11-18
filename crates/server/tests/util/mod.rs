@@ -60,8 +60,15 @@ pub fn spawn_controlled(text: &str) -> (SocketAddr, impl FnOnce() + use<>, watch
 
 /// Address that refuses connections.
 pub fn dead_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind");
+    let address = socket.local_addr().expect("address");
+    // Bound but never listening: connections are refused, and the port stays taken for the whole
+    // test binary, so a listener of a concurrent test cannot be given the same port.
+    std::mem::forget(socket);
+    address
 }
 
 async fn serve_http<F, Fut>(listener: TcpListener, handler: F)
