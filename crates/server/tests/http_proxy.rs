@@ -219,6 +219,38 @@ async fn cache_serves_repeated_gets() {
 }
 
 #[tokio::test]
+async fn cache_keeps_host_and_uri_apart() {
+    let backend = util::backend_with(|request: Request<hyper::body::Incoming>| async move {
+        let host = request.headers()[header::HOST].to_str().unwrap().to_owned();
+        hyper::Response::new(http_body_util::Full::new(Bytes::from(format!(
+            "{host} {}",
+            request.uri()
+        ))))
+    })
+    .await;
+    let proxy = util::spawn(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"{backend}\"\ncache = {{ enabled = true, ttl_seconds = 60 }}"
+    ))[0];
+
+    // Both requests read `h|/a|/b` when host and URI are joined with `|`.
+    let get = async |host: &str, uri: &str| {
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        let request = format!("GET {uri} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    };
+    let first = get("h|/a", "/b").await;
+    assert!(first.ends_with("h|/a /b"), "{first}");
+    let second = get("h", "/a|/b").await;
+    assert!(
+        second.ends_with("h /a|/b"),
+        "cache served another request: {second}"
+    );
+}
+
+#[tokio::test]
 async fn http2_clients_reach_http1_backends() {
     let (backend, mut requests) = util::interceptor().await;
     let proxy = util::spawn(&format!(

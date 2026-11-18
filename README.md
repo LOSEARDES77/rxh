@@ -262,6 +262,9 @@ cargo test --workspace
 ./target/release/rxh-bench --quick --no-caddy   # smoke test of every policy
 ```
 
+Fuzz targets for the parsers live in [`fuzz/`](fuzz); see
+[docs/fuzzing.md](docs/fuzzing.md) for how to run them with `cargo fuzz`.
+
 Feature progress against Caddy is tracked in [PARITY.md](PARITY.md). The plan
 for the next versions is in [ROADMAP.md](ROADMAP.md).
 

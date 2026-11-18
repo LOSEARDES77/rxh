@@ -23,7 +23,7 @@ use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
 use tokio::sync::watch;
 
 use crate::http::body::{self, BodyError, Guarded};
-use crate::http::cache::Cache;
+use crate::http::cache::{self, Cache};
 use crate::http::headers::{self, Forwarding};
 use crate::http::response::{self, BoxResponse};
 use crate::http::service::{Route, Service, UpstreamAddress};
@@ -58,7 +58,7 @@ pub(crate) async fn forward(
         .cache
         .as_ref()
         .filter(|_| request.method() == Method::GET && !upgrade)
-        .map(|_| format!("{}|{}|{}", group.pool.name(), host(&request), request.uri()));
+        .map(|_| cache::key(group.pool.name(), &host(&request), request.uri()));
 
     if let (Some(cache), Some(key)) = (&route.cache, &cache_key)
         && let Some(cached) = cache.get(key)

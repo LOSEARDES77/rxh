@@ -169,7 +169,7 @@ enum Step<T> {
 }
 
 /// Identifies the protocol of `bytes`, or `None` if more bytes are needed.
-fn detect(bytes: &[u8]) -> Option<Detected> {
+pub(crate) fn detect(bytes: &[u8]) -> Option<Detected> {
     if bytes.is_empty() {
         return None;
     }

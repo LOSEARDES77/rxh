@@ -8,6 +8,7 @@ use bytes::Bytes;
 use hyper::HeaderMap;
 use hyper::Response;
 use hyper::StatusCode;
+use hyper::Uri;
 use hyper::Version;
 use hyper::header;
 use rxh_core::config;
@@ -22,6 +23,13 @@ struct Entry {
     headers: HeaderMap,
     body: Bytes,
     expires_at: Instant,
+}
+
+/// Cache key of a `GET` request to `pool`. The pool name and the client
+/// controlled host carry their length, so no bytes inside them can make two
+/// different requests share an entry (`h|/a` + `/b` against `h` + `/a|/b`).
+pub(crate) fn key(pool: &str, host: &str, uri: &Uri) -> String {
+    format!("{}:{pool}{}:{host}{uri}", pool.len(), host.len())
 }
 
 /// Cache of one route.
@@ -108,5 +116,18 @@ impl Cache {
                 expires_at: now + self.ttl,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_keep_pool_host_and_uri_apart() {
+        let uri = |text: &str| -> Uri { text.parse().unwrap() };
+        assert_ne!(key("p", "h|/a", &uri("/b")), key("p", "h", &uri("/a|/b")));
+        assert_ne!(key("|", "", &uri("/")), key("", "|", &uri("/")));
+        assert_eq!(key("p", "h", &uri("/a")), key("p", "h", &uri("/a")));
     }
 }

@@ -10,6 +10,10 @@ rust-version.workspace = true
 keywords = ["reverse-proxy", "load-balancer", "tcp-proxy", "udp-proxy", "http"]
 categories = ["network-programming", "web-programming::http-server"]
 
+[features]
+# Exposes internal parsers to the fuzz targets in `fuzz/`. Not a stable API.
+fuzzing = []
+
 [dependencies]
 async-compression.workspace = true
 bytes.workspace = true

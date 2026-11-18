@@ -301,10 +301,12 @@ proptest! {
             );
         }
 
-        // Weighted round robin never picks weight 0, whatever its health.
+        // Weighted round robin, as the policy or its fallback, never picks
+        // weight 0, whatever its health.
+        let weighted = policy == Policy::WeightedRoundRobin
+            || fallback == Some(Policy::WeightedRoundRobin);
         let pickable = |upstream: &Arc<Upstream>, weight: u32| {
-            upstream.is_available()
-                && (policy != Policy::WeightedRoundRobin || weight > 0)
+            upstream.is_available() && (!weighted || weight > 0)
         };
         let any_pickable = upstreams
             .iter()
