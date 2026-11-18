@@ -54,6 +54,49 @@ The full report, with the verdict and the share of requests per backend for
 each run, is in [bench/results.md](bench/results.md). The raw data is in
 [bench/results.json](bench/results.json).
 
+## More scenarios: TLS, HTTP/2, bodies, WebSocket, UDP, idle connections
+
+Measured 2026-11-19 on the same machine, with rxh 0.3.0 (unreleased) and
+the same images: 5 seconds per scenario, 32 connections, 5000 idle
+connections for `idle` and `memory`. The scenarios are described in the
+[rxh-bench README](../crates/bench/README.md#scenarios).
+
+Requests (or echo round trips) per second, and p99 latency in milliseconds:
+
+| Scenario | rxh | Caddy | NGINX | Traefik |
+|---|---:|---:|---:|---:|
+| tls | 190 136 / 0.49 | 100 248 / 0.84 | 288 884 / 0.22 | 150 499 / 0.60 |
+| http2 | 151 601 / 0.42 | 76 200 / 1.07 | 167 035 / 0.28 | 111 044 / 0.69 |
+| large-body (1 MiB each way) | 1 999 / 25.83 | 2 649 / 19.93 | 1 096 / 49.10 | 2 648 / 19.59 (FAIL) |
+| websocket | 258 879 / 0.34 | 181 093 / 0.57 | 311 340 / 0.25 | 185 572 / 0.56 |
+| udp | 247 093 / 0.21 | n/a | 233 041 / 0.35 | 199 523 / 0.45 |
+| idle (load next to 5000 idle connections) | 193 355 / 0.52 | 125 458 / 1.12 | 320 431 / 0.22 | 151 221 / 0.60 |
+
+Memory per idle keep-alive connection (RSS growth over 5000 connections,
+after 100 warm-up connections):
+
+| | rxh | Caddy | NGINX | Traefik |
+|---|---:|---:|---:|---:|
+| Per connection | 27.7 KiB | 30.2 KiB | 0.6 KiB | 35.3 KiB |
+| RSS with 100 connections | 14.5 MiB | 65.5 MiB | 234.3 MiB | 112.4 MiB |
+| RSS with 5100 connections | 150.0 MiB | 212.8 MiB | 237.2 MiB | 284.5 MiB |
+
+NGINX's RSS is summed over its master and one worker per core (16 here),
+which is why it starts high; its per connection cost is the lowest by far.
+
+- **rxh passes all seven.** Traefik failed `large-body` in two runs out of
+  two: about one response body in a thousand was cut off mid-stream (6 or 7
+  of ~6 600). The same backends and client pass through the three other
+  proxies.
+- **rxh is slower with large bodies**: 2.0 GB/s each way against 2.6 for
+  Caddy and Traefik. NGINX buffers request bodies to disk by default and
+  comes last.
+- **HTTP/2 narrows the gap with NGINX** (0.91x) compared with HTTP/1.1 over
+  TLS (0.66x). rxh leads on UDP.
+- **Memory**: rxh starts the smallest and holds an idle connection in
+  slightly less than Caddy and Traefik, but about 45 times more than NGINX.
+  Idle buffers per connection are a target for the performance milestone.
+
 ## What the numbers say
 
 - **Correctness**: every scenario a proxy can run passes. No run failed.
@@ -76,13 +119,17 @@ each run, is in [bench/results.md](bench/results.md). The raw data is in
   cores. Read the ratios, not the absolute values.
 - One run per scenario. Differences below 10% are noise; one earlier run
   was off by half and went back to normal when repeated.
-- Requests are small `GET`s over cleartext HTTP/1.1. TLS, HTTP/2, large
-  bodies and many idle connections are not measured yet.
+- In the first table, requests are small `GET`s over cleartext HTTP/1.1.
+  TLS, HTTP/2, large bodies, WebSocket, UDP and idle connections are in
+  their own section. TLS clients keep their connection, so handshakes are
+  not measured.
 - Traefik's `least-conn` uses `p2c`, and NGINX's `ip-hash` uses
   `hash $remote_addr consistent`. See the
   [mapping table](../crates/bench/README.md#nginx-and-traefik).
-- Proxies run with their defaults, apart from upstream keep-alive and
-  `worker_processes auto` on NGINX.
+- Proxies run with their defaults, apart from upstream keep-alive,
+  `worker_processes auto`, `client_max_body_size 0` and
+  `keepalive_requests 1000000` on NGINX, and rxh's `max_connections`
+  raised above the 5000 idle connections.
 
 ## Run it yourself
 

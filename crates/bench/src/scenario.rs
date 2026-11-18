@@ -3,15 +3,25 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use clap::ValueEnum;
 use serde::Serialize;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-use crate::backend::{EchoBackend, HttpBackend};
+use crate::backend::{EchoBackend, HttpBackend, UdpEchoBackend};
 use crate::load;
-use crate::load::{KeyMode, Load, Stats};
-use crate::target::{Problem, Protocol, ProxySpec, Target};
+use crate::load::{Client, KeyMode, Load, Stats};
+use crate::target::{Problem, Protocol, ProxySpec, Target, TlsFiles};
+
+/// Request body size of the `large-body` scenario.
+const LARGE_BODY: usize = 1024 * 1024;
+
+/// Connections opened before the memory baseline, so allocator and pool
+/// warm-up is not charged to the measured connections.
+const MEMORY_WARMUP: usize = 100;
 
 /// A benchmark scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -47,6 +57,28 @@ pub enum Scenario {
 
     /// Layer 4 TCP echo through round_robin.
     Tcp,
+
+    /// HTTPS termination: HTTP/1.1 over TLS to 2 backends.
+    Tls,
+
+    /// HTTP/2 clients over TLS (ALPN h2), 8 streams per connection.
+    Http2,
+
+    /// 1 MiB request bodies, echoed back by the backends.
+    LargeBody,
+
+    /// WebSocket upgrades, then 64 byte frames echoed by the backends.
+    Websocket,
+
+    /// UDP echo through round_robin, one long-lived session per client.
+    Udp,
+
+    /// Load while thousands of idle keep-alive connections are open; the idle
+    /// ones must still work afterwards.
+    Idle,
+
+    /// Proxy memory (RSS) per idle keep-alive connection.
+    Memory,
 }
 
 impl Scenario {
@@ -113,6 +145,9 @@ pub struct Options {
 
     /// Parallel client connections.
     pub concurrency: usize,
+
+    /// Idle connections held open by the `idle` and `memory` scenarios.
+    pub idle_connections: usize,
 }
 
 /// Measurement before it is labelled with scenario and target.
@@ -145,6 +180,13 @@ pub async fn run(scenario: Scenario, target: &Target, options: Options) -> Outco
         Scenario::Failover => failover(target, options).await,
         Scenario::ActiveHealth => active_health(target, options).await,
         Scenario::Tcp => tcp(target, options).await,
+        Scenario::Tls => tls(target, options, /* http2= */ false).await,
+        Scenario::Http2 => tls(target, options, /* http2= */ true).await,
+        Scenario::LargeBody => large_body(target, options).await,
+        Scenario::Websocket => websocket(target, options).await,
+        Scenario::Udp => udp(target, options).await,
+        Scenario::Idle => idle(target, options).await,
+        Scenario::Memory => memory(target, options).await,
     };
 
     let (verdict, reason, stats, distribution) = match result {
@@ -225,7 +267,11 @@ async fn throughput(target: &Target, options: Options) -> Result<Measured, Probl
     let proxy = target
         .start(&ProxySpec::http("round_robin", addresses(&backends)))
         .await?;
-    let outcome = load::http(load(proxy.address(), options), KeyMode::None).await;
+    let outcome = load::http(
+        load(proxy.address(), options),
+        &Client::plain(KeyMode::None),
+    )
+    .await;
 
     let distribution = hits(&backends);
     let deviation = max_deviation(&distribution, &[0.25; 4]);
@@ -248,7 +294,11 @@ async fn weighted(target: &Target, options: Options) -> Result<Measured, Problem
         *weight = wanted;
     }
     let proxy = target.start(&spec).await?;
-    let outcome = load::http(load(proxy.address(), options), KeyMode::None).await;
+    let outcome = load::http(
+        load(proxy.address(), options),
+        &Client::plain(KeyMode::None),
+    )
+    .await;
 
     let distribution = hits(&backends);
     let total: u32 = weights.iter().sum();
@@ -275,7 +325,11 @@ async fn least_conn(target: &Target, options: Options) -> Result<Measured, Probl
         concurrency: options.concurrency.max(8),
         ..options
     };
-    let outcome = load::http(load(proxy.address(), options), KeyMode::None).await;
+    let outcome = load::http(
+        load(proxy.address(), options),
+        &Client::plain(KeyMode::None),
+    )
+    .await;
 
     let distribution = hits(&backends);
     let slow_share = shares(&distribution)[0] * 100.0;
@@ -298,7 +352,7 @@ async fn sticky(
     let mut spec = ProxySpec::http(policy, addresses(&backends));
     spec.key = key;
     let proxy = target.start(&spec).await?;
-    let outcome = load::http(load(proxy.address(), options), keys).await;
+    let outcome = load::http(load(proxy.address(), options), &Client::plain(keys)).await;
 
     let moved = outcome
         .key_backends
@@ -326,13 +380,11 @@ async fn failover(target: &Target, options: Options) -> Result<Measured, Problem
     let proxy = target.start(&spec).await?;
 
     let kill_after = options.duration / 3;
-    let (outcome, ()) = tokio::join!(
-        load::http(load(proxy.address(), options), KeyMode::None),
-        async {
-            tokio::time::sleep(kill_after).await;
-            backends[0].stop();
-        }
-    );
+    let client = Client::plain(KeyMode::None);
+    let (outcome, ()) = tokio::join!(load::http(load(proxy.address(), options), &client), async {
+        tokio::time::sleep(kill_after).await;
+        backends[0].stop();
+    });
 
     let stats = outcome.stats;
     let error_rate = error_rate(&stats);
@@ -362,15 +414,14 @@ async fn active_health(target: &Target, options: Options) -> Result<Measured, Pr
         duration,
         ..options
     };
-    let (outcome, hits_after_grace) = tokio::join!(
-        load::http(load(proxy.address(), options), KeyMode::None),
-        async {
+    let client = Client::plain(KeyMode::None);
+    let (outcome, hits_after_grace) =
+        tokio::join!(load::http(load(proxy.address(), options), &client), async {
             tokio::time::sleep(flip_after).await;
             backends[0].set_healthy(false);
             tokio::time::sleep(GRACE).await;
             backends[0].hits()
-        }
-    );
+        });
 
     let late = backends[0].hits() - hits_after_grace;
     // Requests already in flight when the check flipped may still land.
@@ -415,6 +466,214 @@ async fn tcp(target: &Target, options: Options) -> Result<Measured, Problem> {
     })
 }
 
+/// A self-signed certificate for [`load::TLS_NAME`] and a client config
+/// trusting it that offers `alpn`.
+fn certificate(alpn: &[u8]) -> Result<(TlsFiles, Arc<ClientConfig>), Problem> {
+    let failed = |err: &dyn fmt::Display| Problem::Failed(format!("certificate: {err}"));
+    let certified = rcgen::generate_simple_self_signed(vec![
+        load::TLS_NAME.to_owned(),
+        String::from("127.0.0.1"),
+    ])
+    .map_err(|err| failed(&err))?;
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(certified.cert.der().clone())
+        .map_err(|err| failed(&err))?;
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![alpn.to_vec()];
+    let files = TlsFiles {
+        cert_pem: certified.cert.pem(),
+        key_pem: certified.signing_key.serialize_pem(),
+    };
+    Ok((files, Arc::new(config)))
+}
+
+/// Requests over TLS, as HTTP/1.1 or HTTP/2 depending on `http2`.
+async fn tls(target: &Target, options: Options, http2: bool) -> Result<Measured, Problem> {
+    let alpn: &[u8] = if http2 { b"h2" } else { b"http/1.1" };
+    let (files, config) = certificate(alpn)?;
+    let backends = spawn_backends(&[Duration::ZERO; 2]).await?;
+    let mut spec = ProxySpec::http("round_robin", addresses(&backends));
+    spec.tls = Some(files);
+    let proxy = target.start(&spec).await?;
+    let client = Client {
+        tls: Some(config),
+        ..Client::plain(KeyMode::None)
+    };
+    let outcome = load::http(load(proxy.address(), options), &client).await;
+
+    let stats = outcome.stats;
+    let distribution = hits(&backends);
+    let spread =
+        stats.errors == 0 && stats.requests > 0 && distribution.iter().all(|count| *count > 0);
+    let (pass, reason) = if http2 {
+        (
+            spread && outcome.http2 == stats.requests,
+            format!(
+                "{} of {} responses over HTTP/2, {} errors",
+                outcome.http2, stats.requests, stats.errors
+            ),
+        )
+    } else {
+        (
+            spread,
+            format!("HTTP/1.1 over TLS, {} errors", stats.errors),
+        )
+    };
+    Ok(Measured {
+        pass,
+        reason,
+        stats,
+        distribution,
+    })
+}
+
+async fn large_body(target: &Target, options: Options) -> Result<Measured, Problem> {
+    let backends = spawn_backends(&[Duration::ZERO; 2]).await?;
+    let proxy = target
+        .start(&ProxySpec::http("round_robin", addresses(&backends)))
+        .await?;
+    let body: Vec<u8> = (0..LARGE_BODY).map(|index| (index % 251) as u8).collect();
+    let client = Client {
+        body: Bytes::from(body),
+        ..Client::plain(KeyMode::None)
+    };
+    let outcome = load::http(load(proxy.address(), options), &client).await;
+
+    let stats = outcome.stats;
+    let mebibytes_per_second = stats.rps * LARGE_BODY as f64 / (1024.0 * 1024.0);
+    Ok(Measured {
+        pass: stats.errors == 0 && stats.requests > 0,
+        reason: format!(
+            "1 MiB up and back per request, {mebibytes_per_second:.0} MiB/s each way, \
+             {} errors (wrong echoes included)",
+            stats.errors
+        ),
+        stats,
+        distribution: hits(&backends),
+    })
+}
+
+async fn websocket(target: &Target, options: Options) -> Result<Measured, Problem> {
+    let backends = spawn_backends(&[Duration::ZERO; 2]).await?;
+    let proxy = target
+        .start(&ProxySpec::http("round_robin", addresses(&backends)))
+        .await?;
+    let stats = load::websocket(load(proxy.address(), options)).await;
+
+    // Backends count each upgrade request as a hit.
+    let distribution = hits(&backends);
+    Ok(Measured {
+        pass: stats.errors == 0
+            && stats.requests > 0
+            && distribution.iter().all(|count| *count > 0),
+        reason: format!(
+            "{} frame echo errors, upgrades per backend {distribution:?}",
+            stats.errors
+        ),
+        stats,
+        distribution,
+    })
+}
+
+async fn udp(target: &Target, options: Options) -> Result<Measured, Problem> {
+    let mut backends = Vec::new();
+    for _ in 0..2 {
+        backends.push(
+            UdpEchoBackend::spawn()
+                .await
+                .map_err(|err| Problem::Failed(format!("udp echo: {err}")))?,
+        );
+    }
+    let mut spec = ProxySpec::http("round_robin", backends.iter().map(UdpEchoBackend::address));
+    spec.protocol = Protocol::Udp;
+    let proxy = target.start(&spec).await?;
+    // One session per worker: at least one per backend.
+    let options = Options {
+        concurrency: options.concurrency.max(2),
+        ..options
+    };
+    let stats = load::udp(load(proxy.address(), options)).await;
+
+    let distribution: Vec<u64> = backends.iter().map(UdpEchoBackend::sessions).collect();
+    let loss = error_rate(&stats);
+    Ok(Measured {
+        // Loopback UDP should not drop, but a datagram may: allow 1%.
+        pass: stats.requests > 0 && loss <= 1.0 && distribution.iter().all(|count| *count > 0),
+        reason: format!("{loss:.2}% datagrams lost, sessions per backend {distribution:?}"),
+        stats,
+        distribution,
+    })
+}
+
+/// Spec for the scenarios that hold `idle` connections next to the load.
+fn idle_spec(backends: &[HttpBackend], options: Options) -> ProxySpec {
+    let mut spec = ProxySpec::http("round_robin", addresses(backends));
+    spec.max_connections =
+        Some(options.idle_connections + MEMORY_WARMUP + options.concurrency + 64);
+    spec
+}
+
+async fn idle(target: &Target, options: Options) -> Result<Measured, Problem> {
+    let backends = spawn_backends(&[Duration::ZERO; 2]).await?;
+    let proxy = target.start(&idle_spec(&backends, options)).await?;
+    let address = proxy.address();
+
+    let idle = load::open_idle(address, options.idle_connections).await;
+    let opened = idle.len();
+    let outcome = load::http(load(address, options), &Client::plain(KeyMode::None)).await;
+    let dropped = idle.probe(address).await;
+
+    let stats = outcome.stats;
+    Ok(Measured {
+        pass: opened == options.idle_connections
+            && dropped == 0
+            && stats.errors == 0
+            && stats.requests > 0,
+        reason: format!(
+            "{opened} of {} idle connections opened, {dropped} of them failed after the load, \
+             {} load errors",
+            options.idle_connections, stats.errors
+        ),
+        stats,
+        distribution: hits(&backends),
+    })
+}
+
+async fn memory(target: &Target, options: Options) -> Result<Measured, Problem> {
+    let backends = spawn_backends(&[Duration::ZERO; 2]).await?;
+    let proxy = target.start(&idle_spec(&backends, options)).await?;
+    let address = proxy.address();
+
+    let warmup = load::open_idle(address, MEMORY_WARMUP).await;
+    let settle = Duration::from_millis(500);
+    tokio::time::sleep(settle).await;
+    let baseline = proxy.rss().await?;
+    let idle = load::open_idle(address, options.idle_connections).await;
+    tokio::time::sleep(settle).await;
+    let loaded = proxy.rss().await?;
+    let opened = idle.len();
+    drop(warmup);
+
+    let mebibyte = 1024.0 * 1024.0;
+    let per_connection = loaded.saturating_sub(baseline) as f64 / opened.max(1) as f64;
+    Ok(Measured {
+        pass: opened == options.idle_connections,
+        reason: format!(
+            "{:.1} KiB per idle connection: RSS {:.1} MiB with {MEMORY_WARMUP}, \
+             {:.1} MiB with {} more ({opened} opened)",
+            per_connection / 1024.0,
+            baseline as f64 / mebibyte,
+            loaded as f64 / mebibyte,
+            options.idle_connections
+        ),
+        stats: idle.stats,
+        distribution: hits(&backends),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +688,14 @@ mod tests {
     fn names_are_kebab_case() {
         assert_eq!(Scenario::ActiveHealth.name(), "active-health");
         assert_eq!(Scenario::IpHash.name(), "ip-hash");
+        assert_eq!(Scenario::LargeBody.name(), "large-body");
+    }
+
+    #[test]
+    fn certificate_is_trusted_for_tls_name() {
+        let (files, config) = certificate(b"h2").unwrap();
+        assert!(files.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(files.key_pem.contains("PRIVATE KEY"));
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
     }
 }

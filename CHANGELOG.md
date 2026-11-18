@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- `rxh-bench` scenarios `tls` (HTTPS termination), `http2` (HTTP/2 clients
+  over TLS), `large-body` (1 MiB echoed bodies), `websocket`, `udp`, `idle`
+  (load next to thousands of idle keep-alive connections) and `memory` (proxy
+  RSS per idle connection), and the `--idle-connections` flag. They run on
+  rxh, Caddy, NGINX and Traefik.
 - Request matchers on routes: `host` (exact or `*.wildcard`, also server
   wide), Caddy style `path` patterns, `method`, `header`, `query` and
   `remote_ip`, ANDed with the `uri` prefix. `rxh service add --host`.
