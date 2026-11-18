@@ -1,7 +1,7 @@
 # rxh-bench
 
-`rxh-bench` runs the same load balancing scenarios against **rxh** and
-**Caddy**. For every scenario it reports:
+`rxh-bench` runs the same load balancing scenarios against **rxh**,
+**Caddy**, **NGINX** and **Traefik**. For every scenario it reports:
 
 - a correctness verdict (`PASS`, `FAIL` or `n/a`): did the balancer do what
   the policy promises?
@@ -17,6 +17,7 @@ are built in, so you don't need `wrk`, `oha` or `hey`.
 cargo build --release -p rxh-cli -p rxh-bench
 ./target/release/rxh-bench --quick                # rxh, plus Caddy if `caddy` is in PATH
 ./target/release/rxh-bench --quick --caddy-docker # run Caddy from the caddy:2 image
+./target/release/rxh-bench --docker               # rxh, Caddy, NGINX and Traefik, all in Docker
 ./target/release/rxh-bench -s throughput -s cookie -d 10 -c 64 --json results.json
 ./target/release/rxh-bench --list
 ```
@@ -28,7 +29,9 @@ cargo build --release -p rxh-cli -p rxh-bench
 | `--caddy-docker` | When no Caddy binary is found, run Caddy in Docker with `--network host`. The image is pulled if missing. |
 | `--caddy-image IMAGE` | Image for `--caddy-docker`. The default is `caddy:2`. |
 | `--caddy-l4 PATH` | Caddy built with [caddy-l4](https://github.com/mholt/caddy-l4), for the `tcp` scenario. |
-| `--no-rxh`, `--no-caddy` | Skip one of the two targets. |
+| `--docker` | Run every proxy in Docker with `--network host`, and add NGINX and Traefik. The local rxh binary is mounted into `--rxh-image`, so all four pay the same container cost. |
+| `--rxh-image`, `--nginx-image`, `--traefik-image` | Images for `--docker`. The defaults are `debian:stable-slim`, `nginx:stable-alpine` and `traefik:v3`. |
+| `--no-rxh`, `--no-caddy`, `--no-nginx`, `--no-traefik` | Skip a target. |
 | `-s, --scenario NAME` | Run only this scenario. Repeat the flag to run several. The default is all scenarios. |
 | `-d, --duration SECONDS` | Load time per scenario. The default is 5, or 2 with `--quick`. |
 | `-c, --concurrency N` | Number of keep-alive client connections. The default is 32, or 16 with `--quick`. |
@@ -58,16 +61,47 @@ into an rxh TOML file and an equivalent Caddyfile.
 | `active-health` | `round_robin` with `/health` checked every second. One backend starts answering 503 on `/health`. | No more than one request per client connection reaches that backend 3 seconds after the flip. |
 | `tcp` | Layer 4 `round_robin` to 2 TCP echo servers. Each client reconnects every 50 round trips. | No echo errors, and both backends receive connections. Core Caddy has no layer 4 proxy, so this shows `n/a` unless you pass `--caddy-l4`. |
 
+## NGINX and Traefik
+
+NGINX and Traefik run only with `--docker`. They do not have every policy,
+so some scenarios show `n/a`:
+
+| rxh policy | NGINX (open source) | Traefik v3 |
+|---|---|---|
+| `round_robin`, `weighted_round_robin` | default method, `weight=` | default strategy, `weight` |
+| `least_conn` | `least_conn` | `strategy: p2c` (power of two choices, the closest relative) |
+| `ip_hash` | `hash $remote_addr consistent` (`ip_hash` ignores the last octet) | `strategy: hrw` |
+| `uri_hash`, `header` | `hash $request_uri`, `hash $http_x_user` | n/a |
+| `cookie` | n/a (NGINX Plus) | `sticky.cookie` |
+| retries and passive health | `proxy_next_upstream_tries`, `max_fails` | `retry` middleware, `passiveHealthCheck` |
+| active health | n/a (NGINX Plus) | `healthCheck` |
+| `tcp` | `stream` module | TCP router |
+
+NGINX runs with `worker_processes auto`, upstream keep-alive and a shared
+`zone`.
+
+## Charts
+
+`plot.py` draws requests per second and p99 latency from the JSON file. It
+needs Python 3 with matplotlib:
+
+```bash
+./target/release/rxh-bench --docker --json docs/bench/results.json > docs/bench/results.md
+python3 crates/bench/plot.py docs/bench/results.json docs/bench
+```
+
+The latest run is in [docs/benchmarks.md](../../docs/benchmarks.md).
+
 Notes:
 
 - `ip-hash` binds to addresses in 127.0.0.0/8 other than 127.0.0.1. Linux
   supports this out of the box. On macOS, add the aliases first, for example
   `sudo ifconfig lo0 alias 127.0.0.2 up`.
 - The backends and the load generator run in the `rxh-bench` process.
-  Absolute numbers depend on your machine. Compare the ratio between rxh and
-  Caddy, not the raw values.
-- For a fair comparison, use `--caddy PATH` rather than Docker. Even with
-  host networking, Docker adds some overhead.
+  Absolute numbers depend on your machine. Compare the ratios between
+  proxies, not the raw values.
+- For a fair comparison, run every proxy the same way: all native
+  (`--caddy PATH`) or all in Docker (`--docker`).
 
 ## Get Caddy
 

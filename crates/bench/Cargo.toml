@@ -1,6 +1,6 @@
 [package]
 name = "rxh-bench"
-description = "Compares RXH against Caddy on load balancing correctness and performance"
+description = "Compares RXH against Caddy, NGINX and Traefik on load balancing correctness and performance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

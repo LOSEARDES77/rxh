@@ -1,4 +1,5 @@
-//! Proxies under test: how to find, configure, start and stop rxh and Caddy.
+//! Proxies under test: how to find, configure, start and stop rxh, Caddy,
+//! NGINX and Traefik.
 
 use std::env;
 use std::fmt::Write as _;
@@ -31,7 +32,65 @@ pub enum Flavor {
 
     /// `caddy run --adapter caddyfile --config Caddyfile`.
     Caddy,
+
+    /// `nginx -c nginx.conf` (open source NGINX).
+    Nginx,
+
+    /// `traefik --configFile=traefik.yml` with a file provider.
+    Traefik,
 }
+
+impl Flavor {
+    /// Column name in the report.
+    pub fn name(self) -> &'static str {
+        match self {
+            Flavor::Rxh => "rxh",
+            Flavor::Caddy => "caddy",
+            Flavor::Nginx => "nginx",
+            Flavor::Traefik => "traefik",
+        }
+    }
+
+    /// Program name followed by its arguments, with the config files in `dir`.
+    fn command_line(self, dir: &str) -> Vec<String> {
+        let line: &[&str] = match self {
+            Flavor::Rxh => &["rxh", "run", "--config", "{dir}/rxh.toml"],
+            Flavor::Caddy => &[
+                "caddy",
+                "run",
+                "--adapter",
+                "caddyfile",
+                "--config",
+                "{dir}/Caddyfile",
+            ],
+            Flavor::Nginx => &["nginx", "-c", "{dir}/nginx.conf"],
+            Flavor::Traefik => &["traefik", "--configFile={dir}/traefik.yml"],
+        };
+        line.iter().map(|arg| arg.replace("{dir}", dir)).collect()
+    }
+
+    /// Config files for `spec`, as `(file name, contents)`. `dir` is where
+    /// the proxy will see them.
+    fn configs(
+        self,
+        spec: &ProxySpec,
+        listen: SocketAddr,
+        dir: &str,
+    ) -> Result<Vec<(&'static str, String)>, Problem> {
+        Ok(match self {
+            Flavor::Rxh => vec![("rxh.toml", rxh_config(spec, listen))],
+            Flavor::Caddy => vec![("Caddyfile", caddy_config(spec, listen))],
+            Flavor::Nginx => vec![("nginx.conf", nginx_config(spec, listen)?)],
+            Flavor::Traefik => vec![
+                ("traefik.yml", traefik_static_config(listen, dir)),
+                ("dynamic.yml", traefik_dynamic_config(spec)?),
+            ],
+        })
+    }
+}
+
+/// Where a container sees the config directory.
+const CONTAINER_DIR: &str = "/bench";
 
 /// How to start a proxy process.
 #[derive(Debug, Clone)]
@@ -39,8 +98,15 @@ pub enum Launcher {
     /// A local executable.
     Binary(PathBuf),
 
-    /// A Caddy container image, run with host networking.
-    Docker(String),
+    /// A container, run with host networking.
+    Docker {
+        /// Image to run.
+        image: String,
+
+        /// Local executable mounted at `/usr/local/bin/rxh`, for images that
+        /// do not ship the proxy (rxh runs in a plain base image).
+        binary: Option<PathBuf>,
+    },
 }
 
 /// A proxy under test.
@@ -54,23 +120,13 @@ pub struct Target {
 }
 
 impl Target {
-    /// rxh, which handles HTTP and layer 4 with the same binary.
-    pub fn rxh(binary: PathBuf) -> Self {
+    /// A proxy that handles HTTP with `http` and layer 4 with `l4`.
+    pub fn new(flavor: Flavor, http: Launcher, l4: Option<Launcher>) -> Self {
         Self {
-            name: "rxh",
-            flavor: Flavor::Rxh,
-            http: Launcher::Binary(binary.clone()),
-            l4: Some(Launcher::Binary(binary)),
-        }
-    }
-
-    /// Caddy. Layer 4 needs a build with the `caddy-l4` plugin.
-    pub fn caddy(http: Launcher, l4: Option<PathBuf>) -> Self {
-        Self {
-            name: "caddy",
-            flavor: Flavor::Caddy,
+            name: flavor.name(),
+            flavor,
             http,
-            l4: l4.map(Launcher::Binary),
+            l4,
         }
     }
 
@@ -96,12 +152,16 @@ impl Target {
             .map_err(|err| failed("temp dir", &err))?;
         let address = free_address().map_err(|err| failed("free port", &err))?;
 
-        let (file_name, contents) = match self.flavor {
-            Flavor::Rxh => ("rxh.toml", rxh_config(spec, address)),
-            Flavor::Caddy => ("Caddyfile", caddy_config(spec, address)),
+        let host_dir = dir.path().display().to_string();
+        let seen_dir = match launcher {
+            Launcher::Binary(_) => host_dir.as_str(),
+            Launcher::Docker { .. } => CONTAINER_DIR,
         };
-        let config = dir.path().join(file_name);
-        fs::write(&config, contents).map_err(|err| failed("write config", &err))?;
+        for (file_name, contents) in self.flavor.configs(spec, address, seen_dir)? {
+            fs::write(dir.path().join(file_name), contents)
+                .map_err(|err| failed("write config", &err))?;
+        }
+        let command_line = self.flavor.command_line(seen_dir);
 
         let log_path = dir.path().join("proxy.log");
         let log = File::create(&log_path).map_err(|err| failed("log file", &err))?;
@@ -111,30 +171,25 @@ impl Target {
         let mut command = match launcher {
             Launcher::Binary(binary) => {
                 let mut command = Command::new(binary);
-                match self.flavor {
-                    Flavor::Rxh => {
-                        command.arg("run").arg("--config").arg(&config);
-                    }
-                    Flavor::Caddy => {
-                        command
-                            .args(["run", "--adapter", "caddyfile", "--config"])
-                            .arg(&config)
-                            // Keep Caddy's state out of the user's home.
-                            .env("XDG_DATA_HOME", dir.path())
-                            .env("XDG_CONFIG_HOME", dir.path());
-                    }
-                }
+                command
+                    .args(&command_line[1..])
+                    // Keep Caddy's state out of the user's home.
+                    .env("XDG_DATA_HOME", dir.path())
+                    .env("XDG_CONFIG_HOME", dir.path());
                 command
             }
-            Launcher::Docker(image) => {
+            Launcher::Docker { image, binary } => {
                 let name = format!("rxh-bench-{}-{}", std::process::id(), address.port());
                 let mut command = Command::new("docker");
                 command
                     .args(["run", "--rm", "--name", &name, "--network", "host", "-v"])
-                    .arg(format!("{}:/etc/caddy:ro", dir.path().display()))
-                    .arg(image)
-                    .args(["caddy", "run", "--config", "/etc/caddy/Caddyfile"])
-                    .args(["--adapter", "caddyfile"]);
+                    .arg(format!("{host_dir}:{CONTAINER_DIR}:ro"));
+                if let Some(binary) = binary {
+                    command
+                        .arg("-v")
+                        .arg(format!("{}:/usr/local/bin/rxh:ro", binary.display()));
+                }
+                command.arg(image).args(&command_line);
                 container = Some(name);
                 command
             }
@@ -155,8 +210,15 @@ impl Target {
             _dir: dir,
         };
         let timeout = if running.container.is_some() { 30 } else { 10 };
+        // ponytail: fixed settle time. Traefik listens before its file
+        // provider has loaded the routes; probe a route if 1s proves flaky.
+        let settle = if self.flavor == Flavor::Traefik {
+            1000
+        } else {
+            200
+        };
         running
-            .wait_ready(Duration::from_secs(timeout))
+            .wait_ready(Duration::from_secs(timeout), Duration::from_millis(settle))
             .await
             .map_err(Problem::Failed)?;
         Ok(running)
@@ -178,7 +240,7 @@ impl Running {
         self.address
     }
 
-    async fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
+    async fn wait_ready(&mut self, timeout: Duration, settle: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -186,7 +248,7 @@ impl Running {
             }
             if TcpStream::connect(self.address).await.is_ok() {
                 // Give health checkers and pools a moment to settle.
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(settle).await;
                 return Ok(());
             }
             if Instant::now() > deadline {
@@ -240,13 +302,13 @@ pub enum Protocol {
     Tcp,
 }
 
-/// Proxy setup shared by both targets, translated to rxh TOML or a Caddyfile.
+/// Proxy setup shared by every target, translated to each config format.
 #[derive(Debug, Clone)]
 pub struct ProxySpec {
     /// Listener protocol.
     pub protocol: Protocol,
 
-    /// Policy name. rxh and Caddy use the same names.
+    /// Policy name, as rxh and Caddy spell it. Other targets map it.
     pub policy: &'static str,
 
     /// Header name for the `header` policy.
@@ -370,6 +432,139 @@ fn caddy_config(spec: &ProxySpec, listen: SocketAddr) -> String {
     )
 }
 
+/// `nginx.conf` equivalent of [`rxh_config`], limited to open source NGINX.
+fn nginx_config(spec: &ProxySpec, listen: SocketAddr) -> Result<String, Problem> {
+    let method = match spec.policy {
+        "round_robin" | "weighted_round_robin" => String::new(),
+        "least_conn" => String::from("least_conn;"),
+        // `ip_hash` only looks at the first three octets, so every loopback
+        // client would land on one backend.
+        "ip_hash" => String::from("hash $remote_addr consistent;"),
+        "uri_hash" => String::from("hash $request_uri consistent;"),
+        "header" => format!(
+            "hash $http_{} consistent;",
+            spec.key
+                .unwrap_or_default()
+                .to_lowercase()
+                .replace('-', "_")
+        ),
+        "cookie" => {
+            return Err(Problem::Unsupported(String::from(
+                "sticky cookies need NGINX Plus",
+            )));
+        }
+        other => return Err(Problem::Unsupported(format!("no `{other}` policy"))),
+    };
+    if spec.health_uri.is_some() {
+        return Err(Problem::Unsupported(String::from(
+            "active health checks need NGINX Plus",
+        )));
+    }
+
+    // NGINX marks backends as failed by default; switch that off unless asked.
+    let max_fails = u8::from(spec.passive);
+    let mut upstream = format!("upstream bench {{\n zone bench 64k;\n {method}\n");
+    for (address, weight) in &spec.backends {
+        let _ = writeln!(
+            upstream,
+            " server {address} weight={weight} max_fails={max_fails} fail_timeout=10s;"
+        );
+    }
+
+    let body = match spec.protocol {
+        Protocol::Tcp => format!(
+            "stream {{\n{upstream}}}\nserver {{\n listen {listen};\n proxy_pass bench;\n}}\n}}\n"
+        ),
+        Protocol::Http => format!(
+            "http {{\naccess_log off;\n{upstream} keepalive 64;\n}}\nserver {{\n listen {listen};\n \
+             location / {{\n  proxy_pass http://bench;\n  proxy_http_version 1.1;\n  \
+             proxy_set_header Connection \"\";\n  proxy_set_header Host $host;\n  \
+             proxy_next_upstream error timeout;\n  proxy_next_upstream_tries {tries};\n }}\n}}\n}}\n",
+            tries = spec.retries + 1
+        ),
+    };
+    Ok(format!(
+        "worker_processes auto;\ndaemon off;\npid /tmp/rxh-bench-nginx.pid;\n\
+         error_log stderr error;\nevents {{\n worker_connections 4096;\n}}\n{body}"
+    ))
+}
+
+/// Traefik static configuration: one entry point and the file provider.
+fn traefik_static_config(listen: SocketAddr, dir: &str) -> String {
+    format!(
+        "global:\n  checkNewVersion: false\n  sendAnonymousUsage: false\nentryPoints:\n  bench:\n    \
+         address: \"{listen}\"\nproviders:\n  file:\n    filename: {dir}/dynamic.yml\nlog:\n  \
+         level: ERROR\n"
+    )
+}
+
+/// Traefik dynamic configuration equivalent of [`rxh_config`].
+fn traefik_dynamic_config(spec: &ProxySpec) -> Result<String, Problem> {
+    if spec.protocol == Protocol::Tcp {
+        let mut text = String::from(
+            "tcp:\n  routers:\n    bench:\n      rule: \"HostSNI(`*`)\"\n      \
+             entryPoints: [bench]\n      service: bench\n  services:\n    bench:\n      \
+             loadBalancer:\n        servers:\n",
+        );
+        for (address, _) in &spec.backends {
+            let _ = writeln!(text, "          - address: \"{address}\"");
+        }
+        return Ok(text);
+    }
+
+    let mut balancer = String::new();
+    match spec.policy {
+        "round_robin" | "weighted_round_robin" => {}
+        // Power of two choices on connections in flight: Traefik's closest
+        // relative of `least_conn`.
+        "least_conn" => balancer.push_str("        strategy: p2c\n"),
+        // Rendezvous hashing on the client IP.
+        "ip_hash" => balancer.push_str("        strategy: hrw\n"),
+        "cookie" => balancer.push_str("        sticky:\n          cookie:\n            name: lb\n"),
+        other => {
+            return Err(Problem::Unsupported(format!(
+                "no `{other}` policy (Traefik hashes only the client IP)"
+            )));
+        }
+    }
+    if let Some(uri) = spec.health_uri {
+        let _ = write!(
+            balancer,
+            "        healthCheck:\n          path: {uri}\n          interval: 1s\n          \
+             timeout: 1s\n"
+        );
+    }
+    if spec.passive {
+        balancer.push_str(
+            "        passiveHealthCheck:\n          failureWindow: 10s\n          \
+             maxFailedAttempts: 1\n",
+        );
+    }
+    balancer.push_str("        servers:\n");
+    for (address, weight) in &spec.backends {
+        let _ = writeln!(
+            balancer,
+            "          - url: \"http://{address}\"\n            weight: {weight}"
+        );
+    }
+
+    let mut router = String::from(
+        "http:\n  routers:\n    bench:\n      rule: \"PathPrefix(`/`)\"\n      \
+         entryPoints: [bench]\n      service: bench\n",
+    );
+    if spec.retries > 0 {
+        let _ = write!(
+            router,
+            "      middlewares: [retry]\n  middlewares:\n    retry:\n      retry:\n        \
+             attempts: {}\n",
+            spec.retries + 1
+        );
+    }
+    Ok(format!(
+        "{router}  services:\n    bench:\n      loadBalancer:\n{balancer}"
+    ))
+}
+
 /// Finds the rxh binary: next to this executable, then `target/release`,
 /// `target/debug` and `PATH`.
 pub fn find_rxh() -> Option<PathBuf> {
@@ -447,5 +642,53 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
+    }
+    #[test]
+    fn nginx_config_mentions_everything() {
+        let mut spec = spec();
+        spec.health_uri = None;
+        let text = nginx_config(&spec, "127.0.0.1:9000".parse().expect("valid"))
+            .unwrap_or_else(|problem| panic!("config should render: {problem:?}"));
+        for needle in [
+            "listen 127.0.0.1:9000;",
+            "server 127.0.0.1:1002 weight=3 max_fails=1 fail_timeout=10s;",
+            "proxy_next_upstream_tries 3;",
+            "keepalive 64;",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn nginx_rejects_plus_only_features() {
+        let listen = "127.0.0.1:9000".parse().expect("valid");
+        assert!(
+            matches!(nginx_config(&spec(), listen), Err(Problem::Unsupported(_))),
+            "active health checks are NGINX Plus only"
+        );
+        let cookie = ProxySpec::http("cookie", []);
+        assert!(
+            matches!(nginx_config(&cookie, listen), Err(Problem::Unsupported(_))),
+            "sticky cookies are NGINX Plus only"
+        );
+    }
+
+    #[test]
+    fn traefik_config_mentions_everything() {
+        let text = traefik_dynamic_config(&spec())
+            .unwrap_or_else(|problem| panic!("config should render: {problem:?}"));
+        for needle in [
+            "- url: \"http://127.0.0.1:1002\"\n            weight: 3",
+            "attempts: 3",
+            "path: /health",
+            "maxFailedAttempts: 1",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        let hash = ProxySpec::http("uri_hash", []);
+        assert!(
+            matches!(traefik_dynamic_config(&hash), Err(Problem::Unsupported(_))),
+            "Traefik has no URI hash"
+        );
     }
 }

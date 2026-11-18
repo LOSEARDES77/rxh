@@ -1,5 +1,5 @@
-//! `rxh-bench`: runs the same load balancing scenarios against rxh and Caddy
-//! and reports correctness (PASS/FAIL) and performance side by side.
+//! `rxh-bench`: runs the same load balancing scenarios against rxh, Caddy,
+//! NGINX and Traefik and reports correctness (PASS/FAIL) and performance side by side.
 
 mod backend;
 mod load;
@@ -15,9 +15,9 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 
 use crate::scenario::{Options, Outcome, Scenario, Verdict};
-use crate::target::{Launcher, Target};
+use crate::target::{Flavor, Launcher, Target};
 
-/// Compares rxh and Caddy on load balancing behaviour and speed.
+/// Compares rxh with Caddy, NGINX and Traefik on load balancing behaviour and speed.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -49,6 +49,31 @@ struct Cli {
     /// Skip Caddy.
     #[arg(long)]
     no_caddy: bool,
+
+    /// Run every proxy in Docker with host networking, and add NGINX and
+    /// Traefik. The local rxh binary is mounted into --rxh-image.
+    #[arg(long)]
+    docker: bool,
+
+    /// Base image the rxh binary runs in with --docker.
+    #[arg(long, default_value = "debian:stable-slim", value_name = "IMAGE")]
+    rxh_image: String,
+
+    /// NGINX image used by --docker.
+    #[arg(long, default_value = "nginx:stable-alpine", value_name = "IMAGE")]
+    nginx_image: String,
+
+    /// Skip NGINX.
+    #[arg(long)]
+    no_nginx: bool,
+
+    /// Traefik image used by --docker.
+    #[arg(long, default_value = "traefik:v3", value_name = "IMAGE")]
+    traefik_image: String,
+
+    /// Skip Traefik.
+    #[arg(long)]
+    no_traefik: bool,
 
     /// Scenario to run. Repeat for several. Defaults to all.
     #[arg(long = "scenario", short, value_enum, value_name = "NAME")]
@@ -122,7 +147,12 @@ async fn run(cli: Cli) -> ExitCode {
     let mut missing = Vec::new();
     if !cli.no_rxh {
         match cli.rxh.clone().or_else(target::find_rxh) {
-            Some(binary) => targets.push(Target::rxh(binary)),
+            Some(binary) => match rxh_launcher(&cli, binary) {
+                Ok(launcher) => {
+                    targets.push(Target::new(Flavor::Rxh, launcher.clone(), Some(launcher)));
+                }
+                Err(reason) => missing.push(("rxh", reason)),
+            },
             None => missing.push((
                 "rxh",
                 String::from("binary not found, run `cargo build --release -p rxh-cli`"),
@@ -131,8 +161,29 @@ async fn run(cli: Cli) -> ExitCode {
     }
     if !cli.no_caddy {
         match caddy_launcher(&cli) {
-            Ok(launcher) => targets.push(Target::caddy(launcher, cli.caddy_l4.clone())),
+            Ok(launcher) => targets.push(Target::new(
+                Flavor::Caddy,
+                launcher,
+                cli.caddy_l4.clone().map(Launcher::Binary),
+            )),
             Err(reason) => missing.push(("caddy", reason)),
+        }
+    }
+    if cli.docker {
+        let extras = [
+            (Flavor::Nginx, &cli.nginx_image, cli.no_nginx),
+            (Flavor::Traefik, &cli.traefik_image, cli.no_traefik),
+        ];
+        for (flavor, image, skip) in extras {
+            if skip {
+                continue;
+            }
+            match docker_image(image) {
+                Ok(launcher) => {
+                    targets.push(Target::new(flavor, launcher.clone(), Some(launcher)));
+                }
+                Err(reason) => missing.push((flavor.name(), reason)),
+            }
         }
     }
 
@@ -176,8 +227,27 @@ async fn run(cli: Cli) -> ExitCode {
     }
 }
 
+/// Picks how to run rxh: the binary itself, or mounted into a container.
+fn rxh_launcher(cli: &Cli, binary: PathBuf) -> Result<Launcher, String> {
+    if !cli.docker {
+        return Ok(Launcher::Binary(binary));
+    }
+    // Docker needs an absolute path to mount.
+    let binary = fs::canonicalize(&binary).map_err(|err| format!("{}: {err}", binary.display()))?;
+    let Launcher::Docker { image, .. } = docker_image(&cli.rxh_image)? else {
+        unreachable!("docker_image returns a Docker launcher");
+    };
+    Ok(Launcher::Docker {
+        image,
+        binary: Some(binary),
+    })
+}
+
 /// Picks how to run Caddy: explicit binary, PATH, or Docker if allowed.
 fn caddy_launcher(cli: &Cli) -> Result<Launcher, String> {
+    if cli.docker {
+        return docker_image(&cli.caddy_image);
+    }
     if let Some(binary) = cli.caddy.clone().or_else(|| target::find_in_path("caddy")) {
         return Ok(Launcher::Binary(binary));
     }
@@ -186,7 +256,11 @@ fn caddy_launcher(cli: &Cli) -> Result<Launcher, String> {
             "caddy not found, pass --caddy PATH or --caddy-docker",
         ));
     }
+    docker_image(&cli.caddy_image)
+}
 
+/// A Docker launcher for `image`, pulling it when it is not local yet.
+fn docker_image(image: &str) -> Result<Launcher, String> {
     let docker = |args: &[&str]| {
         std::process::Command::new("docker")
             .args(args)
@@ -195,17 +269,20 @@ fn caddy_launcher(cli: &Cli) -> Result<Launcher, String> {
             .status()
             .is_ok_and(|status| status.success())
     };
-    if !docker(&["image", "inspect", &cli.caddy_image]) {
-        eprintln!("pulling {}...", cli.caddy_image);
-        if !docker(&["pull", &cli.caddy_image]) {
-            return Err(format!("docker could not pull {}", cli.caddy_image));
+    if !docker(&["image", "inspect", image]) {
+        eprintln!("pulling {image}...");
+        if !docker(&["pull", image]) {
+            return Err(format!("docker could not pull {image}"));
         }
     }
-    Ok(Launcher::Docker(cli.caddy_image.clone()))
+    Ok(Launcher::Docker {
+        image: image.to_owned(),
+        binary: None,
+    })
 }
 
 /// Markdown report: one row per scenario and target, then a head to head
-/// comparison when both targets ran.
+/// comparison when several targets ran.
 fn report(outcomes: &[Outcome], options: Options) -> String {
     let millis = |micros: u32| format!("{:.2}ms", f64::from(micros) / 1000.0);
 
@@ -243,34 +320,48 @@ fn report(outcomes: &[Outcome], options: Options) -> String {
         );
     }
 
-    let mut comparison = String::new();
-    for rxh in outcomes.iter().filter(|outcome| outcome.target == "rxh") {
-        let caddy = outcomes
-            .iter()
-            .find(|outcome| outcome.target == "caddy" && outcome.scenario == rxh.scenario);
-        let (Some(rxh_stats), Some(caddy_stats)) =
-            (&rxh.stats, caddy.and_then(|outcome| outcome.stats.as_ref()))
-        else {
-            continue;
-        };
-        let _ = writeln!(
-            comparison,
-            "| {} | {:.0} | {:.0} | {:.2}x | {} | {} |",
-            rxh.scenario.name(),
-            rxh_stats.rps,
-            caddy_stats.rps,
-            rxh_stats.rps / caddy_stats.rps.max(f64::EPSILON),
-            millis(rxh_stats.p99_us),
-            millis(caddy_stats.p99_us)
-        );
+    // Requests per second of every target next to rxh's.
+    let mut names: Vec<&str> = Vec::new();
+    for outcome in outcomes {
+        if outcome.stats.is_some() && !names.contains(&outcome.target.as_str()) {
+            names.push(&outcome.target);
+        }
     }
-    if !comparison.is_empty() {
-        let _ = write!(
-            text,
-            "\n### rxh vs caddy\n\n\
-             | Scenario | rxh req/s | caddy req/s | rxh/caddy | rxh p99 | caddy p99 |\n\
-             |---|---:|---:|---:|---:|---:|\n{comparison}"
-        );
+    if names.len() < 2 {
+        return text;
+    }
+    let _ = write!(
+        text,
+        "\n### Requests per second (and ratio to rxh)\n\n| Scenario | {} |\n|---|{}\n",
+        names.join(" | "),
+        "---:|".repeat(names.len())
+    );
+    let mut scenarios = Vec::new();
+    for outcome in outcomes {
+        if !scenarios.contains(&outcome.scenario) {
+            scenarios.push(outcome.scenario);
+        }
+    }
+    for scenario in scenarios {
+        let rps = |name: &str| {
+            let outcome = outcomes
+                .iter()
+                .find(|outcome| outcome.scenario == scenario && outcome.target == name)?;
+            Some(outcome.stats.as_ref()?.rps)
+        };
+        let rxh = rps("rxh");
+        let _ = write!(text, "| {} |", scenario.name());
+        for name in &names {
+            let cell = match (rps(name), rxh) {
+                (Some(rps), Some(rxh)) if *name != "rxh" => {
+                    format!("{rps:.0} ({:.2}x)", rps / rxh.max(f64::EPSILON))
+                }
+                (Some(rps), _) => format!("{rps:.0}"),
+                (None, _) => String::from("-"),
+            };
+            let _ = write!(text, " {cell} |");
+        }
+        text.push('\n');
     }
 
     text

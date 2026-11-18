@@ -62,30 +62,24 @@ pool web (least_conn)
 - **Also**: static file server with directory listing, TLS with ALPN,
   connection limits, graceful shutdown with `grace_period`.
 
-## Benchmark against Caddy
+## Benchmarks
 
-`rxh-bench` starts the same backends behind rxh and behind Caddy, runs every
-scenario on both and checks that each policy does what it promises. Every
-scenario passes on both. Throughput in a `--quick` run (16 keep-alive
-connections, Intel Core Ultra 7 255H, Caddy 2 in Docker with host
-networking):
+`rxh-bench` starts the same backends behind rxh, Caddy, NGINX and Traefik,
+runs every scenario on each and checks that each policy does what it
+promises. With every proxy in Docker (32 keep-alive connections, Intel Core
+Ultra 7 255H), rxh serves about 1.5 times the requests of Caddy, is 10% to
+30% faster than Traefik, and reaches about half the throughput of NGINX. It
+is the only one of the four that runs all ten scenarios.
 
-| Scenario | rxh req/s | Caddy req/s | rxh p99 | Caddy p99 |
-|---|---:|---:|---:|---:|
-| round_robin, 4 backends | 138 376 | 74 738 | 0.41 ms | 0.94 ms |
-| weighted_round_robin 1:3:2 | 121 540 | 83 287 | 0.49 ms | 0.77 ms |
-| least_conn, one slow backend | 127 027 | 70 222 | 0.33 ms | 0.63 ms |
-| ip_hash | 137 953 | 81 220 | 0.43 ms | 0.81 ms |
-| cookie sticky sessions | 136 901 | 76 588 | 0.42 ms | 0.81 ms |
-| failover (backend killed mid-run) | 128 301 | 84 913 | 0.46 ms | 0.75 ms |
-| TCP echo (layer 4) | 297 202 | n/a | 0.12 ms | n/a |
+![Requests per second by scenario and proxy](docs/bench/rps.svg)
 
-Docker adds overhead to Caddy, so run it yourself with a native binary
-before drawing conclusions:
+Tables, latency and the limits of the measurement are in
+[docs/benchmarks.md](docs/benchmarks.md). Run it yourself:
 
 ```bash
 cargo build --release -p rxh-cli -p rxh-bench
-./target/release/rxh-bench --quick --caddy "$(which caddy)"   # or --caddy-docker
+./target/release/rxh-bench --docker          # all four proxies in Docker
+./target/release/rxh-bench --quick --caddy "$(which caddy)"   # rxh and a native Caddy
 ```
 
 ## Install
@@ -197,7 +191,7 @@ RXH is a Cargo workspace:
 | [`crates/core`](crates/core) (`rxh-core`) | Configuration model and the load balancing engine: policies, pools, health state. No I/O. |
 | [`crates/server`](crates/server) (`rxh-server`) | Runtime on Tokio and Hyper: listeners, HTTP proxy, TCP/UDP proxy, health checks, admin API, daemon. |
 | [`crates/cli`](crates/cli) (`rxh-cli`) | The `rxh` binary: daemon and CLI. |
-| [`crates/bench`](crates/bench) (`rxh-bench`) | Correctness and performance comparison against Caddy. |
+| [`crates/bench`](crates/bench) (`rxh-bench`) | Correctness and performance comparison against Caddy, NGINX and Traefik. |
 
 ## Development
 
