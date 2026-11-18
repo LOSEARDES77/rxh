@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/LOSEARDES77/rxh/actions/workflows/ci.yml/badge.svg)](https://github.com/LOSEARDES77/rxh/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.100%2B-orange.svg)](https://www.rust-lang.org)
 
 **RXH** is a fast, lightweight **reverse proxy** and **load balancer** written
 in Rust. It balances **HTTP/1.1, HTTP/2 and WebSocket** traffic (layer 7) and
@@ -84,7 +84,7 @@ cargo build --release -p rxh-cli -p rxh-bench
 
 ## Install
 
-From source, with Rust 1.88 or newer:
+From source, with Rust 1.100 or newer:
 
 ```bash
 cargo install --git https://github.com/LOSEARDES77/rxh rxh-cli   # installs `rxh`

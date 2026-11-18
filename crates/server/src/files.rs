@@ -7,9 +7,8 @@ use hyper::header;
 use crate::http::body;
 use crate::http::response::{self, BoxResponse};
 
-const FILE_EXPLORER_TEMPLATE: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/file_explorer.min.html"));
-const NOT_FOUND_TEMPLATE: &str = include_str!(concat!(env!("OUT_DIR"), "/404.min.html"));
+const FILE_EXPLORER_TEMPLATE: &str = include_str!("../assets/file_explorer.html");
+const NOT_FOUND_TEMPLATE: &str = include_str!("../assets/404.html");
 
 /// Returns an HTTP response whose body is the content of a file. The file
 /// must be located inside the root directory specified by the configuration

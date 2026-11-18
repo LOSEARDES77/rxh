@@ -621,6 +621,8 @@ fn find_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn cookie_value(secret: &str, address: &str) -> String {
+    use hmac::KeyInit;
+
     let mut mac =
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
     mac.update(address.as_bytes());

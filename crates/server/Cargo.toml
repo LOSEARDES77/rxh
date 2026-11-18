@@ -25,9 +25,6 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 toml.workspace = true
 
-[build-dependencies]
-minify-html.workspace = true
-
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true
