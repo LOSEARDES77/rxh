@@ -9,6 +9,7 @@ use async_compression::tokio::bufread::GzipDecoder;
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::{HeaderMap, Method, Request, StatusCode};
+use rxh_test_util::{Fault, FlakyBackend};
 use tokio::io::AsyncReadExt;
 
 async fn request(
@@ -442,23 +443,7 @@ async fn not_modified_keeps_vary_for_encoded_routes() {
 async fn encode_does_not_hide_upstream_truncation() {
     use tokio::io::AsyncWriteExt;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let backend = listener.local_addr().expect("address");
-    tokio::task::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            tokio::task::spawn(async move {
-                let mut request = [0; 1024];
-                let _ = stream.read(&mut request).await;
-                let head =
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 1000\r\n\r\n";
-                let _ = stream
-                    .write_all(format!("{head}only ten b").as_bytes())
-                    .await;
-            });
-        }
-    });
+    let backend = FlakyBackend::spawn(Fault::TruncatedBody).await.address();
     let config = format!(
         "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"{backend}\"\nencode = [\"gzip\"]\n"
     );

@@ -91,6 +91,9 @@ Changed.
   (event in `RXH_EVENT`, `RXH_POOL`, `RXH_UPSTREAM`, `RXH_REASON`) and posts
   JSON to a `webhook` when active checks mark a backend `healthy` or
   `unhealthy`, in event order and without delaying the checks.
+- Tests: `crates/util` (`rxh-test-util`, not published) with `FlakyBackend`, a
+  backend that refuses connections, accepts then closes them, delays its
+  response head or truncates its body.
 
 ### Changed
 

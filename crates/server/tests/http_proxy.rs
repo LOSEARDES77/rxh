@@ -10,6 +10,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::header;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rxh_test_util::{Fault, FlakyBackend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -46,7 +47,7 @@ async fn unknown_prefix_is_404() {
 
 #[tokio::test]
 async fn dead_backend_is_502_and_empty_pool_is_503() {
-    let dead = util::dead_address();
+    let dead = FlakyBackend::spawn(Fault::Refuse).await.address();
     let proxies = util::spawn(&format!(
         r#"
         [upstream.empty]
@@ -67,6 +68,18 @@ async fn dead_backend_is_502_and_empty_pool_is_503() {
         util::get(proxies[1], "/").await.0,
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+#[tokio::test]
+async fn backend_closing_without_answer_is_502() {
+    let backend = FlakyBackend::spawn(Fault::AcceptThenClose).await;
+    let proxy = util::spawn(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"{}\"",
+        backend.address()
+    ))[0];
+
+    assert_eq!(util::get(proxy, "/").await.0, StatusCode::BAD_GATEWAY);
+    assert!(backend.connections() >= 1, "the proxy reached the backend");
 }
 
 #[tokio::test]

@@ -6,20 +6,15 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use hyper::StatusCode;
+use rxh_test_util::{Fault, FlakyBackend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Backend that accepts connections and never answers.
+/// Backend whose response head does not come within any test's timeouts.
 async fn silent_backend() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let address = listener.local_addr().expect("address");
-    tokio::task::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok((stream, _)) = listener.accept().await {
-            held.push(stream);
-        }
-    });
-    address
+    FlakyBackend::spawn(Fault::SlowHeaders(Duration::from_secs(60)))
+        .await
+        .address()
 }
 
 /// Reads until the peer closes the connection, failing after 3s.
@@ -38,15 +33,25 @@ async fn closed_within_3s(stream: &mut TcpStream) -> Duration {
 
 #[tokio::test]
 async fn slow_backend_gets_a_504() {
-    let backend = silent_backend().await;
-    let proxy = util::spawn(&format!(
-        "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = {{ backends = [\"{backend}\"], response_header_timeout = \"200ms\" }}"
-    ))[0];
+    let backend = FlakyBackend::spawn(Fault::SlowHeaders(Duration::from_millis(600))).await;
+    let proxy = |timeout: &str| {
+        util::spawn(&format!(
+            "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = {{ backends = [\"{}\"], response_header_timeout = \"{timeout}\" }}",
+            backend.address()
+        ))[0]
+    };
 
     let started = Instant::now();
-    let (status, _, _) = util::get(proxy, "/").await;
+    let (status, _, _) = util::get(proxy("200ms"), "/").await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    // The same backend is fine when the timeout leaves it enough time.
+    let (status, _, body) = util::get(proxy("3s"), "/").await;
+    assert_eq!(
+        (status, &body[..]),
+        (StatusCode::OK, rxh_test_util::SLOW_BODY.as_bytes())
+    );
 }
 
 #[tokio::test]
