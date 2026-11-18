@@ -1,3 +1,6 @@
 /target
 rxh.log
 *.toml.tmp
+*.profraw
+*.profdata
+.ruff_cache/
