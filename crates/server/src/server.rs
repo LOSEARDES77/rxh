@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use rxh_core::config::{Action, Config, Protocol, ProxyProtocol};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -27,6 +27,7 @@ use crate::error::Error;
 use crate::http::service::{Activity, Route, Service, Site};
 use crate::registry::{Group, Registry};
 use crate::tcp;
+use crate::timeout::{Stamp, Watched};
 use crate::tls;
 use crate::udp::{self, UdpSettings};
 
@@ -66,6 +67,7 @@ enum Handler {
     Tcp {
         group: Arc<Group>,
         proxy_protocol: Option<ProxyProtocol>,
+        limits: tcp::Limits,
     },
 }
 
@@ -79,6 +81,8 @@ struct ConnectionContext {
     handler: Handler,
     tls: Option<TlsAcceptor>,
     log_name: Arc<str>,
+    read_header_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
 }
 
 /// One listener. See the module documentation.
@@ -167,6 +171,10 @@ impl Server {
                     Protocol::Tcp => Handler::Tcp {
                         group: forward_group()?,
                         proxy_protocol: server.proxy_protocol,
+                        limits: tcp::Limits {
+                            idle: server.idle_timeout,
+                            stream: server.stream_timeout,
+                        },
                     },
                     _ => {
                         let mut routes = Vec::new();
@@ -190,6 +198,8 @@ impl Server {
                     tls: tls::acceptor(&servers)?,
                     handler,
                     log_name: Arc::clone(&log_name),
+                    read_header_timeout: server.read_header_timeout,
+                    idle_timeout: server.idle_timeout,
                 };
                 (Socket::Tcp(listener), Some(Arc::new(context)))
             }
@@ -440,6 +450,7 @@ async fn serve<S>(
         Handler::Tcp {
             group,
             proxy_protocol,
+            limits,
         } => {
             tcp::proxy(
                 stream,
@@ -447,6 +458,7 @@ async fn serve<S>(
                 local,
                 group,
                 *proxy_protocol,
+                *limits,
                 &context.log_name,
             )
             .await;
@@ -460,23 +472,32 @@ async fn serve<S>(
                 local,
                 activity: Arc::clone(&activity),
             };
-            let io = TokioIo::new(stream);
+            let stamp = Stamp::new();
+            let io = TokioIo::new(Watched::new(stream, Arc::clone(&stamp)));
+            let idle = context.idle_timeout.map(|idle| (idle, stamp));
 
             let result = if *http2 {
                 let mut builder = auto::Builder::new(TokioExecutor::new());
-                builder.http1().preserve_header_case(true);
+                let mut http1 = builder.http1();
+                http1.preserve_header_case(true).timer(TokioTimer::new());
+                if let Some(timeout) = context.read_header_timeout {
+                    http1.header_read_timeout(timeout);
+                }
                 drive_http(
                     builder.serve_connection_with_upgrades(io, service),
                     stop,
                     &activity,
+                    idle,
                 )
                 .await
             } else {
-                let connection = hyper::server::conn::http1::Builder::new()
-                    .preserve_header_case(true)
-                    .serve_connection(io, service)
-                    .with_upgrades();
-                drive_http(connection, stop, &activity).await
+                let mut builder = hyper::server::conn::http1::Builder::new();
+                builder.preserve_header_case(true).timer(TokioTimer::new());
+                if let Some(timeout) = context.read_header_timeout {
+                    builder.header_read_timeout(timeout);
+                }
+                let connection = builder.serve_connection(io, service).with_upgrades();
+                drive_http(connection, stop, &activity, idle).await
             };
 
             if let Err(err) = result {
@@ -520,7 +541,8 @@ where
     }
 }
 
-/// Runs an HTTP connection. Once shutdown starts, the connection is closed
+/// Runs an HTTP connection. A connection without traffic and without requests
+/// in flight for `idle` is dropped. Once shutdown starts, the connection is closed
 /// after its current request; connections that never sent a request are left
 /// open until they send one, so clients that connected right before the
 /// shutdown still get an answer.
@@ -528,6 +550,7 @@ async fn drive_http<C, E>(
     connection: C,
     mut stop: watch::Receiver<bool>,
     activity: &Activity,
+    idle: Option<(Duration, Arc<Stamp>)>,
 ) -> Result<(), String>
 where
     C: GracefulConnection<Output = Result<(), E>>,
@@ -535,8 +558,16 @@ where
 {
     let mut connection = std::pin::pin!(connection);
 
+    let idle = async {
+        match &idle {
+            Some((limit, stamp)) => stamp.idle_for(*limit, || activity.in_flight() > 0).await,
+            None => std::future::pending().await,
+        }
+    };
+
     tokio::select! {
         result = connection.as_mut() => return result.map_err(|err| err.to_string()),
+        () = idle => return Ok(()),
         () = async {
             let _ = stop.wait_for(|stopping| *stopping).await;
             activity.first_request().await;

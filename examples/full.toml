@@ -24,6 +24,9 @@ retries = 2                    # extra attempts after a failure (lb_retries)
 # try_duration = "5s"          # keep retrying this long (lb_try_duration)
 try_interval = "250ms"         # wait between attempts (lb_try_interval)
 dial_timeout = "3s"
+# response_header_timeout = "30s"  # 504 when the backend sends no headers in time
+# read_timeout = "1m"              # upstream read without progress fails
+# write_timeout = "1m"             # upstream write without progress fails
 keepalive = "2m"               # idle upstream connection lifetime
 keepalive_idle_conns_per_host = 32
 h2c = false                    # cleartext HTTP/2 to backends
@@ -94,6 +97,9 @@ name = "edge"
 listen = ["0.0.0.0:8100", "[::]:8100"]
 max_connections = 1024
 http2 = true
+read_header_timeout = "10s"    # clients must send request headers in time
+idle_timeout = "2m"            # close idle keep-alive connections
+stream_timeout = "1h"          # maximum lifetime of WebSocket tunnels
 trusted_proxies = ["private_ranges", "203.0.113.0/24"]
 # tls = { cert = "/etc/rxh/cert.pem", key = "/etc/rxh/key.pem" }
 
@@ -127,6 +133,8 @@ serve = "/var/www"
 name = "postgres"
 listen = "0.0.0.0:5432"
 protocol = "tcp"
+idle_timeout = "10m"           # no traffic in either direction
+stream_timeout = "12h"         # maximum connection lifetime
 proxy_protocol = "v2"
 forward = { policy = "first", backends = ["10.0.0.1:5432", "10.0.0.2:5432"], health = { interval = "5s" } }
 

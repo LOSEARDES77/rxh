@@ -56,3 +56,8 @@ pub(crate) fn service_unavailable() -> BoxResponse {
         "HTTP 503 SERVICE UNAVAILABLE: no upstreams available",
     )
 }
+
+/// `504 Gateway Timeout`: the backend did not answer in time.
+pub(crate) fn gateway_timeout() -> BoxResponse {
+    plain(StatusCode::GATEWAY_TIMEOUT, "HTTP 504 GATEWAY TIMEOUT")
+}

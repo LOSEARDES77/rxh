@@ -51,6 +51,9 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `try_duration` | unset | `lb_try_duration` | Keep retrying for this long. Wins over `retries`. |
 | `try_interval` | `"250ms"` | `lb_try_interval` | Wait between attempts. |
 | `dial_timeout` | `"3s"` | `dial_timeout` | Connect timeout. |
+| `response_header_timeout` | unset | `response_header_timeout` | Time from sending the request to receiving the response headers. On expiry the client gets `504 Gateway Timeout` and the backend counts a passive failure. |
+| `read_timeout` | unset | `read_timeout` | An upstream read that makes no progress for this long fails the connection (also idle pooled connections and upgraded tunnels). |
+| `write_timeout` | unset | `write_timeout` | An upstream write that makes no progress for this long fails the connection. |
 | `h2c` | `false` | `h2c://` | Speak cleartext HTTP/2 to the backends (one shared connection each). |
 | `keepalive` | `"2m"` | `keepalive` | How long idle upstream HTTP connections are kept. `"0s"` disables pooling. |
 | `keepalive_idle_conns_per_host` | `32` | `keepalive_idle_conns_per_host` | Idle connections kept per backend. |
@@ -182,6 +185,9 @@ socket, except that `http` servers listing the same address share one socket
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
+| `read_header_timeout` | unset | Time a client has to send the request headers; slower clients are disconnected (http only). On a listener shared by several http servers, this and `idle_timeout` come from the first server. |
+| `idle_timeout` | unset | Keep-alive HTTP connections without traffic and without requests in flight for this long are closed. For `tcp`, a connection with no traffic in either direction for this long is closed. |
+| `stream_timeout` | unset | Maximum lifetime of upgraded HTTP tunnels (WebSockets) and of `tcp` connections. |
 | `udp_idle_timeout` | `"60s"` | Idle time after which a UDP client session ends (udp only). |
 | `request`, `response`, `cache` | | Same as in `match` entries, for the single pattern form. |
 

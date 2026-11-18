@@ -2,7 +2,7 @@
 //! response back and feeds passive health checks.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
@@ -164,7 +164,23 @@ pub(crate) async fn forward(
         }
         let started = Instant::now();
 
-        match transport.send(address, upstream_connection, outgoing).await {
+        let sent = transport.send(address, upstream_connection, outgoing);
+        let sent = match group.pool.settings().response_header_timeout {
+            Some(limit) => match tokio::time::timeout(limit, sent).await {
+                Ok(sent) => sent,
+                Err(_) => {
+                    selection.upstream.record_failure();
+                    eprintln!(
+                        "{} => upstream {address} sent no response headers within {limit:?}",
+                        site.log_name
+                    );
+                    return response::gateway_timeout();
+                }
+            },
+            None => sent.await,
+        };
+
+        match sent {
             Ok(upstream_response) => break (selection, guard, started, upstream_response),
             Err(SendError::Stale(request)) if stale_attempts < MAX_STALE_RETRIES => {
                 stale_attempts += 1;
@@ -201,7 +217,12 @@ pub(crate) async fn forward(
             return response::bad_gateway();
         };
         let server_upgrade = hyper::upgrade::on(&mut upstream_response);
-        tokio::task::spawn(tunnel(client_upgrade, server_upgrade, guard));
+        tokio::task::spawn(tunnel(
+            client_upgrade,
+            server_upgrade,
+            guard,
+            site.stream_timeout,
+        ));
 
         let (parts, _) = upstream_response.into_parts();
         let mut client_response = Response::from_parts(parts, body::empty());
@@ -312,8 +333,14 @@ fn host<B>(request: &Request<B>) -> String {
 }
 
 /// Copies bytes both ways between an upgraded client and backend (WebSocket
-/// or any other protocol). Runs until either side closes.
-async fn tunnel(client: OnUpgrade, server: OnUpgrade, _guard: RequestGuard) {
+/// or any other protocol). Runs until either side closes or `stream_timeout`
+/// passes.
+async fn tunnel(
+    client: OnUpgrade,
+    server: OnUpgrade,
+    _guard: RequestGuard,
+    stream_timeout: Option<Duration>,
+) {
     let (Ok(client), Ok(server)) = (client.await, server.await) else {
         return;
     };
@@ -321,7 +348,15 @@ async fn tunnel(client: OnUpgrade, server: OnUpgrade, _guard: RequestGuard) {
     let mut client = TokioIo::new(client);
     let mut server = TokioIo::new(server);
 
-    if let Err(err) = tokio::io::copy_bidirectional(&mut client, &mut server).await {
+    let copy = tokio::io::copy_bidirectional(&mut client, &mut server);
+    let result = match stream_timeout {
+        Some(limit) => match tokio::time::timeout(limit, copy).await {
+            Ok(result) => result,
+            Err(_) => return,
+        },
+        None => copy.await,
+    };
+    if let Err(err) = result {
         eprintln!("tunnel error: {err}");
     }
 }

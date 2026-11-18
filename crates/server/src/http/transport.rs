@@ -97,7 +97,9 @@ impl Transport {
                 .await
                 .map_err(io::Error::other)?;
             tokio::task::spawn(async move {
-                if let Err(err) = connection.await {
+                if let Err(err) = connection.await
+                    && !is_idle_timeout(&err)
+                {
                     eprintln!("upstream h2c connection error: {err}");
                 }
             });
@@ -129,7 +131,9 @@ impl Transport {
             .await
             .map_err(io::Error::other)?;
         tokio::task::spawn(async move {
-            if let Err(err) = connection.with_upgrades().await {
+            if let Err(err) = connection.with_upgrades().await
+                && !is_idle_timeout(&err)
+            {
                 eprintln!("upstream connection error: {err}");
             }
         });
@@ -213,4 +217,19 @@ impl Transport {
     pub(crate) fn is_h2c(&self) -> bool {
         self.h2c
     }
+}
+
+/// True when `err` was caused by the upstream `read_timeout` firing, which
+/// is how idle pooled connections end.
+fn is_idle_timeout(err: &hyper::Error) -> bool {
+    let mut source = std::error::Error::source(err);
+    while let Some(inner) = source {
+        if let Some(io) = inner.downcast_ref::<io::Error>()
+            && io.kind() == io::ErrorKind::TimedOut
+        {
+            return true;
+        }
+        source = inner.source();
+    }
+    false
 }

@@ -105,12 +105,13 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `header_up` / `header_down` set and delete | `request.headers.set/remove`, `response.headers.set/remove` | 🟡 | No `+` (add), no regex replace, no wildcard delete. |
 | Upstream keep-alive pool | `keepalive`, `keepalive_idle_conns_per_host` | ✅ | |
 | `dial_timeout` | `dial_timeout` | ✅ | Default 3s. |
-| `read_timeout`, `write_timeout`, `response_header_timeout` | | ❌ | |
+| `read_timeout`, `write_timeout`, `response_header_timeout` | same names | ✅ | Unset by default. `response_header_timeout` gives `504`; read and write timeouts also apply to idle pooled connections and tunnels. |
 | `max_conns_per_host` | | 🟡 | `unhealthy_request_count` covers the common use. |
 | `proxy_protocol v1/v2` on HTTP transport | | ❌ | Supported on TCP servers. |
 | `flush_interval` | | 🟡 | Responses always stream immediately (Caddy's `-1`). |
 | `request_buffers`, `response_buffers` | | ❌ | |
-| `stream_timeout`, `stream_close_delay` | | ❌ | |
+| `stream_timeout` | `stream_timeout` on the server | 🟡 | Server level option, also caps `tcp` connections. |
+| `stream_close_delay` | | ❌ | |
 | `rewrite`, `method` | | ❌ | |
 | `handle_response`, `replace_status`, `copy_response` | | ❌ | |
 | `transport fastcgi` | | ❌ | |
@@ -140,6 +141,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | caddy-l4 | RXH | Status | Notes |
 |---|---|---|---|
 | TCP proxy | `protocol = "tcp"` | ✅ | |
+| Server timeouts | `read_header_timeout`, `idle_timeout`, `stream_timeout` | ✅ | Unset by default. `idle_timeout` also closes idle `tcp` connections. |
 | UDP proxy | `protocol = "udp"` | ✅ | Per client sessions, `udp_idle_timeout`. |
 | TLS termination | `tls` on a `tcp` server | ✅ | |
 | PROXY protocol to upstreams | `proxy_protocol = "v1"` or `"v2"` | ✅ | |
@@ -170,15 +172,15 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 
 ## Next steps
 
-Ordered by value for a load balancer:
+The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). Ordered by value
+for a load balancer:
 
-1. Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`, `stream_timeout`.
-2. Prometheus metrics and JSON access logs.
-3. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
-4. Compression (`encode`), range requests and ETags for the file server.
-5. Automatic HTTPS with ACME.
-6. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-7. HTTP/3.
+1. Prometheus metrics and JSON access logs.
+2. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
+3. Compression (`encode`), range requests and ETags for the file server.
+4. Automatic HTTPS with ACME.
+5. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
+6. HTTP/3.
 
 ## Roadmap beyond Caddy
 

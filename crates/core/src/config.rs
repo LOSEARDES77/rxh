@@ -136,6 +136,16 @@ impl Config {
                 }
             }
 
+            for (name, value) in [
+                ("read_header_timeout", server.read_header_timeout),
+                ("idle_timeout", server.idle_timeout),
+                ("stream_timeout", server.stream_timeout),
+            ] {
+                if value.is_some_and(|value| value.is_zero()) {
+                    return invalid(format!("{label}: {name} must be greater than zero"));
+                }
+            }
+
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
                 RequestMatcher::new(pattern, &server.host).map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
@@ -318,6 +328,19 @@ pub struct Server {
     /// Idle time after which a UDP session is dropped.
     #[serde(with = "duration")]
     pub udp_idle_timeout: Duration,
+
+    /// Time a client has to send the request headers (http only).
+    #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    pub read_header_timeout: Option<Duration>,
+
+    /// Idle time after which a keep-alive HTTP connection or a `tcp`
+    /// connection is closed.
+    #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    pub idle_timeout: Option<Duration>,
+
+    /// Maximum lifetime of upgraded HTTP tunnels and `tcp` connections.
+    #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    pub stream_timeout: Option<Duration>,
 }
 
 impl Server {
@@ -370,6 +393,12 @@ struct RawServer {
     proxy_protocol: Option<ProxyProtocol>,
     #[serde(default = "default::udp_idle_timeout", with = "duration")]
     udp_idle_timeout: Duration,
+    #[serde(default, with = "duration::option")]
+    read_header_timeout: Option<Duration>,
+    #[serde(default, with = "duration::option")]
+    idle_timeout: Option<Duration>,
+    #[serde(default, with = "duration::option")]
+    stream_timeout: Option<Duration>,
 }
 
 impl TryFrom<RawServer> for Server {
@@ -451,6 +480,9 @@ impl TryFrom<RawServer> for Server {
             trusted_proxies,
             proxy_protocol: raw.proxy_protocol,
             udp_idle_timeout: raw.udp_idle_timeout,
+            read_header_timeout: raw.read_header_timeout,
+            idle_timeout: raw.idle_timeout,
+            stream_timeout: raw.stream_timeout,
         })
     }
 }
@@ -632,6 +664,31 @@ pub struct UpstreamGroup {
     #[serde(default = "default::dial_timeout", with = "duration")]
     pub dial_timeout: Duration,
 
+    /// Time from sending a request to receiving the response headers
+    /// before the client gets `504` (Caddy `response_header_timeout`).
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_header_timeout: Option<Duration>,
+
+    /// An upstream read without progress for this long fails the connection.
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub read_timeout: Option<Duration>,
+
+    /// An upstream write without progress for this long fails the connection.
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub write_timeout: Option<Duration>,
+
     /// Speak cleartext HTTP/2 to the backends instead of HTTP/1.1.
     #[serde(default)]
     pub h2c: bool,
@@ -789,6 +846,9 @@ impl UpstreamGroup {
             try_duration: None,
             try_interval: default::try_interval(),
             dial_timeout: default::dial_timeout(),
+            response_header_timeout: None,
+            read_timeout: None,
+            write_timeout: None,
             h2c: false,
             keepalive: default::keepalive(),
             keepalive_idle_conns_per_host: default::keepalive_idle_conns_per_host(),
@@ -867,6 +927,16 @@ impl UpstreamGroup {
 
         if self.choose == 0 {
             return Err(String::from("choose must be at least 1"));
+        }
+
+        for (name, value) in [
+            ("response_header_timeout", self.response_header_timeout),
+            ("read_timeout", self.read_timeout),
+            ("write_timeout", self.write_timeout),
+        ] {
+            if value.is_some_and(|value| value.is_zero()) {
+                return Err(format!("{name} must be greater than zero"));
+            }
         }
 
         if matches!(self.policy, Policy::Query | Policy::Header) && self.key.is_none() {
@@ -1648,6 +1718,23 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn timeouts_parse_and_reject_zero() {
+        let config = Config::from_toml(
+            "[[server]]\nlisten = \"127.0.0.1:0\"\nidle_timeout = \"5s\"\n\
+             forward = { backends = [\"a:1\"], read_timeout = \"250ms\" }",
+        )
+        .expect("valid");
+        assert_eq!(config.servers[0].idle_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(config.servers[0].stream_timeout, None);
+
+        let err = Config::from_toml(
+            "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = { backends = [\"a:1\"], read_timeout = \"0s\" }",
+        )
+        .expect_err("zero is invalid");
+        assert!(err.to_string().contains("read_timeout"), "{err}");
     }
 
     #[test]

@@ -7,7 +7,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use http_body_util::BodyExt;
 use hyper::Request;
 use hyper::body::Incoming;
 use rxh_core::config::{self, Action, ConfigError, RequestHeaders, ResponseHeaders};
@@ -18,6 +20,7 @@ use tokio::time::Instant;
 
 use crate::error::Error;
 use crate::files;
+use crate::http::body::Guarded;
 use crate::http::cache::Cache;
 use crate::http::proxy;
 use crate::http::response::{self, BoxResponse};
@@ -38,6 +41,9 @@ pub(crate) struct Site {
 
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
+
+    /// Maximum lifetime of upgraded tunnels.
+    pub(crate) stream_timeout: Option<Duration>,
 }
 
 /// One compiled pattern.
@@ -77,6 +83,7 @@ impl Site {
             by: server.name.clone().unwrap_or_else(|| local.to_string()),
             trusted_proxies: server.trusted_proxies.clone(),
             tls: server.tls.is_some(),
+            stream_timeout: server.stream_timeout,
         });
 
         for (pattern_index, pattern) in server.patterns.iter().enumerate() {
@@ -115,10 +122,25 @@ impl Site {
 #[derive(Debug, Default)]
 pub(crate) struct Activity {
     pub(crate) requests: AtomicUsize,
+    in_flight: AtomicUsize,
     pub(crate) notify: Notify,
 }
 
+/// Counts a request as in flight until dropped.
+pub(crate) struct InFlight(Arc<Activity>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl Activity {
+    /// Requests whose response has not been fully sent yet.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
     /// Waits until at least one request has been received.
     pub(crate) async fn first_request(&self) {
         while self.requests.load(Ordering::Acquire) == 0 {
@@ -148,8 +170,14 @@ impl hyper::service::Service<Request<Incoming>> for Service {
         self.activity.requests.fetch_add(1, Ordering::Release);
         self.activity.notify.notify_one();
 
+        self.activity.in_flight.fetch_add(1, Ordering::Release);
+        let in_flight = InFlight(Arc::clone(&self.activity));
+
         let service = self.clone();
-        Box::pin(async move { Ok(service.handle(request).await) })
+        Box::pin(async move {
+            let response = service.handle(request).await;
+            Ok(response.map(|body| Guarded::new(body, in_flight).boxed()))
+        })
     }
 }
 

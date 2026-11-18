@@ -3,21 +3,34 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rxh_core::config::ProxyProtocol;
 use rxh_core::pool::{SelectContext, Upstream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::registry::Group;
+use crate::timeout::{Stamp, Watched};
 use crate::upstream::{self, DialError};
+
+/// Time limits of a proxied connection.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Limits {
+    /// Close after this long without traffic in either direction.
+    pub(crate) idle: Option<Duration>,
+
+    /// Close after this long, whatever the traffic.
+    pub(crate) stream: Option<Duration>,
+}
 
 /// Proxies one client connection to a backend of `group`.
 pub(crate) async fn proxy<S>(
-    mut client: S,
+    client: S,
     peer: SocketAddr,
     local: SocketAddr,
     group: &Group,
     proxy_protocol: Option<ProxyProtocol>,
+    limits: Limits,
     log_name: &str,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -55,11 +68,33 @@ pub(crate) async fn proxy<S>(
         return;
     }
 
-    match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
-        Ok((sent, received)) => {
-            println!("{peer} -> {log_name} TCP {address} sent {sent}B received {received}B");
+    // Traffic from the client is a read of `client`, traffic from the backend
+    // a write to it, so watching the client sees both directions.
+    let stamp = Stamp::new();
+    let mut client = Watched::new(client, Arc::clone(&stamp));
+    let copy = tokio::io::copy_bidirectional(&mut client, &mut backend);
+    let idle = async {
+        match limits.idle {
+            Some(idle) => stamp.idle_for(idle, || false).await,
+            None => std::future::pending().await,
         }
-        Err(err) => eprintln!("{peer} -> {log_name} TCP {address} closed: {err}"),
+    };
+    let lifetime = async {
+        match limits.stream {
+            Some(stream) => tokio::time::sleep(stream).await,
+            None => std::future::pending().await,
+        }
+    };
+
+    tokio::select! {
+        result = copy => match result {
+            Ok((sent, received)) => {
+                println!("{peer} -> {log_name} TCP {address} sent {sent}B received {received}B");
+            }
+            Err(err) => eprintln!("{peer} -> {log_name} TCP {address} closed: {err}"),
+        },
+        () = idle => println!("{peer} -> {log_name} TCP {address} closed: idle timeout"),
+        () = lifetime => println!("{peer} -> {log_name} TCP {address} closed: stream timeout"),
     }
 }
 

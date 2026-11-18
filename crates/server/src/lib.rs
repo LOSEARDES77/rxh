@@ -17,6 +17,7 @@ mod registry;
 mod server;
 mod stream;
 mod tcp;
+mod timeout;
 mod tls;
 mod udp;
 mod upstream;

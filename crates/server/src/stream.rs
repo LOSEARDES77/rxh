@@ -25,6 +25,8 @@ use tokio_rustls::rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
 
+use crate::timeout::Timed;
+
 /// Transport under TLS, or used as is.
 #[derive(Debug)]
 pub(crate) enum Raw {
@@ -134,6 +136,8 @@ struct Tls {
 #[derive(Debug)]
 pub(crate) struct Dialer {
     timeout: Duration,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
     tls: Option<Tls>,
 }
 
@@ -151,6 +155,8 @@ impl Dialer {
         };
         Ok(Self {
             timeout: group.dial_timeout,
+            read_timeout: group.read_timeout,
+            write_timeout: group.write_timeout,
             tls,
         })
     }
@@ -161,11 +167,14 @@ impl Dialer {
     }
 
     /// Connects to `address` (any backend address form) within `dial_timeout`,
-    /// including the TLS handshake when the pool uses TLS.
-    pub(crate) async fn dial(&self, address: &str) -> io::Result<UpstreamStream> {
-        tokio::time::timeout(self.timeout, self.connect(address))
+    /// including the TLS handshake when the pool uses TLS. The stream fails
+    /// reads and writes that make no progress for `read_timeout` and
+    /// `write_timeout`.
+    pub(crate) async fn dial(&self, address: &str) -> io::Result<Timed<UpstreamStream>> {
+        let stream = tokio::time::timeout(self.timeout, self.connect(address))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))??;
+        Ok(Timed::new(stream, self.read_timeout, self.write_timeout))
     }
 
     async fn connect(&self, address: &str) -> io::Result<UpstreamStream> {
