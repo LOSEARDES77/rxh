@@ -17,37 +17,52 @@ This file orders the work into milestones. The detail lives elsewhere:
 Milestones are ordered by value, not by date. Version numbers are a plan,
 not a promise. An item moves to [CHANGELOG.md](CHANGELOG.md) when it ships.
 
-## Where RXH is today (0.2.0)
+## Where RXH is today (0.3.0, unreleased)
 
 - HTTP/1.1, HTTP/2, WebSocket, TCP and UDP proxying with one pool model.
-- Every Caddy load balancing policy, retries, active and passive health
-  checks, dynamic upstreams from DNS, TLS and unix socket upstreams.
-- Virtual hosts, matchers, SNI certificates, static files, response cache.
-- Daemon with zero downtime reloads, admin API and a CLI that edits the
-  configuration file and applies changes live.
-- In the benchmark RXH passes every scenario and is faster than Caddy, but
-  clearly slower than NGINX. See docs/benchmarks.md for the numbers.
-- 82% line coverage without the benchmark tool.
+- Every Caddy load balancing policy (with nested `fallback`), retries with
+  `retry_match`, active and passive health checks with event hooks and
+  webhooks, dynamic upstreams from DNS, TLS and unix socket upstreams,
+  `max_conns_per_host`, request and response buffering, `flush_interval`.
+- Virtual hosts, request matchers, SNI certificates, automatic HTTPS with
+  ACME HTTP-01 and HTTP to HTTPS redirects.
+- Routes with `rewrite`, `redirect`, `handle_response`, header rules, body
+  size limits, `encode` (zstd, br, gzip), a file server with ranges, ETag
+  and precompressed files, and a response cache.
+- Layer 4 routing by SNI, ALPN, protocol and HTTP host; PROXY protocol in on
+  `http` and `tcp` servers and out to backends on both.
+- Caddy's timeouts, Prometheus metrics on the admin API and JSON or text
+  access logs.
+- Daemon with zero downtime reloads, admin API, `include` files and a CLI
+  that edits the configuration file and applies changes live, plus
+  `rxh file-server` and `rxh reverse-proxy` quick commands.
+- In the benchmark (measured with 0.2.0) RXH passes every scenario and is
+  faster than Caddy, but clearly slower than NGINX. See docs/benchmarks.md
+  for the numbers.
+- 82% line coverage without the benchmark tool, measured before most of the
+  0.3 work; docs/test-coverage.md has the details and how to re-measure.
 
 ## 0.3: finish Caddy parity for load balancing
 
 The remaining rows of PARITY.md that a load balancer needs every day.
 
-- [ ] Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`,
-      `stream_timeout`, plus per route overrides.
-- [ ] Prometheus metrics on the admin listener: requests, latency
-      histograms, in-flight, retries, health state per backend, per pool
-      and per server.
-- [ ] JSON access logs with a stable field set, log rotation left to the
+- [x] Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`,
+      `stream_timeout`.
+- [ ] Per route timeout overrides.
+- [x] Prometheus metrics on the admin listener: requests, latency
+      histograms, in-flight, health state per backend, per pool and per
+      server.
+- [ ] A retry counter in the metrics.
+- [x] JSON access logs with a stable field set, log rotation left to the
       system.
-- [ ] `lb_retry_match`, nested `fallback`, header `+` (add), regex replace
+- [x] `lb_retry_match`, nested `fallback`, header `+` (add), regex replace
       and wildcard delete.
 - [x] `max_conns_per_host`, request and response buffering, body size
       limit.
 - [x] `rewrite`, `method`, redirects and HTTP to HTTPS redirect.
 - [x] `handle_response`, `replace_status` and `copy_response` on proxy
       routes.
-- [ ] `encode gzip zstd`; range requests, ETag and precompressed files in
+- [x] `encode gzip zstd`; range requests, ETag and precompressed files in
       the file server.
 - [x] Health check events (`healthy`, `unhealthy`) as hooks, not only log
       lines.
@@ -76,8 +91,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 
 ## 0.5: TLS and security
 
-- [ ] Automatic HTTPS with ACME (HTTP-01 and TLS-ALPN-01), certificate
-      storage and renewal.
+- [x] Automatic HTTPS with ACME HTTP-01, certificate storage and renewal.
+- [ ] ACME TLS-ALPN-01.
 - [ ] ACME DNS-01 and wildcard certificates (Cloudflare, Route53,
       RFC 2136).
 - [ ] mTLS on listeners with the four Traefik modes, and the client
@@ -119,7 +134,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [ ] Consistent hashing with bounded loads, Maglev.
 - [ ] Per backend connection limits with a queue.
 - [ ] Retry budgets and hedged requests.
-- [ ] Custom error pages.
+- [ ] Custom error pages. Upstream errors can already be replaced with
+      `handle_response`; errors RXH generates itself cannot.
 - [ ] gRPC health checks and gRPC-Web.
 - [x] Layer 4 matchers (SNI, HTTP, SSH) and routing; receiving PROXY
       protocol; PROXY protocol on the HTTP transport.
