@@ -94,6 +94,18 @@ where
     }
 }
 
+/// Backend answering each request with `handler`.
+pub async fn backend_with<F, Fut>(handler: F) -> SocketAddr
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::task::spawn(serve_http(listener, handler));
+    address
+}
+
 /// Backend answering every request with `body`.
 pub async fn backend(body: &'static str) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

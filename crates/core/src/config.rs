@@ -253,8 +253,8 @@ impl Config {
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
                 if server.protocol != Protocol::Http && pattern.has_http_options() {
                     return invalid(format!(
-                        "{label}: match[{pattern_index}]: rewrite, request, response, encode \
-                         and cache only apply to http servers"
+                        "{label}: match[{pattern_index}]: rewrite, request, response, \
+                         handle_response, encode and cache only apply to http servers"
                     ));
                 }
                 pattern.validate_rewrite().map_err(|err| {
@@ -296,15 +296,25 @@ impl Config {
                         "{label}: match[{pattern_index}]: response.headers: {err}"
                     ))
                 })?;
+                if !pattern.handle_response.is_empty()
+                    && !matches!(pattern.action, Action::Forward(_))
+                {
+                    return invalid(format!(
+                        "{label}: match[{pattern_index}]: handle_response only applies to forward"
+                    ));
+                }
+                for (handler_index, handler) in pattern.handle_response.iter().enumerate() {
+                    handler.validate().map_err(|err| {
+                        ConfigError::Invalid(format!(
+                            "{label}: match[{pattern_index}]: handle_response[{handler_index}]: \
+                             {err}"
+                        ))
+                    })?;
+                }
                 if let Action::Serve(files) = &pattern.action {
-                    for entry in &files.hide {
-                        if entry.is_empty() || entry.contains('/') {
-                            return invalid(format!(
-                                "{label}: match[{pattern_index}]: serve.hide entry {entry:?} \
-                                 must be a file name or a `*` glob without `/`"
-                            ));
-                        }
-                    }
+                    files.validate().map_err(|err| {
+                        ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
+                    })?;
                     continue;
                 }
                 if let Action::Redirect(redirect) = &pattern.action {
@@ -714,6 +724,8 @@ struct RawServer {
     remote_ip: Vec<IpNet>,
     request: Option<RequestConfig>,
     response: Option<ResponseConfig>,
+    #[serde(default)]
+    handle_response: Vec<HandleResponse>,
     cache: Option<Cache>,
     #[serde(default = "default::max_connections", alias = "connections")]
     max_connections: usize,
@@ -769,6 +781,7 @@ impl TryFrom<RawServer> for Server {
             || raw.rewrite.is_some()
             || raw.request.is_some()
             || raw.response.is_some()
+            || !raw.handle_response.is_empty()
             || !raw.encode.is_empty()
             || raw.cache.is_some();
 
@@ -781,7 +794,8 @@ impl TryFrom<RawServer> for Server {
             (Some(_), None) if has_inline_options => {
                 return Err(String::from(
                     "'uri', 'path', 'method', 'header', 'query', 'remote_ip', 'rewrite', \
-                     'request', 'response', 'encode' and 'cache' go inside each 'match' entry",
+                     'request', 'response', 'handle_response', 'encode' and 'cache' go inside \
+                     each 'match' entry",
                 ));
             }
             (Some(patterns), None) if !patterns.is_empty() => patterns,
@@ -795,6 +809,7 @@ impl TryFrom<RawServer> for Server {
                 rewrite: raw.rewrite,
                 request: raw.request.unwrap_or_default(),
                 response: raw.response.unwrap_or_default(),
+                handle_response: raw.handle_response,
                 encode: raw.encode,
                 cache: raw.cache.unwrap_or_default(),
                 ..Pattern::new(action)
@@ -899,6 +914,11 @@ pub struct Pattern {
     #[serde(default)]
     pub response: ResponseConfig,
 
+    /// Handlers of upstream responses, the first matching one runs
+    /// (`forward` only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handle_response: Vec<HandleResponse>,
+
     /// Encodings to compress responses with, in order of preference. Applies
     /// to files and proxied responses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -952,6 +972,7 @@ impl Pattern {
             rewrite: None,
             request: RequestConfig::default(),
             response: ResponseConfig::default(),
+            handle_response: Vec::new(),
             encode: Vec::new(),
             cache: Cache::default(),
             sni: Vec::new(),
@@ -1018,12 +1039,13 @@ impl Pattern {
     }
 
     /// Returns true if the entry sets `rewrite`, `request`, `response`,
-    /// `encode` or `cache`, which only HTTP servers use.
+    /// `handle_response`, `encode` or `cache`, which only HTTP servers use.
     fn has_http_options(&self) -> bool {
         !self.encode.is_empty()
             || self.rewrite.is_some()
             || self.request != RequestConfig::default()
             || self.response != ResponseConfig::default()
+            || !self.handle_response.is_empty()
             || self.cache != Cache::default()
     }
 }
@@ -1106,6 +1128,19 @@ impl FileServer {
             hide: Vec::new(),
             precompressed: Vec::new(),
         }
+    }
+}
+
+impl FileServer {
+    fn validate(&self) -> Result<(), String> {
+        for entry in &self.hide {
+            if entry.is_empty() || entry.contains('/') {
+                return Err(format!(
+                    "serve.hide entry {entry:?} must be a file name or a `*` glob without `/`"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1211,6 +1246,10 @@ impl From<RedirectOption> for Redirect {
 impl Redirect {
     fn validate(&self) -> Result<(), String> {
         self.to.parse::<Template>()?;
+        self.validate_status()
+    }
+
+    fn validate_status(&self) -> Result<(), String> {
         if ![301, 302, 303, 307, 308].contains(&self.status) {
             return Err(format!(
                 "status {} is not a redirect, expected 301, 302, 303, 307 or 308",
@@ -1218,6 +1257,137 @@ impl Redirect {
             ));
         }
         Ok(())
+    }
+}
+
+/// One entry of `handle_response` on a `forward` route: what to do with the
+/// upstream responses that match `status` and `header`.
+///
+/// ```toml
+/// handle_response = [
+///     { status = 404, replace_status = 200 },
+///     { header = { x-accel-redirect = "*" }, serve = "/srv/private", rewrite = "{header.x-accel-redirect}" },
+///     { status = [502, 503], serve = "/srv/errors", rewrite = "/{status}.html" },
+///     { status = 401, redirect = "/login?next={path}" },
+///     { status = "5xx", copy_response = 500 },
+/// ]
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HandleResponse {
+    /// Statuses to handle: codes or classes (`"5xx"`), any may match. Empty
+    /// means every status.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub status: Vec<StatusMatcher>,
+
+    /// Required response headers. The value `*` only requires presence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub header: BTreeMap<String, String>,
+
+    /// Send the upstream response with this status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_status: Option<u16>,
+
+    /// Send the upstream response as it is (`true`) or with a status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_response: Option<CopyResponse>,
+
+    /// Drop the upstream response and answer with a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<FileServer>,
+
+    /// Drop the upstream response and answer with a redirect. The target
+    /// may use the response placeholders of [`Template::for_response`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<Redirect>,
+
+    /// Path of the file `serve` looks up instead of the request path, a
+    /// [`Template::for_response`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<String>,
+}
+
+/// Value of `copy_response`: `true` or the status to send.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CopyResponse {
+    /// `true` keeps the upstream status; `false` is rejected.
+    Enabled(bool),
+
+    /// Status sent instead of the upstream one.
+    Status(u16),
+}
+
+impl HandleResponse {
+    /// Returns true if an upstream response with `status` and `headers` is
+    /// handled by this entry.
+    #[must_use]
+    pub fn matches(&self, status: u16, headers: &http::HeaderMap) -> bool {
+        (self.status.is_empty() || self.status.iter().any(|matcher| matcher.matches(status)))
+            && self.header.iter().all(|(name, want)| {
+                let mut values = headers.get_all(name).iter();
+                if want == "*" {
+                    values.next().is_some()
+                } else {
+                    values.any(|value| value.as_bytes() == want.as_bytes())
+                }
+            })
+    }
+
+    /// Status the upstream response is sent with, when the entry replaces it.
+    #[must_use]
+    pub fn new_status(&self) -> Option<u16> {
+        match self.copy_response {
+            Some(CopyResponse::Status(status)) => Some(status),
+            _ => self.replace_status,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let actions = [
+            self.replace_status.is_some(),
+            self.copy_response.is_some(),
+            self.serve.is_some(),
+            self.redirect.is_some(),
+        ];
+        if actions.iter().filter(|set| **set).count() != 1 {
+            return Err(String::from(
+                "needs exactly one of replace_status, copy_response, serve or redirect",
+            ));
+        }
+        for name in self.header.keys() {
+            if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(format!("invalid header name {name:?}"));
+            }
+        }
+        if self.copy_response == Some(CopyResponse::Enabled(false)) {
+            return Err(String::from("copy_response must be true or a status"));
+        }
+        if let Some(status) = self.new_status()
+            && !(200..=599).contains(&status)
+        {
+            return Err(format!("status {status} must be between 200 and 599"));
+        }
+        if let Some(files) = &self.serve {
+            files.validate()?;
+        }
+        if let Some(redirect) = &self.redirect {
+            Template::for_response(&redirect.to).map_err(|err| format!("redirect: {err}"))?;
+            redirect
+                .validate_status()
+                .map_err(|err| format!("redirect: {err}"))?;
+        }
+        match &self.rewrite {
+            Some(_) if self.serve.is_none() => Err(String::from("rewrite needs serve")),
+            Some(rewrite) => Template::for_response(rewrite)
+                .map(drop)
+                .map_err(|err| format!("rewrite: {err}")),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3482,6 +3652,143 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
             ),
             (
                 server("match = [{ forward = \"127.0.0.1:2\" }]\nrewrite = \"/x\""),
+                "inside each 'match' entry",
+            ),
+        ] {
+            let message = invalid(&text);
+            assert!(message.contains(expected), "{text}\n=> {message}");
+        }
+    }
+
+    #[test]
+    fn handle_response_parses() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            forward = "127.0.0.1:1"
+            handle_response = [
+                { status = 404, replace_status = 200 },
+                { status = ["5xx", 404], header = { x-accel-redirect = "*" }, serve = "/srv", rewrite = "{header.x-accel-redirect}" },
+                { status = 401, redirect = { to = "/login?from={path}&status={status}", status = 303 } },
+                { copy_response = true },
+                { status = "5xx", copy_response = 500 },
+            ]
+            "#,
+        )
+        .unwrap();
+        let handlers = &config.servers[0].patterns[0].handle_response;
+        assert_eq!(handlers.len(), 5);
+        assert_eq!(handlers[0].status, [StatusMatcher::Code(404)]);
+        assert_eq!(handlers[0].new_status(), Some(200));
+        assert_eq!(
+            handlers[1].status,
+            [StatusMatcher::Class(5), StatusMatcher::Code(404)]
+        );
+        assert_eq!(handlers[1].serve.as_ref().unwrap().root, "/srv");
+        assert_eq!(
+            handlers[1].rewrite.as_deref(),
+            Some("{header.x-accel-redirect}")
+        );
+        assert_eq!(handlers[2].redirect.as_ref().unwrap().status, 303);
+        assert_eq!(handlers[3].copy_response, Some(CopyResponse::Enabled(true)));
+        assert_eq!(handlers[3].new_status(), None);
+        assert_eq!(handlers[4].new_status(), Some(500));
+
+        // The serialized form (admin API, `rxh service`) parses back.
+        let text = toml::to_string(&config).unwrap();
+        let again = Config::from_toml(&text).unwrap();
+        assert_eq!(again.servers[0].patterns[0].handle_response.len(), 5);
+    }
+
+    #[test]
+    fn handle_response_matches_status_and_headers() {
+        let handler = |text: &str| -> HandleResponse { toml::from_str(text).unwrap() };
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-kind", "error".parse().unwrap());
+
+        let any = handler("copy_response = true");
+        assert!(any.matches(200, &headers) && any.matches(503, &http::HeaderMap::new()));
+
+        let by_status = handler("status = [404, \"5xx\"]\nreplace_status = 200");
+        assert!(by_status.matches(404, &headers) && by_status.matches(502, &headers));
+        assert!(!by_status.matches(403, &headers));
+
+        // Status and headers must both match; header names ignore case.
+        let both = handler("status = 500\nheader = { X-Kind = \"error\" }\nreplace_status = 200");
+        assert!(both.matches(500, &headers));
+        assert!(!both.matches(404, &headers));
+        assert!(!both.matches(500, &http::HeaderMap::new()));
+
+        let other_value = handler("header = { x-kind = \"other\" }\nreplace_status = 200");
+        assert!(!other_value.matches(500, &headers));
+        let present = handler("header = { x-kind = \"*\" }\nreplace_status = 200");
+        assert!(present.matches(200, &headers) && !present.matches(200, &http::HeaderMap::new()));
+    }
+
+    #[test]
+    fn invalid_handle_response_is_rejected() {
+        let server = |options: &str| format!("[[server]]\nlisten = \"127.0.0.1:1\"\n{options}");
+        let forward = |handler: &str| {
+            server(&format!(
+                "forward = \"127.0.0.1:2\"\nhandle_response = [{{ {handler} }}]"
+            ))
+        };
+
+        for (text, expected) in [
+            (forward("status = 404"), "exactly one of"),
+            (
+                forward("replace_status = 200, copy_response = true"),
+                "exactly one of",
+            ),
+            (
+                forward("serve = \".\", redirect = \"/x\""),
+                "exactly one of",
+            ),
+            (forward("replace_status = 99"), "between 200 and 599"),
+            (forward("replace_status = 600"), "between 200 and 599"),
+            (forward("copy_response = 1000"), "between 200 and 599"),
+            (forward("copy_response = false"), "true or a status"),
+            (forward("status = 700, replace_status = 200"), "status"),
+            (forward("status = \"9xx\", replace_status = 200"), "status"),
+            (
+                forward("header = { \"bad name\" = \"x\" }, replace_status = 200"),
+                "invalid header name",
+            ),
+            (
+                forward("replace_status = 200, rewrite = \"/x\""),
+                "rewrite needs serve",
+            ),
+            (
+                forward("serve = \".\", rewrite = \"/{nope}\""),
+                "unknown placeholder",
+            ),
+            (
+                forward("serve = { root = \".\", hide = [\"a/b\"] }"),
+                "serve.hide",
+            ),
+            (
+                forward("redirect = { to = \"/x\", status = 200 }"),
+                "status 200",
+            ),
+            (forward("redirect = \"/{header.bad name}\""), "redirect"),
+            (forward("replace_status = 200, respond = \"x\""), "unknown"),
+            (
+                server("serve = \".\"\nhandle_response = [{ replace_status = 200 }]"),
+                "only applies to forward",
+            ),
+            (
+                server(
+                    "protocol = \"tcp\"\nforward = \"127.0.0.1:2\"\n\
+                     handle_response = [{ replace_status = 200 }]",
+                ),
+                "only apply to http",
+            ),
+            (
+                server(
+                    "match = [{ forward = \"127.0.0.1:2\" }]\n\
+                     handle_response = [{ replace_status = 200 }]",
+                ),
                 "inside each 'match' entry",
             ),
         ] {

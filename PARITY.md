@@ -115,7 +115,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `stream_close_delay` | | ❌ | |
 | `rewrite`, `method` | `rewrite`, `request.method` on a route | ✅ | `rewrite` is a path (optionally with a query) with `{host}`, `{path}`, `{query}` and `{uri}` placeholders; the query is kept unless the rewrite has one. Applied after routing (routes are not matched again), also on `serve` routes. No regex, `strip_prefix` or `replace`. |
 | `redir` | `redirect` on a route (`"target"` or `{ to, status }`) | ✅ | Same placeholders; `302` by default, `301`, `303`, `307` and `308` allowed. No `html` redirects. |
-| `handle_response`, `replace_status`, `copy_response` | | ❌ | |
+| `handle_response`, `replace_status`, `copy_response` | `handle_response` list on a route, with `replace_status`, `copy_response`, `serve` + `rewrite` or `redirect` per entry | ✅ | Matchers: `status` (codes, classes) and `header`; first match wins. `{status}` and `{header.NAME}` placeholders cover error pages and `X-Accel-Redirect`. Handlers are a file or a redirect, not arbitrary routes: no `respond`, no second `forward`, no `copy_response_headers`. |
 | `transport fastcgi` | | ❌ | |
 | Response cache | `cache` per route | ➕ | Core Caddy needs the cache-handler plugin. |
 

@@ -488,6 +488,7 @@ match = [
 | `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
 | `forward` / `serve` / `redirect` | Action, exactly one. `serve` is a directory or a [file server table](#file-server), `redirect` a target or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `rewrite` | New URI of the request before it is forwarded or served, see [Rewrites and redirects](#rewrites-and-redirects). |
+| `handle_response` | List of handlers for upstream responses: change the status, or answer with a file or a redirect instead, see [Handling upstream responses](#handling-upstream-responses) (`forward` only). |
 | `request.method` | Method the request is forwarded or served with instead of its own (upper cased), for example `"POST"`. |
 | `request.max_body_size` | [Size](#sizes): largest request body accepted, for example `"10MB"`. Larger ones get `413 Content Too Large`: at once when `Content-Length` says so (nothing is sent to the backend), else when the streamed body passes the limit, which aborts the upstream request (with `request_buffers` at least as large, the backend is never contacted). Unset means no limit; `0` is rejected. Also on `serve` and `redirect` routes, by `Content-Length`. Example: `request = { max_body_size = "10MB" }`. |
 | `encode` | List of `zstd`, `br`, `gzip`: compress this route's responses (files and proxied) with the first one the client accepts in `Accept-Encoding`. Only text, JSON, JavaScript, XML, SVG and WebAssembly responses without a `Content-Encoding`, and never `206` or `304`. Removes `Content-Length`, adds `Vary: Accept-Encoding`, makes a strong `ETag` weak. |
@@ -555,6 +556,60 @@ match = [
   `301`, `303`, `307` and `308` are accepted. `rewrite` and `request.method`
   are rejected on a `redirect` route.
 - Unknown placeholders, spaces and control characters are configuration
+  errors.
+
+### Handling upstream responses
+
+`handle_response` on a `forward` route decides what happens with the
+responses of the backend (Caddy's `handle_response`, `replace_status` and
+`copy_response`). Each entry has matchers and exactly one action; the first
+entry that matches a response runs, and responses matching none are proxied
+as usual.
+
+```toml
+[[server]]
+listen = "0.0.0.0:80"
+forward = "@app"
+handle_response = [
+    # Keep the response, change its status.
+    { status = 404, replace_status = 200 },
+    # X-Accel-Redirect: the backend names a file, rxh sends it.
+    { header = { x-accel-redirect = "*" }, serve = "/srv/private", rewrite = "{header.x-accel-redirect}" },
+    # 504 passes untouched, the other errors get /srv/errors/502.html, ...
+    { status = 504, copy_response = true },
+    { status = "5xx", serve = "/srv/errors", rewrite = "/{status}.html" },
+    { status = 401, redirect = { to = "/login?next={path}", status = 303 } },
+]
+```
+
+| Key | Description |
+|---|---|
+| `status` | Matcher: a status code, a class (`"5xx"`) or a list of them; any may match. Unset matches every status. |
+| `header` | Matcher: `{ name = "value" }`, the response must have the header with this exact value; `"*"` only requires the header. |
+| `replace_status` | Action: send the upstream response with this status (`200` to `599`). |
+| `copy_response` | Action: send the upstream response as it is (`true`), which exempts it from the entries below, or with a status (`copy_response = 500`, same as `replace_status`). |
+| `serve` | Action: drop the upstream response and answer with a file from this directory or [file server table](#file-server). |
+| `rewrite` | With `serve`: path of the file instead of the request path. |
+| `redirect` | Action: drop the upstream response and answer with a redirect, `"target"` or `{ to, status }` as in [Rewrites and redirects](#rewrites-and-redirects). |
+
+- `rewrite` and `redirect` take the request placeholders (`{host}`,
+  `{path}`, `{query}`, `{uri}`) plus `{status}`, the upstream status code,
+  and `{header.NAME}`, the first value of an upstream response header
+  (empty when missing).
+- Matching uses the response as the backend sent it, before
+  `response.headers` rules. Responses kept by `replace_status` and
+  `copy_response` then go through those rules, `cache` and `encode` as
+  usual; responses made by `serve` and `redirect` only go through `encode`.
+- A file found by `serve` is sent with the status of the upstream response,
+  so an error page keeps its `503`; a missing file is a `404`. The file
+  answers any request method, and it cannot be outside the root whatever
+  the backend puts in a header.
+- Only responses of a backend are handled: the `502`, `503` and `504` that
+  rxh answers itself when no backend can be reached are not. Passive health
+  checks and `retry_match` see the upstream status, not the replaced one.
+- An entry without action or with two, a `replace_status` outside `200` to
+  `599`, `copy_response = false`, `rewrite` without `serve` and
+  `handle_response` on a `serve` or `redirect` route are configuration
   errors.
 
 ### HTTP to HTTPS redirect
@@ -634,8 +689,8 @@ handshake and `alpn` matches the negotiated protocol. Entries using only
 
 HTTP request matchers (`uri`, `host`, `path`, `method`, `header`, `query`,
 `remote_ip`) are rejected on `tcp` and `udp` servers, and layer 4 matchers on
-`http` and `udp` servers. `rewrite`, `request`, `response`, `encode` and `cache` only
-apply to `http` servers and are rejected elsewhere.
+`http` and `udp` servers. `rewrite`, `request`, `response`, `handle_response`,
+`encode` and `cache` only apply to `http` servers and are rejected elsewhere.
 
 ### PROXY protocol input
 
