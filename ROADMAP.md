@@ -176,8 +176,9 @@ A release people can run without reading the source.
       API are covered.
 - [ ] Fuzzing with `cargo fuzz`: configuration parser, PROXY protocol,
       matchers, cache keys.
-- [ ] Property tests for the policies: weights respected, hashing stable
-      when a backend leaves, no pick of an unhealthy backend.
+- [x] Property tests for the policies: weights respected, hashing stable
+      when a backend leaves, no pick of an unhealthy backend
+      (`crates/core/tests/policy_properties.rs`).
 - [x] A reusable flaky backend for tests: refuse, accept then close, slow
       headers, truncated body.
 - [ ] `rxh-bench --quick` as a correctness gate in CI for RXH, with the

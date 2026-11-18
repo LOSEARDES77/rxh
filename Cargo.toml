@@ -27,6 +27,7 @@ hyper = { version = "1.12.0", features = ["full"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
 instant-acme = { version = "0.8.5", features = ["rcgen"] }
 libc = "0.2.191"
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rcgen = "0.14.10"
 regex = "1.13.2"
 rustls-pemfile = "2.2.0"

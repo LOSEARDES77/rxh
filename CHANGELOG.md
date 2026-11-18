@@ -94,6 +94,12 @@ Changed.
 - Tests: `crates/util` (`rxh-test-util`, not published) with `FlakyBackend`, a
   backend that refuses connections, accepts then closes them, delays its
   response head or truncates its body.
+- Tests: property tests (`proptest`) of the load balancing policies in
+  `crates/core/tests/policy_properties.rs`: weighted round robin picks each
+  backend exactly its weight per cycle, hash policies only move the keys of
+  a backend that is removed or marked down (and give them back when it
+  returns), and no policy, fallback or cookie ever picks a backend that is
+  down, failed or full.
 - CI: a `coverage` job runs `cargo llvm-cov --fail-under-lines 85` over the
   workspace without `crates/bench` and fails below 85% line coverage.
 
