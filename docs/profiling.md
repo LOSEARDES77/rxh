@@ -307,6 +307,74 @@ In order of expected gain. Each one maps to an item of the
 `splice` for TCP, the last item of the milestone, is about layer 4 and is not
 covered by this profile.
 
+## After: fewer allocations
+
+Recommendation 2 was applied on 2026-11-19, on the same machine. Same
+scenario, `rxh-bench -s throughput -d 10 -c 32`, three runs of each binary,
+taken in turns.
+
+| Metric | Before | After |
+|---|---:|---:|
+| Allocator calls per request (`malloc`, `calloc`, `realloc`, `posix_memalign`) | 84 | 26 |
+| `free` calls per request | 67 | 26 |
+| Requests per second (3 runs) | 227 020, 227 006, 229 488 | 241 975, 245 900, 243 434 |
+| Requests per second (mean) | 227 800 | 243 800 (+7%) |
+| p99 latency | 0.38 to 0.40 ms | 0.37 to 0.40 ms |
+
+The other HTTP scenarios, one run of 5 seconds each, in requests per second:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| weighted | 222 369 | 248 421 |
+| least-conn | 188 392 | 210 560 |
+| ip-hash | 228 385 | 249 899 |
+| uri-hash | 228 924 | 246 851 |
+| header | 227 265 | 247 773 |
+| cookie | 225 336 | 247 749 |
+| failover | 226 505 | 245 780 |
+| active-health | 231 297 | 247 946 |
+| tls | 219 134 | 238 292 |
+| http2 | 162 359 | 174 828 |
+| large-body | 2 016 | 2 006 |
+| websocket | 261 039 | 258 872 |
+| tcp | 273 143 | 273 948 |
+
+`large-body`, `websocket` and `tcp` spend their time copying bytes, not in
+the request path: they do not move, as expected.
+
+What changed:
+
+- `Forwarded`, `X-Forwarded-For` and extended lists are written into one
+  buffer per thread. Values that never change are built once and shared: the
+  `Via` entries of a server, its `Server` header, the IP of the peer of a
+  connection. `X-Forwarded-Host` shares the bytes of `Host`.
+- Quoting writes into that buffer and no longer goes through `str::replace`
+  and `format!`.
+- The request head is copied for a retry only when `retries` or
+  `try_duration` allow one.
+- A request target already in origin form is forwarded as it is, instead of
+  being copied to a `String` and parsed again.
+- The idle pool is keyed by backend address, then by PROXY header, so a
+  lookup borrows both. The `recycle` task shares the backend instead of
+  copying its address.
+- The backend of a response is attached to it only for JSON access lines,
+  and as a shared reference.
+- `round_robin` no longer builds a list of indexes on every pick.
+- The text access line is written into one buffer per thread, newline
+  included.
+
+What is left: 11 calls of hyper's header case map
+(`preserve_header_case`), 7 of hyper itself, and about 8 of RXH: the boxed
+request future and body, the `recycle` task, hyper's request channel and
+the `Forwarded` value. Turning `preserve_header_case` off changes what
+backends receive, and returning a connection to the pool without a task
+changes when it becomes reusable: both are left for their own change.
+
+The allocator calls were counted with an `LD_PRELOAD` library that wraps the
+allocator functions of glibc, not with uprobes: total calls over 8 seconds
+divided by the requests served. `crates/server/tests/allocations.rs` keeps
+the count from growing back: it fails above 40 calls per request.
+
 ## Limits
 
 - One scenario: small `GET` requests, cleartext HTTP/1.1, keep-alive on both

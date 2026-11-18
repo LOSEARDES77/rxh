@@ -15,6 +15,7 @@ use hyper::Uri;
 use hyper::Version;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderValue};
+use hyper::http::uri::PathAndQuery;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use rxh_core::address::BackendAddress;
@@ -74,10 +75,12 @@ pub(crate) async fn forward(
     let (mut parts, incoming) = request.into_parts();
     let forwarding = Forwarding {
         peer: connection.peer,
+        peer_ip: &connection.peer_ip,
         local: connection.local,
         trusted,
         tls: site.tls,
         by: &site.by,
+        via: &site.via,
         rules: &route.request,
         replace: &route.request_replace,
     };
@@ -89,11 +92,6 @@ pub(crate) async fn forward(
         &forwarding,
     );
 
-    let path = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |path| path.as_str())
-        .to_owned();
     if h2c {
         parts.headers.remove(header::CONNECTION);
         parts.headers.remove(header::UPGRADE);
@@ -102,22 +100,28 @@ pub(crate) async fn forward(
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("localhost");
+        let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
         parts.uri = format!("http://{host}{path}")
             .parse()
             .unwrap_or_else(|_| Uri::from_static("/"));
         parts.version = Version::HTTP_2;
     } else {
-        parts.uri = path.parse().unwrap_or_else(|_| Uri::from_static("/"));
+        parts.uri = origin_form(parts.uri);
         parts.version = Version::HTTP_11;
     }
 
     let settings = group.pool.settings();
     // Set when the request body turns out to be larger than `max_body_size`.
-    let too_large = Arc::new(AtomicBool::new(false));
-    let mut outgoing = match route.max_body_size {
+    let too_large: Option<Arc<AtomicBool>> = route.max_body_size.map(|_| Arc::default());
+    let was_too_large = || {
+        too_large
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    };
+    let mut outgoing = match (route.max_body_size, &too_large) {
         _ if client_upgrade.is_some() => body::empty(),
-        Some(limit) => {
-            let too_large = Arc::clone(&too_large);
+        (Some(limit), Some(too_large)) => {
+            let too_large = Arc::clone(too_large);
             Limited::new(incoming, limit)
                 .map_err(move |err| match err.downcast::<hyper::Error>() {
                     Ok(err) => BodyError::Hyper(*err),
@@ -128,12 +132,12 @@ pub(crate) async fn forward(
                 })
                 .boxed()
         }
-        None => body::incoming(incoming),
+        _ => body::incoming(incoming),
     };
     if settings.request_buffers > 0 && client_upgrade.is_none() {
         outgoing = match body::buffer(outgoing, settings.request_buffers).await {
             Ok(buffered) => buffered,
-            Err(_) if too_large.load(Ordering::Acquire) => return response::payload_too_large(),
+            Err(_) if was_too_large() => return response::payload_too_large(),
             Err(err) => {
                 eprintln!(
                     "{} => reading the request body failed: {err}",
@@ -165,14 +169,16 @@ pub(crate) async fn forward(
     // response status matches `retry_match.status`.
     let default_match = RetryMatch::default();
     let retry_match = settings.retry_match.as_ref().unwrap_or(&default_match);
-    let replay = (client_upgrade.is_none()
-        && retry_match.retries_method(outgoing.method())
-        && hyper::body::Body::is_end_stream(outgoing.body()))
-    .then(|| head(&outgoing));
     let mut round_trip_retries = settings.retries;
     if settings.try_duration.is_some() {
         round_trip_retries = round_trip_retries.max(1);
     }
+    // The head is only copied when the settings allow a retry at all.
+    let replay = (round_trip_retries > 0
+        && client_upgrade.is_none()
+        && retry_match.retries_method(outgoing.method())
+        && hyper::body::Body::is_end_stream(outgoing.body()))
+    .then(|| head(&outgoing));
     let first_try = Instant::now();
     let in_budget = |retries: u32| {
         retries > 0
@@ -214,7 +220,7 @@ pub(crate) async fn forward(
         }
         let started = Instant::now();
 
-        let sent = transport.send(address, preface, upstream_connection, outgoing);
+        let sent = transport.send(&selection.upstream, preface, upstream_connection, outgoing);
         let sent = match group.pool.settings().response_header_timeout {
             Some(limit) => match tokio::time::timeout(limit, sent).await {
                 Ok(sent) => sent,
@@ -258,7 +264,7 @@ pub(crate) async fn forward(
                 return response::bad_gateway();
             }
             // The backend is not to blame for a request cut short by the limit.
-            Err(SendError::Failed(_)) if too_large.load(Ordering::Acquire) => {
+            Err(SendError::Failed(_)) if was_too_large() => {
                 return response::payload_too_large();
             }
             Err(SendError::Failed(err)) => {
@@ -299,11 +305,9 @@ pub(crate) async fn forward(
             &mut client_response,
             &route.response,
             &route.response_replace,
-            &site.by,
+            &site.via,
         );
-        client_response
-            .extensions_mut()
-            .insert(UpstreamAddress(selection.upstream.address().to_owned()));
+        note_upstream(&mut client_response, connection, &selection.upstream);
         return client_response;
     }
 
@@ -315,9 +319,7 @@ pub(crate) async fn forward(
         && let Some(mut replaced) = handler.apply(request, host, &mut upstream_response).await
     {
         // The upstream response is dropped unread.
-        replaced
-            .extensions_mut()
-            .insert(UpstreamAddress(selection.upstream.address().to_owned()));
+        note_upstream(&mut replaced, connection, &selection.upstream);
         return replaced;
     }
 
@@ -346,7 +348,7 @@ pub(crate) async fn forward(
         &mut client_response,
         &route.response,
         &route.response_replace,
-        &site.by,
+        &site.via,
     );
 
     if let (Some(cache), Some(key)) = (&route.cache, cache_key) {
@@ -361,10 +363,33 @@ pub(crate) async fn forward(
             .append(header::SET_COOKIE, cookie);
     }
 
-    client_response
-        .extensions_mut()
-        .insert(UpstreamAddress(selection.upstream.address().to_owned()));
+    note_upstream(&mut client_response, connection, &selection.upstream);
     client_response.map(|body| Guarded::new(body, (guard, permit)).boxed())
+}
+
+/// Request target sent to an HTTP/1.1 backend: path and query only. A target
+/// already in that form, which is what HTTP/1.1 clients send, is kept as is.
+fn origin_form(uri: Uri) -> Uri {
+    if uri.scheme().is_none() && uri.authority().is_none() && uri.path_and_query().is_some() {
+        return uri;
+    }
+    let mut parts = uri.into_parts();
+    parts.scheme = None;
+    parts.authority = None;
+    parts
+        .path_and_query
+        .get_or_insert_with(|| PathAndQuery::from_static("/"));
+    Uri::from_parts(parts).unwrap_or_else(|_| Uri::from_static("/"))
+}
+
+/// Remembers the backend of `response` for the JSON access line, the only
+/// reader of it. The backend is shared, its address is not copied.
+fn note_upstream<B>(response: &mut Response<B>, connection: &Service, upstream: &Arc<Upstream>) {
+    if connection.logger.is_json() {
+        response
+            .extensions_mut()
+            .insert(UpstreamAddress(Arc::clone(upstream)));
+    }
 }
 
 /// Whether `flush_interval` applies to a response with these headers. Like
@@ -504,5 +529,20 @@ async fn tunnel(
     };
     if let Err(err) = result {
         eprintln!("tunnel error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_form_keeps_path_and_query_only() {
+        let origin = |uri: &'static str| origin_form(Uri::from_static(uri)).to_string();
+        assert_eq!(origin("/a/b?c=d"), "/a/b?c=d");
+        assert_eq!(origin("*"), "*");
+        assert_eq!(origin("http://example.com/a?b=1"), "/a?b=1");
+        assert_eq!(origin("http://example.com"), "/");
+        assert_eq!(origin("example.com:443"), "/");
     }
 }
