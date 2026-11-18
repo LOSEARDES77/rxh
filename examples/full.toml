@@ -33,6 +33,18 @@ backends = [
     "127.0.0.1:9001-9003",     # port range
 ]
 
+# Backends over TLS. Other address forms: "http://host[:port]" and
+# "unix//run/app.sock". A pool cannot mix https:// and plain backends.
+[upstream.secure]
+backends = ["https://secure.internal", "https://other.internal:8443"]
+
+[upstream.secure.tls]
+# server_name = "secure.internal"   # SNI override, default the backend host
+insecure_skip_verify = false
+ca = "/etc/rxh/ca.pem"              # extra trusted roots on top of webpki-roots
+client_cert = "/etc/rxh/client.pem" # mutual TLS
+client_key = "/etc/rxh/client.key"
+
 # Active health checks. Without `uri` they are TCP connect checks.
 [upstream.api.health]
 uri = "/health"

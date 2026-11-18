@@ -23,17 +23,14 @@ pub(crate) async fn proxy<S>(
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let context = SelectContext::l4(peer.ip());
-    let dial_timeout = group.pool.settings().dial_timeout;
+    let dialer = &group.dialer;
 
-    let dialed =
-        upstream::connect_with_retries(
-            &group.pool,
-            &context,
-            |upstream: Arc<Upstream>| async move {
-                upstream::dial(upstream.address(), dial_timeout).await
-            },
-        )
-        .await;
+    let dialed = upstream::connect_with_retries(
+        &group.pool,
+        &context,
+        |upstream: Arc<Upstream>| async move { dialer.dial(upstream.address()).await },
+    )
+    .await;
 
     let (selection, mut backend) = match dialed {
         Ok(dialed) => dialed,

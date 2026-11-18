@@ -6,6 +6,7 @@
 //! policies that Caddy offers (`random`, `round_robin`, `least_conn`,
 //! `ip_hash`, `cookie`, ...).
 
+pub mod address;
 pub mod config;
 pub mod duration;
 pub mod matcher;

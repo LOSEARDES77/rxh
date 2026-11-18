@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use rxh_core::address::BackendAddress;
 use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
@@ -117,7 +118,11 @@ async fn open_session(
         .ok_or_else(|| io::Error::other("no upstreams available"))?;
     let upstream = selection.upstream;
 
-    let target = tokio::net::lookup_host(upstream.address())
+    let address = BackendAddress::parse(upstream.address())
+        .ok()
+        .and_then(|address| address.host_port())
+        .ok_or_else(|| io::Error::other(format!("{} is not a udp address", upstream.address())))?;
+    let target = tokio::net::lookup_host(address)
         .await?
         .next()
         .ok_or_else(|| io::Error::other(format!("{} did not resolve", upstream.address())))?;

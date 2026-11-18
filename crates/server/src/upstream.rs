@@ -3,10 +3,9 @@
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rxh_core::pool::{Pool, SelectContext, Selection, Upstream};
-use tokio::net::TcpStream;
 
 /// Why no upstream connection could be made.
 #[derive(Debug)]
@@ -62,13 +61,4 @@ where
 
         tokio::time::sleep(settings.try_interval).await;
     }
-}
-
-/// Opens a TCP connection with a timeout and `TCP_NODELAY`.
-pub(crate) async fn dial(address: &str, timeout: Duration) -> io::Result<TcpStream> {
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(address))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))??;
-    stream.set_nodelay(true)?;
-    Ok(stream)
 }

@@ -17,7 +17,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rxh_core::config::UpstreamGroup;
 
 use crate::http::body::Body;
-use crate::upstream;
+use crate::stream::Dialer;
 
 type IdleMap = HashMap<String, Vec<Idle>>;
 
@@ -54,7 +54,7 @@ pub(crate) enum SendError {
 /// Connection pool for one load balancing group.
 #[derive(Debug)]
 pub(crate) struct Transport {
-    dial_timeout: Duration,
+    dialer: Arc<Dialer>,
     keepalive: Duration,
     max_idle: usize,
     h2c: bool,
@@ -63,9 +63,9 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    pub(crate) fn new(settings: &UpstreamGroup) -> Self {
+    pub(crate) fn new(settings: &UpstreamGroup, dialer: Arc<Dialer>) -> Self {
         Self {
-            dial_timeout: settings.dial_timeout,
+            dialer,
             keepalive: settings.keepalive,
             max_idle: settings.keepalive_idle_conns_per_host,
             h2c: settings.h2c,
@@ -91,7 +91,7 @@ impl Transport {
                 return Ok(Connection::Http2(sender));
             }
 
-            let stream = upstream::dial(address, self.dial_timeout).await?;
+            let stream = self.dialer.dial(address).await?;
             let (sender, connection) = http2::Builder::new(TokioExecutor::new())
                 .handshake(TokioIo::new(stream))
                 .await
@@ -122,7 +122,7 @@ impl Transport {
     }
 
     async fn dial_http1(&self, address: &str) -> io::Result<http1::SendRequest<Body>> {
-        let stream = upstream::dial(address, self.dial_timeout).await?;
+        let stream = self.dialer.dial(address).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
             .handshake(TokioIo::new(stream))

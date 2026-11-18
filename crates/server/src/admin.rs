@@ -33,6 +33,7 @@ use hyper::header;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use rxh_core::config::{Backend, Config};
+use rxh_core::pool::PoolError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -220,6 +221,7 @@ fn add_upstream(state: &AdminState, name: &str, body: UpstreamBody) -> Response<
             println!("Admin => added {} to {name}", body.address);
             json_response(StatusCode::CREATED, &group.pool.status())
         }
+        Err(err @ PoolError::InvalidAddress(_)) => error(StatusCode::BAD_REQUEST, &err.to_string()),
         Err(err) => error(StatusCode::CONFLICT, &err.to_string()),
     }
 }

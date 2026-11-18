@@ -14,6 +14,7 @@ mod http;
 mod master;
 mod registry;
 mod server;
+mod stream;
 mod tcp;
 mod tls;
 mod udp;

@@ -28,6 +28,7 @@ use std::time::Duration;
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::address::{self, BackendAddress, Scheme};
 use crate::duration;
 use crate::matcher::RequestMatcher;
 use crate::net::IpNet;
@@ -180,6 +181,22 @@ impl Config {
                         server.protocol
                     ));
                 }
+            }
+
+            if server.protocol == Protocol::Udp
+                && let Some(Action::Forward(forward)) = server.patterns.first().map(|p| &p.action)
+                && let Some(group) = match forward {
+                    Forward::Group(name) => self.upstreams.get(name),
+                    Forward::Inline(group) => Some(&**group),
+                }
+                && group
+                    .backends
+                    .iter()
+                    .any(|backend| backend.address.starts_with("unix/"))
+            {
+                return invalid(format!(
+                    "{label}: unix// backends are not supported for udp servers"
+                ));
             }
 
             if server.protocol == Protocol::Udp && server.tls.is_some() {
@@ -638,6 +655,37 @@ pub struct UpstreamGroup {
     /// Passive health checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive: Option<PassiveHealth>,
+
+    /// TLS settings for connections to the backends. Setting this table
+    /// enables TLS even without `https://` backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<UpstreamTls>,
+}
+
+/// TLS client settings of an [`UpstreamGroup`] (Caddy `transport http { tls }`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTls {
+    /// Server name sent as SNI and checked against the certificate. Defaults
+    /// to the backend host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+
+    /// Accept any certificate. Insecure, for tests only.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+
+    /// Path to a PEM file with extra trusted root certificates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+
+    /// Path to the PEM client certificate chain (mutual TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+
+    /// Path to the PEM client private key (mutual TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
 }
 
 impl Default for UpstreamGroup {
@@ -666,7 +714,19 @@ impl UpstreamGroup {
             backends,
             health: None,
             passive: None,
+            tls: None,
         }
+    }
+
+    /// True when connections to the backends use TLS: an `https://` backend
+    /// or a `tls` table.
+    #[must_use]
+    pub fn uses_tls(&self) -> bool {
+        self.tls.is_some()
+            || self
+                .backends
+                .iter()
+                .any(|backend| backend.address.starts_with("https://"))
     }
 
     /// Backends with port ranges expanded.
@@ -684,7 +744,29 @@ impl UpstreamGroup {
     }
 
     fn validate(&self) -> Result<(), String> {
-        self.expanded_backends()?;
+        let backends = self.expanded_backends()?;
+
+        let schemes = |wanted: bool| {
+            backends.iter().any(|backend| {
+                matches!(
+                    BackendAddress::parse(&backend.address),
+                    Ok(BackendAddress::Tcp { scheme, .. }) if (scheme == Scheme::Https) == wanted
+                ) || (!wanted && backend.address.starts_with("unix/"))
+            })
+        };
+        if schemes(true) && schemes(false) {
+            return Err(String::from(
+                "schemes can't be mixed: https:// backends cannot share a pool with plain ones",
+            ));
+        }
+
+        if let Some(tls) = &self.tls
+            && tls.client_cert.is_some() != tls.client_key.is_some()
+        {
+            return Err(String::from(
+                "tls.client_cert and tls.client_key must be set together",
+            ));
+        }
 
         if self.choose == 0 {
             return Err(String::from("choose must be at least 1"));
@@ -723,27 +805,29 @@ impl UpstreamGroup {
 
 /// Splits `host:port` and checks the port, expanding `host:8001-8004`.
 fn expand_port_range(address: &str) -> Result<Vec<String>, String> {
-    let invalid = || format!("invalid backend address {address:?}, expected host:port");
+    if address.starts_with("unix/") {
+        BackendAddress::parse(address)?;
+        return Ok(vec![address.to_owned()]);
+    }
 
-    let (host, port) = address.rsplit_once(':').ok_or_else(invalid)?;
-    if host.is_empty() {
+    let (_, rest) = address::split_scheme(address);
+    let prefix = &address[..address.len() - rest.len()];
+    let range = address::split_host_port(rest)
+        .and_then(|(host, port)| Some((host, port?.split_once('-')?)));
+    let Some((host, (start, end))) = range else {
+        BackendAddress::parse(address)?;
+        return Ok(vec![address.to_owned()]);
+    };
+
+    let invalid = || format!("invalid port range in backend address {address:?}");
+    let start: u16 = start.parse().map_err(|_| invalid())?;
+    let end: u16 = end.parse().map_err(|_| invalid())?;
+    if start > end {
         return Err(invalid());
     }
-
-    match port.split_once('-') {
-        None => {
-            port.parse::<u16>().map_err(|_| invalid())?;
-            Ok(vec![address.to_owned()])
-        }
-        Some((start, end)) => {
-            let start: u16 = start.parse().map_err(|_| invalid())?;
-            let end: u16 = end.parse().map_err(|_| invalid())?;
-            if start > end {
-                return Err(invalid());
-            }
-            Ok((start..=end).map(|port| format!("{host}:{port}")).collect())
-        }
-    }
+    Ok((start..=end)
+        .map(|port| format!("{prefix}{host}:{port}"))
+        .collect())
 }
 
 /// One backend of an [`UpstreamGroup`].
@@ -1252,6 +1336,16 @@ mod default {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_ranges_keep_the_scheme() {
+        assert_eq!(
+            expand_port_range("https://h:1-2").unwrap(),
+            ["https://h:1", "https://h:2"]
+        );
+        assert_eq!(expand_port_range("h:3").unwrap(), ["h:3"]);
+        assert!(expand_port_range("h:2-1").is_err());
+    }
 
     #[test]
     fn simple_forms() {

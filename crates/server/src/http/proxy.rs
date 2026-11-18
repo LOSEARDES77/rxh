@@ -16,6 +16,7 @@ use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
+use rxh_core::address::BackendAddress;
 use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
 
 use crate::http::body::{self, Guarded};
@@ -110,6 +111,13 @@ pub(crate) async fn forward(
     let mut outgoing = Request::from_parts(parts, outgoing);
     let transport = &group.transport;
     let mut stale_attempts = 0;
+    // Like Caddy, HTTPS backends get their own host as `Host` unless the user sets it.
+    let rewrite_host = group.dialer.is_tls()
+        && !route
+            .request
+            .set
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("host"));
 
     // Like Caddy, requests without a body and with a safe method are retried
     // on another backend when the round trip fails after connecting.
@@ -151,6 +159,9 @@ pub(crate) async fn forward(
 
         let guard = selection.upstream.start_request();
         let address = selection.upstream.address();
+        if rewrite_host {
+            set_backend_host(&mut outgoing, address);
+        }
         let started = Instant::now();
 
         match transport.send(address, upstream_connection, outgoing).await {
@@ -259,6 +270,30 @@ fn rebuild(head: &Request<()>) -> Request<body::Body> {
     *request.version_mut() = head.version();
     *request.headers_mut() = head.headers().clone();
     request
+}
+
+/// Points `Host` (and the authority of an absolute URI) at the backend.
+fn set_backend_host<B>(request: &mut Request<B>, address: &str) {
+    let Ok(BackendAddress::Tcp { host, port, .. }) = BackendAddress::parse(address) else {
+        return;
+    };
+    let authority = if port == 443 {
+        host.to_owned()
+    } else {
+        format!("{host}:{port}")
+    };
+    let Ok(value) = HeaderValue::from_str(&authority) else {
+        return;
+    };
+    request.headers_mut().insert(header::HOST, value);
+
+    if request.uri().authority().is_some() {
+        let mut parts = request.uri().clone().into_parts();
+        parts.authority = authority.parse().ok();
+        if let Ok(uri) = Uri::from_parts(parts) {
+            *request.uri_mut() = uri;
+        }
+    }
 }
 
 fn host<B>(request: &Request<B>) -> String {

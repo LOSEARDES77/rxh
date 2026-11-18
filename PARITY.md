@@ -24,8 +24,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Static upstreams `host:port` | `backends = ["host:port"]` | ✅ | Host names are resolved on every dial. |
 | Port ranges `host:8001-8006` | same syntax | ✅ | |
 | `h2c://` upstreams | `h2c = true` | ✅ | One multiplexed HTTP/2 connection per backend. |
-| `https://` upstreams, `transport http { tls }` | | ❌ | Planned: rustls client with system roots. |
-| `unix//path` upstreams | | ❌ | |
+| `https://` upstreams, `transport http { tls }` | `https://host[:port]`, `[upstream.NAME.tls]` | ✅ | `server_name`, `insecure_skip_verify`, `ca` (extra roots on top of webpki-roots), `client_cert`/`client_key`. `Host` is the backend host unless set. Also used by L4 and health checks. Pools cannot mix `https://` and plain backends. |
+| `unix//path` upstreams | `unix//run/app.sock` | ✅ | HTTP, TCP and health checks. Not for UDP. |
 | `dynamic srv`, `dynamic a`, `dynamic multi` | | ❌ | Planned: periodic DNS refresh feeding the pool. |
 | Change upstreams at runtime | `rxh upstream add/rm`, `POST/DELETE /pools/{name}/upstreams` | ✅ ➕ | Caddy needs a full config patch; RXH changes one pool in place and keeps health state and counters of the other members. |
 | Named, reusable upstream groups | `[upstream.NAME]`, `forward = "@NAME"` | ➕ | Caddy repeats the upstream list in every `reverse_proxy`. |
@@ -172,12 +172,72 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 
 Ordered by value for a load balancer:
 
-1. HTTPS upstreams (`transport http { tls }`) and unix socket upstreams.
-2. Dynamic upstreams from DNS (`A`/`AAAA`, `SRV`).
-3. Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`, `stream_timeout`.
-4. Prometheus metrics and JSON access logs.
-5. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
-6. Compression (`encode`), range requests and ETags for the file server.
-7. Automatic HTTPS with ACME.
-8. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-9. HTTP/3.
+1. Dynamic upstreams from DNS (`A`/`AAAA`, `SRV`).
+2. Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`, `stream_timeout`.
+3. Prometheus metrics and JSON access logs.
+4. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
+5. Compression (`encode`), range requests and ETags for the file server.
+6. Automatic HTTPS with ACME.
+7. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
+8. HTTP/3.
+
+## Roadmap beyond Caddy
+
+Features from other reverse proxies and load balancers (Traefik, Nginx,
+Nginx Proxy Manager, HAProxy, Envoy) that RXH should grow into after Caddy
+parity. Grouped by area, roughly in priority order inside each group.
+
+### Security and access control
+
+| Feature | Inspired by | Notes |
+|---|---|---|
+| mTLS on listeners: require and verify client certificates | Traefik TLS options `clientAuth`, Nginx `ssl_verify_client` | Per server `tls.client_auth = { mode = "require_and_verify", ca = [...] }`; modes like Traefik (`request`, `require`, `verify_if_given`, `require_and_verify`); pass the client certificate subject to backends in a header (Traefik `PassTLSClientCert`). |
+| TLS options: minimum version, cipher suites, curves | Traefik TLS options, Nginx `ssl_protocols` | |
+| OCSP stapling | Nginx, HAProxy, Caddy (core) | |
+| ACME DNS-01 challenge and wildcard certificates | Traefik, Caddy (plugins) | Providers: Cloudflare, Route53, RFC 2136. |
+| IP allow and deny lists | Traefik `IPAllowList`, Nginx `allow`/`deny` | Per route, using `trusted_proxies` for the client IP. |
+| Rate limiting (requests per second, burst) per client IP, header or route | Traefik `RateLimit`, Nginx `limit_req`, HAProxy stick tables | Token bucket in memory first, later shared. |
+| Concurrent connection limit per client IP | Traefik `InFlightReq`, Nginx `limit_conn` | |
+| Basic auth with hashed passwords | Traefik `BasicAuth`, Nginx, NPM access lists | |
+| Forward auth (delegate auth to an external service) | Traefik `ForwardAuth`, Nginx `auth_request` | Authelia, Authentik, oauth2-proxy integrations. |
+| Security headers presets (HSTS, CSP, frame options), CORS | Traefik `Headers` middleware, NPM | |
+| Request body size limit | Nginx `client_max_body_size`, Traefik `Buffering` | |
+| GeoIP allow/deny (MaxMind database) | Nginx GeoIP2, HAProxy | |
+
+### Service discovery and configuration providers
+
+| Feature | Inspired by | Notes |
+|---|---|---|
+| Docker provider: discover containers and route by labels | Traefik Docker provider | Labels like `rxh.enable=true`, `rxh.http.host=app.example.com`, `rxh.http.port=8080`, `rxh.pool=web`, `rxh.policy=least_conn`, `rxh.tcp.listen=:5432`; watch the Docker socket for start/stop events and update pools live. |
+| Docker image and Compose examples with tags | Traefik images (`traefik:v3`, `v3.x`) | Publish `rxh:latest`, `rxh:0.x`, `rxh:0.x.y` and `-alpine`/distroless variants for amd64 and arm64 on GHCR and Docker Hub from CI on release tags. |
+| Docker Swarm, Podman and Kubernetes Ingress / Gateway API providers | Traefik | |
+| Consul, etcd and Nomad service discovery | Traefik, HAProxy | |
+| File provider watch: reload automatically when the config file changes | Traefik file provider `watch = true` | inotify/kqueue, debounced, same validation as `rxh reload`. |
+| Upload a full configuration through the admin API (`POST /load`) | Caddy, Traefik API | |
+
+### Traffic management
+
+| Feature | Inspired by | Notes |
+|---|---|---|
+| Traffic splitting and canary releases between pools (weighted services) | Traefik weighted services, Envoy | `forward = [{ pool = "v1", weight = 90 }, { pool = "v2", weight = 10 }]`. |
+| Request mirroring (shadow traffic) | Traefik mirroring, Nginx `mirror`, Envoy | |
+| Circuit breaker on error ratio or latency | Traefik `CircuitBreaker`, Envoy outlier detection | |
+| Slow start for recovered or new backends | Nginx Plus `slow_start`, HAProxy `slowstart` | Ramp weight up over a duration. |
+| Backend drain and maintenance states through CLI and admin API | HAProxy runtime API (`set server state drain`) | `rxh upstream drain web 10.0.0.1:80`. |
+| Consistent hashing with bounded loads, Maglev | Envoy, HAProxy `hash-type consistent` | |
+| Retry budgets and hedged requests | Envoy | |
+| Per backend connection limits and queueing | HAProxy `maxconn` + queue | |
+| HTTP to HTTPS redirect, redirect and rewrite rules with regex | Nginx `rewrite`, Traefik `RedirectRegex`/`ReplacePath`, NPM | |
+| Custom error pages per status | Traefik `Errors`, Nginx `error_page`, NPM | |
+| gRPC health checks and gRPC-Web | Envoy, Traefik | |
+| Splice/zero-copy for layer 4 on Linux | HAProxy | |
+
+### Observability and operations
+
+| Feature | Inspired by | Notes |
+|---|---|---|
+| OpenTelemetry tracing (W3C trace context propagation) | Traefik, Envoy | |
+| Dashboard web UI and management UI | Traefik dashboard, Nginx Proxy Manager | Future plan: an NPM-like UI on top of the admin API (hosts, certificates, access lists, live health). |
+| Access log filters and sampling | Traefik access logs | |
+| Health check events to webhooks | Caddy events, HAProxy agent checks | |
+| Plugin or WASM middleware | Traefik plugins, Envoy WASM | |

@@ -162,7 +162,8 @@ impl Upstream {
         }
     }
 
-    /// `host:port` of the backend.
+    /// Address of the backend as configured (`host:port`, `https://host[:port]`,
+    /// `unix//path`, ...).
     #[must_use]
     pub fn address(&self) -> &str {
         &self.address
@@ -360,6 +361,7 @@ pub struct Pool {
     settings: UpstreamGroup,
     members: RwLock<Arc<Members>>,
     cursor: AtomicUsize,
+    allow_unix: bool,
 }
 
 impl Pool {
@@ -376,6 +378,7 @@ impl Pool {
             settings,
             members: RwLock::new(Arc::default()),
             cursor: AtomicUsize::new(0),
+            allow_unix: true,
         };
 
         let mut upstreams: Vec<Arc<Upstream>> = Vec::with_capacity(backends.len());
@@ -392,6 +395,13 @@ impl Pool {
             Arc::new(Members::new(upstreams));
 
         Ok(pool)
+    }
+
+    /// Makes [`Pool::add`] refuse `unix//` backends, for pools that serve UDP.
+    #[must_use]
+    pub fn without_unix(mut self) -> Self {
+        self.allow_unix = false;
+        self
     }
 
     fn make_upstream(&self, backend: Backend) -> Upstream {
@@ -462,6 +472,35 @@ impl Pool {
 
         let mut guard = self.members.write().unwrap_or_else(PoisonError::into_inner);
         let mut upstreams = guard.upstreams.clone();
+
+        // Same rules as config validation: no unix sockets for UDP, and no
+        // mixing of https:// and plain backends unless `tls` makes them all TLS.
+        let is_https = |address: &str| address.starts_with("https://");
+        let pool_https = self
+            .settings
+            .tls
+            .is_none()
+            .then(|| upstreams.first().map(|u| is_https(&u.address)))
+            .flatten();
+        for backend in &expanded {
+            let address = &backend.address;
+            if !self.allow_unix && address.starts_with("unix/") {
+                return Err(PoolError::InvalidAddress(format!(
+                    "{address}: unix// backends are not supported in pools used by udp servers"
+                )));
+            }
+            if pool_https.is_some_and(|https| https != is_https(address)) {
+                return Err(PoolError::InvalidAddress(format!(
+                    "{address}: schemes can't be mixed, pool {} uses {} backends",
+                    self.name,
+                    if pool_https == Some(true) {
+                        "https://"
+                    } else {
+                        "plain"
+                    }
+                )));
+            }
+        }
         for backend in expanded.drain(..) {
             if upstreams
                 .iter()

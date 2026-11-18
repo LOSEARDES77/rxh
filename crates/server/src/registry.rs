@@ -1,22 +1,28 @@
 //! Live load balancing groups of one configuration generation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use regex::Regex;
-use rxh_core::config::{Action, Config, ConfigError, Forward, Server as ServerConfig};
+use rxh_core::config::{
+    Action, Config, ConfigError, Forward, Protocol, Server as ServerConfig, UpstreamGroup,
+};
 use rxh_core::pool::Pool;
 use tokio::task::JoinSet;
 
 use crate::error::Error;
 use crate::health;
 use crate::http::transport::Transport;
+use crate::stream::Dialer;
 
 /// A pool plus the connections and checks attached to it.
 #[derive(Debug)]
 pub struct Group {
     /// Members, health and selection.
     pub pool: Pool,
+
+    /// Opens connections to the members.
+    pub(crate) dialer: Arc<Dialer>,
 
     /// Pooled upstream HTTP connections.
     pub(crate) transport: Transport,
@@ -39,9 +45,13 @@ impl Group {
                 })?),
                 None => None,
             };
-        let transport = Transport::new(pool.settings());
+        let dialer = Dialer::new(pool.settings())
+            .map(Arc::new)
+            .map_err(|err| invalid(format!("upstream {}: tls: {err}", pool.name())))?;
+        let transport = Transport::new(pool.settings(), Arc::clone(&dialer));
         Ok(Self {
             pool,
+            dialer,
             transport,
             health_body,
         })
@@ -60,9 +70,35 @@ impl Registry {
     pub fn build(config: &Config) -> Result<Self, Error> {
         let mut groups = BTreeMap::new();
 
-        for (name, group) in &config.upstreams {
+        // Pools that serve UDP servers cannot have unix socket members.
+        let mut udp_pools = BTreeSet::new();
+        for (server_index, server) in config.servers.iter().enumerate() {
+            if server.protocol != Protocol::Udp {
+                continue;
+            }
+            for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+                if let Action::Forward(forward) = &pattern.action {
+                    udp_pools.insert(match forward {
+                        Forward::Group(name) => name.clone(),
+                        Forward::Inline(_) => {
+                            Self::inline_name(server_index, server, pattern_index)
+                        }
+                    });
+                }
+            }
+        }
+        let pool_for = |name: &String, group: &UpstreamGroup| -> Result<Pool, Error> {
             let pool =
                 Pool::new(name.clone(), group).map_err(|err| invalid(format!("{name}: {err}")))?;
+            Ok(if udp_pools.contains(name) {
+                pool.without_unix()
+            } else {
+                pool
+            })
+        };
+
+        for (name, group) in &config.upstreams {
+            let pool = pool_for(name, group)?;
             groups.insert(name.clone(), Arc::new(Group::new(pool)?));
         }
 
@@ -70,8 +106,7 @@ impl Registry {
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
                 if let Action::Forward(Forward::Inline(group)) = &pattern.action {
                     let name = Self::inline_name(server_index, server, pattern_index);
-                    let pool = Pool::new(name.clone(), group)
-                        .map_err(|err| invalid(format!("{name}: {err}")))?;
+                    let pool = pool_for(&name, group)?;
                     groups.insert(name, Arc::new(Group::new(pool)?));
                 }
             }

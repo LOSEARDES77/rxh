@@ -10,8 +10,8 @@ use hyper::Request;
 use hyper::Uri;
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper_util::rt::TokioIo;
+use rxh_core::address::BackendAddress;
 use rxh_core::config::ActiveHealth;
-use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
@@ -66,16 +66,18 @@ pub(crate) async fn run(group: Arc<Group>) {
 async fn check(group: &Group, settings: &ActiveHealth, address: &str) -> Result<(), String> {
     let target = match (&settings.upstream, settings.port) {
         (Some(upstream), _) => upstream.clone(),
-        (None, Some(port)) => {
-            let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
-            format!("{host}:{port}")
-        }
+        (None, Some(port)) => match BackendAddress::parse(address) {
+            Ok(BackendAddress::Tcp { host, .. }) => format!("{host}:{port}"),
+            _ => address.to_owned(),
+        },
         (None, None) => address.to_owned(),
     };
 
     let attempt = async {
         match &settings.uri {
-            None => TcpStream::connect(&target)
+            None => group
+                .dialer
+                .dial(&target)
                 .await
                 .map(drop)
                 .map_err(|err| err.to_string()),
@@ -96,9 +98,17 @@ async fn http_check(
 ) -> Result<(), String> {
     let method = Method::from_bytes(settings.method.as_bytes()).map_err(|err| err.to_string())?;
     let mut path = uri.to_owned();
+    let host_header = match BackendAddress::parse(target) {
+        Ok(address) => address
+            .host_port()
+            .unwrap_or_else(|| String::from("localhost")),
+        Err(_) => target.to_owned(),
+    };
 
     for _ in 0..=MAX_REDIRECTS {
-        let stream = TcpStream::connect(target)
+        let stream = group
+            .dialer
+            .dial(target)
             .await
             .map_err(|err| err.to_string())?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -115,7 +125,7 @@ async fn http_check(
         let headers = request.headers_mut();
         headers.insert(
             header::HOST,
-            HeaderValue::from_str(target).map_err(|err| err.to_string())?,
+            HeaderValue::from_str(&host_header).map_err(|err| err.to_string())?,
         );
         headers.insert(
             header::USER_AGENT,

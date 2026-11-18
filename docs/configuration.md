@@ -42,7 +42,7 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | Key | Default | Caddy equivalent | Description |
 |---|---|---|---|
 | `policy` | `"weighted_round_robin"` | `lb_policy` | Selection policy, see below. Aliases: `lb_policy`, `algorithm`. |
-| `backends` | `[]` | upstreams | List of `"host:port"` or `{ address = "host:port", weight = N }`. Port ranges `"host:8001-8004"` expand to several backends. Host names are resolved on each dial. Alias: `to`. |
+| `backends` | `[]` | upstreams | List of addresses or `{ address = "...", weight = N }`. Address forms: `host:port`, `http://host[:port]` (default port 80), `https://host[:port]` (TLS, default port 443) and `unix//absolute/path.sock` (unix socket, not for UDP). Port ranges `"host:8001-8004"` expand to several backends. Host names are resolved on each dial. A pool cannot mix `https://` and plain backends. Alias: `to`. |
 | `choose` | `2` | `random_choose <n>` | Sample size of `random_choose`. |
 | `key` | | `query [key]`, `header [field]`, `cookie [name]` | Query parameter, header or cookie name. Required for `query` and `header`; `cookie` defaults to `lb`. |
 | `secret` | `""` | `cookie name <secret>` | HMAC secret of the `cookie` policy. |
@@ -54,6 +54,7 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `h2c` | `false` | `h2c://` | Speak cleartext HTTP/2 to the backends (one shared connection each). |
 | `keepalive` | `"2m"` | `keepalive` | How long idle upstream HTTP connections are kept. `"0s"` disables pooling. |
 | `keepalive_idle_conns_per_host` | `32` | `keepalive_idle_conns_per_host` | Idle connections kept per backend. |
+| `tls` | | `transport http { tls }` | Table of TLS client settings, see below. Setting it enables TLS for every backend, also without `https://`. |
 | `health` | | active health checks | Table, see below. |
 | `passive` | | passive health checks | Table, see below. |
 
@@ -77,6 +78,24 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 Only available backends are picked: healthy for active and passive checks,
 and below `unhealthy_request_count`. When none is available the client gets
 `503` (HTTP) or the connection is closed (TCP/UDP).
+
+### `[upstream.NAME.tls]`: TLS to the backends
+
+Used when the pool has `https://` backends or this table. Backend certificates
+are checked against the bundled Mozilla roots (`webpki-roots`) plus `ca`. For
+HTTPS backends the proxied `Host` header is the backend host (and port unless
+443), as in Caddy 2.11, unless the route sets `request.headers.set.Host`.
+TLS is pool-wide: with this table an `http://` or `unix//` backend is dialed with TLS too, and unix sockets send SNI `localhost` unless `server_name` is set. Backends added at runtime (`rxh upstream add`, admin API) follow the same rules: mixing schemes or adding `unix//` to a pool used by a UDP server is rejected with `400`.
+Layer 4 pools with this table also connect to the backends over TLS, and
+active health checks use TLS too.
+
+| Key | Default | Description |
+|---|---|---|
+| `server_name` | backend host | SNI name sent and checked against the certificate. |
+| `insecure_skip_verify` | `false` | Accept any certificate. Insecure. |
+| `ca` | | PEM file with extra trusted root certificates. |
+| `client_cert` | | PEM client certificate chain for mutual TLS. Needs `client_key`. |
+| `client_key` | | PEM private key of `client_cert`. |
 
 ### `[upstream.NAME.health]`: active health checks
 
