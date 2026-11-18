@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use rxh_core::config::{Action, Config, Protocol, ProxyProtocol};
+use rxh_core::config::{Action, Config, ConfigError, Protocol, ProxyProtocol};
+use rxh_core::net::IpNet;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -25,8 +26,10 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::error::Error;
 use crate::http::service::{Activity, Route, Service, Site};
+use crate::l4match::{self, Detected, L4Matcher, Rewind};
 use crate::log::{ListenerLog, Logger};
-use crate::registry::{Group, Registry};
+use crate::proxy_protocol;
+use crate::registry::Registry;
 use crate::tcp;
 use crate::timeout::{Stamp, Watched};
 use crate::tls;
@@ -66,7 +69,9 @@ enum Handler {
         http2: bool,
     },
     Tcp {
-        group: Arc<Group>,
+        routes: Arc<[tcp::Route]>,
+        /// True if picking a route needs the client's first bytes.
+        sniff: bool,
         proxy_protocol: Option<ProxyProtocol>,
         limits: tcp::Limits,
     },
@@ -84,6 +89,11 @@ struct ConnectionContext {
     log: ListenerLog,
     read_header_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
+    /// Read a PROXY header first, from peers in `trusted_proxies` (any peer
+    /// if empty).
+    proxy_protocol_in: bool,
+    trusted_proxies: Vec<IpNet>,
+    match_timeout: Duration,
 }
 
 /// One listener. See the module documentation.
@@ -152,17 +162,15 @@ impl Server {
         let label: Arc<str> = name.clone().unwrap_or_else(|| address.to_string()).into();
         let logger = Arc::new(Logger::new(&config.log)?);
 
-        let forward_group = || -> Result<Arc<Group>, Error> {
-            let Action::Forward(forward) = &server.patterns[0].action else {
-                unreachable!("validation guarantees L4 servers forward")
-            };
-            registry.resolve(forward, server_index, server, 0)
-        };
-
         let (socket, context) = match socket {
             SocketKind::Udp(socket) => {
                 let settings = UdpSettings {
-                    group: forward_group()?,
+                    group: {
+                        let Action::Forward(forward) = &server.patterns[0].action else {
+                            unreachable!("validation guarantees udp servers forward")
+                        };
+                        registry.resolve(forward, server_index, server, 0)?
+                    },
                     idle_timeout: server.udp_idle_timeout,
                     max_sessions: server.max_connections,
                     log_name: Arc::clone(&log_name),
@@ -173,14 +181,36 @@ impl Server {
             }
             SocketKind::Tcp(listener) => {
                 let handler = match server.protocol {
-                    Protocol::Tcp => Handler::Tcp {
-                        group: forward_group()?,
-                        proxy_protocol: server.proxy_protocol,
-                        limits: tcp::Limits {
-                            idle: server.idle_timeout,
-                            stream: server.stream_timeout,
-                        },
-                    },
+                    Protocol::Tcp => {
+                        let mut routes = Vec::new();
+                        for (index, pattern) in server.patterns.iter().enumerate() {
+                            let Action::Forward(forward) = &pattern.action else {
+                                unreachable!("validation guarantees tcp servers forward")
+                            };
+                            let matcher = L4Matcher::new(pattern).map_err(|err| {
+                                Error::Config(ConfigError::Invalid(format!(
+                                    "match[{index}]: {err}"
+                                )))
+                            })?;
+                            let group = registry.resolve(forward, server_index, server, index)?;
+                            routes.push(tcp::Route { matcher, group });
+                        }
+                        // Entries after the first one without matchers never match.
+                        let terminated = server.tls.is_some();
+                        let sniff = routes
+                            .iter()
+                            .take_while(|route| !route.matcher.is_default())
+                            .any(|route| route.matcher.needs_bytes(terminated));
+                        Handler::Tcp {
+                            routes: routes.into(),
+                            sniff,
+                            proxy_protocol: server.proxy_protocol,
+                            limits: tcp::Limits {
+                                idle: server.idle_timeout,
+                                stream: server.stream_timeout,
+                            },
+                        }
+                    }
                     _ => {
                         let mut routes = Vec::new();
                         for (&index, member) in members.iter().zip(&servers) {
@@ -209,6 +239,9 @@ impl Server {
                     },
                     read_header_timeout: server.read_header_timeout,
                     idle_timeout: server.idle_timeout,
+                    proxy_protocol_in: server.proxy_protocol_in,
+                    trusted_proxies: server.trusted_proxies.clone(),
+                    match_timeout: server.match_timeout,
                 };
                 (Socket::Tcp(listener), Some(Arc::new(context)))
             }
@@ -427,45 +460,99 @@ async fn accept_loop(
 }
 
 async fn handle_connection(
-    stream: TcpStream,
-    peer: SocketAddr,
+    mut stream: TcpStream,
+    mut peer: SocketAddr,
     local: SocketAddr,
     context: Arc<ConnectionContext>,
     stop: watch::Receiver<bool>,
     _permit: OwnedSemaphorePermit,
 ) {
+    let log_name = &context.log.log_name;
+    let mut buffer = Vec::new();
+    if context.proxy_protocol_in {
+        let trusted = &context.trusted_proxies;
+        if !trusted.is_empty() && !trusted.iter().any(|range| range.contains(peer.ip())) {
+            eprintln!("{log_name} => {peer}: PROXY header from an untrusted peer, closing");
+            return;
+        }
+        match proxy_protocol::read(&mut stream, &mut buffer, context.match_timeout).await {
+            Ok(source) => peer = source.unwrap_or(peer),
+            Err(err) => {
+                eprintln!("{log_name} => {peer}: invalid PROXY header: {err}");
+                return;
+            }
+        }
+    }
+    let stream = Rewind::new(buffer, stream);
+
     match &context.tls {
         Some(acceptor) => match acceptor.accept(stream).await {
-            Ok(stream) => serve(stream, peer, local, &context, stop).await,
-            Err(err) => eprintln!(
-                "{} => TLS handshake with {peer} failed: {err}",
-                context.log.log_name
-            ),
+            Ok(stream) => {
+                let (_, connection) = stream.get_ref();
+                let handshake = Detected {
+                    tls: true,
+                    sni: connection.server_name().map(str::to_owned),
+                    alpn: connection
+                        .alpn_protocol()
+                        .map(<[u8]>::to_vec)
+                        .into_iter()
+                        .collect(),
+                    ..Detected::default()
+                };
+                serve(stream, peer, local, &context, stop, Some(handshake)).await;
+            }
+            Err(err) => eprintln!("{log_name} => TLS handshake with {peer} failed: {err}"),
         },
-        None => serve(stream, peer, local, &context, stop).await,
+        None => serve(stream, peer, local, &context, stop, None).await,
     }
 }
 
+/// Runs the handler of `context` on an accepted (and maybe decrypted)
+/// connection. `handshake` holds what the TLS handshake revealed.
 async fn serve<S>(
-    stream: S,
+    mut stream: S,
     peer: SocketAddr,
     local: SocketAddr,
     context: &ConnectionContext,
     stop: watch::Receiver<bool>,
+    handshake: Option<Detected>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match &context.handler {
         Handler::Tcp {
-            group,
+            routes,
+            sniff,
             proxy_protocol,
             limits,
         } => {
+            let log_name = &context.log.log_name;
+            let mut buffer = Vec::new();
+            let mut detected = if *sniff {
+                match l4match::sniff(&mut stream, &mut buffer, context.match_timeout).await {
+                    Ok(detected) => detected,
+                    Err(err) => {
+                        eprintln!("{log_name} => {peer}: reading the first bytes failed: {err}");
+                        return;
+                    }
+                }
+            } else {
+                Detected::default()
+            };
+            if let Some(handshake) = handshake {
+                detected.tls = true;
+                detected.sni = handshake.sni;
+                detected.alpn = handshake.alpn;
+            }
+            let Some(route) = routes.iter().find(|route| route.matcher.matches(&detected)) else {
+                eprintln!("{log_name} => {peer}: no match entry accepts the connection, closing");
+                return;
+            };
             tcp::proxy(
-                stream,
+                Rewind::new(buffer, stream),
                 peer,
                 local,
-                group,
+                &route.group,
                 *proxy_protocol,
                 *limits,
                 &context.log,

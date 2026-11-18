@@ -144,13 +144,21 @@ pub(crate) fn acceptor(servers: &[&config::Server]) -> io::Result<Option<TlsAcce
     }
 
     let mut config = builder.with_cert_resolver(Arc::new(resolver));
-    if first.protocol == Protocol::Http {
-        config.alpn_protocols = if first.http2 {
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        } else {
-            vec![b"http/1.1".to_vec()]
-        };
-    }
+    config.alpn_protocols = match first.protocol {
+        Protocol::Http if first.http2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        Protocol::Http => vec![b"http/1.1".to_vec()],
+        // A `tcp` server offers the protocols its `alpn` matchers expect, in
+        // order, and matches on the one negotiated.
+        _ => {
+            let mut protocols: Vec<Vec<u8>> = Vec::new();
+            for alpn in first.patterns.iter().flat_map(|pattern| &pattern.alpn) {
+                if !protocols.iter().any(|known| known == alpn.as_bytes()) {
+                    protocols.push(alpn.as_bytes().to_vec());
+                }
+            }
+            protocols
+        }
+    };
 
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::address::{self, BackendAddress, Scheme};
 use crate::duration;
-use crate::matcher::RequestMatcher;
+use crate::matcher::{HostPattern, RequestMatcher};
 use crate::net::IpNet;
 use crate::status::StatusMatcher;
 
@@ -200,12 +200,19 @@ impl Config {
                          either all or none of the servers on it must use TLS"
                     ));
                 }
+                if server.proxy_protocol_in != first.proxy_protocol_in {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         either all or none of the servers on it must set proxy_protocol_in"
+                    ));
+                }
             }
 
             for (name, value) in [
                 ("read_header_timeout", server.read_header_timeout),
                 ("idle_timeout", server.idle_timeout),
                 ("stream_timeout", server.stream_timeout),
+                ("match_timeout", Some(server.match_timeout)),
             ] {
                 if value.is_some_and(|value| value.is_zero()) {
                     return invalid(format!("{label}: {name} must be greater than zero"));
@@ -213,6 +220,24 @@ impl Config {
             }
 
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+                if server.protocol == Protocol::Tcp {
+                    if pattern.has_http_matchers() {
+                        return invalid(format!(
+                            "{label}: match[{pattern_index}]: tcp servers match with sni, \
+                             alpn, protocol and http_host, not with HTTP request matchers"
+                        ));
+                    }
+                    for host in pattern.sni.iter().chain(&pattern.http_host) {
+                        HostPattern::new(host).map_err(|err| {
+                            ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
+                        })?;
+                    }
+                } else if pattern.has_l4_matchers() {
+                    return invalid(format!(
+                        "{label}: match[{pattern_index}]: sni, alpn, protocol and http_host \
+                         only apply to tcp servers"
+                    ));
+                }
                 RequestMatcher::new(pattern, &server.host).map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
                 })?;
@@ -265,19 +290,19 @@ impl Config {
                 }
             }
 
-            if server.protocol != Protocol::Http {
-                let [pattern] = server.patterns.as_slice() else {
-                    return invalid(format!(
-                        "{label}: {} servers take a single forward",
-                        server.protocol
-                    ));
-                };
-                if !matches!(pattern.action, Action::Forward(_)) {
-                    return invalid(format!(
-                        "{label}: {} servers can only forward",
-                        server.protocol
-                    ));
-                }
+            if server.protocol == Protocol::Udp && server.patterns.len() != 1 {
+                return invalid(format!("{label}: udp servers take a single forward"));
+            }
+            if server.protocol != Protocol::Http
+                && server
+                    .patterns
+                    .iter()
+                    .any(|pattern| !matches!(pattern.action, Action::Forward(_)))
+            {
+                return invalid(format!(
+                    "{label}: {} servers can only forward",
+                    server.protocol
+                ));
             }
 
             if server.protocol == Protocol::Udp
@@ -303,6 +328,12 @@ impl Config {
             if server.proxy_protocol.is_some() && server.protocol != Protocol::Tcp {
                 return invalid(format!(
                     "{label}: proxy_protocol only applies to tcp servers"
+                ));
+            }
+
+            if server.proxy_protocol_in && server.protocol == Protocol::Udp {
+                return invalid(format!(
+                    "{label}: proxy_protocol_in only applies to http and tcp servers"
                 ));
             }
         }
@@ -451,6 +482,15 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<ProxyProtocol>,
 
+    /// Requires a PROXY protocol header (v1 or v2) at the start of every
+    /// connection and uses its source address as the client address.
+    pub proxy_protocol_in: bool,
+
+    /// Time a client has to send the incoming PROXY header and, on `tcp`
+    /// servers with layer 4 matchers, the bytes the matchers look at.
+    #[serde(with = "duration")]
+    pub match_timeout: Duration,
+
     /// Idle time after which a UDP session is dropped.
     #[serde(with = "duration")]
     pub udp_idle_timeout: Duration,
@@ -519,6 +559,10 @@ struct RawServer {
     #[serde(default)]
     trusted_proxies: Vec<String>,
     proxy_protocol: Option<ProxyProtocol>,
+    #[serde(default)]
+    proxy_protocol_in: bool,
+    #[serde(default = "default::match_timeout", with = "duration")]
+    match_timeout: Duration,
     #[serde(default = "default::udp_idle_timeout", with = "duration")]
     udp_idle_timeout: Duration,
     #[serde(default, with = "duration::option")]
@@ -585,6 +629,10 @@ impl TryFrom<RawServer> for Server {
                 response: raw.response.unwrap_or_default(),
                 encode: raw.encode,
                 cache: raw.cache.unwrap_or_default(),
+                sni: Vec::new(),
+                alpn: Vec::new(),
+                protocol: None,
+                http_host: Vec::new(),
             }],
             _ => return Err(String::from("missing 'match', 'forward' or 'serve'")),
         };
@@ -609,6 +657,8 @@ impl TryFrom<RawServer> for Server {
             http2: raw.http2,
             trusted_proxies,
             proxy_protocol: raw.proxy_protocol,
+            proxy_protocol_in: raw.proxy_protocol_in,
+            match_timeout: raw.match_timeout,
             udp_idle_timeout: raw.udp_idle_timeout,
             read_header_timeout: raw.read_header_timeout,
             idle_timeout: raw.idle_timeout,
@@ -682,6 +732,72 @@ pub struct Pattern {
     /// Response cache for this pattern.
     #[serde(default)]
     pub cache: Cache,
+
+    /// TLS server names (SNI), exact or `*.example.com` (tcp only).
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub sni: Vec<String>,
+
+    /// ALPN protocols; any may match (tcp only).
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub alpn: Vec<String>,
+
+    /// Protocol detected from the first bytes of the connection (tcp only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<L4Protocol>,
+
+    /// `Host` header of an HTTP/1 request, exact or `*.example.com` (tcp only).
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub http_host: Vec<String>,
+}
+
+impl Pattern {
+    /// Returns true if the entry uses a layer 4 matcher (`sni`, `alpn`,
+    /// `protocol` or `http_host`).
+    #[must_use]
+    pub fn has_l4_matchers(&self) -> bool {
+        !self.sni.is_empty()
+            || !self.alpn.is_empty()
+            || self.protocol.is_some()
+            || !self.http_host.is_empty()
+    }
+
+    /// Returns true if the entry uses an HTTP request matcher.
+    #[must_use]
+    fn has_http_matchers(&self) -> bool {
+        self.uri != "/"
+            || !self.host.is_empty()
+            || !self.path.is_empty()
+            || !self.method.is_empty()
+            || !self.header.is_empty()
+            || !self.query.is_empty()
+            || !self.remote_ip.is_empty()
+    }
+}
+
+/// Protocol recognized by the `protocol` matcher of `tcp` servers.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum L4Protocol {
+    /// A TLS ClientHello, or any connection to a `tcp` server that terminates TLS.
+    Tls,
+
+    /// An HTTP/1 request line, or the HTTP/2 connection preface.
+    Http,
+
+    /// An SSH banner (`SSH-`).
+    Ssh,
 }
 
 /// Content encoding RXH can produce.
@@ -1961,6 +2077,10 @@ mod default {
         Duration::from_secs(60)
     }
 
+    pub fn match_timeout() -> Duration {
+        Duration::from_secs(3)
+    }
+
     pub fn cache_ttl_seconds() -> u64 {
         30
     }
@@ -2108,6 +2228,88 @@ mod tests {
             assert!(
                 Config::from_toml(case).is_err(),
                 "config should be rejected:\n{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn layer4_match_entries() {
+        let tcp = |rest: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n{rest}"
+            ))
+        };
+        let config = tcp("match = [\n\
+             { sni = [\"a.test\", \"*.b.test\"], alpn = \"h2\", forward = \"x:1\" },\n\
+             { protocol = \"http\", http_host = \"c.test\", forward = \"x:2\" },\n\
+             { forward = \"x:3\" },\n]")
+        .unwrap();
+        let server = &config.servers[0];
+        assert_eq!(server.match_timeout, Duration::from_secs(3));
+        assert!(!server.proxy_protocol_in);
+        assert_eq!(server.patterns.len(), 3);
+        assert_eq!(server.patterns[0].sni, ["a.test", "*.b.test"]);
+        assert_eq!(server.patterns[0].alpn, ["h2"]);
+        assert_eq!(server.patterns[1].protocol, Some(L4Protocol::Http));
+        assert!(!server.patterns[2].has_l4_matchers());
+        let server = &tcp("proxy_protocol_in = true\nmatch_timeout = \"500ms\"\nforward = \"x:1\"")
+            .unwrap()
+            .servers[0];
+        assert!(server.proxy_protocol_in);
+        assert_eq!(server.match_timeout, Duration::from_millis(500));
+
+        let message = |result: Result<Config, ConfigError>| match result {
+            Err(err) => err.to_string(),
+            Ok(_) => String::from("accepted"),
+        };
+        let http = |rest: &str| {
+            Config::from_toml(&format!("[[server]]\nlisten = \"127.0.0.1:1\"\n{rest}"))
+        };
+        for (result, expected) in [
+            (
+                http("match = [{ sni = \"a.test\", forward = \"x:1\" }]"),
+                "only apply to tcp servers",
+            ),
+            (
+                tcp("match = [{ path = \"/a\", forward = \"x:1\" }]"),
+                "not with HTTP request matchers",
+            ),
+            (
+                tcp("match = [{ http_host = \"a.*\", forward = \"x:1\" }]"),
+                "invalid host",
+            ),
+            (
+                tcp("match = [{ protocol = \"ftp\", forward = \"x:1\" }]"),
+                "unknown variant",
+            ),
+            (
+                tcp("match = [{ sni = \"a.test\", serve = \".\" }]"),
+                "can only forward",
+            ),
+            (
+                tcp("match_timeout = \"0s\"\nforward = \"x:1\""),
+                "greater than zero",
+            ),
+            (
+                http("protocol = \"udp\"\nproxy_protocol_in = true\nforward = \"x:1\""),
+                "only applies to http and tcp",
+            ),
+            (
+                http("protocol = \"udp\"\nmatch = [{ forward = \"x:1\" }, { forward = \"x:2\" }]"),
+                "single forward",
+            ),
+            (
+                http(
+                    "forward = \"x:1\"\n[[server]]\nlisten = \"127.0.0.1:1\"\n\
+                      proxy_protocol_in = true\nforward = \"x:1\"",
+                ),
+                "proxy_protocol_in",
+            ),
+        ] {
+            let message = message(result);
+            assert!(
+                message.contains(expected),
+                "{expected:?} not in {message:?}"
             );
         }
     }

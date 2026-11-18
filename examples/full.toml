@@ -154,6 +154,22 @@ stream_timeout = "12h"         # maximum connection lifetime
 proxy_protocol = "v2"
 forward = { policy = "first", backends = ["10.0.0.1:5432", "10.0.0.2:5432"], health = { interval = "5s" } }
 
+# TCP (layer 4) routing without terminating TLS: SNI, ALPN, protocol and
+# HTTP Host matchers on the first bytes, behind a PROXY protocol balancer.
+[[server]]
+name = "edge"
+listen = "0.0.0.0:8443"
+protocol = "tcp"
+proxy_protocol_in = true       # every connection starts with a PROXY v1/v2 header
+trusted_proxies = ["10.0.0.0/8"]
+match_timeout = "3s"           # time for the PROXY header and the first bytes
+match = [
+    { sni = ["a.example.com", "*.a.example.com"], alpn = ["h2", "http/1.1"], forward = "10.0.1.1:443" },
+    { protocol = "ssh", forward = "10.0.1.2:22" },
+    { protocol = "http", http_host = "plain.example.com", forward = "10.0.1.3:80" },
+    { forward = "10.0.1.4:443" }, # no matchers: the default
+]
+
 # UDP (layer 4), one session per client address.
 [[server]]
 name = "dns"

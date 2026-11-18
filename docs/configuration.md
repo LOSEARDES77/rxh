@@ -255,19 +255,22 @@ socket, except that `http` servers listing the same address share one socket
 | `uri` | `"/"` | Path prefix for the single `forward` or `serve` of this server (http only). |
 | `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. |
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
-| `match` | | List of patterns instead of `forward`/`serve`/`uri`, see below (http only). |
+| `match` | | List of patterns instead of `forward`/`serve`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. Servers sharing an address pick their certificate by SNI. |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
-| `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. |
+| `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
+| `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). |
+| `match_timeout` | `"3s"` | Time a client has to send the PROXY header (`proxy_protocol_in`) and, on `tcp` servers with layer 4 matchers, the first bytes the matchers look at. |
 | `read_header_timeout` | unset | Time a client has to send the request headers; slower clients are disconnected (http only). On a listener shared by several http servers, this and `idle_timeout` come from the first server. |
 | `idle_timeout` | unset | Keep-alive HTTP connections without traffic and without requests in flight for this long are closed. For `tcp`, a connection with no traffic in either direction for this long is closed. |
 | `stream_timeout` | unset | Maximum lifetime of upgraded HTTP tunnels (WebSockets) and of `tcp` connections. |
 | `udp_idle_timeout` | `"60s"` | Idle time after which a UDP client session ends (udp only). |
 | `request`, `response`, `cache`, `encode` | | Same as in `match` entries, for the single pattern form. |
 
-A `tcp` or `udp` server takes exactly one `forward` and no `match`.
+A `udp` server takes exactly one `forward` and no `match`. A `tcp` server
+takes one `forward`, or a `match` list of [layer 4 routes](#match-entries-of-tcp-servers-layer-4-routing).
 
 ### Virtual hosts on a shared address
 
@@ -355,6 +358,77 @@ match = [
     { forward = "@web" },
 ]
 ```
+
+### `match` entries of `tcp` servers (layer 4 routing)
+
+A `tcp` server can pick the backend from the first bytes of each connection,
+like caddy-l4. Entries are tried in order and the first one whose matchers
+all hold wins; an entry without matchers matches everything (the default).
+When no entry matches, the connection is closed.
+
+```toml
+# TLS passthrough: route HTTPS by SNI without terminating it.
+[[server]]
+listen = "0.0.0.0:443"
+protocol = "tcp"
+match = [
+    { sni = "a.example.com", forward = "10.0.0.1:443" },
+    { sni = ["b.example.com", "*.b.example.com"], alpn = "h2", forward = "@b_h2" },
+    { protocol = "ssh", forward = "10.0.0.9:22" },
+    { forward = "@fallback" },
+]
+```
+
+| Key | Description |
+|---|---|
+| `sni` | Server name or list from the TLS ClientHello, same patterns as `host`: exact or leading `*.` wildcard, case insensitive. |
+| `alpn` | ALPN protocol or list; matches if the client offers any of them. |
+| `protocol` | `"tls"` (a TLS ClientHello), `"http"` (an HTTP/1 request line, or the h2c preface `PRI * HTTP/2.0`) or `"ssh"` (an `SSH-` banner). |
+| `http_host` | `Host` header of an HTTP/1 request, same patterns as `host`; the port is ignored. |
+| `forward` | Required: where matching connections go. Each entry has its own pool. |
+
+To decide, RXH reads up to 16 KiB from the client for at most
+`match_timeout`; these bytes are not lost, they are replayed to the chosen
+backend. A client that sends nothing in time (protocols where the server
+speaks first), closes early or sends something unrecognized only matches
+entries without matchers. The ClientHello may span several TLS records.
+When the first entry has no matchers, nothing is read.
+
+When the `tcp` server terminates TLS (`tls` is set), `sni` and `alpn` come
+from the completed handshake and `protocol = "tls"` matches every
+connection; `http_host` and the other protocols look at the decrypted
+stream. The server offers the `alpn` values of its entries during the
+handshake and `alpn` matches the negotiated protocol. Entries using only
+`sni`, `alpn` or `protocol = "tls"` then need no extra read.
+
+HTTP request matchers (`uri`, `host`, `path`, `method`, `header`, `query`,
+`remote_ip`) are rejected on `tcp` servers, and layer 4 matchers on `http`
+and `udp` servers.
+
+### PROXY protocol input
+
+Behind a load balancer that speaks the PROXY protocol (HAProxy, AWS NLB,
+another RXH with `proxy_protocol`), set `proxy_protocol_in = true` on an
+`http` or `tcp` server. Every connection must then start with a v1 or v2
+header, read within `match_timeout`, before TLS and before any matching. Its
+source address becomes the client address everywhere: logs, `ip_hash`,
+`remote_ip`, `X-Forwarded-For`, `Forwarded`, `trusted_proxies` decisions and
+the outgoing `proxy_protocol` header of `tcp` servers. Connections without a
+valid header are closed. A v2 `LOCAL` header (health checks of the balancer),
+`UNKNOWN` (v1) and unix or unspecified addresses keep the real peer.
+
+```toml
+[[server]]
+listen = "0.0.0.0:80"
+proxy_protocol_in = true
+trusted_proxies = ["10.0.0.0/8"]   # only the balancer may send the header
+forward = "@web"
+```
+
+If `trusted_proxies` is not empty, only peers in it may connect; others are
+closed. Servers sharing a listen address must agree on `proxy_protocol_in`,
+and the first one's `trusted_proxies` and `match_timeout` apply to the
+header.
 
 ### File server
 

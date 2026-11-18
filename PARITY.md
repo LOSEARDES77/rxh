@@ -147,8 +147,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | TLS termination | `tls` on a `tcp` server | ✅ | |
 | PROXY protocol to upstreams | `proxy_protocol = "v1"` or `"v2"` | ✅ | |
 | Load balancing and health checks | same pools as HTTP | ✅ | Active TCP checks, passive dial failures. |
-| Matchers (SNI, HTTP, SSH, ...) and routing | | ❌ | |
-| Receiving PROXY protocol | | ❌ | |
+| Matchers (SNI, HTTP, SSH, ...) and routing | `match = [{ sni, alpn, protocol, http_host, forward }]` on `tcp` servers | 🟡 | TLS passthrough by SNI/ALPN, `protocol` `tls`/`http`/`ssh`, HTTP/1 `Host`; first match wins, replayed bytes, `match_timeout`. No other caddy-l4 matchers (`remote_ip`, regexp, postgres, ...) and no subroutes. |
+| Receiving PROXY protocol | `proxy_protocol_in = true` (`http` and `tcp`) | ✅ | v1 and v2, gated by `trusted_proxies`; the source address is the client everywhere. |
 
 ## Operations: daemon, CLI and admin API
 
@@ -180,8 +180,7 @@ The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). Ordered by value
 for a load balancer:
 
 1. Automatic HTTPS with ACME.
-2. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-3. HTTP/3.
+2. HTTP/3.
 
 ## Roadmap beyond Caddy
 
