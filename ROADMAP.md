@@ -177,7 +177,7 @@ A release people can run without reading the source.
       matchers, cache keys.
 - [ ] Property tests for the policies: weights respected, hashing stable
       when a backend leaves, no pick of an unhealthy backend.
-- [ ] A reusable flaky backend for tests: refuse, accept then close, slow
+- [x] A reusable flaky backend for tests: refuse, accept then close, slow
       headers, truncated body.
 - [ ] `rxh-bench --quick` as a correctness gate in CI for RXH, with the
       other proxies as information only.

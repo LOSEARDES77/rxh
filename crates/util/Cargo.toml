@@ -1,0 +1,13 @@
+[package]
+name = "rxh-test-util"
+description = "Test helpers shared by the RXH crates: misbehaving backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

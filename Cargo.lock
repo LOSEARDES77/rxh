@@ -1699,6 +1699,7 @@ dependencies = [
  "regex",
  "rustls-pemfile",
  "rxh-core",
+ "rxh-test-util",
  "serde",
  "serde_json",
  "tempfile",
@@ -1707,6 +1708,13 @@ dependencies = [
  "toml",
  "webpki-roots",
  "x509-parser",
+]
+
+[[package]]
+name = "rxh-test-util"
+version = "0.3.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

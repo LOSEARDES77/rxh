@@ -33,6 +33,7 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+rxh-test-util = { path = "../util" }
 tempfile.workspace = true
 
 [lints]
