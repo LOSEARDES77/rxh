@@ -26,6 +26,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  coverage:
+    name: line coverage (85% or more, without crates/bench)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # The benchmark tool has no tests and is not shipped; it stays out of the gate.
+      - run: >-
+          cargo llvm-cov --workspace
+          --ignore-filename-regex 'crates/bench/'
+          --summary-only
+          --fail-under-lines 85
+
   bench-smoke:
     name: load balancing smoke test vs Caddy
     runs-on: ubuntu-latest

@@ -94,6 +94,8 @@ Changed.
 - Tests: `crates/util` (`rxh-test-util`, not published) with `FlakyBackend`, a
   backend that refuses connections, accepts then closes them, delays its
   response head or truncates its body.
+- CI: a `coverage` job runs `cargo llvm-cov --fail-under-lines 85` over the
+  workspace without `crates/bench` and fails below 85% line coverage.
 
 ### Changed
 

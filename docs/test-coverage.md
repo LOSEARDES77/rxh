@@ -201,13 +201,15 @@ written against an older snapshot: their line numbers and percentages are stale,
     `server/tests/virtual_hosts.rs`, a config with an unreadable cert path and a mismatched key asserting a clear startup error;
     two hosts on one port where one has no matching SNI/Host asserting the fallback/404 and that the other still serves;
     reload that removes one host and asserts only it disappears.
-12. **`crates/bench` (16%).** No tests. Decide whether it is a shipped tool: if not, exclude it from CI
-    coverage; if yes, unit-test `load.rs` percentile/aggregation and `scenario.rs` parsing.
+12. **`crates/bench` (16%): excluded.** A benchmark tool, not shipped with the proxy; the CI coverage
+    gate leaves it out with `--ignore-filename-regex 'crates/bench/'`.
 
 ## 4. Structural recommendations
 
-- **CI job:** `cargo llvm-cov --workspace --ignore-filename-regex 'crates/bench/' --lcov --output-path lcov.info --fail-under-lines 80`,
-  upload lcov (Codecov/Coveralls) and gate PRs on "no drop in patch coverage". Raise the threshold as gaps close.
+- **CI job: done.** The `coverage` job of `.github/workflows/ci.yml` runs
+  `cargo llvm-cov --workspace --ignore-filename-regex 'crates/bench/' --summary-only --fail-under-lines 85`
+  on Ubuntu and fails below 85% of lines. Raise the threshold as gaps close; uploading lcov
+  (Codecov/Coveralls) and a patch-coverage gate are not set up.
 - **Ignore noise:** add `*.profraw` to `.gitignore`; mark `crates/bench` as excluded in the CI command.
 - **Daemon and signals:** test through the real `rxh` binary with temp dirs, random free ports
   (bind to port 0 and read it back), `kill_on_drop` guards, and a bounded poll loop instead of
@@ -226,7 +228,7 @@ written against an older snapshot: their line numbers and percentages are stale,
 
 ## 5. Prioritized checklist
 
-- [ ] Add CI coverage job with `--fail-under-lines` (start at 80, bench excluded) and `.gitignore` for `*.profraw`.
+- [x] CI coverage job with `--fail-under-lines 85` (bench excluded) and `.gitignore` for `*.profraw`.
 - [x] Reload failure and rollback tests (gap 3).
 - [x] Admin API route table incl. loopback 403 (gap 4).
 - [x] `signal()` PID validation unit tests and `start`/`stop` e2e (gap 1).
@@ -237,5 +239,5 @@ written against an older snapshot: their line numbers and percentages are stale,
 - [x] CLI rendering and admin-client e2e tests (gap 2).
 - [ ] Config validation/edit edge cases (gap 9).
 - [ ] Small modules: error, duration, cache, net, master, registry (gap 10).
-- [ ] Decide bench policy (gap 12).
+- [x] Decide bench policy (gap 12): excluded from the coverage gate.
 - [ ] TLS error paths and shared-listener failure isolation (gap 11).

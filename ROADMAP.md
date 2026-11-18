@@ -169,9 +169,9 @@ A release people can run without reading the source.
 
 ## Quality, in every milestone
 
-- [ ] Coverage of 85% or more without the benchmark tool, enforced in CI
-      with `cargo llvm-cov --fail-under-lines`. The level is reached (92%);
-      the CI job is missing. The remaining gaps are listed in
+- [x] Coverage of 85% or more without the benchmark tool, enforced in CI
+      with `cargo llvm-cov --fail-under-lines` (the `coverage` job of
+      `.github/workflows/ci.yml`; 92% measured). The remaining gaps are listed in
       docs/test-coverage.md; daemon signals, reload rollback and the admin
       API are covered.
 - [ ] Fuzzing with `cargo fuzz`: configuration parser, PROXY protocol,
