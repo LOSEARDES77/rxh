@@ -351,6 +351,15 @@ impl Config {
                     }
                 };
 
+                // An h2c backend shares one connection between all clients, and a
+                // PROXY header describes a single one.
+                if server.protocol == Protocol::Http && server.proxy_protocol.is_some() && group.h2c
+                {
+                    return invalid(format!(
+                        "{label}: proxy_protocol cannot be used with h2c backends"
+                    ));
+                }
+
                 if server.protocol != Protocol::Http && group.policy.requires_http() {
                     return invalid(format!(
                         "{label}: policy {} needs HTTP requests, it cannot be used with {}",
@@ -432,9 +441,9 @@ impl Config {
                 }
             }
 
-            if server.proxy_protocol.is_some() && server.protocol != Protocol::Tcp {
+            if server.proxy_protocol.is_some() && server.protocol == Protocol::Udp {
                 return invalid(format!(
-                    "{label}: proxy_protocol only applies to tcp servers"
+                    "{label}: proxy_protocol only applies to http and tcp servers"
                 ));
             }
 
@@ -601,7 +610,8 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// PROXY protocol header sent to upstreams on new TCP connections.
+/// PROXY protocol header sent to upstreams on new connections of `http` and
+/// `tcp` servers.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyProtocol {
@@ -3073,6 +3083,14 @@ mod tests {
         let http = |rest: &str| {
             Config::from_toml(&format!("[[server]]\nlisten = \"127.0.0.1:1\"\n{rest}"))
         };
+        for (text, expected) in [("v1", ProxyProtocol::V1), ("v2", ProxyProtocol::V2)] {
+            let config = http(&format!("proxy_protocol = \"{text}\"\nforward = \"x:1\"")).unwrap();
+            assert_eq!(config.servers[0].proxy_protocol, Some(expected));
+        }
+        assert_eq!(
+            http("forward = \"x:1\"").unwrap().servers[0].proxy_protocol,
+            None
+        );
         for (result, expected) in [
             (
                 http("match = [{ sni = \"a.test\", forward = \"x:1\" }]"),
@@ -3100,7 +3118,26 @@ mod tests {
             ),
             (
                 http("protocol = \"udp\"\nproxy_protocol_in = true\nforward = \"x:1\""),
-                "only applies to http and tcp",
+                "proxy_protocol_in only applies to http and tcp",
+            ),
+            (
+                http("protocol = \"udp\"\nproxy_protocol = \"v1\"\nforward = \"x:1\""),
+                "proxy_protocol only applies to http and tcp",
+            ),
+            (
+                http("proxy_protocol = \"v3\"\nforward = \"x:1\""),
+                "unknown variant",
+            ),
+            (
+                http("proxy_protocol = \"v2\"\nforward = { backends = [\"x:1\"], h2c = true }"),
+                "proxy_protocol cannot be used with h2c",
+            ),
+            (
+                http(
+                    "proxy_protocol = \"v2\"\nforward = \"@grpc\"\n\
+                     [upstream.grpc]\nbackends = [\"x:1\"]\nh2c = true",
+                ),
+                "proxy_protocol cannot be used with h2c",
             ),
             (
                 http("protocol = \"udp\"\nmatch = [{ forward = \"x:1\" }, { forward = \"x:2\" }]"),

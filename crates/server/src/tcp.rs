@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use rxh_core::config::ProxyProtocol;
 use rxh_core::pool::{SelectContext, Upstream};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::l4match::L4Matcher;
 use crate::log::{self, ListenerLog};
@@ -55,11 +55,17 @@ pub(crate) async fn proxy<S>(
     metrics::global().record_l4(&log.server, "tcp");
     let context = SelectContext::l4(peer.ip());
     let dialer = &group.dialer;
+    let preface: Vec<u8> = proxy_protocol
+        .map(|version| proxy_protocol::header(version, peer, local))
+        .unwrap_or_default();
+    let preface = &preface;
 
     let dialed = upstream::connect_with_retries(
         &group.pool,
         &context,
-        |upstream: Arc<Upstream>| async move { dialer.dial(upstream.address()).await },
+        |upstream: Arc<Upstream>| async move {
+            dialer.dial_with_preface(upstream.address(), preface).await
+        },
     )
     .await;
 
@@ -101,19 +107,6 @@ pub(crate) async fn proxy<S>(
 
     let _guard = selection.upstream.start_request();
     let address = selection.upstream.address();
-
-    if let Some(version) = proxy_protocol
-        && let Err(err) = backend
-            .write_all(&proxy_protocol::header(version, peer, local))
-            .await
-    {
-        selection.upstream.record_failure();
-        json(Some(address), 0, 0);
-        if text {
-            eprintln!("{log_name} => {peer}: PROXY header to {address} failed: {err}");
-        }
-        return;
-    }
 
     // Traffic from the client is a read of `client`, traffic from the backend
     // a write to it, so watching the client sees both directions.

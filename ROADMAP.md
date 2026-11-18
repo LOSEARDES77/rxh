@@ -121,7 +121,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [ ] Retry budgets and hedged requests.
 - [ ] Custom error pages.
 - [ ] gRPC health checks and gRPC-Web.
-- [ ] Layer 4 matchers (SNI, HTTP, SSH) and routing; receiving PROXY
+- [x] Layer 4 matchers (SNI, HTTP, SSH) and routing; receiving PROXY
       protocol; PROXY protocol on the HTTP transport.
 
 ## 0.8: observability and UI

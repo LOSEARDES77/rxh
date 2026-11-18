@@ -419,7 +419,7 @@ socket, except that `http` servers listing the same address share one socket
 | `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
-| `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
+| `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header with the client address on every new connection to a backend, see [PROXY protocol output](#proxy-protocol-output) (http and tcp). |
 | `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). Set `trusted_proxies` too: with it empty any directly connecting client can spoof its address. |
 | `match_timeout` | `"3s"` | Time a client has to send the PROXY header (`proxy_protocol_in`) and, on `tcp` servers with layer 4 matchers, the first bytes the matchers look at. |
 | `read_header_timeout` | `"30s"` (TLS handshake `"10s"`) | Time a client has to send the request headers; slower clients are disconnected (http only). It also bounds the TLS handshake (`http` and `tcp` servers with `tls`) and the time to the first complete request head of a connection, HTTP/2 included, so clients that connect and send nothing are closed too. When unset, request heads get 30 seconds and TLS handshakes 10 seconds. On a listener shared by several http servers, this and `idle_timeout` come from the first server. |
@@ -711,7 +711,7 @@ another RXH with `proxy_protocol`), set `proxy_protocol_in = true` on an
 header, read within `match_timeout`, before TLS and before any matching. Its
 source address becomes the client address everywhere: logs, `ip_hash`,
 `remote_ip`, `X-Forwarded-For`, `Forwarded`, `trusted_proxies` decisions and
-the outgoing `proxy_protocol` header of `tcp` servers. Connections without a
+the outgoing `proxy_protocol` header. Connections without a
 valid header are closed. A v2 `LOCAL` header (health checks of the balancer),
 `UNKNOWN` (v1) and unix or unspecified addresses keep the real peer.
 
@@ -731,6 +731,34 @@ address**, defeating `remote_ip`, `ip_hash`, logs and `X-Forwarded-For`. Set
 can reach the port. Servers sharing a listen address must agree on `proxy_protocol_in`,
 and the first one's `trusted_proxies` and `match_timeout` apply to the
 header.
+
+### PROXY protocol output
+
+`proxy_protocol = "v1"` (text) or `"v2"` (binary) on an `http` or `tcp` server
+starts every new connection to a backend with a PROXY protocol header: the
+source is the client address (the one of the incoming header with
+`proxy_protocol_in`) and the destination the address the client connected to.
+The backend must expect it (`accept-proxy` in HAProxy, `listen ... proxy_protocol`
+in nginx, `proxy_protocol_in` in RXH). With TLS backends the header goes first,
+in cleartext, and the TLS handshake follows.
+
+```toml
+[[server]]
+listen = "0.0.0.0:80"
+proxy_protocol = "v2"
+forward = "@web"
+```
+
+On `http` servers:
+
+- The header describes one client connection, so an upstream keep-alive
+  connection is only reused for requests of the client connection it was
+  opened for. Idle ones are closed after `keepalive`; `max_conns_per_host`
+  only counts connections carrying a request.
+- It applies to every `forward` of the server, and is rejected when one of
+  them uses an `h2c` pool, whose single connection is shared by all clients.
+- Active health checks send no header: check a port of the backend that does
+  not require it (`health.port`), or rely on passive checks.
 
 ### File server
 

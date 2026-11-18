@@ -28,6 +28,7 @@ use crate::http::headers::{self, Forwarding};
 use crate::http::response::{self, BoxResponse};
 use crate::http::service::{Route, Service, UpstreamAddress};
 use crate::http::transport::{Permit, SendError};
+use crate::proxy_protocol;
 use crate::registry::Group;
 use crate::upstream::{self, DialError};
 
@@ -144,6 +145,11 @@ pub(crate) async fn forward(
     }
     let mut outgoing = Request::from_parts(parts, outgoing);
     let transport = &group.transport;
+    let preface: Vec<u8> = site
+        .proxy_protocol
+        .map(|version| proxy_protocol::header(version, connection.peer, connection.local))
+        .unwrap_or_default();
+    let preface = &preface;
     let mut stale_attempts = 0;
     // Like Caddy, HTTPS backends get their own host as `Host` unless the user sets it.
     let rewrite_host = group.dialer.is_tls()
@@ -189,7 +195,9 @@ pub(crate) async fn forward(
         let dialed = upstream::connect_with_retries(
             &group.pool,
             &context,
-            |upstream: Arc<Upstream>| async move { transport.connect(upstream.address()).await },
+            |upstream: Arc<Upstream>| async move {
+                transport.connect(upstream.address(), preface).await
+            },
         )
         .await;
 
@@ -206,7 +214,7 @@ pub(crate) async fn forward(
         }
         let started = Instant::now();
 
-        let sent = transport.send(address, upstream_connection, outgoing);
+        let sent = transport.send(address, preface, upstream_connection, outgoing);
         let sent = match group.pool.settings().response_header_timeout {
             Some(limit) => match tokio::time::timeout(limit, sent).await {
                 Ok(sent) => sent,
@@ -239,7 +247,7 @@ pub(crate) async fn forward(
             Ok(sent) => break (selection, guard, started, sent),
             Err(SendError::Stale(request)) if stale_attempts < MAX_STALE_RETRIES => {
                 stale_attempts += 1;
-                transport.forget(address);
+                transport.forget(address, preface);
                 outgoing = *request;
             }
             Err(SendError::Stale(_)) => {
