@@ -202,7 +202,8 @@ cargo test --workspace
 ./target/release/rxh-bench --quick --no-caddy   # smoke test of every policy
 ```
 
-Feature progress against Caddy is tracked in [PARITY.md](PARITY.md).
+Feature progress against Caddy is tracked in [PARITY.md](PARITY.md). The plan
+for the next versions is in [ROADMAP.md](ROADMAP.md).
 
 ## License
 
