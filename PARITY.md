@@ -122,11 +122,11 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 |---|---|---|---|
 | Multiple sites and listeners | `[[server]]`, `listen = [...]` | ✅ | |
 | Path matchers | `uri` prefix, `path` patterns | ✅ | Exact, prefix, suffix and middle `*`. Case sensitive, `*` also crosses `/`. |
-| Host matchers (virtual hosts) | `host`, server level `host` | ✅ | Exact and `*.domain`. SNI certificate selection is not done yet. |
+| Host matchers (virtual hosts) | `host`, server level `host` | ✅ | Exact and `*.domain`. HTTP servers on the same `listen` address share one socket. |
 | Header, method, query, remote IP matchers | `header`, `method`, `query`, `remote_ip` | ✅ | AND across matchers, OR inside lists. No regex or percent decoding. |
 | Manual TLS certificates | `tls = { cert, key }` | ✅ | |
 | Automatic HTTPS (ACME) | | ❌ | Large feature. |
-| SNI with many certificates, mTLS | | ❌ | |
+| SNI with many certificates, mTLS | `tls` per server on a shared address | 🟡 | Certificate picked by SNI against `host` (exact beats wildcard, first is the default). No mTLS. |
 | `file_server` with `browse` | `serve` | ✅ | Index files and directory listing. |
 | Range requests, ETag, precompressed files | | ❌ | |
 | `encode gzip zstd` | | ❌ | |

@@ -115,7 +115,8 @@ Failed dials always count.
 ## `[[server]]`: listeners
 
 Each `[[server]]` is a service. Every address in `listen` gets its own
-socket.
+socket, except that `http` servers listing the same address share one socket
+(see [Virtual hosts on a shared address](#virtual-hosts-on-a-shared-address)).
 
 | Key | Default | Description |
 |---|---|---|
@@ -129,7 +130,7 @@ socket.
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
 | `match` | | List of patterns instead of `forward`/`serve`/`uri`, see below (http only). |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
-| `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. |
+| `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. Servers sharing an address pick their certificate by SNI. |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
@@ -137,6 +138,41 @@ socket.
 | `request`, `response`, `cache` | | Same as in `match` entries, for the single pattern form. |
 
 A `tcp` or `udp` server takes exactly one `forward` and no `match`.
+
+### Virtual hosts on a shared address
+
+Several `http` servers may list the same `listen` address. They share one
+socket and their routes are tried in configuration order, each route keeping
+the settings of its own server (`name`, `trusted_proxies`, `host`, headers,
+cache). Give each server a `host` so requests reach the right one; a request
+no route accepts gets `404`. `http2` and `max_connections` of the shared
+socket come from the first server, and `rxh status` shows one listener whose
+name joins the server names.
+
+With TLS every server on the address needs its own `tls`, and the certificate
+is picked by the SNI name of the client against the servers' `host` patterns:
+an exact name beats a wildcard, and a client without SNI (or with a name that
+matches nothing) gets the certificate of the first server.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+host = "a.example.com"
+tls = { cert = "/etc/rxh/a.pem", key = "/etc/rxh/a.key" }
+forward = "@a"
+
+[[server]]
+listen = "0.0.0.0:443"
+host = ["b.example.com", "*.b.example.com"]
+tls = { cert = "/etc/rxh/b.pem", key = "/etc/rxh/b.key" }
+forward = "@b"
+```
+
+It is a validation error to share an address between an `http` server and a
+`tcp` server, between two `tcp` servers or two `udp` servers, or between `http`
+servers with and without `tls`. TCP and UDP sockets never conflict, so a `udp`
+server may use the address of a `tcp` or `http` server. Port `0` is never
+shared: every port `0` entry gets its own free port.
 
 ### `match` entries (HTTP routes)
 

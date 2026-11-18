@@ -15,6 +15,7 @@ mod master;
 mod registry;
 mod server;
 mod tcp;
+mod tls;
 mod udp;
 mod upstream;
 
@@ -24,3 +25,4 @@ pub use master::{Master, ServerInfo};
 pub use registry::{Group, Registry};
 pub use rxh_core::{VERSION, config, pool};
 pub use server::{Server, ShutdownState, State};
+pub use tls::CertResolver;

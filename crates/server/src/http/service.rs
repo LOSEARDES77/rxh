@@ -23,7 +23,8 @@ use crate::http::proxy;
 use crate::http::response::{self, BoxResponse};
 use crate::registry::{Group, Registry};
 
-/// Compiled HTTP server: routes plus the settings they share.
+/// Settings of one `[[server]]`, shared by its routes. Several sites can
+/// share one listener, each route keeps its own site.
 #[derive(Debug)]
 pub(crate) struct Site {
     /// Name used in logs, like `127.0.0.1:80 (web)`.
@@ -31,9 +32,6 @@ pub(crate) struct Site {
 
     /// Proxy identifier for `Forwarded: by=` and `Via`.
     pub(crate) by: String,
-
-    /// Routes, matched in order.
-    pub(crate) routes: Vec<Route>,
 
     /// Peers allowed to set `X-Forwarded-*`.
     pub(crate) trusted_proxies: Vec<IpNet>,
@@ -45,6 +43,7 @@ pub(crate) struct Site {
 /// One compiled pattern.
 #[derive(Debug)]
 pub(crate) struct Route {
+    pub(crate) site: Arc<Site>,
     pub(crate) uri: String,
     pub(crate) matcher: RequestMatcher,
     pub(crate) action: RouteAction,
@@ -64,14 +63,21 @@ pub(crate) enum RouteAction {
 }
 
 impl Site {
-    pub(crate) fn build(
+    /// Compiles the routes of `server`, appending them to `routes`.
+    pub(crate) fn build_routes(
         server_index: usize,
         server: &config::Server,
         registry: &Registry,
         log_name: String,
         local: SocketAddr,
-    ) -> Result<Self, Error> {
-        let mut routes = Vec::with_capacity(server.patterns.len());
+        routes: &mut Vec<Route>,
+    ) -> Result<(), Error> {
+        let site = Arc::new(Self {
+            log_name,
+            by: server.name.clone().unwrap_or_else(|| local.to_string()),
+            trusted_proxies: server.trusted_proxies.clone(),
+            tls: server.tls.is_some(),
+        });
 
         for (pattern_index, pattern) in server.patterns.iter().enumerate() {
             let action = match &pattern.action {
@@ -85,6 +91,7 @@ impl Site {
             };
 
             routes.push(Route {
+                site: Arc::clone(&site),
                 uri: pattern.uri.clone(),
                 matcher: RequestMatcher::new(pattern, &server.host).map_err(|err| {
                     Error::Config(ConfigError::Invalid(format!(
@@ -98,13 +105,7 @@ impl Site {
             });
         }
 
-        Ok(Self {
-            log_name,
-            by: server.name.clone().unwrap_or_else(|| local.to_string()),
-            routes,
-            trusted_proxies: server.trusted_proxies.clone(),
-            tls: server.tls.is_some(),
-        })
+        Ok(())
     }
 }
 
@@ -129,7 +130,10 @@ impl Activity {
 /// [`hyper::service::Service`] of one client connection.
 #[derive(Clone)]
 pub(crate) struct Service {
-    pub(crate) site: Arc<Site>,
+    /// Routes of every server sharing the listener, in configuration order.
+    pub(crate) routes: Arc<[Route]>,
+    /// Name of the listener, for requests that match no route.
+    pub(crate) log_name: Arc<str>,
     pub(crate) peer: SocketAddr,
     pub(crate) local: SocketAddr,
     pub(crate) activity: Arc<Activity>,
@@ -163,7 +167,6 @@ impl Service {
             peer: self.peer.ip(),
         };
         let route = self
-            .site
             .routes
             .iter()
             .find(|route| route.matcher.matches(&input));
@@ -179,7 +182,7 @@ impl Service {
         println!(
             "{} -> {} {method} {uri} HTTP {} {:?}",
             self.peer,
-            self.site.log_name,
+            route.map_or(&*self.log_name, |route| &route.site.log_name),
             response.status(),
             started.elapsed()
         );

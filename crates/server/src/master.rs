@@ -1,7 +1,8 @@
 //! Spawns every listener of a configuration and shuts them down together.
 //!
 //! A server with several `listen` addresses becomes one [`Server`] per
-//! address ("replicas"), so each server owns exactly one socket:
+//! address ("replicas"), and HTTP servers listing the same address (other
+//! than port 0) share one [`Server`], so each socket has exactly one owner:
 //!
 //! ```text
 //!                 shutdown signal
@@ -38,7 +39,8 @@ pub struct ServerInfo {
     /// Protocol.
     pub protocol: Protocol,
 
-    /// Name from the configuration.
+    /// Name from the configuration; the names of the servers sharing the
+    /// socket, joined by `, `.
     pub name: Option<String>,
 
     /// Live state.
@@ -54,23 +56,45 @@ pub struct Master {
     shutdown_notify: broadcast::Sender<()>,
 }
 
+/// Groups listen addresses into sockets: HTTP servers sharing an address
+/// (port 0 excluded) get one socket, in configuration order.
+fn listeners(config: &Config) -> Vec<(SocketAddr, Vec<usize>)> {
+    let mut listeners: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
+    for (index, server) in config.servers.iter().enumerate() {
+        let shareable = server.protocol == Protocol::Http;
+        for &address in &server.listen {
+            // ponytail: linear scan, configurations have few listeners.
+            let shared = listeners.iter_mut().find(|(existing, members)| {
+                shareable
+                    && address.port() != 0
+                    && *existing == address
+                    && config.servers[members[0]].protocol == Protocol::Http
+            });
+            match shared {
+                Some((_, members)) if members.contains(&index) => {}
+                Some((_, members)) => members.push(index),
+                None => listeners.push((address, vec![index])),
+            }
+        }
+    }
+    listeners
+}
+
 impl Master {
     /// Binds every listener of `config`, using the pools of `registry`.
     pub fn init(config: &Config, registry: Arc<Registry>) -> Result<Self, Error> {
         let mut servers = Vec::new();
         let mut infos = Vec::new();
 
-        for (server_index, server_config) in config.servers.iter().enumerate() {
-            for replica in 0..server_config.listen.len() {
-                let server = Server::init(config, &registry, server_index, replica)?;
-                infos.push(ServerInfo {
-                    address: server.socket_address(),
-                    protocol: server.protocol(),
-                    name: server.name().map(str::to_owned),
-                    state: server.subscribe(),
-                });
-                servers.push(server);
-            }
+        for (address, members) in listeners(config) {
+            let server = Server::init(config, &registry, address, &members)?;
+            infos.push(ServerInfo {
+                address: server.socket_address(),
+                protocol: server.protocol(),
+                name: server.name().map(str::to_owned),
+                state: server.subscribe(),
+            });
+            servers.push(server);
         }
 
         Ok(Self {

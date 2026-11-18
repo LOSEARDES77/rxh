@@ -45,7 +45,7 @@ pub fn spawn_controlled(text: &str) -> (SocketAddr, impl FnOnce() + use<>, watch
     let config = config(text);
     let registry = Registry::build(&config).expect("pools build");
     let (trigger, shutdown) = oneshot::channel::<()>();
-    let server = Server::init(&config, &registry, 0, 0)
+    let server = Server::init(&config, &registry, config.servers[0].listen[0], &[0])
         .expect("server binds")
         .shutdown_on(shutdown);
     let address = server.socket_address();

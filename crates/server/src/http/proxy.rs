@@ -38,7 +38,7 @@ pub(crate) async fn forward(
     group: &Group,
     connection: &Service,
 ) -> BoxResponse {
-    let site = &connection.site;
+    let site = &route.site;
     let (client_ip, trusted) = headers::client_ip(
         connection.peer.ip(),
         request.headers(),

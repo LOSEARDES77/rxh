@@ -108,8 +108,32 @@ impl Config {
                 .map_err(|err| ConfigError::Invalid(format!("upstream.{name}: {err}")))?;
         }
 
+        // Servers sharing a listen address, keyed by address and "is UDP".
+        let mut listeners: HashMap<(SocketAddr, bool), (String, &Server)> = HashMap::new();
+
         for (index, server) in self.servers.iter().enumerate() {
             let label = server.label(index);
+
+            // Port 0 always gets its own socket, it is never shared.
+            for &address in server.listen.iter().filter(|address| address.port() != 0) {
+                let key = (address, server.protocol == Protocol::Udp);
+                let Some((first_label, first)) = listeners.get(&key) else {
+                    listeners.insert(key, (label.clone(), server));
+                    continue;
+                };
+                if server.protocol != Protocol::Http || first.protocol != Protocol::Http {
+                    return invalid(format!(
+                        "{label}: listen address {address} is already used by {first_label}, \
+                         only http servers can share a listen address"
+                    ));
+                }
+                if server.tls.is_some() != first.tls.is_some() {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         either all or none of the servers on it must use TLS"
+                    ));
+                }
+            }
 
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
                 RequestMatcher::new(pattern, &server.host).map_err(|err| {
@@ -1351,6 +1375,36 @@ mod tests {
                 "config should be rejected:\n{case}"
             );
         }
+    }
+
+    #[test]
+    fn shared_listen_addresses() {
+        let http = "[[server]]\nlisten = \"127.0.0.1:8000\"\nforward = \"a:1\"\n";
+        let tls = "[[server]]\nlisten = \"127.0.0.1:8000\"\nforward = \"a:1\"\n\
+                   tls = { cert = \"c.pem\", key = \"k.pem\" }\n";
+        let tcp =
+            "[[server]]\nlisten = \"127.0.0.1:8000\"\nprotocol = \"tcp\"\nforward = \"a:1\"\n";
+        let udp =
+            "[[server]]\nlisten = \"127.0.0.1:8000\"\nprotocol = \"udp\"\nforward = \"a:1\"\n";
+        let error = |text: String| match Config::from_toml(&text) {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("expected a validation error, got {other:?}\n{text}"),
+        };
+
+        assert!(Config::from_toml(&format!("{http}{http}")).is_ok());
+        assert!(Config::from_toml(&format!("{tls}{tls}")).is_ok());
+        // TCP and UDP sockets never conflict.
+        assert!(Config::from_toml(&format!("{tcp}{udp}")).is_ok());
+        assert!(Config::from_toml(&format!("{http}{udp}")).is_ok());
+        // Port 0 is a new free port every time.
+        let zero = http.replace("8000", "0");
+        let zero_tcp = tcp.replace("8000", "0");
+        assert!(Config::from_toml(&format!("{zero}{zero_tcp}")).is_ok());
+
+        assert!(error(format!("{http}{tcp}")).contains("only http servers can share"));
+        assert!(error(format!("{tcp}{tcp}")).contains("only http servers can share"));
+        assert!(error(format!("{udp}{udp}")).contains("only http servers can share"));
+        assert!(error(format!("{http}{tls}")).contains("all or none"));
     }
 
     #[test]

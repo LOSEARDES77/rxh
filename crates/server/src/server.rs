@@ -1,14 +1,14 @@
 //! One listening socket and the connections it accepts.
 //!
 //! A `[[server]]` with several `listen` addresses becomes several [`Server`]
-//! values (see [`crate::Master`]). Each one accepts connections, limits them
+//! values, and HTTP servers listing the same address share one [`Server`]
+//! (see [`crate::Master`]). Each one accepts connections, limits them
 //! to `max_connections`, and on shutdown stops accepting, lets open
 //! connections finish (up to `grace_period`) and reports progress through
 //! [`State`].
 
-use std::fs::File;
 use std::future::Future;
-use std::io::{self, BufReader};
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,18 +16,18 @@ use std::time::Duration;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use rxh_core::config::{self, Action, Config, Protocol, ProxyProtocol};
+use rxh_core::config::{Action, Config, Protocol, ProxyProtocol};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig;
 
 use crate::error::Error;
-use crate::http::service::{Activity, Service, Site};
+use crate::http::service::{Activity, Route, Service, Site};
 use crate::registry::{Group, Registry};
 use crate::tcp;
+use crate::tls;
 use crate::udp::{self, UdpSettings};
 
 /// Current state of a [`Server`].
@@ -60,7 +60,7 @@ pub enum ShutdownState {
 #[derive(Clone)]
 enum Handler {
     Http {
-        site: Arc<Site>,
+        routes: Arc<[Route]>,
         http2: bool,
     },
     Tcp {
@@ -96,21 +96,28 @@ pub struct Server {
 }
 
 impl Server {
-    /// Binds the `replica`-th listen address of `config.servers[server_index]`
-    /// without accepting connections yet. Port 0 picks a free port, see
+    /// Binds `requested` for the servers `config.servers[index]` of every
+    /// index in `members` without accepting connections yet. Only HTTP
+    /// servers can share a listener: their routes are tried in the order of
+    /// `members`, and the first member decides the protocol, `http2` and
+    /// `max_connections`. Port 0 picks a free port, see
     /// [`Server::socket_address`].
     ///
     /// # Panics
     ///
-    /// Panics if `server_index` or `replica` are out of bounds.
+    /// Panics if `members` is empty or has an index out of bounds.
     pub fn init(
         config: &Config,
         registry: &Registry,
-        server_index: usize,
-        replica: usize,
+        requested: SocketAddr,
+        members: &[usize],
     ) -> Result<Self, Error> {
+        let server_index = members[0];
         let server = &config.servers[server_index];
-        let requested = server.listen[replica];
+        let servers: Vec<_> = members
+            .iter()
+            .map(|&index| &config.servers[index])
+            .collect();
 
         let (socket, address) = match server.protocol {
             Protocol::Udp => {
@@ -127,11 +134,16 @@ impl Server {
             }
         };
 
-        let log_name: Arc<str> = match &server.name {
+        let site_log_name = |name: Option<&str>| match name {
             Some(name) => format!("{address} ({name})"),
             None => address.to_string(),
-        }
-        .into();
+        };
+        let names: Vec<&str> = servers
+            .iter()
+            .filter_map(|server| server.name.as_deref())
+            .collect();
+        let name = (!names.is_empty()).then(|| names.join(", "));
+        let log_name: Arc<str> = site_log_name(name.as_deref()).into();
 
         let forward_group = || -> Result<Arc<Group>, Error> {
             let Action::Forward(forward) = &server.patterns[0].action else {
@@ -156,19 +168,26 @@ impl Server {
                         group: forward_group()?,
                         proxy_protocol: server.proxy_protocol,
                     },
-                    _ => Handler::Http {
-                        site: Arc::new(Site::build(
-                            server_index,
-                            server,
-                            registry,
-                            log_name.to_string(),
-                            address,
-                        )?),
-                        http2: server.http2,
-                    },
+                    _ => {
+                        let mut routes = Vec::new();
+                        for (&index, member) in members.iter().zip(&servers) {
+                            Site::build_routes(
+                                index,
+                                member,
+                                registry,
+                                site_log_name(member.name.as_deref()),
+                                address,
+                                &mut routes,
+                            )?;
+                        }
+                        Handler::Http {
+                            routes: routes.into(),
+                            http2: server.http2,
+                        }
+                    }
                 };
                 let context = ConnectionContext {
-                    tls: load_tls_acceptor(server)?,
+                    tls: tls::acceptor(&servers)?,
                     handler,
                     log_name: Arc::clone(&log_name),
                 };
@@ -181,7 +200,7 @@ impl Server {
             socket,
             address,
             protocol: server.protocol,
-            name: server.name.clone(),
+            name,
             log_name,
             max_connections: server.max_connections.max(1),
             grace_period: config.grace_period,
@@ -211,7 +230,8 @@ impl Server {
         self.protocol
     }
 
-    /// Server name from the configuration.
+    /// Server name from the configuration; the names of the servers sharing
+    /// this listener, joined by `, `.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
@@ -431,10 +451,11 @@ async fn serve<S>(
             )
             .await;
         }
-        Handler::Http { site, http2 } => {
+        Handler::Http { routes, http2 } => {
             let activity = Arc::new(Activity::default());
             let service = Service {
-                site: Arc::clone(site),
+                routes: Arc::clone(routes),
+                log_name: Arc::clone(&context.log_name),
                 peer,
                 local,
                 activity: Arc::clone(&activity),
@@ -524,35 +545,4 @@ where
 
     connection.as_mut().begin_graceful_shutdown();
     connection.await.map_err(|err| err.to_string())
-}
-
-fn load_tls_acceptor(server: &config::Server) -> io::Result<Option<TlsAcceptor>> {
-    let Some(tls) = &server.tls else {
-        return Ok(None);
-    };
-
-    let mut cert_reader = BufReader::new(File::open(&tls.cert)?);
-    let mut key_reader = BufReader::new(File::open(&tls.key)?);
-
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io::Error::other)?;
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::other(format!("no private key found in {}", tls.key)))?;
-
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(io::Error::other)?;
-
-    if server.protocol == Protocol::Http {
-        config.alpn_protocols = if server.http2 {
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        } else {
-            vec![b"http/1.1".to_vec()]
-        };
-    }
-
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }

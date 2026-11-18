@@ -57,6 +57,18 @@ unhealthy_status = ["5xx"]
 unhealthy_latency = "2s"
 unhealthy_request_count = 500  # concurrent requests per backend, 0 = no limit
 
+# Virtual host: "blog" and "edge" below list the same addresses, so they share
+# one socket. Routes are tried in file order, so this host-bound site comes
+# before the catch-all routes of "edge". With TLS, each server would have its
+# own `tls` and the certificate would be picked by SNI.
+
+[[server]]
+
+name = "blog"
+listen = ["0.0.0.0:8100", "[::]:8100"]
+host = ["blog.example.com", "*.blog.example.com"]
+forward = "@api"
+
 # HTTP server with several routes.
 [[server]]
 name = "edge"

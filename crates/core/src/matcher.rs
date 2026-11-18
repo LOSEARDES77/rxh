@@ -44,6 +44,12 @@ impl HostPattern {
         })
     }
 
+    /// Returns true for a leading wildcard pattern like `*.example.com`.
+    #[must_use]
+    pub fn is_wildcard(&self) -> bool {
+        self.wildcard
+    }
+
     /// Returns true if `host` (optionally with `:port`) matches.
     #[must_use]
     pub fn matches(&self, host: &str) -> bool {
