@@ -17,7 +17,7 @@ use http::{HeaderMap, Uri};
 use serde::Serialize;
 use sha2::Sha256;
 
-use crate::config::{Backend, PassiveHealth, Policy, UpstreamGroup};
+use crate::config::{Backend, Fallback, PassiveHealth, Policy, UpstreamGroup};
 use crate::random;
 
 /// Default cookie name of the `cookie` policy, same as Caddy.
@@ -86,6 +86,15 @@ pub struct Selection {
 
     /// `Set-Cookie` value to send back, for the `cookie` policy.
     pub set_cookie: Option<String>,
+}
+
+impl Selection {
+    fn plain(upstream: Arc<Upstream>) -> Self {
+        Selection {
+            upstream,
+            set_cookie: None,
+        }
+    }
 }
 
 /// Snapshot of a backend, as reported by the admin API.
@@ -423,9 +432,11 @@ impl Pool {
     }
 
     fn make_upstream(&self, backend: Backend) -> Upstream {
-        let secret = (self.settings.policy == Policy::Cookie)
-            .then(|| self.settings.secret.as_deref().unwrap_or(""));
-        Upstream::new(backend, self.settings.passive.clone(), secret)
+        Upstream::new(
+            backend,
+            self.settings.passive.clone(),
+            self.settings.cookie_secret(),
+        )
     }
 
     fn members(&self) -> Arc<Members> {
@@ -586,10 +597,7 @@ impl Pool {
         }
         // Passive settings and cookie values are baked into each member: share
         // the old ones only when they still apply, otherwise rebuild them.
-        let cookie_secret = |pool: &Pool| {
-            (pool.settings.policy == Policy::Cookie)
-                .then(|| pool.settings.secret.clone().unwrap_or_default())
-        };
+        let cookie_secret = |pool: &Pool| pool.settings.cookie_secret().map(str::to_owned);
         let reusable = self.settings.passive == previous.settings.passive
             && cookie_secret(self) == cookie_secret(previous);
 
@@ -633,33 +641,33 @@ impl Pool {
     #[must_use]
     pub fn select(&self, context: &SelectContext<'_>) -> Option<Selection> {
         let members = self.members();
-
-        if self.settings.policy == Policy::Cookie {
-            return self.select_cookie(&members, context);
-        }
-
-        self.pick(self.settings.policy, &members, context)
-            .map(|upstream| Selection {
-                upstream,
-                set_cookie: None,
-            })
+        let settings = &self.settings;
+        let node = Node {
+            policy: settings.policy,
+            choose: settings.choose,
+            key: settings.key.as_deref(),
+            fallback: settings.fallback.as_ref(),
+        };
+        self.choose(node, &members, context)
     }
 
-    fn fallback(&self) -> Policy {
-        self.settings.fallback.unwrap_or(Policy::Random)
-    }
-
-    fn pick(
+    /// Selects with `node`; when its policy cannot decide, with its fallback.
+    fn choose(
         &self,
-        policy: Policy,
+        node: Node<'_>,
         members: &Members,
         context: &SelectContext<'_>,
-    ) -> Option<Arc<Upstream>> {
+    ) -> Option<Selection> {
         let upstreams = &members.upstreams;
+        let missing = || match node.fallback {
+            Some(next) => self.choose(Node::from(next), members, context),
+            None => pick_random(upstreams).map(Selection::plain),
+        };
 
-        match policy {
-            Policy::Random | Policy::Cookie => pick_random(upstreams),
-            Policy::RandomChoose => pick_random_choose(upstreams, self.settings.choose),
+        let picked = match node.policy {
+            Policy::Cookie => return self.select_cookie(node, members, context, missing),
+            Policy::Random => pick_random(upstreams),
+            Policy::RandomChoose => pick_random_choose(upstreams, node.choose),
             Policy::First => upstreams
                 .iter()
                 .find(|upstream| upstream.is_available())
@@ -676,17 +684,18 @@ impl Pool {
             }
             Policy::UriHash => match context.uri.and_then(Uri::path_and_query) {
                 Some(path) => pick_rendezvous(upstreams, path.as_str().as_bytes()),
-                None => self.pick(self.fallback(), members, context),
+                None => return missing(),
             },
-            Policy::Query => match self.query_value(context) {
+            Policy::Query => match query_value(node.key, context) {
                 Some(value) => pick_rendezvous(upstreams, value.as_bytes()),
-                None => self.pick(self.fallback(), members, context),
+                None => return missing(),
             },
-            Policy::Header => match self.header_value(context) {
+            Policy::Header => match header_value(node.key, context) {
                 Some(value) => pick_rendezvous(upstreams, value.as_bytes()),
-                None => self.pick(self.fallback(), members, context),
+                None => return missing(),
             },
-        }
+        };
+        picked.map(Selection::plain)
     }
 
     fn rotate(&self, upstreams: &[Arc<Upstream>], order: &[usize]) -> Option<Arc<Upstream>> {
@@ -700,23 +709,14 @@ impl Pool {
             .cloned()
     }
 
-    fn query_value<'a>(&self, context: &SelectContext<'a>) -> Option<&'a str> {
-        let key = self.settings.key.as_deref()?;
-        let query = context.uri?.query()?;
-        query.split('&').find_map(|pair| {
-            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (name == key && !value.is_empty()).then_some(value)
-        })
-    }
-
-    fn header_value<'a>(&self, context: &SelectContext<'a>) -> Option<&'a str> {
-        let key = self.settings.key.as_deref()?;
-        let value = context.headers?.get(key)?.to_str().ok()?;
-        (!value.is_empty()).then_some(value)
-    }
-
-    fn select_cookie(&self, members: &Members, context: &SelectContext<'_>) -> Option<Selection> {
-        let name = self.settings.key.as_deref().unwrap_or(DEFAULT_COOKIE_NAME);
+    fn select_cookie(
+        &self,
+        node: Node<'_>,
+        members: &Members,
+        context: &SelectContext<'_>,
+        missing: impl FnOnce() -> Option<Selection>,
+    ) -> Option<Selection> {
+        let name = node.key.unwrap_or(DEFAULT_COOKIE_NAME);
 
         if let Some(value) = context
             .headers
@@ -725,13 +725,10 @@ impl Pool {
                 upstream.cookie.as_deref() == Some(value) && upstream.is_available()
             })
         {
-            return Some(Selection {
-                upstream: Arc::clone(upstream),
-                set_cookie: None,
-            });
+            return Some(Selection::plain(Arc::clone(upstream)));
         }
 
-        let upstream = self.pick(self.fallback(), members, context)?;
+        let upstream = missing()?.upstream;
         let value = upstream.cookie.as_deref().unwrap_or_default();
         let secure = if context.secure {
             "; Secure; SameSite=None"
@@ -744,6 +741,40 @@ impl Pool {
             set_cookie,
         })
     }
+}
+
+/// Settings of one level of the policy chain.
+#[derive(Clone, Copy)]
+struct Node<'a> {
+    policy: Policy,
+    choose: usize,
+    key: Option<&'a str>,
+    fallback: Option<&'a Fallback>,
+}
+
+impl<'a> From<&'a Fallback> for Node<'a> {
+    fn from(fallback: &'a Fallback) -> Self {
+        Node {
+            policy: fallback.policy,
+            choose: fallback.choose,
+            key: fallback.key.as_deref(),
+            fallback: fallback.fallback.as_deref(),
+        }
+    }
+}
+
+fn query_value<'a>(key: Option<&str>, context: &SelectContext<'a>) -> Option<&'a str> {
+    let key = key?;
+    let query = context.uri?.query()?;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (name == key && !value.is_empty()).then_some(value)
+    })
+}
+
+fn header_value<'a>(key: Option<&str>, context: &SelectContext<'a>) -> Option<&'a str> {
+    let value = context.headers?.get(key?)?.to_str().ok()?;
+    (!value.is_empty()).then_some(value)
 }
 
 fn find_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1193,6 +1224,58 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(pick(&pool, &with_query), owner);
         }
+    }
+
+    #[test]
+    fn nested_fallbacks_use_their_own_keys() {
+        let fallback = |policy, key: Option<&str>, next: Option<Fallback>| Fallback {
+            policy,
+            choose: 2,
+            key: key.map(Into::into),
+            secret: None,
+            fallback: next.map(Box::new),
+        };
+        let mut config = group(Policy::Header, &[("a:1", 1), ("b:1", 1), ("c:1", 1)]);
+        config.key = Some("x-user".into());
+        config.fallback = Some(fallback(
+            Policy::Query,
+            Some("user"),
+            Some(fallback(Policy::First, None, None)),
+        ));
+        let pool = Pool::new("t", &config).unwrap();
+
+        // No header, no query: the innermost `first` fallback decides.
+        for _ in 0..5 {
+            assert_eq!(pick(&pool, &context()), "a:1");
+        }
+
+        // No header, but the query fallback has its own key.
+        let uri: Uri = "/?user=bob".parse().unwrap();
+        let with_query = SelectContext {
+            uri: Some(&uri),
+            ..context()
+        };
+        let owner = pick(&pool, &with_query);
+        for _ in 0..10 {
+            assert_eq!(pick(&pool, &with_query), owner);
+        }
+    }
+
+    #[test]
+    fn cookie_fallback_sets_cookie_for_other_policies() {
+        let mut config = group(Policy::Header, &[("a:1", 1), ("b:1", 1)]);
+        config.key = Some("x-user".into());
+        config.fallback = Some(Fallback {
+            policy: Policy::Cookie,
+            choose: 2,
+            key: Some("sid".into()),
+            secret: Some("s3cret".into()),
+            fallback: None,
+        });
+        let pool = Pool::new("t", &config).unwrap();
+        let selection = pool.select(&context()).unwrap();
+        let cookie = selection.set_cookie.expect("cookie fallback sets a cookie");
+        assert!(cookie.starts_with("sid="), "{cookie}");
     }
 
     #[test]

@@ -46,7 +46,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `query [key]` | `query` + `key` | ✅ | |
 | `header [field]` | `header` + `key` | ✅ | |
 | `cookie [name [secret]]` | `cookie` + `key`, `secret` | ✅ | HMAC-SHA256 of the backend address. `Secure; SameSite=None` on TLS listeners. |
-| `fallback <policy>` | `fallback` | 🟡 | One level. Caddy allows nesting fallbacks. |
+| `fallback <policy>` | `fallback` | ✅ | Policy name or a table with its own `key`, `secret`, `choose` and a nested `fallback`. |
 | Layer 4 policies (caddy-l4) | same policy names on `tcp`/`udp` servers | ✅ | HTTP-only policies are rejected for L4 at load time. |
 
 ## Retries
@@ -58,7 +58,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `lb_try_interval` | `try_interval` | ✅ | Default 250ms. |
 | Dial failures always retried | same | ✅ | |
 | Round-trip failures retried for `GET` by default | `GET`, `HEAD`, `OPTIONS` without body | ✅ | |
-| `lb_retry_match` | | ❌ | |
+| `lb_retry_match` | `retry_match = { method, status }` | ✅ | `method` lists methods retried after a failed round trip (default GET, HEAD, OPTIONS, bodyless only); `status` drops matching responses and retries another backend. |
 | Stale pooled connection transparently replaced | same | ✅ | |
 
 ## Active health checks
@@ -102,7 +102,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `X-Forwarded-For/Proto/Host` | same | ✅ | Client values kept only from `trusted_proxies`. |
 | `trusted_proxies` (+ `private_ranges`) | per server `trusted_proxies` | ✅ | |
 | `Forwarded` (RFC 7239) and `Via` | `request.headers.forwarded`, `response.headers.via` | ➕ | |
-| `header_up` / `header_down` set and delete | `request.headers.set/remove`, `response.headers.set/remove` | 🟡 | No `+` (add), no regex replace, no wildcard delete. |
+| `header_up` / `header_down` set, add, delete, replace | `request.headers.set/add/remove/replace`, `response.headers.set/add/remove/replace` | ✅ | Plus `add` (Caddy `+`), regex `replace` and `x-prefix-*` wildcard delete. Order: remove, replace, set, add. |
 | Upstream keep-alive pool | `keepalive`, `keepalive_idle_conns_per_host` | ✅ | |
 | `dial_timeout` | `dial_timeout` | ✅ | Default 3s. |
 | `read_timeout`, `write_timeout`, `response_header_timeout` | same names | ✅ | Unset by default. `response_header_timeout` gives `504`; read and write timeouts also apply to idle pooled connections and tunnels. |
@@ -175,11 +175,10 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). Ordered by value
 for a load balancer:
 
-1. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
-2. Compression (`encode`), range requests and ETags for the file server.
-3. Automatic HTTPS with ACME.
-4. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-5. HTTP/3.
+1. Compression (`encode`), range requests and ETags for the file server.
+2. Automatic HTTPS with ACME.
+3. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
+4. HTTP/3.
 
 ## Roadmap beyond Caddy
 

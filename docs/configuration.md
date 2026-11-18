@@ -88,9 +88,10 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `choose` | `2` | `random_choose <n>` | Sample size of `random_choose`. |
 | `key` | | `query [key]`, `header [field]`, `cookie [name]` | Query parameter, header or cookie name. Required for `query` and `header`; `cookie` defaults to `lb`. |
 | `secret` | `""` | `cookie name <secret>` | HMAC secret of the `cookie` policy. |
-| `fallback` | `"random"` | `fallback` | Policy used when the key of `query`, `header`, `uri_hash` or `cookie` is missing. |
+| `fallback` | `"random"` | `fallback` | Policy used when the key of `query`, `header`, `uri_hash` or `cookie` is missing. A policy name, or a table `{ policy, key, choose, secret, fallback }` whose own `fallback` nests another one, for example `fallback = { policy = "header", key = "x-user", fallback = "round_robin" }`. A `query`, `header` or `cookie` fallback uses its own `key`. Cookie values use the secret of the first `cookie` policy in the chain. |
+| `retry_match` | unset | `lb_retry_match` | `{ method = [...], status = [...] }`. `method`: methods whose bodyless requests are retried on another backend (default `GET`, `HEAD`, `OPTIONS`). `status`: response statuses (`"503"`, `"5xx"`) that make the proxy drop the response and retry another backend, only for requests retryable under `method`. Retries obey `retries` and `try_duration`; when they run out, the last response is returned. |
 | `retries` | `0` | `lb_retries` | Extra attempts after a failure. |
-| `try_duration` | unset | `lb_try_duration` | Keep retrying for this long. Wins over `retries`. |
+| `try_duration` | unset | `lb_try_duration` | Keep retrying for this long. Wins over `retries`. Round-trip and `retry_match.status` retries wait `try_interval` first and are skipped when that wait would pass this limit, counted from the first attempt. |
 | `try_interval` | `"250ms"` | `lb_try_interval` | Wait between attempts. |
 | `dial_timeout` | `"3s"` | `dial_timeout` | Connect timeout. |
 | `response_header_timeout` | unset | `response_header_timeout` | Time from sending the request to receiving the response headers. On expiry the client gets `504 Gateway Timeout` and the backend counts a passive failure. |
@@ -296,12 +297,16 @@ match = [
 | `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
 | `forward` / `serve` | Action, exactly one. |
 | `request.headers.set` | Headers to set on the upstream request, `{ name = "value" }`. |
-| `request.headers.remove` | Headers to remove from the upstream request. |
+| `request.headers.add` | Headers to append a value to, keeping existing ones, `{ name = "value" }`. |
+| `request.headers.remove` | Headers to remove from the upstream request. A trailing `*` removes every header with that prefix (`"x-debug-*"`); `"*"` alone is rejected. |
+| `request.headers.replace` | `{ "name" = { search = "regex", replace = "text $1" } }`: rewrites each value of the header with a regex. An invalid regex is a configuration error. |
 | `request.headers.forwarded` | `{ extend = true, by = "name" }`: RFC 7239 `Forwarded` header. `extend = false` replaces client values. |
-| `response.headers.set` / `remove` | Same for the response. |
+| `response.headers.set` / `add` / `remove` / `replace` | Same for the response. |
 | `response.headers.via` | `{ extend = true }` appends this proxy to `Via`. |
 | `response.headers.server` | `{ override = true, version = true }`: replace the backend `Server` header with `rxh/VERSION`. |
 | `cache` | `{ enabled = true, ttl_seconds = 30, max_entries = 1024, max_body_bytes = 1048576 }`: cache `200` responses to `GET` requests that have a `Content-Length` up to `max_body_bytes` and no `Set-Cookie`, `no-store` or `private`. |
+
+Header rules apply in this order: `remove`, `replace`, `set`, `add`.
 
 Virtual hosts on one listener:
 

@@ -17,6 +17,7 @@ use hyper::header::{self, HeaderValue};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use rxh_core::address::BackendAddress;
+use rxh_core::config::RetryMatch;
 use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
 
 use crate::http::body::{self, Guarded};
@@ -72,6 +73,7 @@ pub(crate) async fn forward(
         tls: site.tls,
         by: &site.by,
         rules: &route.request,
+        replace: &route.request_replace,
     };
     headers::prepare_request(
         &mut parts.headers,
@@ -119,19 +121,28 @@ pub(crate) async fn forward(
             .keys()
             .any(|name| name.eq_ignore_ascii_case("host"));
 
-    // Like Caddy, requests without a body and with a safe method are retried
-    // on another backend when the round trip fails after connecting.
+    // Like Caddy, bodyless requests with a retryable method (safe methods
+    // unless `retry_match.method` says otherwise) are retried on another
+    // backend when the round trip fails after connecting, or when the
+    // response status matches `retry_match.status`.
+    let settings = group.pool.settings();
+    let default_match = RetryMatch::default();
+    let retry_match = settings.retry_match.as_ref().unwrap_or(&default_match);
     let replay = (client_upgrade.is_none()
-        && matches!(
-            *outgoing.method(),
-            Method::GET | Method::HEAD | Method::OPTIONS
-        )
+        && retry_match.retries_method(outgoing.method())
         && hyper::body::Body::is_end_stream(outgoing.body()))
     .then(|| head(&outgoing));
-    let mut round_trip_retries = group.pool.settings().retries;
-    if group.pool.settings().try_duration.is_some() {
+    let mut round_trip_retries = settings.retries;
+    if settings.try_duration.is_some() {
         round_trip_retries = round_trip_retries.max(1);
     }
+    let first_try = Instant::now();
+    let in_budget = |retries: u32| {
+        retries > 0
+            && settings
+                .try_duration
+                .is_none_or(|limit| first_try.elapsed() + settings.try_interval < limit)
+    };
 
     // Loops only when a pooled connection turned out to be closed before the
     // request was written, so retrying is safe for any method.
@@ -181,6 +192,19 @@ pub(crate) async fn forward(
         };
 
         match sent {
+            Ok(unwanted)
+                if replay.is_some()
+                    && in_budget(round_trip_retries)
+                    && retry_match.retries_status(unwanted.status().as_u16()) =>
+            {
+                // The response is dropped unread; another backend gets the request.
+                selection
+                    .upstream
+                    .record_response(unwanted.status().as_u16(), started.elapsed());
+                round_trip_retries -= 1;
+                tokio::time::sleep(settings.try_interval).await;
+                outgoing = rebuild(replay.as_ref().expect("guard checked replay"));
+            }
             Ok(upstream_response) => break (selection, guard, started, upstream_response),
             Err(SendError::Stale(request)) if stale_attempts < MAX_STALE_RETRIES => {
                 stale_attempts += 1;
@@ -198,8 +222,9 @@ pub(crate) async fn forward(
                 selection.upstream.record_failure();
                 eprintln!("{} => upstream {address} failed: {err}", site.log_name);
                 match &replay {
-                    Some(head) if round_trip_retries > 0 => {
+                    Some(head) if in_budget(round_trip_retries) => {
                         round_trip_retries -= 1;
+                        tokio::time::sleep(settings.try_interval).await;
                         outgoing = rebuild(head);
                     }
                     _ => return response::bad_gateway(),
@@ -226,7 +251,12 @@ pub(crate) async fn forward(
 
         let (parts, _) = upstream_response.into_parts();
         let mut client_response = Response::from_parts(parts, body::empty());
-        headers::prepare_response(&mut client_response, &route.response, &site.by);
+        headers::prepare_response(
+            &mut client_response,
+            &route.response,
+            &route.response_replace,
+            &site.by,
+        );
         client_response
             .extensions_mut()
             .insert(UpstreamAddress(selection.upstream.address().to_owned()));
@@ -234,7 +264,12 @@ pub(crate) async fn forward(
     }
 
     let mut client_response = upstream_response.map(BodyExt::boxed);
-    headers::prepare_response(&mut client_response, &route.response, &site.by);
+    headers::prepare_response(
+        &mut client_response,
+        &route.response,
+        &route.response_replace,
+        &site.by,
+    );
 
     if let (Some(cache), Some(key)) = (&route.cache, cache_key) {
         client_response = store(cache, key, client_response).await;

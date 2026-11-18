@@ -26,6 +26,8 @@ policy = "least_conn"          # random | random_choose | first | round_robin |
 # key = "x-user"               # query/header/cookie name (cookie default "lb")
 # secret = "change-me"         # cookie HMAC secret
 # fallback = "random"          # used when the hash key is missing
+# fallback = { policy = "query", key = "user", fallback = "round_robin" }  # nested
+# retry_match = { method = ["GET", "POST"], status = ["502", "5xx"] }  # lb_retry_match
 retries = 2                    # extra attempts after a failure (lb_retries)
 # try_duration = "5s"          # keep retrying this long (lb_try_duration)
 try_interval = "250ms"         # wait between attempts (lb_try_interval)
@@ -114,10 +116,13 @@ uri = "/api"
 forward = "@api"
 request.headers.forwarded = { extend = true, by = "edge" }
 request.headers.set = { "x-proxied-by" = "rxh" }
-request.headers.remove = ["x-debug"]
+request.headers.remove = ["x-debug", "x-internal-*"]
+request.headers.add = { "x-extra" = "1" }
+request.headers.replace = { "x-path" = { search = "^/v1/(.*)$", replace = "/v2/$1" } }
 response.headers.via = { extend = true }
 response.headers.server = { override = true, version = false }
 response.headers.remove = ["x-powered-by"]
+response.headers.add = { "x-served-by" = "rxh" }
 cache = { enabled = true, ttl_seconds = 30, max_entries = 1024, max_body_bytes = 1048576 }
 
 # Matchers are ANDed: host, path, method, header, query and remote_ip.

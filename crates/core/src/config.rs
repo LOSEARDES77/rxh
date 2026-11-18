@@ -158,6 +158,16 @@ impl Config {
                 RequestMatcher::new(pattern, &server.host).map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
                 })?;
+                pattern.request.headers.validate().map_err(|err| {
+                    ConfigError::Invalid(format!(
+                        "{label}: match[{pattern_index}]: request.headers: {err}"
+                    ))
+                })?;
+                pattern.response.headers.validate().map_err(|err| {
+                    ConfigError::Invalid(format!(
+                        "{label}: match[{pattern_index}]: response.headers: {err}"
+                    ))
+                })?;
                 let Action::Forward(forward) = &pattern.action else {
                     continue;
                 };
@@ -661,6 +671,154 @@ impl From<ForwardOption> for Forward {
     }
 }
 
+/// Selection policy used when a policy cannot decide, with its own settings.
+///
+/// ```toml
+/// fallback = "random"
+/// fallback = { policy = "header", key = "x-user", fallback = "round_robin" }
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(from = "FallbackOption")]
+pub struct Fallback {
+    /// Selection policy.
+    pub policy: Policy,
+
+    /// Candidates sampled by `random_choose`.
+    pub choose: usize,
+
+    /// Query parameter, header or cookie name for `query`, `header` and `cookie`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    /// HMAC secret for the `cookie` policy. Cookie values use the secret of
+    /// the first `cookie` policy in the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+
+    /// Policy used when this one cannot decide. Defaults to random.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Box<Fallback>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FallbackOption {
+    Text(Policy),
+    Table(FallbackTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FallbackTable {
+    policy: Policy,
+    #[serde(default = "default::choose")]
+    choose: usize,
+    key: Option<String>,
+    secret: Option<String>,
+    fallback: Option<Box<Fallback>>,
+}
+
+impl From<FallbackOption> for Fallback {
+    fn from(value: FallbackOption) -> Self {
+        match value {
+            FallbackOption::Text(policy) => Fallback {
+                policy,
+                choose: default::choose(),
+                key: None,
+                secret: None,
+                fallback: None,
+            },
+            FallbackOption::Table(table) => Fallback {
+                policy: table.policy,
+                choose: table.choose,
+                key: table.key,
+                secret: table.secret,
+                fallback: table.fallback,
+            },
+        }
+    }
+}
+
+impl Fallback {
+    fn validate(&self) -> Result<(), String> {
+        if self.choose == 0 {
+            return Err(String::from("fallback: choose must be at least 1"));
+        }
+        if matches!(self.policy, Policy::Query | Policy::Header) && self.key.is_none() {
+            return Err(format!("fallback: policy {} needs a 'key'", self.policy));
+        }
+        Ok(())
+    }
+}
+
+/// Which requests are retried on another backend.
+///
+/// ```toml
+/// retry_match = { method = ["GET", "POST"], status = ["502", "5xx"] }
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetryMatch {
+    /// Methods whose bodyless requests are retried after a failed round trip.
+    /// Defaults to `GET`, `HEAD` and `OPTIONS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub method: Vec<String>,
+
+    /// Response statuses that make the proxy discard the response and try
+    /// another backend, for retryable requests only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status: Vec<StatusMatcher>,
+}
+
+impl RetryMatch {
+    fn validate(&self) -> Result<(), String> {
+        for method in &self.method {
+            http::Method::from_bytes(method.as_bytes())
+                .map_err(|_| format!("retry_match.method: invalid method {method:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Returns true if a bodyless request with `method` may be retried.
+    #[must_use]
+    pub fn retries_method(&self, method: &http::Method) -> bool {
+        if self.method.is_empty() {
+            return matches!(
+                *method,
+                http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+            );
+        }
+        self.method
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(method.as_str()))
+    }
+
+    /// Returns true if a response with `status` should be retried.
+    #[must_use]
+    pub fn retries_status(&self, status: u16) -> bool {
+        self.status.iter().any(|matcher| matcher.matches(status))
+    }
+}
+
+impl UpstreamGroup {
+    /// Secret of the first `cookie` policy of the chain (the group's policy,
+    /// then its fallbacks), if any: backends carry cookie values only then.
+    #[must_use]
+    pub fn cookie_secret(&self) -> Option<&str> {
+        if self.policy == Policy::Cookie {
+            return Some(self.secret.as_deref().unwrap_or(""));
+        }
+        let mut node = self.fallback.as_ref();
+        while let Some(fallback) = node {
+            if fallback.policy == Policy::Cookie {
+                return Some(fallback.secret.as_deref().unwrap_or(""));
+            }
+            node = fallback.fallback.as_deref();
+        }
+        None
+    }
+}
+
 /// Load balancing group: backends plus selection, retry and health settings.
 /// Field names follow Caddy's `reverse_proxy` subdirectives.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -683,8 +841,14 @@ pub struct UpstreamGroup {
     pub secret: Option<String>,
 
     /// Policy used when the key of a hash policy is missing. Defaults to random.
+    /// A policy name, or a table that can nest another fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<Policy>,
+    pub fallback: Option<Fallback>,
+
+    /// Which requests and responses are retried on another backend
+    /// (Caddy `lb_retry_match`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_match: Option<RetryMatch>,
 
     /// Extra attempts after a failed connection (Caddy `lb_retries`).
     #[serde(default, alias = "lb_retries")]
@@ -889,6 +1053,7 @@ impl UpstreamGroup {
             key: None,
             secret: None,
             fallback: None,
+            retry_match: None,
             retries: 0,
             try_duration: None,
             try_interval: default::try_interval(),
@@ -990,13 +1155,14 @@ impl UpstreamGroup {
             return Err(format!("policy {} needs a 'key'", self.policy));
         }
 
-        if self
-            .fallback
-            .is_some_and(|fallback| fallback.requires_key())
-        {
-            return Err(String::from(
-                "fallback must not be a hash policy that needs a key",
-            ));
+        let mut fallback = self.fallback.as_ref();
+        while let Some(node) = fallback {
+            node.validate()?;
+            fallback = node.fallback.as_deref();
+        }
+
+        if let Some(retry_match) = &self.retry_match {
+            retry_match.validate()?;
         }
 
         if let Some(passive) = &self.passive
@@ -1335,9 +1501,70 @@ pub struct RequestHeaders {
     #[serde(default)]
     pub set: HashMap<String, String>,
 
-    /// Headers to remove.
+    /// Headers to append a value to, keeping existing values.
+    #[serde(default)]
+    pub add: HashMap<String, String>,
+
+    /// Headers to remove. A trailing `*` removes every header with that prefix.
     #[serde(default)]
     pub remove: Vec<String>,
+
+    /// Regex rewrites of header values.
+    #[serde(default)]
+    pub replace: HashMap<String, HeaderReplace>,
+}
+
+/// Regex rewrite of every value of a header.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderReplace {
+    /// Regular expression to look for.
+    pub search: String,
+
+    /// Replacement, `$1` and `${name}` refer to capture groups.
+    pub replace: String,
+}
+
+fn validate_header_rules(
+    set: &HashMap<String, String>,
+    add: &HashMap<String, String>,
+    remove: &[String],
+    replace: &HashMap<String, HeaderReplace>,
+) -> Result<(), String> {
+    let names = set.keys().chain(add.keys()).chain(replace.keys());
+    for name in names {
+        http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("invalid header name {name:?}"))?;
+    }
+    for (name, rule) in replace {
+        regex::Regex::new(&rule.search)
+            .map_err(|err| format!("replace.{name}: invalid regex: {err}"))?;
+    }
+    for name in remove {
+        if name == "*" {
+            return Err(String::from(
+                "removing every header with \"*\" is not allowed",
+            ));
+        }
+        let name = name.strip_suffix('*').unwrap_or(name);
+        http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("invalid header name {name:?}"))?;
+    }
+    Ok(())
+}
+
+impl RequestHeaders {
+    /// Checks header names and wildcards.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_header_rules(&self.set, &self.add, &self.remove, &self.replace)
+    }
+}
+
+impl ResponseHeaders {
+    /// Checks header names and wildcards.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_header_rules(&self.set, &self.add, &self.remove, &self.replace)
+    }
 }
 
 /// Response header rules, applied before the response goes to the client.
@@ -1356,9 +1583,17 @@ pub struct ResponseHeaders {
     #[serde(default)]
     pub set: HashMap<String, String>,
 
-    /// Headers to remove.
+    /// Headers to append a value to, keeping existing values.
+    #[serde(default)]
+    pub add: HashMap<String, String>,
+
+    /// Headers to remove. A trailing `*` removes every header with that prefix.
     #[serde(default)]
     pub remove: Vec<String>,
+
+    /// Regex rewrites of header values.
+    #[serde(default)]
+    pub replace: HashMap<String, HeaderReplace>,
 }
 
 /// `Forwarded` header settings.
@@ -1786,6 +2021,69 @@ mod tests {
         )
         .expect_err("zero is invalid");
         assert!(err.to_string().contains("read_timeout"), "{err}");
+    }
+
+    #[test]
+    fn fallback_accepts_text_and_nested_tables() {
+        let config = Config::from_toml(
+            r#"
+            [upstream.text]
+            fallback = "round_robin"
+            backends = ["127.0.0.1:1"]
+
+            [upstream.nested]
+            policy = "header"
+            key = "x-a"
+            fallback = { policy = "query", key = "q", fallback = { policy = "cookie", key = "sid", secret = "s", fallback = "first" } }
+            retry_match = { method = ["POST"], status = ["502", "5xx"] }
+            backends = ["127.0.0.1:1"]
+            "#,
+        )
+        .expect("valid");
+        assert_eq!(
+            config.upstreams["text"].fallback.as_ref().unwrap().policy,
+            Policy::RoundRobin
+        );
+        let nested = &config.upstreams["nested"];
+        let query = nested.fallback.as_ref().unwrap();
+        assert_eq!(query.key.as_deref(), Some("q"));
+        let cookie = query.fallback.as_ref().unwrap();
+        assert_eq!(cookie.policy, Policy::Cookie);
+        assert_eq!(cookie.fallback.as_ref().unwrap().policy, Policy::First);
+        assert_eq!(nested.cookie_secret(), Some("s"));
+        let retry = nested.retry_match.as_ref().unwrap();
+        assert!(retry.retries_method(&http::Method::POST));
+        assert!(!retry.retries_method(&http::Method::GET));
+        assert!(
+            retry.retries_status(502) && retry.retries_status(500) && !retry.retries_status(404)
+        );
+    }
+
+    #[test]
+    fn nested_fallback_and_header_rules_are_validated() {
+        for extra in [
+            "fallback = { policy = \"query\" }",
+            "fallback = { policy = \"first\", fallback = { policy = \"header\" } }",
+            "fallback = { policy = \"first\", bogus = 1 }",
+            "retry_match = { method = [\"BAD METHOD\"] }",
+            "retry_match = { status = [\"nope\"] }",
+        ] {
+            let text = format!("[upstream.a]\nbackends = [\"127.0.0.1:1\"]\n{extra}\n");
+            assert!(Config::from_toml(&text).is_err(), "{extra}");
+        }
+        let text = "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"127.0.0.1:1\"\n";
+        for extra in [
+            "request.headers.remove = [\"*\"]",
+            "response.headers.remove = [\"*\"]",
+            "request.headers.add = { \"bad name\" = \"x\" }",
+            "request.headers.replace = { \"x\" = { search = \"(\", replace = \"\" } }",
+            "response.headers.replace = { \"x\" = { search = \"(\", replace = \"\" } }",
+        ] {
+            assert!(
+                Config::from_toml(&format!("{text}{extra}\n")).is_err(),
+                "{extra}"
+            );
+        }
     }
 
     #[test]

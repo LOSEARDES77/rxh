@@ -22,7 +22,7 @@ use crate::error::Error;
 use crate::files;
 use crate::http::body::Guarded;
 use crate::http::cache::Cache;
-use crate::http::headers;
+use crate::http::headers::{self, Replacement};
 use crate::http::proxy;
 use crate::http::response::{self, BoxResponse};
 use crate::log::{self, Logger};
@@ -58,6 +58,8 @@ pub(crate) struct Route {
     pub(crate) action: RouteAction,
     pub(crate) request: RequestHeaders,
     pub(crate) response: ResponseHeaders,
+    pub(crate) request_replace: Vec<Replacement>,
+    pub(crate) response_replace: Vec<Replacement>,
     pub(crate) cache: Option<Cache>,
 }
 
@@ -100,6 +102,16 @@ impl Site {
                 Action::Serve(root) => RouteAction::Files(root.clone()),
             };
 
+            let invalid = |side: &str, err: String| {
+                Error::Config(ConfigError::Invalid(format!(
+                    "match[{pattern_index}]: {side}.headers: {err}"
+                )))
+            };
+            let request_replace = Replacement::compile(&pattern.request.headers.replace)
+                .map_err(|err| invalid("request", err))?;
+            let response_replace = Replacement::compile(&pattern.response.headers.replace)
+                .map_err(|err| invalid("response", err))?;
+
             routes.push(Route {
                 site: Arc::clone(&site),
                 uri: pattern.uri.clone(),
@@ -111,6 +123,8 @@ impl Site {
                 action,
                 request: pattern.request.headers.clone(),
                 response: pattern.response.headers.clone(),
+                request_replace,
+                response_replace,
                 cache: Cache::new(&pattern.cache),
             });
         }

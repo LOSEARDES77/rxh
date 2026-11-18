@@ -6,6 +6,7 @@
 //! supplied `X-Forwarded-*` values are only kept when the peer is listed in
 //! `trusted_proxies`.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use hyper::HeaderMap;
@@ -14,7 +15,8 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::Version;
 use hyper::header::{self, HeaderName, HeaderValue};
-use rxh_core::config::{RequestHeaders, ResponseHeaders};
+use regex::Regex;
+use rxh_core::config::{HeaderReplace, RequestHeaders, ResponseHeaders};
 use rxh_core::net::IpNet;
 
 use crate::http::response;
@@ -54,6 +56,98 @@ pub(crate) struct Forwarding<'a> {
 
     /// User header rules.
     pub rules: &'a RequestHeaders,
+
+    /// Compiled `rules.replace`.
+    pub replace: &'a [Replacement],
+}
+
+/// Compiled `replace` rule of a header.
+#[derive(Debug)]
+pub(crate) struct Replacement {
+    name: HeaderName,
+    search: Regex,
+    replace: String,
+}
+
+impl Replacement {
+    /// Compiles the rules; an invalid regex is an error message.
+    pub(crate) fn compile(rules: &HashMap<String, HeaderReplace>) -> Result<Vec<Self>, String> {
+        rules
+            .iter()
+            .map(|(name, rule)| {
+                Ok(Replacement {
+                    name: HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| format!("invalid header name {name:?}"))?,
+                    search: Regex::new(&rule.search)
+                        .map_err(|err| format!("replace.{name}: invalid regex: {err}"))?,
+                    replace: rule.replace.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Applies `remove`, `replace`, `set` then `add`.
+fn apply_rules(
+    headers: &mut HeaderMap,
+    remove: &[String],
+    replace: &[Replacement],
+    set: &HashMap<String, String>,
+    add: &HashMap<String, String>,
+) {
+    for name in remove {
+        match name.strip_suffix('*') {
+            Some(prefix) => {
+                let prefix = prefix.to_ascii_lowercase();
+                let matching: Vec<HeaderName> = headers
+                    .keys()
+                    .filter(|name| name.as_str().starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                for name in matching {
+                    headers.remove(name);
+                }
+            }
+            None => {
+                if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+                    headers.remove(name);
+                }
+            }
+        }
+    }
+
+    for rule in replace {
+        let values: Vec<HeaderValue> = headers.get_all(&rule.name).iter().cloned().collect();
+        if values.is_empty() {
+            continue;
+        }
+        headers.remove(&rule.name);
+        for value in values {
+            let rewritten = value
+                .to_str()
+                .ok()
+                .map(|text| rule.search.replace_all(text, rule.replace.as_str()))
+                .and_then(|text| HeaderValue::from_str(&text).ok());
+            headers.append(&rule.name, rewritten.unwrap_or(value));
+        }
+    }
+
+    for (name, value) in set {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    for (name, value) in add {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
 }
 
 /// Real client IP: the left-most `X-Forwarded-For` entry when the peer is a
@@ -151,19 +245,14 @@ pub(crate) fn prepare_request(
     let via = format!("{} {}", version_token(version), forwarding.by);
     append_list(headers, header::VIA, &via);
 
-    for (name, value) in &forwarding.rules.set {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
-    for name in &forwarding.rules.remove {
-        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
-            headers.remove(name);
-        }
-    }
+    let rules = forwarding.rules;
+    apply_rules(
+        headers,
+        &rules.remove,
+        forwarding.replace,
+        &rules.set,
+        &rules.add,
+    );
 }
 
 fn set_x_forwarded(
@@ -240,6 +329,7 @@ fn quote(value: &str) -> String {
 pub(crate) fn prepare_response<B>(
     response: &mut Response<B>,
     rules: &ResponseHeaders,
+    replace: &[Replacement],
     received_by: &str,
 ) {
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
@@ -259,19 +349,7 @@ pub(crate) fn prepare_response<B>(
     if rules.via.extend {
         append_list(headers, header::VIA, &via);
     }
-    for (name, value) in &rules.set {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
-    for name in &rules.remove {
-        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
-            headers.remove(name);
-        }
-    }
+    apply_rules(headers, &rules.remove, replace, &rules.set, &rules.add);
 }
 
 fn version_token(version: Version) -> &'static str {
@@ -319,6 +397,7 @@ mod tests {
             tls: false,
             by: "edge",
             rules,
+            replace: &[],
         }
     }
 
@@ -411,6 +490,57 @@ mod tests {
         );
         assert_eq!(headers[header::HOST], "example.com:8443");
         assert_eq!(headers[header::VIA], "2 edge");
+    }
+
+    #[test]
+    fn rules_apply_in_order_with_wildcards_and_regex() {
+        let mut rules = RequestHeaders {
+            remove: vec!["x-debug-*".into()],
+            ..RequestHeaders::default()
+        };
+        rules.replace.insert(
+            "x-path".into(),
+            HeaderReplace {
+                search: "^/v1/(.*)$".into(),
+                replace: "/v2/$1".into(),
+            },
+        );
+        rules.set.insert("x-set".into(), "set".into());
+        rules.add.insert("x-multi".into(), "two".into());
+        let replace = Replacement::compile(&rules.replace).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-debug-a", "1".parse().unwrap());
+        headers.insert("x-debug-b", "1".parse().unwrap());
+        headers.insert("x-keep", "1".parse().unwrap());
+        headers.insert("x-path", "/v1/users".parse().unwrap());
+        headers.append("x-multi", "one".parse().unwrap());
+        apply_rules(
+            &mut headers,
+            &rules.remove,
+            &replace,
+            &rules.set,
+            &rules.add,
+        );
+
+        assert!(!headers.contains_key("x-debug-a") && !headers.contains_key("x-debug-b"));
+        assert_eq!(headers["x-keep"], "1");
+        assert_eq!(headers["x-path"], "/v2/users");
+        assert_eq!(headers["x-set"], "set");
+        let multi: Vec<_> = headers.get_all("x-multi").iter().collect();
+        assert_eq!(multi, ["one", "two"]);
+    }
+
+    #[test]
+    fn invalid_regex_is_an_error() {
+        let rules = HashMap::from([(
+            "x".to_owned(),
+            HeaderReplace {
+                search: "(".into(),
+                replace: String::new(),
+            },
+        )]);
+        assert!(Replacement::compile(&rules).is_err());
     }
 
     #[test]
