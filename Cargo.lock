@@ -1553,6 +1553,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "toml_edit",
 ]
 

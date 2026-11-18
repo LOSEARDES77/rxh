@@ -139,6 +139,30 @@ Docker and systemd files are in [`dist/`](dist).
    rxh stop
    ```
 
+### Quick file server and proxy
+
+No configuration file needed, like `caddy file-server` and `caddy reverse-proxy`:
+
+```bash
+rxh file-server                                   # serve . on http://127.0.0.1:8080
+rxh file-server --root ./public --listen 0.0.0.0:8000 --no-browse --encode
+rxh reverse-proxy --from 127.0.0.1:8080 --to 127.0.0.1:3001 127.0.0.1:3002 --policy round_robin
+```
+
+### CLI
+
+| Command | Does |
+|---|---|
+| `rxh run`, `start`, `stop`, `reload`, `status`, `validate` | Daemon lifecycle |
+| `rxh upstream add\|rm\|list` | Backends of a pool, live and saved |
+| `rxh pool add\|rm\|list [--file PATH]` | Pools (`--file` writes to an included file) |
+| `rxh service add\|rm\|list [--file PATH]` | Listeners |
+| `rxh config show [--json]` | Effective configuration, includes merged |
+| `rxh file-server`, `rxh reverse-proxy` | Run without a file |
+
+Split big setups with `include = ["conf.d/*.toml"]`, see
+[`examples/includes`](examples/includes) and the [reference](docs/configuration.md#includes).
+
 More configurations: [`examples/`](examples), including
 [every option](examples/full.toml), an
 [HTTP load balancer with sticky sessions](examples/http-load-balancer.toml)

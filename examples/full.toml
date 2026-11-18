@@ -5,6 +5,10 @@
 # Top level keys must come before the first [table].
 grace_period = "30s"
 
+# Split the configuration: merge other files (only [upstream.*] and [[server]]),
+# relative to this file, `*` and `?` in the last component. See examples/includes.
+# include = ["conf.d/*.toml"]
+
 # Admin API, used by the `rxh` CLI. No authentication: keep it on loopback.
 [admin]
 enabled = true                 # default true

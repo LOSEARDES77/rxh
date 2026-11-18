@@ -160,7 +160,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `caddy reload` | `rxh reload`, `SIGHUP` | ✅ | Zero downtime (`SO_REUSEPORT`); an invalid file keeps the running config. |
 | `caddy validate` | `rxh validate` | ✅ | |
 | `caddy fmt`, `caddy adapt` | | ❌ | |
-| `caddy reverse-proxy`, `caddy file-server` quick commands | `rxh service add --to/--serve` | 🟡 | Persists to the config file instead of running ad hoc. |
+| `caddy reverse-proxy` | `rxh reverse-proxy --from --to... [--policy] [--protocol] [--host]` | ✅ | Foreground, no file, admin disabled. `rxh service add --to` persists instead. |
+| `caddy file-server` | `rxh file-server [--listen] [--root] [--no-browse] [--encode]` | ✅ | Foreground, no file, admin disabled. `rxh service add --serve` persists instead. |
 | Admin API on `localhost:2019` | `[admin] listen` (same default) | ✅ | |
 | Admin origin / host checks | same | ✅ | Blocks DNS rebinding from browsers. |
 | `GET /config/` | `GET /config` | 🟡 | Read only, JSON, includes live pool members. |
@@ -169,6 +170,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `POST /stop` | same | ✅ | |
 | Admin over a unix socket | | ❌ | |
 | CLI to manage pools, peers and services | `rxh upstream`, `rxh pool`, `rxh service` | ➕ | Edits the TOML keeping comments, validates, applies live. |
+| Split configuration (Nginx `include`) | `include = ["conf.d/*.toml"]` | ➕ | Included files hold `upstream` and `server` only; the CLI edits the defining file; `--file PATH` on `pool add` and `service add`. |
+| Effective config | `rxh config show [--json]` | ➕ | Daemon `/config` when reachable, else the merged files. |
 | Live status table | `rxh status` | ➕ | |
 
 ## Next steps

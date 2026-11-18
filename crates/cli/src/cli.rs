@@ -75,6 +75,63 @@ pub(crate) enum Command {
 
     /// List load balancing policies.
     Policies,
+
+    /// Show the effective configuration, with includes merged.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+
+    /// Serve a directory over HTTP right now, without a configuration file.
+    FileServer {
+        /// Address to listen on.
+        #[arg(short, long, default_value = "127.0.0.1:8080", value_name = "ADDR")]
+        listen: SocketAddr,
+
+        /// Directory to serve.
+        #[arg(short, long, default_value = ".", value_name = "DIR")]
+        root: PathBuf,
+
+        /// Do not list directories that have no index file.
+        #[arg(long)]
+        no_browse: bool,
+
+        /// Compress responses with zstd and gzip on the fly.
+        #[arg(long)]
+        encode: bool,
+    },
+
+    /// Proxy an address to backends right now, without a configuration file.
+    ReverseProxy {
+        /// Address to listen on.
+        #[arg(short, long, value_name = "ADDR")]
+        from: SocketAddr,
+
+        /// Backend `host:port`. Repeatable, or several after one `--to`.
+        #[arg(short, long, required = true, num_args = 1.., value_name = "BACKEND")]
+        to: Vec<String>,
+
+        /// Load balancing policy (see `rxh policies`).
+        #[arg(short, long, default_value = "weighted_round_robin")]
+        policy: String,
+
+        /// Protocol.
+        #[arg(long, value_enum, default_value = "http")]
+        protocol: ServiceProtocol,
+
+        /// Only answer requests for this host name (http only).
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Print the effective configuration: the running daemon's when it is
+    /// reachable, else the files.
+    Show {
+        /// Print JSON instead of TOML.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -163,6 +220,12 @@ pub(crate) enum PoolCommand {
         /// Enable passive health checks remembering failures this long, like `30s`.
         #[arg(long, value_name = "DURATION")]
         fail_duration: Option<String>,
+
+        /// File to write to instead of the main configuration file. Created
+        /// if missing and added to `include` of the main file. A relative
+        /// path is relative to the directory of the main file.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
     },
 
     /// Delete a pool and reload the daemon.
@@ -216,6 +279,12 @@ pub(crate) enum ServiceCommand {
         /// Host name or `*.domain` to answer to (http only). Repeatable.
         #[arg(long, value_name = "NAME")]
         host: Vec<String>,
+
+        /// File to write to instead of the main configuration file. Created
+        /// if missing and added to `include` of the main file. A relative
+        /// path is relative to the directory of the main file.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
     },
 
     /// Remove a service by name or listen address and reload the daemon.
@@ -245,6 +314,37 @@ mod tests {
         };
         assert_eq!(pool, "api");
         assert_eq!(weight, 3);
+    }
+
+    #[test]
+    fn parses_quick_commands() {
+        let cli = Cli::parse_from(["rxh", "file-server", "--encode", "-r", "/srv"]);
+        let Some(Command::FileServer {
+            listen,
+            root,
+            encode,
+            ..
+        }) = cli.command
+        else {
+            panic!("unexpected parse: {cli:?}");
+        };
+        assert_eq!(listen.to_string(), "127.0.0.1:8080");
+        assert_eq!(root, PathBuf::from("/srv"));
+        assert!(encode);
+
+        let cli = Cli::parse_from([
+            "rxh",
+            "reverse-proxy",
+            "--from",
+            "0.0.0.0:80",
+            "--to",
+            "a:1",
+            "b:2",
+        ]);
+        let Some(Command::ReverseProxy { to, .. }) = cli.command else {
+            panic!("unexpected parse: {cli:?}");
+        };
+        assert_eq!(to, ["a:1", "b:2"]);
     }
 
     #[test]

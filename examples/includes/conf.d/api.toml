@@ -1,0 +1,8 @@
+[upstream.api]
+policy = "least_conn"
+backends = ["127.0.0.1:8081", "127.0.0.1:8082"]
+
+[[server]]
+name = "api"
+listen = "127.0.0.1:8080"
+forward = "@api"

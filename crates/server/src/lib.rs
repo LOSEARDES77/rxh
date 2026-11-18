@@ -12,6 +12,7 @@ mod error;
 mod files;
 mod health;
 mod http;
+mod include;
 mod log;
 mod master;
 mod metrics;
@@ -24,8 +25,9 @@ mod tls;
 mod udp;
 mod upstream;
 
-pub use daemon::{Daemon, load_config};
+pub use daemon::{Daemon, config_files, load_config};
 pub use error::Error;
+pub use include::covers as include_covers;
 pub use master::{Master, ServerInfo};
 pub use registry::{Group, Registry};
 pub use rxh_core::{VERSION, config, pool};

@@ -39,12 +39,16 @@ async fn backend(tag: &'static str) -> SocketAddr {
 }
 
 async fn try_get(address: SocketAddr) -> Option<String> {
+    try_get_path(address, "/").await
+}
+
+async fn try_get_path(address: SocketAddr, path: &str) -> Option<String> {
     let stream = TcpStream::connect(address).await.ok()?;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .ok()?;
     tokio::task::spawn(connection);
-    let request = hyper::Request::get("/").body(Empty::<Bytes>::new()).ok()?;
+    let request = hyper::Request::get(path).body(Empty::<Bytes>::new()).ok()?;
     let response = sender.send_request(request).await.ok()?;
     let body = response.into_body().collect().await.ok()?.to_bytes();
     Some(String::from_utf8_lossy(&body).into_owned())
@@ -264,4 +268,146 @@ fn validate_reports_errors() {
         stderr.contains("unknown upstream group @missing"),
         "{stderr}"
     );
+}
+
+fn spawn_rxh(directory: &Path, args: &[&str]) -> Daemon {
+    Daemon(
+        Command::new(RXH)
+            .current_dir(directory)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("rxh starts"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_server_serves_the_directory_without_a_config() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    std::fs::write(directory.path().join("hello.txt"), "hi there").expect("write");
+    let listen = free_port();
+
+    let output = Command::new(RXH)
+        .args(["file-server", "--root", "/definitely/not/here"])
+        .output()
+        .expect("rxh runs");
+    assert!(!output.status.success());
+
+    let _server = spawn_rxh(
+        directory.path(),
+        &[
+            "file-server",
+            "--listen",
+            &listen.to_string(),
+            "--no-browse",
+        ],
+    );
+    for _ in 0..250 {
+        if try_get_path(listen, "/hello.txt").await.as_deref() == Some("hi there") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("file server never served hello.txt");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reverse_proxy_forwards_to_the_backends() {
+    let first = backend("proxied").await;
+    let listen = free_port();
+    let directory = tempfile::tempdir().expect("temp dir");
+
+    let _proxy = spawn_rxh(
+        directory.path(),
+        &[
+            "reverse-proxy",
+            "--from",
+            &listen.to_string(),
+            "--to",
+            &first.to_string(),
+        ],
+    );
+    wait_for_body(listen, "proxied").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn includes_are_edited_in_the_file_that_defines_them() {
+    let first = backend("first").await;
+    let second = backend("second").await;
+    let admin = free_port();
+    let web = free_port();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::create_dir(dir.join("conf.d")).expect("mkdir");
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!("include = [\"conf.d/*.toml\"]\n[admin]\nlisten = \"{admin}\"\n"),
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("conf.d/api.toml"),
+        format!(
+            "[upstream.api]\npolicy = \"round_robin\"\nbackends = [\"{first}\"]\n\n\
+             [[server]]\nname = \"web\"\nlisten = \"{web}\"\nforward = \"@api\"\n"
+        ),
+    )
+    .expect("write");
+
+    let _daemon = start_daemon(dir);
+    wait_for_body(web, "first").await;
+
+    // The backend lands in the included file and the main file is untouched.
+    let main_before = std::fs::read_to_string(dir.join("rxh.toml")).expect("read");
+    assert_success(&rxh(
+        dir,
+        admin,
+        &["upstream", "add", "api", &second.to_string()],
+    ));
+    let included = std::fs::read_to_string(dir.join("conf.d/api.toml")).expect("read");
+    assert!(included.contains(&second.to_string()), "{included}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("rxh.toml")).expect("read"),
+        main_before
+    );
+    assert_success(&rxh(
+        dir,
+        admin,
+        &["upstream", "rm", "api", &first.to_string()],
+    ));
+    wait_for_body(web, "second").await;
+
+    // `--file` creates a new file and registers it in `include`.
+    assert_success(&rxh(
+        dir,
+        admin,
+        &[
+            "pool",
+            "add",
+            "db",
+            "--backend",
+            "127.0.0.1:1",
+            "--file",
+            "extra/db.toml",
+        ],
+    ));
+    assert!(
+        std::fs::read_to_string(dir.join("extra/db.toml"))
+            .expect("read")
+            .contains("[upstream.db]")
+    );
+    let main = std::fs::read_to_string(dir.join("rxh.toml")).expect("read");
+    assert!(main.contains("extra/db.toml"), "{main}");
+
+    // The merged configuration, from the daemon and from the files.
+    let shown = assert_success(&rxh(dir, admin, &["config", "show", "--json"]));
+    let shown: serde_json::Value = serde_json::from_str(&shown).expect("JSON");
+    assert!(shown["upstream"]["db"].is_object() && shown["upstream"]["api"].is_object());
+    let toml = assert_success(&rxh(dir, admin, &["config", "show"]));
+    assert!(toml.contains("[upstream.api]"), "{toml}");
+
+    // Remove the service from the file that defines it, after it was reloaded.
+    assert_success(&rxh(dir, admin, &["service", "rm", "web"]));
+    let included = std::fs::read_to_string(dir.join("conf.d/api.toml")).expect("read");
+    assert!(!included.contains("[[server]]"), "{included}");
 }

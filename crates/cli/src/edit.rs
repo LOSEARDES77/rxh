@@ -37,22 +37,27 @@ pub(crate) struct ServiceSpec {
 pub(crate) struct ConfigFile {
     path: PathBuf,
     document: DocumentMut,
+    /// Text on disk when opened, `None` if the file did not exist.
+    original: Option<String>,
 }
 
 impl ConfigFile {
     /// Loads `path`. A missing file starts as an empty document.
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        let original = match fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => return Err(format!("{}: {err}", path.display())),
         };
-        let document = text
+        let document = original
+            .as_deref()
+            .unwrap_or_default()
             .parse()
             .map_err(|err| format!("{}: {err}", path.display()))?;
         Ok(Self {
             path: path.to_owned(),
             document,
+            original,
         })
     }
 
@@ -61,12 +66,49 @@ impl ConfigFile {
         Self {
             path: PathBuf::from("test.toml"),
             document: text.parse().expect("valid TOML"),
+            original: Some(text.to_owned()),
         }
     }
 
     /// Path of the file.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// True if `[upstream.NAME]` is defined in this file.
+    pub(crate) fn defines_pool(&self, name: &str) -> bool {
+        self.document
+            .get("upstream")
+            .and_then(|upstreams| upstreams.get(name))
+            .is_some_and(Item::is_table)
+    }
+
+    /// Entries of the top level `include` list.
+    pub(crate) fn includes(&self) -> Vec<String> {
+        self.document
+            .get("include")
+            .and_then(Item::as_array)
+            .map(|include| {
+                include
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Appends `path` to the top level `include` list unless it is there.
+    pub(crate) fn add_include(&mut self, path: &str) -> Result<(), String> {
+        let include = self
+            .document
+            .entry("include")
+            .or_insert_with(|| value(Array::new()))
+            .as_array_mut()
+            .ok_or("`include` is not an array")?;
+        if !include.iter().any(|entry| entry.as_str() == Some(path)) {
+            include.push(path);
+        }
+        Ok(())
     }
 
     fn pool_mut(&mut self, pool: &str) -> Result<&mut Table, String> {
@@ -258,19 +300,81 @@ impl ConfigFile {
         }
         Ok(removed)
     }
+}
 
-    /// Validates the edited document and writes it atomically.
-    pub(crate) fn save(&self) -> Result<Config, String> {
-        let text = self.document.to_string();
-        let config = Config::from_toml(&text)
-            .map_err(|err| format!("the change would break the configuration: {err}"))?;
+/// Writes the edited `files`, then loads the whole configuration starting at
+/// `main` (includes merged) to validate it. If that fails every file goes
+/// back to what it was and the error is returned.
+pub(crate) fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
+    // Topmost directory each new file needs, removed again on rollback.
+    let created_directories: Vec<PathBuf> = files
+        .iter()
+        .filter(|file| file.original.is_none())
+        .filter_map(|file| {
+            let mut missing = None;
+            for ancestor in file.path.ancestors().skip(1) {
+                if ancestor.as_os_str().is_empty() || ancestor.exists() {
+                    break;
+                }
+                missing = Some(ancestor.to_owned());
+            }
+            missing
+        })
+        .collect();
 
-        let temporary = self.path.with_extension("toml.tmp");
-        fs::write(&temporary, &text).map_err(|err| format!("{}: {err}", temporary.display()))?;
-        fs::rename(&temporary, &self.path)
-            .map_err(|err| format!("{}: {err}", self.path.display()))?;
-        Ok(config)
+    let written = files
+        .iter()
+        .try_for_each(|file| write_atomically(&file.path, &file.document.to_string()));
+    let outcome = written
+        .map_err(|err| err.to_string())
+        .and_then(|()| rxh_server::load_config(main).map_err(|err| err.to_string()));
+    let err = match outcome {
+        Ok(config) => return Ok(config),
+        Err(err) => err,
+    };
+
+    let mut failures = Vec::new();
+    for file in files {
+        let restored = match &file.original {
+            Some(text) => write_atomically(&file.path, text),
+            None => match fs::remove_file(&file.path) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                    Err(format!("{}: {err}", file.path.display()))
+                }
+                _ => Ok(()),
+            },
+        };
+        if let Err(err) = restored {
+            failures.push(err);
+        }
     }
+    for directory in created_directories {
+        if let Err(err) = fs::remove_dir_all(&directory)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            failures.push(format!("{}: {err}", directory.display()));
+        }
+    }
+
+    let mut message = format!("the change would break the configuration: {err}");
+    if !failures.is_empty() {
+        message.push_str(&format!(
+            "\nrollback failed, check these files by hand: {}",
+            failures.join("; ")
+        ));
+    }
+    Err(message)
+}
+
+fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory).map_err(|err| format!("{}: {err}", directory.display()))?;
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    fs::write(&temporary, text).map_err(|err| format!("{}: {err}", temporary.display()))?;
+    fs::rename(&temporary, path).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Value as a string when there is one entry, as an array otherwise.

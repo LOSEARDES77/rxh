@@ -24,6 +24,39 @@ grace_period = "30s"     # top level options
 | Key | Default | Description |
 |---|---|---|
 | `grace_period` | unset (wait forever) | Time open connections get to finish on stop or reload before they are closed. Idle keep-alive HTTP connections are closed right away. |
+| `include` | `[]` | Files merged into this one, see [Includes](#includes). Must come before the first `[table]`. |
+
+## Includes
+
+`include` splits a configuration into several files, like Nginx `include`:
+
+```toml
+include = ["conf.d/*.toml", "extra.toml"]
+```
+
+- Paths are relative to the directory of the main file. `*` and `?` work only in
+  the last path component, and a glob may match nothing. A path without a
+  wildcard must exist.
+- An included file may contain only `[upstream.NAME]` and `[[server]]`. Any
+  other table, including `include`, is an error.
+- The files are merged before validation, so a server can reference a pool
+  defined in another file. A pool name defined in two files is an error.
+- Servers keep the order main file first, then the included files sorted by
+  path. Reloads (`rxh reload`, `SIGHUP`, `POST /reload`) read the files again.
+- `rxh upstream add|rm`, `rxh pool rm` and `rxh service rm` edit the file that
+  defines the pool or service. `rxh pool add` and `rxh service add` write to
+  the main file, or to `--file PATH` (relative to the main file directory),
+  which is created if missing and added to `include` if not already covered.
+- `rxh config show [--json]` prints the effective merged configuration, from
+  the running daemon when reachable, else from the files.
+
+## Quick commands without a file
+
+`rxh file-server [--listen ADDR] [--root DIR] [--no-browse] [--encode]` serves a
+directory in the foreground (default `127.0.0.1:8080` and `.`).
+`rxh reverse-proxy --from ADDR --to BACKEND... [--policy P] [--protocol http|tcp|udp]
+[--host NAME]` proxies in the foreground. Both disable the admin API, and
+reload requests answer "no configuration file to reload".
 
 ## `[admin]`
 

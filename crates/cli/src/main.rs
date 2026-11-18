@@ -5,12 +5,14 @@ mod client;
 mod commands;
 mod edit;
 mod process;
+mod quick;
 
-use std::net::TcpListener;
-use std::path::PathBuf;
+use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use rxh_core::config::Config;
 
 use crate::cli::{Cli, Command};
 
@@ -20,6 +22,24 @@ fn main() -> ExitCode {
     let result = match cli.command.take() {
         None | Some(Command::Run) => run(&cli),
         Some(Command::Start { log_file }) => start(&cli, log_file),
+        Some(Command::FileServer {
+            listen,
+            root,
+            no_browse,
+            encode,
+        }) => file_server(listen, &root, !no_browse, encode),
+        Some(Command::ReverseProxy {
+            from,
+            to,
+            policy,
+            protocol,
+            host,
+        }) => {
+            quick::reverse_proxy(from, &to, &policy, protocol, host.as_deref()).and_then(|config| {
+                println!("Proxying {from} to {}", to.join(", "));
+                run_config(config)
+            })
+        }
         Some(command) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -45,6 +65,31 @@ fn run(cli: &Cli) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     runtime
         .block_on(rxh_server::Daemon::new(path).run())
+        .map_err(|err| err.to_string())
+}
+
+/// `rxh file-server`: serves a directory without a configuration file.
+fn file_server(listen: SocketAddr, root: &Path, browse: bool, encode: bool) -> Result<(), String> {
+    let root = std::fs::canonicalize(root).map_err(|err| format!("{}: {err}", root.display()))?;
+    if !root.is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    let config = quick::file_server(listen, &root, browse, encode)?;
+    // Fail with a clear message now if the address is taken; the daemon
+    // binds it again right after.
+    TcpListener::bind(listen).map_err(|err| format!("cannot listen on {listen}: {err}"))?;
+    println!("Serving {} on http://{listen}", root.display());
+    run_config(config)
+}
+
+/// Runs a configuration that has no file in the foreground.
+fn run_config(config: Config) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    runtime
+        .block_on(rxh_server::Daemon::from_config(config).run())
         .map_err(|err| err.to_string())
 }
 

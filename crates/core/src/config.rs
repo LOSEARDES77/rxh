@@ -82,6 +82,12 @@ pub struct Config {
     )]
     pub grace_period: Option<Duration>,
 
+    /// Files merged into this one, relative to the directory of the main
+    /// file. `*` and `?` work in the last path component. Followed by the
+    /// loader of the daemon, which empties this list after merging.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+
     /// Named load balancing groups, referenced from servers as `"@name"`.
     #[serde(
         default,
@@ -95,12 +101,64 @@ pub struct Config {
     pub servers: Vec<Server>,
 }
 
-impl Config {
-    /// Parses and validates a TOML document.
+/// Content of an included file: only pools and servers.
+///
+/// ```toml
+/// [upstream.api]
+/// backends = ["127.0.0.1:8080"]
+///
+/// [[server]]
+/// listen = "0.0.0.0:80"
+/// forward = "@api"
+/// ```
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct IncludedConfig {
+    /// Pools, merged into [`Config::upstreams`].
+    #[serde(default, rename = "upstream")]
+    pub upstreams: BTreeMap<String, UpstreamGroup>,
+
+    /// Servers, appended to [`Config::servers`].
+    #[serde(default, rename = "server")]
+    pub servers: Vec<Server>,
+}
+
+impl IncludedConfig {
+    /// Parses an included file. Any table other than `upstream` and `server`
+    /// is an error.
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(text)?;
+        Ok(toml::from_str(text)?)
+    }
+}
+
+impl Config {
+    /// Parses and validates a TOML document. `include` is not followed, use
+    /// [`Config::parse`] and [`Config::merge`] for that.
+    pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
+        let config = Self::parse(text)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Parses a TOML document without validating it, so included files can
+    /// be merged first.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        Ok(toml::from_str(text)?)
+    }
+
+    /// Adds the pools and servers of an included file, named `origin` in
+    /// error messages. A pool name defined twice is an error.
+    pub fn merge(&mut self, included: IncludedConfig, origin: &str) -> Result<(), ConfigError> {
+        for (name, group) in included.upstreams {
+            if self.upstreams.contains_key(&name) {
+                return Err(ConfigError::Invalid(format!(
+                    "{origin}: pool {name} is already defined in another file"
+                )));
+            }
+            self.upstreams.insert(name, group);
+        }
+        self.servers.extend(included.servers);
+        Ok(())
     }
 
     /// Checks references and protocol constraints that serde cannot express.
@@ -2210,6 +2268,34 @@ mod tests {
                 "{extra}"
             );
         }
+    }
+
+    #[test]
+    fn included_files_merge_pools_and_servers() {
+        let mut config =
+            Config::parse("include = [\"a.toml\"]\n[upstream.web]\nbackends = [\"127.0.0.1:1\"]\n")
+                .expect("main parses");
+        let part = IncludedConfig::from_toml(
+            "[upstream.api]\nbackends = [\"127.0.0.1:2\"]\n\
+             [[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"@api\"\n",
+        )
+        .expect("part parses");
+        config.merge(part, "a.toml").expect("merges");
+        config
+            .validate()
+            .expect("pool references resolve after the merge");
+        assert_eq!(config.include, ["a.toml"]);
+        assert_eq!(config.upstreams.len(), 2);
+
+        let duplicate = IncludedConfig::from_toml("[upstream.web]\nbackends = [\"127.0.0.1:3\"]\n")
+            .expect("parses");
+        let err = config
+            .merge(duplicate, "b.toml")
+            .expect_err("duplicate pool");
+        assert!(err.to_string().contains("pool web"), "{err}");
+
+        assert!(IncludedConfig::from_toml("[admin]\nenabled = false\n").is_err());
+        assert!(IncludedConfig::from_toml("include = [\"x\"]\n").is_err());
     }
 
     #[test]

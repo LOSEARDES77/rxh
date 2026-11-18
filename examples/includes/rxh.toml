@@ -1,0 +1,7 @@
+# Split configuration. Run with: rxh run -c examples/includes/rxh.toml
+# Paths are relative to this file. Included files hold only [upstream.NAME]
+# and [[server]]; pools can be referenced across files.
+include = ["conf.d/*.toml"]
+
+[admin]
+listen = "127.0.0.1:2019"
