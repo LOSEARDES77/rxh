@@ -15,6 +15,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rxh_core::config::UpstreamGroup;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::http::body::Body;
 use crate::stream::Dialer;
@@ -27,6 +28,9 @@ struct Idle {
     since: Instant,
 }
 
+/// Slot of `max_conns_per_host`, free again once every clone is dropped.
+pub(crate) type Permit = Option<Arc<OwnedSemaphorePermit>>;
+
 /// Connection ready to carry one request.
 #[derive(Debug)]
 pub(crate) enum Connection {
@@ -34,6 +38,7 @@ pub(crate) enum Connection {
     Http1 {
         sender: http1::SendRequest<Body>,
         reused: bool,
+        permit: Permit,
     },
 
     /// Shared HTTP/2 connection.
@@ -58,6 +63,9 @@ pub(crate) struct Transport {
     keepalive: Duration,
     max_idle: usize,
     h2c: bool,
+    max_conns: usize,
+    /// One semaphore of `max_conns` permits per backend address.
+    limits: Mutex<HashMap<String, Arc<Semaphore>>>,
     idle: Arc<Mutex<IdleMap>>,
     http2: Mutex<HashMap<String, http2::SendRequest<Body>>>,
 }
@@ -69,12 +77,15 @@ impl Transport {
             keepalive: settings.keepalive,
             max_idle: settings.keepalive_idle_conns_per_host,
             h2c: settings.h2c,
+            max_conns: settings.max_conns_per_host,
+            limits: Mutex::default(),
             idle: Arc::default(),
             http2: Mutex::default(),
         }
     }
 
     /// Returns a connection to `address`, reusing an idle one if possible.
+    /// With `max_conns_per_host`, waits until the backend has a free slot.
     /// Errors here happen before the request is consumed, so they can be
     /// retried on another backend.
     pub(crate) async fn connect(&self, address: &str) -> io::Result<Connection> {
@@ -110,17 +121,39 @@ impl Transport {
             return Ok(Connection::Http2(sender));
         }
 
+        let permit = self.acquire(address).await;
         if let Some(sender) = self.take_idle(address) {
             return Ok(Connection::Http1 {
                 sender,
                 reused: true,
+                permit,
             });
         }
 
         Ok(Connection::Http1 {
             sender: self.dial_http1(address).await?,
             reused: false,
+            permit,
         })
+    }
+
+    /// Waits for one of the `max_conns_per_host` slots of `address`.
+    async fn acquire(&self, address: &str) -> Permit {
+        if self.max_conns == 0 {
+            return None;
+        }
+        let semaphore = Arc::clone(
+            self.limits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(address.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.max_conns))),
+        );
+        let permit = semaphore
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        Some(Arc::new(permit))
     }
 
     async fn dial_http1(&self, address: &str) -> io::Result<http1::SendRequest<Body>> {
@@ -152,9 +185,11 @@ impl Transport {
     }
 
     /// Puts the connection back in the idle pool once the response body has
-    /// been read completely.
-    fn recycle(&self, address: &str, mut sender: http1::SendRequest<Body>) {
-        if self.keepalive.is_zero() || self.max_idle == 0 {
+    /// been read completely. `permit` is held until then, or until the
+    /// connection closes.
+    fn recycle(&self, address: &str, mut sender: http1::SendRequest<Body>, permit: Permit) {
+        let pooled = !self.keepalive.is_zero() && self.max_idle > 0;
+        if !pooled && permit.is_none() {
             return;
         }
 
@@ -163,7 +198,9 @@ impl Transport {
         let (keepalive, max_idle) = (self.keepalive, self.max_idle);
 
         tokio::task::spawn(async move {
-            if sender.ready().await.is_err() {
+            // Dropped last, after the connection is idle or closed.
+            let _permit = permit;
+            if sender.ready().await.is_err() || !pooled {
                 return;
             }
             let mut idle = idle.lock().unwrap_or_else(PoisonError::into_inner);
@@ -178,30 +215,33 @@ impl Transport {
         });
     }
 
-    /// Sends `request` over `connection`.
+    /// Sends `request` over `connection`. The caller keeps the returned
+    /// permit until it is done with the response body or the upgraded tunnel.
     pub(crate) async fn send(
         &self,
         address: &str,
         connection: Connection,
         request: Request<Body>,
-    ) -> Result<Response<Incoming>, SendError> {
+    ) -> Result<(Response<Incoming>, Permit), SendError> {
         match connection {
-            Connection::Http2(mut sender) => sender
-                .send_request(request)
-                .await
-                .map_err(|err| SendError::Failed(io::Error::other(err))),
-            Connection::Http1 { mut sender, reused } => {
-                match sender.try_send_request(request).await {
-                    Ok(response) => {
-                        self.recycle(address, sender);
-                        Ok(response)
-                    }
-                    Err(mut err) => match err.take_message() {
-                        Some(request) if reused => Err(SendError::Stale(Box::new(request))),
-                        _ => Err(SendError::Failed(io::Error::other(err.into_error()))),
-                    },
+            Connection::Http2(mut sender) => match sender.send_request(request).await {
+                Ok(response) => Ok((response, None)),
+                Err(err) => Err(SendError::Failed(io::Error::other(err))),
+            },
+            Connection::Http1 {
+                mut sender,
+                reused,
+                permit,
+            } => match sender.try_send_request(request).await {
+                Ok(response) => {
+                    self.recycle(address, sender, permit.clone());
+                    Ok((response, permit))
                 }
-            }
+                Err(mut err) => match err.take_message() {
+                    Some(request) if reused => Err(SendError::Stale(Box::new(request))),
+                    _ => Err(SendError::Failed(io::Error::other(err.into_error()))),
+                },
+            },
         }
     }
 

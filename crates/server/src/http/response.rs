@@ -55,6 +55,11 @@ pub(crate) fn not_found() -> BoxResponse {
     plain(StatusCode::NOT_FOUND, "HTTP 404 NOT FOUND")
 }
 
+/// `413 Content Too Large`: the request body is over `request.max_body_size`.
+pub(crate) fn payload_too_large() -> BoxResponse {
+    plain(StatusCode::PAYLOAD_TOO_LARGE, "HTTP 413 CONTENT TOO LARGE")
+}
+
 /// `502 Bad Gateway`: the backend failed.
 pub(crate) fn bad_gateway() -> BoxResponse {
     plain(StatusCode::BAD_GATEWAY, "HTTP 502 BAD GATEWAY")

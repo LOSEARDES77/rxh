@@ -12,6 +12,7 @@ pub mod duration;
 pub mod matcher;
 pub mod net;
 pub mod pool;
+pub mod size;
 pub mod status;
 pub mod template;
 

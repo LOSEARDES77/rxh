@@ -63,6 +63,8 @@ pub(crate) struct Route {
     pub(crate) rewrite: Option<Template>,
     /// Method the request is forwarded or served with.
     pub(crate) method: Option<Method>,
+    /// Largest request body accepted, in bytes.
+    pub(crate) max_body_size: Option<usize>,
     pub(crate) request: RequestHeaders,
     pub(crate) response: ResponseHeaders,
     pub(crate) request_replace: Vec<Replacement>,
@@ -170,6 +172,7 @@ impl Site {
                 action,
                 rewrite,
                 method,
+                max_body_size: pattern.request.max_body_size,
                 request: pattern.request.headers.clone(),
                 response: pattern.response.headers.clone(),
                 request_replace,
@@ -320,11 +323,18 @@ impl Service {
             *request.method_mut() = method.clone();
         }
 
+        // Declared length; bodies without one are counted as they stream.
+        let declared = hyper::body::Body::size_hint(request.body()).lower();
+        let too_large = route
+            .and_then(|route| route.max_body_size)
+            .is_some_and(|limit| declared > limit as u64);
+
         let mut response = match route {
             None => response::not_found(),
             Some(_) if rewrite_failed => {
                 response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST")
             }
+            Some(_) if too_large => response::payload_too_large(),
             Some(route) => match &route.action {
                 RouteAction::Proxy(group) => proxy::forward(request, route, group, &self).await,
                 RouteAction::Files(files) => {

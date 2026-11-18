@@ -2,6 +2,7 @@
 //! response back and feeds passive health checks.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -20,12 +21,12 @@ use rxh_core::address::BackendAddress;
 use rxh_core::config::RetryMatch;
 use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
 
-use crate::http::body::{self, Guarded};
+use crate::http::body::{self, BodyError, Guarded};
 use crate::http::cache::Cache;
 use crate::http::headers::{self, Forwarding};
 use crate::http::response::{self, BoxResponse};
 use crate::http::service::{Route, Service, UpstreamAddress};
-use crate::http::transport::SendError;
+use crate::http::transport::{Permit, SendError};
 use crate::registry::Group;
 use crate::upstream::{self, DialError};
 
@@ -105,11 +106,38 @@ pub(crate) async fn forward(
         parts.version = Version::HTTP_11;
     }
 
-    let outgoing = if client_upgrade.is_some() {
-        body::empty()
-    } else {
-        incoming.boxed()
+    let settings = group.pool.settings();
+    // Set when the request body turns out to be larger than `max_body_size`.
+    let too_large = Arc::new(AtomicBool::new(false));
+    let mut outgoing = match route.max_body_size {
+        _ if client_upgrade.is_some() => body::empty(),
+        Some(limit) => {
+            let too_large = Arc::clone(&too_large);
+            Limited::new(incoming, limit)
+                .map_err(move |err| match err.downcast::<hyper::Error>() {
+                    Ok(err) => BodyError::Hyper(*err),
+                    Err(_) => {
+                        too_large.store(true, Ordering::Release);
+                        BodyError::TooLarge
+                    }
+                })
+                .boxed()
+        }
+        None => body::incoming(incoming),
     };
+    if settings.request_buffers > 0 && client_upgrade.is_none() {
+        outgoing = match body::buffer(outgoing, settings.request_buffers).await {
+            Ok(buffered) => buffered,
+            Err(_) if too_large.load(Ordering::Acquire) => return response::payload_too_large(),
+            Err(err) => {
+                eprintln!(
+                    "{} => reading the request body failed: {err}",
+                    site.log_name
+                );
+                return response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST");
+            }
+        };
+    }
     let mut outgoing = Request::from_parts(parts, outgoing);
     let transport = &group.transport;
     let mut stale_attempts = 0;
@@ -125,7 +153,6 @@ pub(crate) async fn forward(
     // unless `retry_match.method` says otherwise) are retried on another
     // backend when the round trip fails after connecting, or when the
     // response status matches `retry_match.status`.
-    let settings = group.pool.settings();
     let default_match = RetryMatch::default();
     let retry_match = settings.retry_match.as_ref().unwrap_or(&default_match);
     let replay = (client_upgrade.is_none()
@@ -146,7 +173,7 @@ pub(crate) async fn forward(
 
     // Loops only when a pooled connection turned out to be closed before the
     // request was written, so retrying is safe for any method.
-    let (selection, guard, started, mut upstream_response) = loop {
+    let (selection, guard, started, (mut upstream_response, permit)) = loop {
         let context = SelectContext {
             peer_ip: connection.peer.ip(),
             client_ip,
@@ -192,7 +219,7 @@ pub(crate) async fn forward(
         };
 
         match sent {
-            Ok(unwanted)
+            Ok((unwanted, _))
                 if replay.is_some()
                     && in_budget(round_trip_retries)
                     && retry_match.retries_status(unwanted.status().as_u16()) =>
@@ -205,7 +232,7 @@ pub(crate) async fn forward(
                 tokio::time::sleep(settings.try_interval).await;
                 outgoing = rebuild(replay.as_ref().expect("guard checked replay"));
             }
-            Ok(upstream_response) => break (selection, guard, started, upstream_response),
+            Ok(sent) => break (selection, guard, started, sent),
             Err(SendError::Stale(request)) if stale_attempts < MAX_STALE_RETRIES => {
                 stale_attempts += 1;
                 transport.forget(address);
@@ -217,6 +244,10 @@ pub(crate) async fn forward(
                     site.log_name
                 );
                 return response::bad_gateway();
+            }
+            // The backend is not to blame for a request cut short by the limit.
+            Err(SendError::Failed(_)) if too_large.load(Ordering::Acquire) => {
+                return response::payload_too_large();
             }
             Err(SendError::Failed(err)) => {
                 selection.upstream.record_failure();
@@ -245,7 +276,7 @@ pub(crate) async fn forward(
         tokio::task::spawn(tunnel(
             client_upgrade,
             server_upgrade,
-            guard,
+            (guard, permit),
             site.stream_timeout,
         ));
 
@@ -263,7 +294,22 @@ pub(crate) async fn forward(
         return client_response;
     }
 
-    let mut client_response = upstream_response.map(BodyExt::boxed);
+    let mut client_response = upstream_response.map(body::incoming);
+    if settings.response_buffers > 0 {
+        let (parts, body) = client_response.into_parts();
+        client_response = match body::buffer(body, settings.response_buffers).await {
+            Ok(buffered) => Response::from_parts(parts, buffered),
+            Err(err) => {
+                selection.upstream.record_failure();
+                eprintln!(
+                    "{} => upstream {} failed: {err}",
+                    site.log_name,
+                    selection.upstream.address()
+                );
+                return response::bad_gateway();
+            }
+        };
+    }
     headers::prepare_response(
         &mut client_response,
         &route.response,
@@ -286,7 +332,7 @@ pub(crate) async fn forward(
     client_response
         .extensions_mut()
         .insert(UpstreamAddress(selection.upstream.address().to_owned()));
-    client_response.map(|body| Guarded::new(body, guard).boxed())
+    client_response.map(|body| Guarded::new(body, (guard, permit)).boxed())
 }
 
 /// Buffers and caches the response when it is small and storable.
@@ -379,7 +425,7 @@ fn host<B>(request: &Request<B>) -> String {
 async fn tunnel(
     client: OnUpgrade,
     server: OnUpgrade,
-    _guard: RequestGuard,
+    _guard: (RequestGuard, Permit),
     stream_timeout: Option<Duration>,
 ) {
     let (Ok(client), Ok(server)) = (client.await, server.await) else {

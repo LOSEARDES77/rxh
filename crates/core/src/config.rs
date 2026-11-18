@@ -32,6 +32,7 @@ use crate::address::{self, BackendAddress, Scheme};
 use crate::duration;
 use crate::matcher::{HostPattern, RequestMatcher};
 use crate::net::IpNet;
+use crate::size;
 use crate::status::StatusMatcher;
 use crate::template::Template;
 
@@ -986,6 +987,11 @@ impl Pattern {
         {
             return Err(format!("request.method: {method:?} is not an HTTP method"));
         }
+        if self.request.max_body_size == Some(0) {
+            return Err(String::from(
+                "request.max_body_size must be greater than zero",
+            ));
+        }
         Ok(())
     }
 
@@ -1510,6 +1516,29 @@ pub struct UpstreamGroup {
     #[serde(default = "default::keepalive_idle_conns_per_host")]
     pub keepalive_idle_conns_per_host: usize,
 
+    /// Maximum upstream HTTP/1.1 connections per backend; requests over it
+    /// wait for a free one. `0` means no limit (Caddy `max_conns_per_host`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_conns_per_host: usize,
+
+    /// Bytes of each request body read before the request is sent upstream.
+    /// `0` streams it (Caddy `request_buffers`).
+    #[serde(
+        default,
+        deserialize_with = "size::deserialize",
+        skip_serializing_if = "is_zero"
+    )]
+    pub request_buffers: usize,
+
+    /// Bytes of each response body read before the response is sent to the
+    /// client. `0` streams it (Caddy `response_buffers`).
+    #[serde(
+        default,
+        deserialize_with = "size::deserialize",
+        skip_serializing_if = "is_zero"
+    )]
+    pub response_buffers: usize,
+
     /// Backends. Port ranges such as `10.0.0.1:8001-8004` expand to many.
     #[serde(default, alias = "to")]
     pub backends: Vec<Backend>,
@@ -1662,6 +1691,9 @@ impl UpstreamGroup {
             h2c: false,
             keepalive: default::keepalive(),
             keepalive_idle_conns_per_host: default::keepalive_idle_conns_per_host(),
+            max_conns_per_host: 0,
+            request_buffers: 0,
+            response_buffers: 0,
             backends,
             health: None,
             passive: None,
@@ -2265,6 +2297,14 @@ pub struct RequestConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
 
+    /// Largest request body accepted; bigger ones get `413`.
+    #[serde(
+        default,
+        deserialize_with = "size::deserialize_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_body_size: Option<usize>,
+
     /// Header rules.
     #[serde(default)]
     pub headers: RequestHeaders,
@@ -2471,6 +2511,14 @@ impl Default for Cache {
 }
 
 /// Accepts `value` or `[value, ...]`.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes a reference"
+)]
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 fn one_or_many<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     T: Deserialize<'de>,
@@ -3443,6 +3491,84 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
         ] {
             let message = invalid(&text);
             assert!(message.contains(expected), "{text}\n=> {message}");
+        }
+    }
+
+    #[test]
+    fn connection_limit_buffers_and_body_size_parse() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            request = { max_body_size = "10MB" }
+            forward = { backends = ["127.0.0.1:1"], max_conns_per_host = 4, request_buffers = "64KiB", response_buffers = 4096 }
+
+            [[server]]
+            listen = "127.0.0.1:8001"
+            match = [{ uri = "/up", request = { max_body_size = 1024 }, forward = "127.0.0.1:1" }]
+            "#,
+        )
+        .unwrap();
+
+        let pattern = &config.servers[0].patterns[0];
+        assert_eq!(pattern.request.max_body_size, Some(10_000_000));
+        let Action::Forward(Forward::Inline(group)) = &pattern.action else {
+            panic!("expected an inline pool");
+        };
+        assert_eq!(group.max_conns_per_host, 4);
+        assert_eq!(group.request_buffers, 65_536);
+        assert_eq!(group.response_buffers, 4096);
+        assert_eq!(
+            config.servers[1].patterns[0].request.max_body_size,
+            Some(1024)
+        );
+
+        // Off by default.
+        let group = UpstreamGroup::default();
+        assert_eq!(
+            (
+                group.max_conns_per_host,
+                group.request_buffers,
+                group.response_buffers
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(RequestConfig::default().max_body_size, None);
+    }
+
+    #[test]
+    fn invalid_connection_limit_buffers_and_body_size_are_rejected() {
+        let forward = |options: &str| {
+            format!(
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"@pool\"\n[upstream.pool]\nbackends = [\"127.0.0.1:2\"]\n{options}"
+            )
+        };
+        let request = |options: &str| {
+            format!("[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n{options}")
+        };
+
+        for (text, expected) in [
+            (forward("max_conns_per_host = -1"), "max_conns_per_host"),
+            (forward("max_conns_per_host = \"4\""), "max_conns_per_host"),
+            (forward("request_buffers = \"4XB\""), "invalid size"),
+            (forward("request_buffers = -1"), "request_buffers"),
+            (forward("response_buffers = \"lots\""), "invalid size"),
+            (forward("response_buffers = 1.5"), "response_buffers"),
+            (
+                request("request = { max_body_size = 0 }"),
+                "greater than zero",
+            ),
+            (
+                request("request = { max_body_size = \"1 mile\" }"),
+                "invalid size",
+            ),
+            (
+                request("protocol = \"tcp\"\nrequest = { max_body_size = 10 }"),
+                "http",
+            ),
+        ] {
+            let message = invalid(&text);
+            assert!(message.contains(expected), "{text}: {message}");
         }
     }
 }

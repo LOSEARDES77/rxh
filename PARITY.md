@@ -106,10 +106,11 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Upstream keep-alive pool | `keepalive`, `keepalive_idle_conns_per_host` | ✅ | |
 | `dial_timeout` | `dial_timeout` | ✅ | Default 3s. |
 | `read_timeout`, `write_timeout`, `response_header_timeout` | same names | ✅ | Unset by default. `response_header_timeout` gives `504`; read and write timeouts also apply to idle pooled connections and tunnels. |
-| `max_conns_per_host` | | 🟡 | `unhealthy_request_count` covers the common use. |
+| `max_conns_per_host` | `max_conns_per_host` | ✅ | HTTP/1.1 connections per backend, idle ones included; requests over the limit wait for a free connection, like Caddy. Upgraded tunnels count. Not applied to `h2c` (one shared connection) or to `tcp`/`udp` servers. |
 | `proxy_protocol v1/v2` on HTTP transport | | ❌ | Supported on TCP servers. |
 | `flush_interval` | | 🟡 | Responses always stream immediately (Caddy's `-1`). |
-| `request_buffers`, `response_buffers` | | ❌ | |
+| `request_buffers`, `response_buffers` | same names | ✅ | Bytes or a size (`"64KiB"`). A body that fits is sent with a `Content-Length`; the rest of a larger one is streamed. No `-1` (unlimited); buffered request bodies are not replayed on retries. |
+| `request_body { max_size }` | `request.max_body_size` on a route | ✅ | `413`, from `Content-Length` before dialing, or while streaming a body without one. |
 | `stream_timeout` | `stream_timeout` on the server | 🟡 | Server level option, also caps `tcp` connections. |
 | `stream_close_delay` | | ❌ | |
 | `rewrite`, `method` | `rewrite`, `request.method` on a route | ✅ | `rewrite` is a path (optionally with a query) with `{host}`, `{path}`, `{query}` and `{uri}` placeholders; the query is kept unless the rewrite has one. Applied after routing (routes are not matched again), also on `serve` routes. No regex, `strip_prefix` or `replace`. |
@@ -203,7 +204,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 | Basic auth with hashed passwords | Traefik `BasicAuth`, Nginx, NPM access lists | |
 | Forward auth (delegate auth to an external service) | Traefik `ForwardAuth`, Nginx `auth_request` | Authelia, Authentik, oauth2-proxy integrations. |
 | Security headers presets (HSTS, CSP, frame options), CORS | Traefik `Headers` middleware, NPM | |
-| Request body size limit | Nginx `client_max_body_size`, Traefik `Buffering` | |
+| Request body size limit | Nginx `client_max_body_size`, Traefik `Buffering` | Done: `request.max_body_size`, with `request_buffers` for buffering. |
 | GeoIP allow/deny (MaxMind database) | Nginx GeoIP2, HAProxy | |
 
 ### Service discovery and configuration providers

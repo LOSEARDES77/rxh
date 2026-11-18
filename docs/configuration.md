@@ -218,9 +218,29 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `h2c` | `false` | `h2c://` | Speak cleartext HTTP/2 to the backends (one shared connection each). |
 | `keepalive` | `"2m"` | `keepalive` | How long idle upstream HTTP connections are kept. `"0s"` disables pooling. |
 | `keepalive_idle_conns_per_host` | `32` | `keepalive_idle_conns_per_host` | Idle connections kept per backend. |
+| `max_conns_per_host` | `0` | `max_conns_per_host` | Most HTTP/1.1 connections open to each backend, idle ones included. Requests over the limit wait for a free connection (they are not failed or sent elsewhere; use `passive.unhealthy_request_count` for that). Upgraded tunnels (WebSockets) count. `0` means no limit. Ignored with `h2c`, which shares one connection per backend, and on `tcp` and `udp` servers. |
+| `request_buffers` | `0` | `request_buffers` | [Size](#sizes): bytes of each request body read before a backend is picked and dialed. A body that fits is sent with a `Content-Length`; the rest of a larger one is streamed. `0` streams everything. Not applied to upgrades. |
+| `response_buffers` | `0` | `response_buffers` | [Size](#sizes): bytes of each response body read before the response goes to the client, which frees the backend from slow clients. Same rules as `request_buffers`; a backend failing meanwhile gives `502`. |
 | `tls` | | `transport http { tls }` | Table of TLS client settings, see below. Setting it enables TLS for every backend, also without `https://`. |
 | `health` | | active health checks | Table, see below. |
 | `passive` | | passive health checks | Table, see below. |
+
+Example: at most 8 connections per backend, uploads up to 64 KiB buffered
+before they are sent, responses up to 1 MiB buffered:
+
+```toml
+[upstream.app]
+backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
+max_conns_per_host = 8
+request_buffers = "64KiB"
+response_buffers = "1MiB"
+```
+
+### Sizes
+
+A size is a number of bytes (`4096`) or a string with a unit, case
+insensitive: `"512B"`, decimal `"KB"`, `"MB"`, `"GB"` (powers of 1000) or
+binary `"KiB"`, `"MiB"`, `"GiB"` (powers of 1024). No fractions.
 
 ### Policies
 
@@ -428,6 +448,7 @@ match = [
 | `forward` / `serve` / `redirect` | Action, exactly one. `serve` is a directory or a [file server table](#file-server), `redirect` a target or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `rewrite` | New URI of the request before it is forwarded or served, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `request.method` | Method the request is forwarded or served with instead of its own (upper cased), for example `"POST"`. |
+| `request.max_body_size` | [Size](#sizes): largest request body accepted, for example `"10MB"`. Larger ones get `413 Content Too Large`: at once when `Content-Length` says so (nothing is sent to the backend), else when the streamed body passes the limit, which aborts the upstream request (with `request_buffers` at least as large, the backend is never contacted). Unset means no limit; `0` is rejected. Also on `serve` and `redirect` routes, by `Content-Length`. Example: `request = { max_body_size = "10MB" }`. |
 | `encode` | List of `zstd`, `br`, `gzip`: compress this route's responses (files and proxied) with the first one the client accepts in `Accept-Encoding`. Only text, JSON, JavaScript, XML, SVG and WebAssembly responses without a `Content-Encoding`, and never `206` or `304`. Removes `Content-Length`, adds `Vary: Accept-Encoding`, makes a strong `ETag` weak. |
 | `request.headers.set` | Headers to set on the upstream request, `{ name = "value" }`. |
 | `request.headers.add` | Headers to append a value to, keeping existing ones, `{ name = "value" }`. |

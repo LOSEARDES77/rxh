@@ -62,6 +62,13 @@ Changed.
 - `redirect = "target"` or `{ to, status }` as a route action next to
   `forward` and `serve`: answers `302` (or `301`, `303`, `307`, `308`) with
   the same placeholders in `Location`.
+- `max_conns_per_host` on a pool caps the HTTP/1.1 connections to each
+  backend; requests over the limit wait for a free connection.
+- `request_buffers` and `response_buffers` on a pool read up to that many
+  bytes of a body before passing it on; a body that fits is sent with a
+  `Content-Length`. Sizes are bytes or strings like `"64KiB"` and `"10MB"`.
+- `request.max_body_size` on a route answers `413 Content Too Large` to
+  larger request bodies, before dialing when `Content-Length` says so.
 - HTTP to HTTPS redirect: `https_redirect = true` on a TLS `http` server
   answers plain requests for its `host` names on `[acme] http_port` with
   `308` to `https://{host}{uri}`. On by default with `tls = "auto"`.
