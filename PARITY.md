@@ -26,7 +26,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `h2c://` upstreams | `h2c = true` | ✅ | One multiplexed HTTP/2 connection per backend. |
 | `https://` upstreams, `transport http { tls }` | `https://host[:port]`, `[upstream.NAME.tls]` | ✅ | `server_name`, `insecure_skip_verify`, `ca` (extra roots on top of webpki-roots), `client_cert`/`client_key`. `Host` is the backend host unless set. Also used by L4 and health checks. Pools cannot mix `https://` and plain backends. |
 | `unix//path` upstreams | `unix//run/app.sock` | ✅ | HTTP, TCP and health checks. Not for UDP. |
-| `dynamic srv`, `dynamic a`, `dynamic multi` | | ❌ | Planned: periodic DNS refresh feeding the pool. |
+| `dynamic srv`, `dynamic a` | `[upstream.NAME.dynamic]` with `srv`/`a`, `refresh`, `resolvers`, `versions` | ✅ | Periodic DNS refresh feeding the pool; health state and counters of unchanged members survive. `a` needs `tls.server_name` with TLS. `dynamic multi` is not implemented. |
 | Change upstreams at runtime | `rxh upstream add/rm`, `POST/DELETE /pools/{name}/upstreams` | ✅ ➕ | Caddy needs a full config patch; RXH changes one pool in place and keeps health state and counters of the other members. |
 | Named, reusable upstream groups | `[upstream.NAME]`, `forward = "@NAME"` | ➕ | Caddy repeats the upstream list in every `reverse_proxy`. |
 
@@ -172,14 +172,13 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 
 Ordered by value for a load balancer:
 
-1. Dynamic upstreams from DNS (`A`/`AAAA`, `SRV`).
-2. Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`, `stream_timeout`.
-3. Prometheus metrics and JSON access logs.
-4. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
-5. Compression (`encode`), range requests and ETags for the file server.
-6. Automatic HTTPS with ACME.
-7. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-8. HTTP/3.
+1. Timeouts: `read_timeout`, `write_timeout`, `response_header_timeout`, `stream_timeout`.
+2. Prometheus metrics and JSON access logs.
+3. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
+4. Compression (`encode`), range requests and ETags for the file server.
+5. Automatic HTTPS with ACME.
+6. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
+7. HTTP/3.
 
 ## Roadmap beyond Caddy
 

@@ -7,6 +7,7 @@
 
 mod admin;
 mod daemon;
+mod dynamic;
 mod error;
 mod files;
 mod health;

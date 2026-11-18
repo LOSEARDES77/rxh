@@ -10,6 +10,7 @@ use rxh_core::config::{
 use rxh_core::pool::Pool;
 use tokio::task::JoinSet;
 
+use crate::dynamic;
 use crate::error::Error;
 use crate::health;
 use crate::http::transport::Transport;
@@ -151,14 +152,27 @@ impl Registry {
         self.groups.values()
     }
 
-    /// Starts active health checks for every group that configures them.
-    /// Dropping the returned set stops the checks.
+    /// Seeds the DNS driven pools with the members of the same pools in
+    /// `previous`, see [`Pool::inherit_dynamic`].
+    pub(crate) fn inherit_dynamic(&self, previous: &Registry) {
+        for (name, group) in &self.groups {
+            if let Some(old) = previous.groups.get(name) {
+                group.pool.inherit_dynamic(&old.pool);
+            }
+        }
+    }
+
+    /// Starts the active health checks and the DNS refreshers of the groups
+    /// that configure them. Dropping the returned set stops them all.
     #[must_use]
-    pub fn start_health_checks(&self) -> JoinSet<()> {
+    pub fn start_background_tasks(&self) -> JoinSet<()> {
         let mut tasks = JoinSet::new();
         for group in self.groups.values() {
             if group.pool.settings().health.is_some() {
                 tasks.spawn(health::run(Arc::clone(group)));
+            }
+            if group.pool.settings().dynamic.is_some() {
+                tasks.spawn(dynamic::run(Arc::clone(group)));
             }
         }
         tasks
@@ -167,4 +181,28 @@ impl Registry {
 
 fn invalid(message: String) -> Error {
     Error::Config(ConfigError::Invalid(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebuilt_registry_inherits_dynamic_members_by_name() {
+        let config = Config::from_toml(
+            "[upstream.dns]\nbackends = []\ndynamic = { a = \"x.test:80\" }\n\
+             [upstream.other]\nbackends = []\ndynamic = { a = \"y.test:80\" }\n",
+        )
+        .unwrap();
+        let old = Registry::build(&config).unwrap();
+        old.get("dns")
+            .unwrap()
+            .pool
+            .sync_dynamic(vec![rxh_core::config::Backend::new("10.0.0.1:80")]);
+
+        let new = Registry::build(&config).unwrap();
+        new.inherit_dynamic(&old);
+        assert_eq!(new.get("dns").unwrap().pool.upstreams().len(), 1);
+        assert!(new.get("other").unwrap().pool.upstreams().is_empty());
+    }
 }

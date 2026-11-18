@@ -132,6 +132,7 @@ pub struct Upstream {
     address: String,
     weight: u32,
     address_hash: u64,
+    dynamic: bool,
     cookie: Option<String>,
     active: AtomicUsize,
     total: AtomicU64,
@@ -150,6 +151,7 @@ impl Upstream {
             address_hash: hash_bytes(backend.address.as_bytes()),
             address: backend.address,
             weight: backend.weight,
+            dynamic: false,
             cookie,
             active: AtomicUsize::new(0),
             total: AtomicU64::new(0),
@@ -441,6 +443,7 @@ impl Pool {
             .members()
             .upstreams
             .iter()
+            .filter(|upstream| !upstream.dynamic)
             .map(|upstream| Backend {
                 address: upstream.address.clone(),
                 weight: upstream.weight,
@@ -512,6 +515,86 @@ impl Pool {
         }
         *guard = Arc::new(Members::new(upstreams));
         Ok(())
+    }
+
+    /// Replaces the members that came from DNS with `addresses`. Static
+    /// members are never touched, and members present in both lists keep
+    /// their health and counters. Addresses equal to a static member are
+    /// ignored.
+    pub fn sync_dynamic(&self, addresses: Vec<Backend>) {
+        let mut guard = self.members.write().unwrap_or_else(PoisonError::into_inner);
+        let mut upstreams: Vec<Arc<Upstream>> = Vec::new();
+        for upstream in &guard.upstreams {
+            let keep = !upstream.dynamic
+                || addresses.iter().any(|backend| {
+                    backend.address == upstream.address && backend.weight == upstream.weight
+                });
+            if keep {
+                upstreams.push(Arc::clone(upstream));
+            }
+        }
+        for backend in addresses {
+            if upstreams
+                .iter()
+                .any(|upstream| upstream.address == backend.address)
+            {
+                continue;
+            }
+            let mut upstream = self.make_upstream(backend);
+            upstream.dynamic = true;
+            upstreams.push(Arc::new(upstream));
+        }
+        let unchanged = upstreams.len() == guard.upstreams.len()
+            && upstreams
+                .iter()
+                .zip(&guard.upstreams)
+                .all(|(new, old)| Arc::ptr_eq(new, old));
+        if !unchanged {
+            *guard = Arc::new(Members::new(upstreams));
+        }
+    }
+
+    /// Takes over the DNS members of `previous`, the same pool in the
+    /// generation being replaced, so a reload does not start with an empty
+    /// pool. Members keep their health and counters. Does nothing unless both
+    /// pools resolve the same `a` or `srv` name.
+    pub fn inherit_dynamic(&self, previous: &Pool) {
+        let same = |pool: &Pool| {
+            pool.settings
+                .dynamic
+                .as_ref()
+                .map(|dynamic| (dynamic.a.clone(), dynamic.srv.clone()))
+        };
+        if same(self).is_none() || same(self) != same(previous) {
+            return;
+        }
+        // Passive settings and cookie values are baked into each member: share
+        // the old ones only when they still apply, otherwise rebuild them.
+        let cookie_secret = |pool: &Pool| {
+            (pool.settings.policy == Policy::Cookie)
+                .then(|| pool.settings.secret.clone().unwrap_or_default())
+        };
+        let reusable = self.settings.passive == previous.settings.passive
+            && cookie_secret(self) == cookie_secret(previous);
+
+        let mut guard = self.members.write().unwrap_or_else(PoisonError::into_inner);
+        let mut upstreams = guard.upstreams.clone();
+        for upstream in &previous.members().upstreams {
+            if !upstream.dynamic || upstreams.iter().any(|u| u.address == upstream.address) {
+                continue;
+            }
+            if reusable {
+                upstreams.push(Arc::clone(upstream));
+            } else {
+                let mut rebuilt = self.make_upstream(Backend {
+                    address: upstream.address.clone(),
+                    weight: upstream.weight,
+                });
+                rebuilt.dynamic = true;
+                upstreams.push(Arc::new(rebuilt));
+            }
+        }
+        *guard = Arc::new(Members::new(upstreams));
     }
 
     /// Removes a backend. Returns false if it was not a member. Connections
@@ -802,6 +885,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::config::{DynamicUpstreams, PassiveHealth};
 
     fn group(policy: Policy, backends: &[(&str, u32)]) -> UpstreamGroup {
         let mut group = UpstreamGroup::with_backends(
@@ -815,6 +899,101 @@ mod tests {
         );
         group.policy = policy;
         group
+    }
+
+    #[test]
+    fn sync_dynamic_adds_removes_and_keeps_state() {
+        let pool = Pool::new("p", &group(Policy::RoundRobin, &[("10.0.0.1:80", 1)])).unwrap();
+        let dns = |addresses: &[&str]| addresses.iter().map(|a| Backend::new(*a)).collect();
+        let addresses = |pool: &Pool| -> Vec<String> {
+            pool.upstreams()
+                .iter()
+                .map(|u| u.address().to_owned())
+                .collect()
+        };
+
+        pool.sync_dynamic(dns(&["10.0.1.1:80", "10.0.1.2:80", "10.0.0.1:80"]));
+        assert_eq!(
+            addresses(&pool),
+            ["10.0.0.1:80", "10.0.1.1:80", "10.0.1.2:80"]
+        );
+
+        let kept = pool.upstreams()[1].clone();
+        let _guard = kept.start_request();
+        pool.sync_dynamic(dns(&["10.0.1.1:80", "10.0.1.3:80"]));
+        assert_eq!(
+            addresses(&pool),
+            ["10.0.0.1:80", "10.0.1.1:80", "10.0.1.3:80"]
+        );
+        assert!(Arc::ptr_eq(&kept, &pool.upstreams()[1]));
+        assert_eq!(pool.upstreams()[1].active_requests(), 1);
+
+        // Dynamic members are not part of the persisted configuration.
+        assert_eq!(pool.to_group().backends.len(), 1);
+
+        // A changed weight replaces the member.
+        pool.sync_dynamic(vec![Backend {
+            address: "10.0.1.1:80".into(),
+            weight: 4,
+        }]);
+        assert_eq!(pool.upstreams()[1].weight(), 4);
+        assert!(!Arc::ptr_eq(&kept, &pool.upstreams()[1]));
+
+        pool.sync_dynamic(Vec::new());
+        assert_eq!(addresses(&pool), ["10.0.0.1:80"]);
+
+        // A rebuilt pool inherits the DNS members and their state.
+        let mut settings = group(Policy::RoundRobin, &[]);
+        settings.dynamic = Some(DynamicUpstreams {
+            a: Some("x:80".into()),
+            srv: None,
+            refresh: Duration::from_secs(1),
+            resolvers: Vec::new(),
+            versions: None,
+        });
+        let old = Pool::new("p", &settings).unwrap();
+        old.sync_dynamic(dns(&["10.0.2.1:80"]));
+        let new = Pool::new("p", &settings).unwrap();
+        assert!(new.upstreams().is_empty());
+        new.inherit_dynamic(&old);
+        assert!(Arc::ptr_eq(&new.upstreams()[0], &old.upstreams()[0]));
+        let mut changed = settings.clone();
+        changed.passive = Some(PassiveHealth {
+            fail_duration: Duration::from_secs(1),
+            max_fails: 7,
+            unhealthy_status: Vec::new(),
+            unhealthy_latency: None,
+            unhealthy_request_count: 0,
+        });
+        let rebuilt = Pool::new("p", &changed).unwrap();
+        rebuilt.inherit_dynamic(&old);
+        assert_eq!(rebuilt.upstreams()[0].address(), "10.0.2.1:80");
+        assert!(!Arc::ptr_eq(&rebuilt.upstreams()[0], &old.upstreams()[0]));
+
+        let mut cookie = settings.clone();
+        cookie.policy = Policy::Cookie;
+        cookie.secret = Some("a".into());
+        let old_cookie = Pool::new("p", &cookie).unwrap();
+        old_cookie.sync_dynamic(dns(&["10.0.2.1:80"]));
+        let mut rotated = cookie.clone();
+        rotated.secret = Some("b".into());
+        let new_cookie = Pool::new("p", &rotated).unwrap();
+        new_cookie.inherit_dynamic(&old_cookie);
+        assert_eq!(new_cookie.upstreams().len(), 1);
+        assert!(!Arc::ptr_eq(
+            &new_cookie.upstreams()[0],
+            &old_cookie.upstreams()[0]
+        ));
+        let same = Pool::new("p", &cookie).unwrap();
+        same.inherit_dynamic(&old_cookie);
+        assert!(Arc::ptr_eq(
+            &same.upstreams()[0],
+            &old_cookie.upstreams()[0]
+        ));
+
+        let other = Pool::new("p", &group(Policy::RoundRobin, &[])).unwrap();
+        other.inherit_dynamic(&old);
+        assert!(other.upstreams().is_empty());
     }
 
     fn context() -> SelectContext<'static> {

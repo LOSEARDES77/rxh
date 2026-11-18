@@ -45,14 +45,17 @@ struct Generation {
 }
 
 impl Generation {
-    fn start(config: Config) -> Result<Self, Error> {
+    fn start(config: Config, previous: Option<&Registry>) -> Result<Self, Error> {
         let registry = Arc::new(Registry::build(&config)?);
+        if let Some(previous) = previous {
+            registry.inherit_dynamic(previous);
+        }
         let (stop, stopped) = oneshot::channel::<()>();
         let master = Master::init(&config, Arc::clone(&registry))?.shutdown_on(async move {
             let _ = stopped.await;
         });
         let servers = master.servers();
-        let health_checks = registry.start_health_checks();
+        let health_checks = registry.start_background_tasks();
         let task = tokio::task::spawn(master.run());
 
         Ok(Self {
@@ -105,7 +108,7 @@ impl Daemon {
     pub async fn run(self) -> Result<(), Error> {
         let config = load_config(&self.config_path)?;
         let admin_settings = config.admin.clone();
-        let mut generation = Generation::start(config)?;
+        let mut generation = Generation::start(config, None)?;
 
         let (control, mut controls) = mpsc::channel(8);
         let admin_state = Arc::new(AdminState {
@@ -181,7 +184,8 @@ impl Daemon {
             eprintln!("Main => [admin] changes take effect after a restart");
         }
 
-        let next = match Generation::start(config.clone()) {
+        let previous_registry = Arc::clone(&generation.registry);
+        let next = match Generation::start(config.clone(), Some(&previous_registry)) {
             Ok(next) => next,
             Err(Error::Io(err)) if err.kind() == io::ErrorKind::AddrInUse => {
                 // UDP sockets and platforms without SO_REUSEPORT cannot bind
@@ -190,10 +194,11 @@ impl Daemon {
                 let previous = Config::clone(&generation.config);
                 let old = std::mem::replace(generation, placeholder()?);
                 old.stop().await.map_err(|err| err.to_string())?;
-                match Generation::start(config) {
+                match Generation::start(config, Some(&previous_registry)) {
                     Ok(next) => next,
                     Err(err) => {
-                        *generation = Generation::start(previous).map_err(|err| err.to_string())?;
+                        *generation = Generation::start(previous, Some(&previous_registry))
+                            .map_err(|err| err.to_string())?;
                         *admin
                             .current
                             .write()
@@ -223,7 +228,7 @@ impl Daemon {
 
 /// Empty generation used while swapping.
 fn placeholder() -> Result<Generation, String> {
-    Generation::start(Config::default()).map_err(|err| err.to_string())
+    Generation::start(Config::default(), None).map_err(|err| err.to_string())
 }
 
 struct AbortOnDrop(JoinHandle<()>);

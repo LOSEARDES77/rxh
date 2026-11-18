@@ -137,7 +137,7 @@ async fn https_active_health_check_uses_tls() {
          health = {{ uri = \"/\", interval = \"50ms\", timeout = \"1s\" }}\n\
          [[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"@secure\""
     ));
-    let _checks = registry.start_health_checks();
+    let _checks = registry.start_background_tasks();
 
     let group = registry.get("secure").unwrap();
     util::eventually(async || {

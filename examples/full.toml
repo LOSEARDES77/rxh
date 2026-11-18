@@ -45,6 +45,13 @@ ca = "/etc/rxh/ca.pem"              # extra trusted roots on top of webpki-roots
 client_cert = "/etc/rxh/client.pem" # mutual TLS
 client_key = "/etc/rxh/client.key"
 
+# Members from DNS on top of `backends`: `a = "name:port"` (A/AAAA records) or
+# `srv = "_service._proto.name"`. With TLS and `a`, `tls.server_name` is required.
+[upstream.discovered]
+backends = []
+dynamic = { a = "app.internal:8080", refresh = "30s", versions = ["ipv4", "ipv6"] }
+# dynamic = { srv = "_http._tcp.app.internal", resolvers = ["10.0.0.53:53"] }
+
 # Active health checks. Without `uri` they are TCP connect checks.
 [upstream.api.health]
 uri = "/health"

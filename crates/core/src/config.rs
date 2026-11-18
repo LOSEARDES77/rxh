@@ -153,7 +153,7 @@ impl Config {
                         group.validate().map_err(|err| {
                             ConfigError::Invalid(format!("{label}: forward: {err}"))
                         })?;
-                        if group.backends.is_empty() {
+                        if group.backends.is_empty() && group.dynamic.is_none() {
                             return invalid(format!("{label}: forward needs at least one backend"));
                         }
                         group
@@ -660,6 +660,87 @@ pub struct UpstreamGroup {
     /// enables TLS even without `https://` backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<UpstreamTls>,
+
+    /// Members discovered through DNS, on top of `backends`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<DynamicUpstreams>,
+}
+
+/// IP versions used by [`DynamicUpstreams::a`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IpVersion {
+    /// `A` records.
+    Ipv4,
+
+    /// `AAAA` records.
+    Ipv6,
+}
+
+/// DNS driven members of an [`UpstreamGroup`] (Caddy `dynamic a` and `dynamic srv`).
+///
+/// `a` resolves to plain `ip:port` backends. When the group uses TLS the SNI
+/// and certificate name cannot come from an IP, so `tls.server_name` is
+/// required. `srv` produces `target:port` backends that keep the host name.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicUpstreams {
+    /// `name:port`, resolved to its `A` and `AAAA` records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a: Option<String>,
+
+    /// `_service._proto.name`, resolved to its `SRV` records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srv: Option<String>,
+
+    /// Time between lookups.
+    #[serde(default = "default::dynamic_refresh", with = "duration")]
+    pub refresh: Duration,
+
+    /// DNS servers to ask, default the system configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolvers: Vec<SocketAddr>,
+
+    /// Record types used with `a`, both by default. Not allowed with `srv`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versions: Option<Vec<IpVersion>>,
+}
+
+impl DynamicUpstreams {
+    fn validate(&self) -> Result<(), String> {
+        match (&self.a, &self.srv) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(String::from("dynamic needs exactly one of 'a' and 'srv'"));
+            }
+            (Some(a), None) => match BackendAddress::parse(a) {
+                Ok(BackendAddress::Tcp {
+                    scheme: Scheme::Bare,
+                    ..
+                }) => {}
+                _ => return Err(format!("dynamic.a must be name:port, got {a:?}")),
+            },
+            (None, Some(srv)) => {
+                if srv.is_empty() || srv.contains(':') || srv.contains('/') {
+                    return Err(format!(
+                        "dynamic.srv must be _service._proto.name, got {srv:?}"
+                    ));
+                }
+            }
+        }
+        if self.refresh.is_zero() {
+            return Err(String::from("dynamic.refresh must be greater than zero"));
+        }
+        match &self.versions {
+            Some(_) if self.srv.is_some() => {
+                return Err(String::from("dynamic.versions only applies to 'a'"));
+            }
+            Some(versions) if versions.is_empty() => {
+                return Err(String::from("dynamic.versions must not be empty"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// TLS client settings of an [`UpstreamGroup`] (Caddy `transport http { tls }`).
@@ -715,6 +796,7 @@ impl UpstreamGroup {
             health: None,
             passive: None,
             tls: None,
+            dynamic: None,
         }
     }
 
@@ -766,6 +848,21 @@ impl UpstreamGroup {
             return Err(String::from(
                 "tls.client_cert and tls.client_key must be set together",
             ));
+        }
+
+        if let Some(dynamic) = &self.dynamic {
+            dynamic.validate()?;
+            let needs_name = dynamic.a.is_some() && self.uses_tls();
+            if needs_name
+                && self
+                    .tls
+                    .as_ref()
+                    .is_none_or(|tls| tls.server_name.is_none())
+            {
+                return Err(String::from(
+                    "dynamic upstreams with TLS need tls.server_name, resolved addresses are IPs",
+                ));
+            }
         }
 
         if self.choose == 0 {
@@ -1051,7 +1148,7 @@ pub struct ActiveHealth {
 
 /// Passive health checks: backends that fail real traffic are taken out of
 /// rotation for `fail_duration`.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PassiveHealth {
     /// How long a failure is remembered.
@@ -1280,6 +1377,10 @@ mod default {
         1
     }
 
+    pub fn dynamic_refresh() -> Duration {
+        Duration::from_secs(60)
+    }
+
     pub fn choose() -> usize {
         2
     }
@@ -1499,6 +1600,54 @@ mod tests {
         assert!(error(format!("{tcp}{tcp}")).contains("only http servers can share"));
         assert!(error(format!("{udp}{udp}")).contains("only http servers can share"));
         assert!(error(format!("{http}{tls}")).contains("all or none"));
+    }
+
+    #[test]
+    fn dynamic_upstreams_validation() {
+        let parse = |dynamic: &str, extra: &str| {
+            Config::from_toml(&format!(
+                "[upstream.x{extra}]\nbackends = []\n[upstream.x.dynamic]\n{dynamic}\n"
+            ))
+        };
+        let config = parse("a = \"app.local:80\"", "").unwrap();
+        let dynamic = config.upstreams["x"].dynamic.as_ref().unwrap();
+        assert_eq!(dynamic.refresh, Duration::from_secs(60));
+        assert_eq!(dynamic.versions, None);
+        assert!(
+            parse(
+                "srv = \"_http._tcp.app.local\"\nresolvers = [\"1.1.1.1:53\"]",
+                ""
+            )
+            .is_ok()
+        );
+
+        for bad in [
+            "",
+            "a = \"x:80\"\nsrv = \"_a._b.c\"",
+            "a = \"x\"",
+            "a = \"https://x:80\"",
+            "srv = \"x:80\"",
+            "a = \"x:80\"\nrefresh = \"0s\"",
+            "a = \"x:80\"\nversions = []",
+            "srv = \"_a._b.c\"\nversions = [\"ipv4\"]",
+        ] {
+            assert!(parse(bad, "").is_err(), "{bad}");
+        }
+
+        let tls = "\n[upstream.x.tls]\ninsecure_skip_verify = true";
+        let error = Config::from_toml(&format!(
+            "[upstream.x]\nbackends = []\ndynamic = {{ a = \"x:80\" }}\n{}",
+            tls
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("tls.server_name"), "{error}");
+        assert!(
+            Config::from_toml(&format!(
+                "[upstream.x]\nbackends = []\ndynamic = {{ a = \"x:80\" }}\n{tls}\n\
+                 server_name = \"x\""
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

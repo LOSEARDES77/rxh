@@ -97,6 +97,35 @@ active health checks use TLS too.
 | `client_cert` | | PEM client certificate chain for mutual TLS. Needs `client_key`. |
 | `client_key` | | PEM private key of `client_cert`. |
 
+### `[upstream.NAME.dynamic]`: members from DNS
+
+Caddy `dynamic a` and `dynamic srv`. The members are the static `backends`
+plus the addresses resolved by the last lookup. A refresh adds new addresses
+and removes vanished ones; members present before and after keep their health
+state and counters. When a lookup fails the previous set stays and the error
+goes to stderr. A reload starts the new pools with the DNS members of the old ones. `rxh upstream rm` of a DNS member comes back at the next refresh. A changed SRV weight replaces the member (its counters reset). Members from DNS are not written back by `rxh upstream`
+persistence, and a pool with `dynamic` may have an empty `backends`.
+
+```toml
+[upstream.app]
+backends = []
+dynamic = { a = "app.internal:8080", refresh = "30s", versions = ["ipv4"] }
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `a` | | `name:port`. Every `A`/`AAAA` record becomes an `ip:port` backend. Exactly one of `a` and `srv`. |
+| `srv` | | `_service._proto.name`. Every record becomes a `target:port` backend (weight = record weight, at least 1). The target stays a host name, resolved on dial. |
+| `refresh` | `"1m"` | Time between lookups. |
+| `resolvers` | system | List of `ip:port` DNS servers, queried over UDP and TCP. Default: `/etc/resolv.conf`. |
+| `versions` | `["ipv4", "ipv6"]` | Record types for `a`. Error together with `srv`. |
+
+With TLS, an `a` pool has IPs as backend hosts, so SNI and certificate
+verification cannot use the host name: when `tls` is set (or `a` is used with
+`https://` backends in the same pool) `tls.server_name` is required, and
+validation fails without it. `srv` backends keep the target name, so
+`server_name` is optional there.
+
 ### `[upstream.NAME.health]`: active health checks
 
 Checks run in the background for every backend. With `uri` the check is an

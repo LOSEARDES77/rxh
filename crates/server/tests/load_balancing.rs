@@ -109,7 +109,7 @@ async fn active_health_checks_remove_and_restore_backends() {
         "#
     ));
     let proxy = proxies[0];
-    let _checks = registry.start_health_checks();
+    let _checks = registry.start_background_tasks();
 
     health.store(503, Ordering::SeqCst);
     let pool = registry.get("api").unwrap();
