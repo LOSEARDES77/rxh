@@ -1809,6 +1809,14 @@ impl UpstreamGroup {
             ));
         }
 
+        if let Some(hooks) = self
+            .health
+            .as_ref()
+            .and_then(|health| health.hooks.as_ref())
+        {
+            hooks.validate()?;
+        }
+
         if let Some(body) = self
             .health
             .as_ref()
@@ -2072,6 +2080,52 @@ pub struct ActiveHealth {
     /// Follow redirects instead of counting them as failures.
     #[serde(default)]
     pub follow_redirects: bool,
+
+    /// Command and webhook run when a backend turns healthy or unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HealthHooks>,
+}
+
+/// Actions run on `healthy` and `unhealthy` events of active health checks,
+/// besides the log line. Each event runs the command, then calls the webhook.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthHooks {
+    /// Program and arguments, run without a shell. The event is passed in
+    /// `RXH_EVENT`, `RXH_POOL`, `RXH_UPSTREAM` and `RXH_REASON`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+
+    /// `http://` or `https://` URL that receives each event as a JSON `POST`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
+}
+
+impl HealthHooks {
+    fn validate(&self) -> Result<(), String> {
+        if self.command.is_empty() && self.webhook.is_none() {
+            return Err(String::from(
+                "health.hooks needs a 'command', a 'webhook' or both",
+            ));
+        }
+        if self.command.first().is_some_and(String::is_empty) {
+            return Err(String::from(
+                "health.hooks.command: program must not be empty",
+            ));
+        }
+        if let Some(webhook) = &self.webhook {
+            let uri: http::Uri = webhook
+                .parse()
+                .map_err(|err| format!("health.hooks.webhook {webhook:?}: {err}"))?;
+            let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
+            if !scheme_ok || uri.host().is_none_or(str::is_empty) {
+                return Err(format!(
+                    "health.hooks.webhook must be an http:// or https:// URL, got {webhook:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Passive health checks: backends that fail real traffic are taken out of
@@ -2936,6 +2990,47 @@ mod tests {
         // Port ranges expand before the comparison.
         let message = error("{ backends = [\"a:1-3\", \"a:2\"] }");
         assert!(message.contains("a:2 is listed twice"), "{message}");
+    }
+
+    #[test]
+    fn health_hooks_parse_and_validate() {
+        let parse = |hooks: &str| {
+            Config::from_toml(&format!(
+                "[upstream.web]\nbackends = [\"a:1\"]\n\
+                 [upstream.web.health.hooks]\n{hooks}\n"
+            ))
+        };
+        let config =
+            parse("command = [\"/bin/notify\", \"--pool\"]\nwebhook = \"https://hooks.test/rxh\"")
+                .unwrap();
+        let hooks = config.upstreams["web"]
+            .health
+            .as_ref()
+            .and_then(|health| health.hooks.as_ref())
+            .unwrap();
+        assert_eq!(hooks.command, ["/bin/notify", "--pool"]);
+        assert_eq!(hooks.webhook.as_deref(), Some("https://hooks.test/rxh"));
+        assert!(parse("command = [\"true\"]").is_ok());
+        assert!(parse("webhook = \"http://127.0.0.1:9000/\"").is_ok());
+
+        let error = |hooks: &str| match parse(hooks) {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("{hooks}: expected a validation error, got {other:?}"),
+        };
+        assert!(error("").contains("needs a 'command', a 'webhook'"));
+        assert!(error("command = []").contains("needs a 'command'"));
+        assert!(error("command = [\"\"]").contains("program must not be empty"));
+        for webhook in ["ftp://hooks.test/", "/relative", "hooks.test:80", "http://"] {
+            let message = error(&format!("webhook = \"{webhook}\""));
+            assert!(
+                message.contains("health.hooks.webhook"),
+                "{webhook}: {message}"
+            );
+        }
+        assert!(matches!(
+            parse("shell = \"echo\""),
+            Err(ConfigError::Toml(_))
+        ));
     }
 
     #[test]

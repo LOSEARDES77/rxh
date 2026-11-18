@@ -281,3 +281,97 @@ async fn upstreams_can_be_added_and_removed_live() {
     assert_eq!(backends[0].1.requests(), 2);
     assert_eq!(backends[1].1.requests(), 6);
 }
+
+#[tokio::test]
+async fn health_hooks_post_events_to_the_webhook() {
+    let health = Arc::new(AtomicU16::new(200));
+    let (flaky, _) = util::counting_backend(Arc::clone(&health)).await;
+    let (webhook, mut events) = util::body_interceptor(204).await;
+    let (_, registry) = util::spawn_with_registry(&format!(
+        r#"
+        [upstream.api]
+        backends = ["{flaky}"]
+
+        [upstream.api.health]
+        uri = "/health"
+        interval = "50ms"
+        timeout = "1s"
+
+        [upstream.api.health.hooks]
+        webhook = "http://{webhook}/events?source=rxh"
+
+        [[server]]
+        listen = "127.0.0.1:0"
+        forward = "@api"
+        "#
+    ));
+    let _checks = registry.start_background_tasks();
+
+    health.store(503, Ordering::SeqCst);
+    let (parts, body) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("unhealthy event within 5s")
+        .unwrap();
+    assert_eq!(parts.method, http::Method::POST);
+    assert_eq!(parts.uri, "/events?source=rxh");
+    assert_eq!(parts.headers["content-type"], "application/json");
+    let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(event["event"], "unhealthy");
+    assert_eq!(event["pool"], "api");
+    assert_eq!(event["upstream"], flaky.to_string());
+    assert!(event["reason"].as_str().unwrap().contains("503"), "{event}");
+
+    health.store(200, Ordering::SeqCst);
+    let (_, body) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("healthy event within 5s")
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(event["event"], "healthy");
+    assert!(event.get("reason").is_none(), "{event}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn health_hooks_run_the_command_even_when_the_webhook_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.log");
+    let health = Arc::new(AtomicU16::new(200));
+    let (flaky, _) = util::counting_backend(Arc::clone(&health)).await;
+    let dead = util::dead_address();
+    let (_, registry) = util::spawn_with_registry(&format!(
+        r#"
+        [upstream.api]
+        backends = ["{flaky}"]
+
+        [upstream.api.health]
+        uri = "/health"
+        interval = "50ms"
+        timeout = "1s"
+
+        [upstream.api.health.hooks]
+        command = ["sh", "-c", 'echo "$RXH_EVENT $RXH_POOL $RXH_UPSTREAM $RXH_REASON" >> "$1"', "hook", "{log}"]
+        webhook = "http://{dead}/"
+
+        [[server]]
+        listen = "127.0.0.1:0"
+        forward = "@api"
+        "#,
+        log = log.display(),
+    ));
+    let _checks = registry.start_background_tasks();
+
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    health.store(503, Ordering::SeqCst);
+    util::eventually(async || read().lines().count() == 1).await;
+    health.store(200, Ordering::SeqCst);
+    util::eventually(async || read().lines().count() == 2).await;
+
+    let lines = read();
+    let lines: Vec<&str> = lines.lines().collect();
+    assert!(
+        lines[0].starts_with(&format!("unhealthy api {flaky} status 503")),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], format!("healthy api {flaky} "));
+}

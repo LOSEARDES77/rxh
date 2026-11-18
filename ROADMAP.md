@@ -47,7 +47,7 @@ The remaining rows of PARITY.md that a load balancer needs every day.
 - [x] `rewrite`, `method`, redirects and HTTP to HTTPS redirect.
 - [ ] `encode gzip zstd`; range requests, ETag and precompressed files in
       the file server.
-- [ ] Health check events (`healthy`, `unhealthy`) as hooks, not only log
+- [x] Health check events (`healthy`, `unhealthy`) as hooks, not only log
       lines.
 
 ## 0.4: performance
@@ -125,7 +125,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 
 - [ ] OpenTelemetry tracing with W3C trace context.
 - [ ] Access log filters and sampling.
-- [ ] Health events to webhooks.
+- [x] Health events to webhooks.
 - [ ] `rxh top`: live requests per second, latency and errors per pool in
       the terminal, built on the metrics endpoint.
 - [ ] Web dashboard on top of the admin API: hosts, certificates, access

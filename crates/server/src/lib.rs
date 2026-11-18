@@ -12,6 +12,7 @@ mod dynamic;
 mod error;
 mod files;
 mod health;
+mod hooks;
 mod http;
 mod include;
 mod l4match;

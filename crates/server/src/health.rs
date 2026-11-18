@@ -12,9 +12,11 @@ use hyper::header::{self, HeaderName, HeaderValue};
 use hyper_util::rt::TokioIo;
 use rxh_core::address::BackendAddress;
 use rxh_core::config::ActiveHealth;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
+use crate::hooks::{Event, Hooks};
 use crate::registry::Group;
 
 const MAX_REDIRECTS: usize = 5;
@@ -26,6 +28,18 @@ pub(crate) async fn run(group: Arc<Group>) {
         return;
     };
     let settings = Arc::new(settings);
+
+    // One worker per pool keeps hook runs in event order without delaying checks.
+    let hooks = settings.hooks.as_ref().map(|hooks| {
+        let hooks = Hooks::new(hooks);
+        let (sender, mut receiver) = mpsc::unbounded_channel::<Event>();
+        tokio::task::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                hooks.run(&event).await;
+            }
+        });
+        sender
+    });
 
     let mut interval = tokio::time::interval(settings.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -45,9 +59,10 @@ pub(crate) async fn run(group: Arc<Group>) {
 
         while let Some(Ok((upstream, result))) = checks.join_next().await {
             let change = upstream.record_check(result.is_ok(), settings.passes, settings.fails);
-            match (change, result) {
+            let (kind, reason) = match (change, result) {
                 (Some(true), _) => {
-                    println!("{} => {} is healthy", group.pool.name(), upstream.address())
+                    println!("{} => {} is healthy", group.pool.name(), upstream.address());
+                    ("healthy", None)
                 }
                 (Some(false), Err(reason)) => {
                     eprintln!(
@@ -55,8 +70,17 @@ pub(crate) async fn run(group: Arc<Group>) {
                         group.pool.name(),
                         upstream.address()
                     );
+                    ("unhealthy", Some(reason))
                 }
-                _ => {}
+                _ => continue,
+            };
+            if let Some(hooks) = &hooks {
+                let _ = hooks.send(Event {
+                    event: kind,
+                    pool: group.pool.name().to_owned(),
+                    upstream: upstream.address().to_owned(),
+                    reason,
+                });
             }
         }
     }

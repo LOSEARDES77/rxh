@@ -96,6 +96,12 @@ headers = { Host = "api.internal" }
 # request_body = ""
 # follow_redirects = false
 
+# Run on healthy/unhealthy events: the command gets RXH_EVENT, RXH_POOL,
+# RXH_UPSTREAM and RXH_REASON; the webhook gets a JSON POST.
+[upstream.api.health.hooks]
+command = ["logger", "-t", "rxh-health"]
+# webhook = "https://hooks.example.com/rxh"
+
 # Passive health checks, based on real traffic.
 [upstream.api.passive]
 fail_duration = "30s"

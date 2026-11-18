@@ -78,7 +78,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `health_headers` | `headers` | ✅ | |
 | `health_follow_redirects` | `follow_redirects` | 🟡 | Follows the path of `Location` on the same target. |
 | TCP connect checks | `health` without `uri` | ➕ | For TCP/UDP pools and non-HTTP backends. |
-| `healthy` / `unhealthy` events | log lines | 🟡 | No event hooks yet. |
+| `healthy` / `unhealthy` events | log lines, `hooks` (`command`, `webhook`) | ✅ | Per pool. Command gets `RXH_*` variables, webhook a JSON `POST`. Active checks only. |
 
 ## Passive health checks
 
