@@ -720,6 +720,89 @@ mod tests {
     }
 
     #[test]
+    fn targets_are_described_per_action() {
+        let config = rxh_core::config::Config::from_toml(
+            r#"
+[upstream.api]
+backends = ["127.0.0.1:1"]
+
+[[server]]
+listen = "127.0.0.1:0"
+[[server.match]]
+uri = "/api/*"
+forward = "@api"
+[[server.match]]
+uri = "/inline/*"
+forward = ["127.0.0.1:2", "127.0.0.1:3"]
+[[server.match]]
+uri = "/old"
+redirect = "/new"
+[[server.match]]
+serve = "/srv/www"
+"#,
+        )
+        .expect("valid");
+        let described: Vec<String> = config.servers[0]
+            .patterns
+            .iter()
+            .map(describe_target)
+            .collect();
+        assert_eq!(
+            described,
+            [
+                "/api/* -> @api",
+                "/inline/* -> 127.0.0.1:2 127.0.0.1:3",
+                "/old -> redirect /new",
+                "files /srv/www",
+            ]
+        );
+    }
+
+    #[test]
+    fn nulls_are_dropped_recursively() {
+        let value = json!({
+            "a": null,
+            "b": { "c": null, "d": 1 },
+            "e": [{ "f": null, "g": "x" }, null],
+        });
+        assert_eq!(
+            without_nulls(value),
+            json!({ "b": { "d": 1 }, "e": [{ "g": "x" }, null] })
+        );
+    }
+
+    #[test]
+    fn missing_main_file_is_its_own_only_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("absent.toml");
+        assert_eq!(config_files(&main).expect("no error"), [main.as_path()]);
+
+        let Err(err) = file_defining_pool(&main, "api") else {
+            panic!("no file defines pool api");
+        };
+        assert!(err.contains("pool api is not defined"), "{err}");
+        assert!(err.contains("rxh pool add api"), "{err}");
+    }
+
+    #[test]
+    fn file_pointing_at_the_main_file_needs_no_include() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("rxh.toml");
+        std::fs::write(&main, "").expect("write");
+
+        let write = WriteTarget::open(&main, Some(Path::new("rxh.toml"))).expect("opens");
+        assert!(write.main_file.is_none());
+        assert_eq!(write.target.path(), main);
+    }
+
+    #[test]
+    fn validate_rejects_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = validate(&dir.path().join("absent.toml")).expect_err("missing");
+        assert!(err.contains("absent.toml"), "{err}");
+    }
+
+    #[test]
     fn encodes_inline_pool_names() {
         assert_eq!(encode("server[0]#1"), "server%5B0%5D%231");
         assert_eq!(encode("api"), "api");

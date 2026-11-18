@@ -87,3 +87,68 @@ pub(crate) fn signal(_pid_file: &Path, _signal: DaemonSignal) -> io::Result<i32>
         "signals are only supported on unix, enable the admin API",
     ))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+
+    use super::*;
+
+    fn pid_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rxh.pid");
+        fs::write(&path, contents).expect("write");
+        (dir, path)
+    }
+
+    #[test]
+    fn missing_pid_file_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = signal(&dir.path().join("none.pid"), DaemonSignal::Reload).expect_err("missing");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn unparsable_and_non_positive_pids_are_rejected() {
+        // 0 and negative PIDs would signal a whole process group.
+        for (contents, expected) in [
+            ("abc", "bad PID in"),
+            ("", "bad PID in"),
+            ("0\n", "bad PID 0 in"),
+            ("-1", "bad PID -1 in"),
+        ] {
+            let (_dir, path) = pid_file(contents);
+            let err = signal(&path, DaemonSignal::Terminate).expect_err(contents);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{contents:?}");
+            assert!(err.to_string().contains(expected), "{contents:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn stale_pid_reports_the_kill_error() {
+        let mut child = Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+        let (_dir, path) = pid_file(&pid.to_string());
+
+        let err = signal(&path, DaemonSignal::Terminate).expect_err("process is gone");
+        assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn signals_map_to_sigterm_and_sighup() {
+        for (daemon_signal, expected) in [
+            (DaemonSignal::Terminate, libc::SIGTERM),
+            (DaemonSignal::Reload, libc::SIGHUP),
+        ] {
+            let mut child = Command::new("sleep").arg("30").spawn().expect("spawn");
+            let (_dir, path) = pid_file(&format!("{}\n", child.id()));
+
+            let pid = signal(&path, daemon_signal).expect("signal sent");
+            assert_eq!(u32::try_from(pid).expect("positive"), child.id());
+            let status = child.wait().expect("wait");
+            assert_eq!(status.signal(), Some(expected), "{daemon_signal:?}");
+        }
+    }
+}
