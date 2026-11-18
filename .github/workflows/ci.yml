@@ -43,6 +43,27 @@ jobs:
           --summary-only
           --fail-under-lines 85
 
+  fuzz:
+    name: fuzz targets (60 seconds each)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Run every target
+        working-directory: fuzz
+        run: |
+          mkdir -p corpus/config
+          cp ../examples/*.toml ../examples/includes/*.toml corpus/config/
+          for target in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done
+
   bench-smoke:
     name: load balancing smoke test vs Caddy
     runs-on: ubuntu-latest

@@ -174,8 +174,9 @@ A release people can run without reading the source.
       `.github/workflows/ci.yml`; 92% measured). The remaining gaps are listed in
       docs/test-coverage.md; daemon signals, reload rollback and the admin
       API are covered.
-- [ ] Fuzzing with `cargo fuzz`: configuration parser, PROXY protocol,
-      matchers, cache keys.
+- [x] Fuzzing with `cargo fuzz`: configuration parser, PROXY protocol,
+      matchers, cache keys (`fuzz/`, docs/fuzzing.md; the `fuzz` CI job runs
+      each target for 60 seconds). The first run found colliding cache keys.
 - [x] Property tests for the policies: weights respected, hashing stable
       when a backend leaves, no pick of an unhealthy backend
       (`crates/core/tests/policy_properties.rs`).

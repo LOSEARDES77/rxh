@@ -11,6 +11,9 @@ mod daemon;
 mod dynamic;
 mod error;
 mod files;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod health;
 mod hooks;
 mod http;

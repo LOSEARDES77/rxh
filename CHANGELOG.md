@@ -102,9 +102,17 @@ Changed.
   down, failed or full.
 - CI: a `coverage` job runs `cargo llvm-cov --fail-under-lines 85` over the
   workspace without `crates/bench` and fails below 85% line coverage.
+- Fuzzing with `cargo fuzz` (`fuzz/`, see `docs/fuzzing.md`): targets for the
+  configuration parser, the PROXY protocol parser and writer, the host and
+  path matchers, layer 4 protocol sniffing and the response cache keys. A
+  `fuzz` CI job runs each target for 60 seconds.
 
 ### Changed
 
+- Response cache keys carry the length of the pool name and of the `Host`
+  header. Joined with `|`, a request with `Host: h|/a` for `/b` and one with
+  `Host: h` for `/a|/b` shared an entry, so a client could plant a response
+  for another host and path (found by the `cache_key` fuzz target).
 - `proxy_protocol` on a `tcp` server with TLS backends sends the header
   before the TLS handshake, as the PROXY protocol requires, instead of inside
   the TLS session. A backend that refuses the header now counts as a failed

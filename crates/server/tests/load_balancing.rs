@@ -230,7 +230,14 @@ async fn least_conn_avoids_busy_backend() {
     held.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while backends[0].1.connections() + backends[1].1.connections() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the held connection must reach a backend for the test to mean anything"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let held_backend = if backends[0].1.connections() == 1 {
         0
     } else {
@@ -247,6 +254,10 @@ async fn least_conn_avoids_busy_backend() {
         tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
             .await
             .unwrap();
+        drop(stream);
+        // The proxy releases the idle backend only after it sees this close;
+        // picking before that is a 1-1 tie, broken at random.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     assert_eq!(

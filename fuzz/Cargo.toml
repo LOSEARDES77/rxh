@@ -1,0 +1,54 @@
+[package]
+name = "rxh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
+http = "1.5.0"
+libfuzzer-sys = "0.4.10"
+rxh-core = { path = "../crates/core" }
+rxh-server = { path = "../crates/server", features = ["fuzzing"] }
+
+# Its own workspace: the fuzz targets need nightly and are not part of
+# `cargo test --workspace`.
+[workspace]
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_protocol"
+path = "fuzz_targets/proxy_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "matchers"
+path = "fuzz_targets/matchers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "l4_detect"
+path = "fuzz_targets/l4_detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_key"
+path = "fuzz_targets/cache_key.rs"
+test = false
+doc = false
+bench = false

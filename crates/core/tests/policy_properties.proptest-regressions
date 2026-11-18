@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 40e0fa1d91cacaea9c2f51cc346b98f0ddc56ea477fc887276103671eacb135d # shrinks to policy = Query, fallback = Some(WeightedRoundRobin), members = [(Up, 0)], key = 0, with_parts = false, pinned = None
