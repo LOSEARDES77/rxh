@@ -217,14 +217,20 @@ async fn run(cli: Cli) -> ExitCode {
         }
     }
 
-    if outcomes
-        .iter()
-        .any(|outcome| outcome.verdict == Verdict::Fail)
-    {
+    if rxh_failed(&outcomes) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Whether the run fails as a correctness gate. Only rxh counts: the other
+/// proxies are reported for information. An rxh `n/a` counts as a failure,
+/// so a missing binary or a scenario rxh cannot run does not pass silently.
+fn rxh_failed(outcomes: &[Outcome]) -> bool {
+    outcomes
+        .iter()
+        .any(|outcome| outcome.target == Flavor::Rxh.name() && outcome.verdict != Verdict::Pass)
 }
 
 /// Picks how to run rxh: the binary itself, or mounted into a container.
@@ -365,4 +371,44 @@ fn report(outcomes: &[Outcome], options: Options) -> String {
     }
 
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(target: &str, verdict: Verdict) -> Outcome {
+        Outcome {
+            scenario: Scenario::Throughput,
+            target: target.to_owned(),
+            verdict,
+            reason: String::new(),
+            stats: None,
+            distribution: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn other_proxies_do_not_fail_the_gate() {
+        let outcomes = [
+            outcome("rxh", Verdict::Pass),
+            outcome("caddy", Verdict::Fail),
+            outcome("nginx", Verdict::NotAvailable),
+        ];
+        assert!(!rxh_failed(&outcomes));
+    }
+
+    #[test]
+    fn rxh_failure_fails_the_gate() {
+        let outcomes = [
+            outcome("rxh", Verdict::Fail),
+            outcome("caddy", Verdict::Pass),
+        ];
+        assert!(rxh_failed(&outcomes));
+    }
+
+    #[test]
+    fn rxh_not_available_fails_the_gate() {
+        assert!(rxh_failed(&[outcome("rxh", Verdict::NotAvailable)]));
+    }
 }

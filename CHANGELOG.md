@@ -106,8 +106,14 @@ Changed.
   configuration parser, the PROXY protocol parser and writer, the host and
   path matchers, layer 4 protocol sniffing and the response cache keys. A
   `fuzz` CI job runs each target for 60 seconds.
+- CI: a `bench-gate` job runs `rxh-bench --quick` and fails when RXH fails
+  or cannot run a scenario. Caddy runs alongside for information only.
 
 ### Changed
+
+- `rxh-bench` exits with 1 only when rxh fails a scenario or cannot run it
+  (`n/a`); failures of Caddy, NGINX and Traefik are reported but no longer
+  change the exit code.
 
 - Response cache keys carry the length of the pool name and of the `Host`
   header. Joined with `|`, a request with `Host: h|/a` for `/b` and one with

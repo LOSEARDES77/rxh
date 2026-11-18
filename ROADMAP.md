@@ -182,7 +182,7 @@ A release people can run without reading the source.
       (`crates/core/tests/policy_properties.rs`).
 - [x] A reusable flaky backend for tests: refuse, accept then close, slow
       headers, truncated body.
-- [ ] `rxh-bench --quick` as a correctness gate in CI for RXH, with the
+- [x] `rxh-bench --quick` as a correctness gate in CI for RXH, with the
       other proxies as information only.
 
 ## Later, or maybe never
