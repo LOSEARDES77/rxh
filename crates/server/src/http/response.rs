@@ -39,6 +39,17 @@ pub(crate) fn plain(status: StatusCode, text: &'static str) -> BoxResponse {
     response
 }
 
+/// Redirect to `location` with an empty body. `400` if `location` is not a
+/// valid header value, which only a hostile `Host` can cause.
+pub(crate) fn redirect(status: StatusCode, location: &str) -> BoxResponse {
+    let Ok(location) = header::HeaderValue::from_str(location) else {
+        return plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST");
+    };
+    let mut response = plain(status, "");
+    response.headers_mut().insert(header::LOCATION, location);
+    response
+}
+
 /// `404 Not Found`.
 pub(crate) fn not_found() -> BoxResponse {
     plain(StatusCode::NOT_FOUND, "HTTP 404 NOT FOUND")

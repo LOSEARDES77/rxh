@@ -63,7 +63,7 @@ impl HostPattern {
 }
 
 /// Removes the port of `host:port` and `[::1]:port`.
-fn strip_port(host: &str) -> &str {
+pub(crate) fn strip_port(host: &str) -> &str {
     if host.starts_with('[') {
         return match host.find(']') {
             Some(end) => &host[..=end],

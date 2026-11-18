@@ -112,7 +112,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `request_buffers`, `response_buffers` | | ❌ | |
 | `stream_timeout` | `stream_timeout` on the server | 🟡 | Server level option, also caps `tcp` connections. |
 | `stream_close_delay` | | ❌ | |
-| `rewrite`, `method` | | ❌ | |
+| `rewrite`, `method` | `rewrite`, `request.method` on a route | ✅ | `rewrite` is a path (optionally with a query) with `{host}`, `{path}`, `{query}` and `{uri}` placeholders; the query is kept unless the rewrite has one. Applied after routing (routes are not matched again), also on `serve` routes. No regex, `strip_prefix` or `replace`. |
+| `redir` | `redirect` on a route (`"target"` or `{ to, status }`) | ✅ | Same placeholders; `302` by default, `301`, `303`, `307` and `308` allowed. No `html` redirects. |
 | `handle_response`, `replace_status`, `copy_response` | | ❌ | |
 | `transport fastcgi` | | ❌ | |
 | Response cache | `cache` per route | ➕ | Core Caddy needs the cache-handler plugin. |
@@ -125,8 +126,9 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Path matchers | `uri` prefix, `path` patterns | ✅ | Exact, prefix, suffix and middle `*`. Case sensitive, `*` also crosses `/`. |
 | Host matchers (virtual hosts) | `host`, server level `host` | ✅ | Exact and `*.domain`. HTTP servers on the same `listen` address share one socket. |
 | Header, method, query, remote IP matchers | `header`, `method`, `query`, `remote_ip` | ✅ | AND across matchers, OR inside lists. No regex or percent decoding. |
+| Automatic HTTP to HTTPS redirect | `https_redirect` on a TLS server | ✅ | On by default with `tls = "auto"`, opt in with certificate files. `308` to `https://{host}{uri}` from `[acme] http_port` on the addresses of the TLS server, for its `host` names, after the routes of plain `http` servers on that port. |
 | Manual TLS certificates | `tls = { cert, key }` | ✅ | |
-| Automatic HTTPS (ACME) | `tls = "auto"`, `[acme]` (`email`, `ca`, `ca_root`, `storage`, `renew_before`, `http_port`) | 🟡 | HTTP-01 with any ACME CA (Let's Encrypt by default), one certificate per `host` name, stored as PEM per CA (switching `ca` obtains new certificates), loaded on start, renewed in the background (daily check, `renew_before` 30 days, one-hour backoff per name that survives reloads) and swapped in without restart. Challenge-only listener (no `SO_REUSEPORT`) when nothing uses `http_port`. No TLS-ALPN-01 or DNS-01 (so no wildcards), no automatic HTTP to HTTPS redirect, no on-demand TLS, no ZeroSSL fallback, EAB or ARI. |
+| Automatic HTTPS (ACME) | `tls = "auto"`, `[acme]` (`email`, `ca`, `ca_root`, `storage`, `renew_before`, `http_port`) | 🟡 | HTTP-01 with any ACME CA (Let's Encrypt by default), one certificate per `host` name, stored as PEM per CA (switching `ca` obtains new certificates), loaded on start, renewed in the background (daily check, `renew_before` 30 days, one-hour backoff per name that survives reloads) and swapped in without restart. Challenge-only listener (no `SO_REUSEPORT`) when nothing uses `http_port`. No TLS-ALPN-01 or DNS-01 (so no wildcards), no on-demand TLS, no ZeroSSL fallback, EAB or ARI. |
 | SNI with many certificates, mTLS | `tls` per server on a shared address | 🟡 | Certificate picked by SNI against `host` (exact beats wildcard, the first loaded certificate is the default and only the first TLS server on an address may omit `host`, except for `tls = "auto"` names, whose handshakes fail until their certificate exists). No mTLS. |
 | `file_server` with `browse`, `index`, `hide` | `serve` (string or table: `browse`, `index`, `hide`) | ✅ | Index files and directory listing. `hide` takes names and `*` globs matched per path component. |
 | Range requests, ETag, conditional requests | `serve` | ✅ | Streamed files, weak ETag, `Last-Modified`, `If-None-Match`, `If-Modified-Since`, `If-Range`, one range (several send the whole file). |
@@ -227,7 +229,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 | Consistent hashing with bounded loads, Maglev | Envoy, HAProxy `hash-type consistent` | |
 | Retry budgets and hedged requests | Envoy | |
 | Per backend connection limits and queueing | HAProxy `maxconn` + queue | |
-| HTTP to HTTPS redirect, redirect and rewrite rules with regex | Nginx `rewrite`, Traefik `RedirectRegex`/`ReplacePath`, NPM | |
+| Redirect and rewrite rules with regex | Nginx `rewrite`, Traefik `RedirectRegex`/`ReplacePath` | HTTP to HTTPS, `redirect` and `rewrite` with placeholders exist; regex captures do not. |
 | Custom error pages per status | Traefik `Errors`, Nginx `error_page`, NPM | |
 | gRPC health checks and gRPC-Web | Envoy, Traefik | |
 | Splice/zero-copy for layer 4 on Linux | HAProxy | |

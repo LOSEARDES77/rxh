@@ -33,6 +33,7 @@ use crate::duration;
 use crate::matcher::{HostPattern, RequestMatcher};
 use crate::net::IpNet;
 use crate::status::StatusMatcher;
+use crate::template::Template;
 
 /// Error produced while loading a configuration file.
 #[derive(Debug)]
@@ -251,10 +252,13 @@ impl Config {
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
                 if server.protocol != Protocol::Http && pattern.has_http_options() {
                     return invalid(format!(
-                        "{label}: match[{pattern_index}]: request, response, encode and cache \
-                         only apply to http servers"
+                        "{label}: match[{pattern_index}]: rewrite, request, response, encode \
+                         and cache only apply to http servers"
                     ));
                 }
+                pattern.validate_rewrite().map_err(|err| {
+                    ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
+                })?;
                 if server.protocol == Protocol::Udp && pattern.has_http_matchers() {
                     return invalid(format!(
                         "{label}: match[{pattern_index}]: udp servers take no request matchers"
@@ -300,6 +304,14 @@ impl Config {
                             ));
                         }
                     }
+                    continue;
+                }
+                if let Action::Redirect(redirect) = &pattern.action {
+                    redirect.validate().map_err(|err| {
+                        ConfigError::Invalid(format!(
+                            "{label}: match[{pattern_index}]: redirect: {err}"
+                        ))
+                    })?;
                     continue;
                 }
                 let Action::Forward(forward) = &pattern.action else {
@@ -383,6 +395,26 @@ impl Config {
                 }
             }
 
+            if server.https_redirect == Some(true) {
+                if server.protocol != Protocol::Http || server.tls.is_none() {
+                    return invalid(format!(
+                        "{label}: https_redirect only applies to http servers with tls"
+                    ));
+                }
+                if server.listen.iter().all(|address| address.port() == 0) {
+                    return invalid(format!(
+                        "{label}: https_redirect needs a listen address with a fixed port"
+                    ));
+                }
+                if let Some(blocker) = self.http_port_blocker() {
+                    return invalid(format!(
+                        "{label}: https_redirect needs port {} ([acme] http_port), which is \
+                         used by {blocker}; only plain http servers can share it",
+                        self.acme.http_port
+                    ));
+                }
+            }
+
             if server.proxy_protocol.is_some() && server.protocol != Protocol::Tcp {
                 return invalid(format!(
                     "{label}: proxy_protocol only applies to tcp servers"
@@ -397,6 +429,72 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Label of the first server on `[acme] http_port` that is not a plain
+    /// `http` server, which keeps HTTP to HTTPS redirects off that port.
+    fn http_port_blocker(&self) -> Option<String> {
+        let port = self.acme.http_port;
+        self.servers
+            .iter()
+            .enumerate()
+            .find(|(_, server)| {
+                server.protocol != Protocol::Udp
+                    && (server.protocol != Protocol::Http || server.tls.is_some())
+                    && server.listen.iter().any(|address| address.port() == port)
+            })
+            .map(|(index, server)| server.label(index))
+    }
+
+    /// Returns this configuration plus one plain `http` server per TLS
+    /// server that redirects HTTP to HTTPS (`https_redirect`, on by default
+    /// with `tls = "auto"`). It listens on the addresses of the TLS server
+    /// with the port replaced by `[acme] http_port`, shares them with the
+    /// plain `http` servers already there (whose routes go first) and
+    /// answers `308` to `https://{host}{uri}`.
+    ///
+    /// Nothing is added while a TLS or `tcp` server uses `http_port`, nor
+    /// for listen addresses with port 0.
+    #[must_use]
+    pub fn with_https_redirects(&self) -> Self {
+        let mut config = self.clone();
+        if self.http_port_blocker().is_some() {
+            return config;
+        }
+        for server in &self.servers {
+            let enabled = server
+                .https_redirect
+                .unwrap_or(server.tls == Some(Tls::Auto));
+            if !enabled || server.tls.is_none() || server.protocol != Protocol::Http {
+                continue;
+            }
+            let mut listen: Vec<SocketAddr> = Vec::new();
+            let mut https_port = None;
+            for address in server.listen.iter().filter(|address| address.port() != 0) {
+                https_port.get_or_insert(address.port());
+                let http = SocketAddr::new(address.ip(), self.acme.http_port);
+                if !listen.contains(&http) {
+                    listen.push(http);
+                }
+            }
+            let Some(https_port) = https_port else {
+                continue;
+            };
+            let to = if https_port == 443 {
+                String::from("https://{host}{uri}")
+            } else {
+                format!("https://{{host}}:{https_port}{{uri}}")
+            };
+            config.servers.push(Server {
+                listen,
+                patterns: vec![Pattern::new(Action::Redirect(Redirect { to, status: 308 }))],
+                name: None,
+                tls: None,
+                https_redirect: None,
+                ..server.clone()
+            });
+        }
+        config
     }
 }
 
@@ -529,6 +627,12 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<Tls>,
 
+    /// Redirects plain HTTP requests for this TLS server to HTTPS, see
+    /// [`Config::with_https_redirects`]. Unset means on with `tls = "auto"`
+    /// and off otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub https_redirect: Option<bool>,
+
     /// Accepts HTTP/2 (h2 over TLS and h2c) on this listener.
     pub http2: bool,
 
@@ -590,6 +694,8 @@ struct RawServer {
     patterns: Option<Vec<Pattern>>,
     forward: Option<Forward>,
     serve: Option<FileServer>,
+    redirect: Option<Redirect>,
+    rewrite: Option<String>,
     #[serde(default)]
     encode: Vec<Encoding>,
     uri: Option<String>,
@@ -612,6 +718,7 @@ struct RawServer {
     max_connections: usize,
     name: Option<String>,
     tls: Option<Tls>,
+    https_redirect: Option<bool>,
     #[serde(default = "default::true_value")]
     http2: bool,
     #[serde(default)]
@@ -639,15 +746,17 @@ impl TryFrom<RawServer> for Server {
             return Err(String::from("missing field `listen`"));
         }
 
-        let inline_action = match (raw.forward, raw.serve) {
-            (Some(_), Some(_)) => {
+        let inline_action = match (raw.forward, raw.serve, raw.redirect) {
+            (Some(forward), None, None) => Some(Action::Forward(forward)),
+            (None, Some(root), None) => Some(Action::Serve(root)),
+            (None, None, Some(redirect)) => Some(Action::Redirect(redirect)),
+            (None, None, None) => None,
+            _ => {
                 return Err(String::from(
-                    "use either 'forward' or 'serve', if you need multiple patterns use 'match'",
+                    "use either 'forward', 'serve' or 'redirect', if you need multiple patterns \
+                     use 'match'",
                 ));
             }
-            (Some(forward), None) => Some(Action::Forward(forward)),
-            (None, Some(root)) => Some(Action::Serve(root)),
-            (None, None) => None,
         };
 
         let has_inline_options = raw.uri.is_some()
@@ -656,6 +765,7 @@ impl TryFrom<RawServer> for Server {
             || !raw.header.is_empty()
             || !raw.query.is_empty()
             || !raw.remote_ip.is_empty()
+            || raw.rewrite.is_some()
             || raw.request.is_some()
             || raw.response.is_some()
             || !raw.encode.is_empty()
@@ -669,30 +779,30 @@ impl TryFrom<RawServer> for Server {
             }
             (Some(_), None) if has_inline_options => {
                 return Err(String::from(
-                    "'uri', 'path', 'method', 'header', 'query', 'remote_ip', 'request', \
-                     'response', 'encode' and 'cache' go inside each 'match' entry",
+                    "'uri', 'path', 'method', 'header', 'query', 'remote_ip', 'rewrite', \
+                     'request', 'response', 'encode' and 'cache' go inside each 'match' entry",
                 ));
             }
             (Some(patterns), None) if !patterns.is_empty() => patterns,
             (None, Some(action)) => vec![Pattern {
                 uri: raw.uri.unwrap_or_else(default::uri),
-                host: Vec::new(),
                 path: raw.path,
                 method: raw.method,
                 header: raw.header,
                 query: raw.query,
                 remote_ip: raw.remote_ip,
-                action,
+                rewrite: raw.rewrite,
                 request: raw.request.unwrap_or_default(),
                 response: raw.response.unwrap_or_default(),
                 encode: raw.encode,
                 cache: raw.cache.unwrap_or_default(),
-                sni: Vec::new(),
-                alpn: Vec::new(),
-                protocol: None,
-                http_host: Vec::new(),
+                ..Pattern::new(action)
             }],
-            _ => return Err(String::from("missing 'match', 'forward' or 'serve'")),
+            _ => {
+                return Err(String::from(
+                    "missing 'match', 'forward', 'serve' or 'redirect'",
+                ));
+            }
         };
 
         let mut trusted_proxies = Vec::new();
@@ -712,6 +822,7 @@ impl TryFrom<RawServer> for Server {
             max_connections: raw.max_connections,
             name: raw.name,
             tls: raw.tls,
+            https_redirect: raw.https_redirect,
             http2: raw.http2,
             trusted_proxies,
             proxy_protocol: raw.proxy_protocol,
@@ -774,7 +885,12 @@ pub struct Pattern {
     #[serde(flatten)]
     pub action: Action,
 
-    /// Request header customization.
+    /// New URI of the request before it is forwarded or served, a
+    /// [`Template`] starting with `/`. Without a `?` the query is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<String>,
+
+    /// Request customization: method and headers.
     #[serde(default)]
     pub request: RequestConfig,
 
@@ -821,6 +937,58 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// An entry that matches everything and runs `action`.
+    fn new(action: Action) -> Self {
+        Self {
+            uri: default::uri(),
+            host: Vec::new(),
+            path: Vec::new(),
+            method: Vec::new(),
+            header: BTreeMap::new(),
+            query: BTreeMap::new(),
+            remote_ip: Vec::new(),
+            action,
+            rewrite: None,
+            request: RequestConfig::default(),
+            response: ResponseConfig::default(),
+            encode: Vec::new(),
+            cache: Cache::default(),
+            sni: Vec::new(),
+            alpn: Vec::new(),
+            protocol: None,
+            http_host: Vec::new(),
+        }
+    }
+
+    /// Checks `rewrite` and `request.method`.
+    fn validate_rewrite(&self) -> Result<(), String> {
+        if matches!(self.action, Action::Redirect(_))
+            && (self.rewrite.is_some() || self.request.method.is_some())
+        {
+            return Err(String::from(
+                "rewrite and request.method do not apply to redirect",
+            ));
+        }
+        if let Some(rewrite) = &self.rewrite {
+            let template: Template = rewrite.parse().map_err(|err| format!("rewrite: {err}"))?;
+            let sample = template.render("example.com", &http::Uri::from_static("/a?b=c"));
+            if !rewrite.starts_with('/')
+                || rewrite.contains('#')
+                || sample.parse::<http::uri::PathAndQuery>().is_err()
+            {
+                return Err(format!(
+                    "rewrite: {rewrite:?} must be a path starting with /, optionally with a query"
+                ));
+            }
+        }
+        if let Some(method) = &self.request.method
+            && (method.is_empty() || http::Method::from_bytes(method.as_bytes()).is_err())
+        {
+            return Err(format!("request.method: {method:?} is not an HTTP method"));
+        }
+        Ok(())
+    }
+
     /// Returns true if the entry uses a layer 4 matcher (`sni`, `alpn`,
     /// `protocol` or `http_host`).
     #[must_use]
@@ -843,10 +1011,11 @@ impl Pattern {
             || !self.remote_ip.is_empty()
     }
 
-    /// Returns true if the entry sets `request`, `response`, `encode` or
-    /// `cache`, which only HTTP servers use.
+    /// Returns true if the entry sets `rewrite`, `request`, `response`,
+    /// `encode` or `cache`, which only HTTP servers use.
     fn has_http_options(&self) -> bool {
         !self.encode.is_empty()
+            || self.rewrite.is_some()
             || self.request != RequestConfig::default()
             || self.response != ResponseConfig::default()
             || self.cache != Cache::default()
@@ -982,6 +1151,68 @@ pub enum Action {
 
     /// Serve static files from a root directory.
     Serve(FileServer),
+
+    /// Answer with a redirect.
+    Redirect(Redirect),
+}
+
+/// Settings of a `redirect` action: `redirect = "target"` or a table.
+///
+/// ```toml
+/// redirect = "https://example.com{uri}"
+/// redirect = { to = "/new{path}", status = 301 }
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(from = "RedirectOption")]
+pub struct Redirect {
+    /// Value of the `Location` header, a [`Template`].
+    pub to: String,
+
+    /// Response status: 301, 302, 303, 307 or 308.
+    pub status: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RedirectOption {
+    To(String),
+    Table(RedirectTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedirectTable {
+    to: String,
+    #[serde(default = "default::redirect_status")]
+    status: u16,
+}
+
+impl From<RedirectOption> for Redirect {
+    fn from(option: RedirectOption) -> Self {
+        match option {
+            RedirectOption::To(to) => Self {
+                to,
+                status: default::redirect_status(),
+            },
+            RedirectOption::Table(table) => Self {
+                to: table.to,
+                status: table.status,
+            },
+        }
+    }
+}
+
+impl Redirect {
+    fn validate(&self) -> Result<(), String> {
+        self.to.parse::<Template>()?;
+        if ![301, 302, 303, 307, 308].contains(&self.status) {
+            return Err(format!(
+                "status {} is not a redirect, expected 301, 302, 303, 307 or 308",
+                self.status
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Target of a `forward` action: a named group (`"@api"`) or an inline one.
@@ -2029,6 +2260,11 @@ pub fn validate_domain(name: &str) -> Result<(), String> {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestConfig {
+    /// Method the request is forwarded or served with instead of its own,
+    /// upper cased.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+
     /// Header rules.
     #[serde(default)]
     pub headers: RequestHeaders,
@@ -2277,6 +2513,10 @@ mod default {
 
     pub fn acme_http_port() -> u16 {
         80
+    }
+
+    pub fn redirect_status() -> u16 {
+        302
     }
 
     pub fn admin_listen() -> SocketAddr {
@@ -3007,5 +3247,202 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
         assert_eq!(Config::default().log.output, "stdout");
         assert!(Config::from_toml("[log]\nfile = \"x\"").is_err());
         assert!(Config::from_toml("[log]\noutput = \"\"").is_err());
+    }
+
+    fn invalid(text: &str) -> String {
+        Config::from_toml(text)
+            .expect_err("configuration must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn redirect_rewrite_and_method_parse() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            redirect = "https://example.com{uri}"
+
+            [[server]]
+            listen = "127.0.0.1:8001"
+            match = [
+                { uri = "/old", redirect = { to = "/new{path}?{query}", status = 301 } },
+                { uri = "/api", rewrite = "/v2{path}", request = { method = "post" }, forward = "127.0.0.1:1" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let Action::Redirect(redirect) = &config.servers[0].patterns[0].action else {
+            panic!("expected a redirect");
+        };
+        assert_eq!(redirect.to, "https://example.com{uri}");
+        assert_eq!(redirect.status, 302, "temporary by default, like Caddy");
+
+        let patterns = &config.servers[1].patterns;
+        let Action::Redirect(redirect) = &patterns[0].action else {
+            panic!("expected a redirect");
+        };
+        assert_eq!(
+            (redirect.to.as_str(), redirect.status),
+            ("/new{path}?{query}", 301)
+        );
+        assert_eq!(patterns[1].rewrite.as_deref(), Some("/v2{path}"));
+        assert_eq!(patterns[1].request.method.as_deref(), Some("post"));
+        assert_eq!(patterns[0].rewrite, None);
+
+        // The single pattern form takes `rewrite` too.
+        let config = Config::from_toml(
+            "[[server]]\nlisten = \"127.0.0.1:1\"\nrewrite = \"/x\"\nforward = \"127.0.0.1:2\"",
+        )
+        .unwrap();
+        assert_eq!(config.servers[0].patterns[0].rewrite.as_deref(), Some("/x"));
+    }
+
+    #[test]
+    fn invalid_redirect_rewrite_and_method_are_rejected() {
+        let server = |options: &str| format!("[[server]]\nlisten = \"127.0.0.1:1\"\n{options}");
+        let forward = |options: &str| server(&format!("forward = \"127.0.0.1:2\"\n{options}"));
+
+        for (text, expected) in [
+            (
+                server("redirect = { to = \"/x\", status = 200 }"),
+                "status 200",
+            ),
+            (server("redirect = { to = \"/x\", code = 301 }"), "redirect"),
+            (server("redirect = \"/{nope}\""), "unknown placeholder"),
+            (server("redirect = \"\""), "must not be empty"),
+            (server("redirect = \"/x\"\nserve = \".\""), "either"),
+            (
+                server("redirect = \"/x\"\nrewrite = \"/y\""),
+                "do not apply to redirect",
+            ),
+            (
+                server("redirect = \"/x\"\nrequest = { method = \"GET\" }"),
+                "do not apply",
+            ),
+            (
+                server("protocol = \"tcp\"\nredirect = \"/x\""),
+                "can only forward",
+            ),
+            (forward("rewrite = \"x\""), "starting with /"),
+            (forward("rewrite = \"/{host\""), "unclosed"),
+            (forward("rewrite = \"/a#b\""), "starting with /"),
+            (
+                forward("request = { method = \"GE T\" }"),
+                "not an HTTP method",
+            ),
+            (forward("request = { method = \"\" }"), "not an HTTP method"),
+            (
+                forward("protocol = \"tcp\"\nrewrite = \"/x\""),
+                "only apply to http",
+            ),
+            (
+                server("match = [{ forward = \"127.0.0.1:2\" }]\nrewrite = \"/x\""),
+                "inside each 'match' entry",
+            ),
+        ] {
+            let message = invalid(&text);
+            assert!(message.contains(expected), "{text}\n=> {message}");
+        }
+    }
+
+    const TLS_FILES: &str = "tls = { cert = \"c.pem\", key = \"k.pem\" }";
+
+    #[test]
+    fn https_redirect_adds_a_plain_server_on_the_http_port() {
+        let config = Config::from_toml(&format!(
+            "[[server]]\nlisten = [\"10.0.0.1:443\", \"10.0.0.2:443\"]\nhost = \"a.test\"\n\
+             tls = \"auto\"\nforward = \"127.0.0.1:1\"\n\
+             [[server]]\nlisten = \"10.0.0.1:8443\"\nhost = \"b.test\"\n{TLS_FILES}\n\
+             https_redirect = true\nforward = \"127.0.0.1:1\"\n\
+             [[server]]\nlisten = \"10.0.0.1:9443\"\n{TLS_FILES}\nforward = \"127.0.0.1:1\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.servers.len(),
+            3,
+            "the parsed configuration is as written"
+        );
+
+        let effective = config.with_https_redirects();
+        // Automatic for `tls = "auto"`, explicit for b.test, none for the last.
+        assert_eq!(effective.servers.len(), 5);
+        let target = |server: &Server| match &server.patterns[0].action {
+            Action::Redirect(redirect) => (redirect.to.clone(), redirect.status),
+            other => panic!("expected a redirect, got {other:?}"),
+        };
+
+        let auto = &effective.servers[3];
+        let listen: Vec<String> = auto.listen.iter().map(SocketAddr::to_string).collect();
+        assert_eq!(listen, ["10.0.0.1:80", "10.0.0.2:80"]);
+        assert_eq!(auto.host, ["a.test"]);
+        assert_eq!(auto.tls, None);
+        assert_eq!(target(auto), (String::from("https://{host}{uri}"), 308));
+
+        let explicit = &effective.servers[4];
+        assert_eq!(explicit.listen[0].to_string(), "10.0.0.1:80");
+        assert_eq!(explicit.host, ["b.test"]);
+        assert_eq!(
+            target(explicit),
+            (String::from("https://{host}:8443{uri}"), 308)
+        );
+        effective
+            .validate()
+            .expect("the effective configuration is valid");
+    }
+
+    #[test]
+    fn https_redirect_can_be_disabled_and_follows_http_port() {
+        let auto = |options: &str| {
+            Config::from_toml(&format!(
+                "[acme]\nhttp_port = 8080\n[[server]]\nlisten = \"10.0.0.1:443\"\n\
+                 host = \"a.test\"\ntls = \"auto\"\nforward = \"127.0.0.1:1\"\n{options}"
+            ))
+            .unwrap()
+            .with_https_redirects()
+        };
+        let enabled = auto("");
+        assert_eq!(enabled.servers[1].listen[0].to_string(), "10.0.0.1:8080");
+        assert_eq!(auto("https_redirect = false").servers.len(), 1);
+        // The automatic redirect steps aside when a tcp server owns the port.
+        let blocked = auto(
+            "[[server]]\nlisten = \"0.0.0.0:8080\"\nprotocol = \"tcp\"\nforward = \"127.0.0.1:1\"",
+        );
+        assert_eq!(blocked.servers.len(), 2);
+    }
+
+    #[test]
+    fn invalid_https_redirect_is_rejected() {
+        let server = |listen: &str, options: &str| {
+            format!(
+                "[[server]]\nlisten = \"{listen}\"\nforward = \"127.0.0.1:1\"\n\
+                 https_redirect = true\n{options}\n"
+            )
+        };
+        for (text, expected) in [
+            (server("127.0.0.1:443", ""), "http servers with tls"),
+            (
+                server("127.0.0.1:443", &format!("protocol = \"tcp\"\n{TLS_FILES}")),
+                "http servers with tls",
+            ),
+            (server("127.0.0.1:0", TLS_FILES), "fixed port"),
+            (
+                // The explicit option is an error where the automatic one steps aside.
+                format!(
+                    "{}[[server]]\nlisten = \"127.0.0.1:80\"\nprotocol = \"tcp\"\n\
+                     forward = \"127.0.0.1:1\"\n",
+                    server("127.0.0.1:443", TLS_FILES)
+                ),
+                "port 80",
+            ),
+            (
+                server("127.0.0.1:443", "https_redirect = \"yes\""),
+                "https_redirect",
+            ),
+        ] {
+            let message = invalid(&text);
+            assert!(message.contains(expected), "{text}\n=> {message}");
+        }
     }
 }

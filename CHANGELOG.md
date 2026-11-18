@@ -55,8 +55,24 @@ Changed.
   server's `host` names from an ACME CA with HTTP-01 (`[acme]` with `email`,
   `ca`, `ca_root`, `storage`, `renew_before`, `http_port`), stored per CA and
   swapped in without a restart.
+- `rewrite = "/v2{path}"` on a route changes the URI that is forwarded or
+  served (the query is kept unless the rewrite has one) and
+  `request.method` changes the method. Placeholders: `{host}`, `{path}`,
+  `{query}`, `{uri}`.
+- `redirect = "target"` or `{ to, status }` as a route action next to
+  `forward` and `serve`: answers `302` (or `301`, `303`, `307`, `308`) with
+  the same placeholders in `Location`.
+- HTTP to HTTPS redirect: `https_redirect = true` on a TLS `http` server
+  answers plain requests for its `host` names on `[acme] http_port` with
+  `308` to `https://{host}{uri}`. On by default with `tls = "auto"`.
 
 ### Changed
+
+- Servers with `tls = "auto"` now listen on `[acme] http_port` (their own
+  addresses with that port) all the time, to redirect to HTTPS and answer
+  challenges, instead of opening a challenge-only listener on `0.0.0.0`
+  while issuing. Starting fails if the port cannot be bound; set
+  `https_redirect = false` for the previous behaviour.
 
 - `read_header_timeout` now also bounds the TLS handshake and the time to the
   first complete request of a connection, HTTP/2 included. When unset, TLS
@@ -68,8 +84,8 @@ Changed.
 - `tls` is an enum in the configuration model (`{ cert, key }` or `"auto"`);
   existing TOML files are unaffected.
 - Stricter validation, so `rxh validate` rejects what the daemon would:
-  - HTTP request matchers on `tcp` and `udp` servers, and `request`,
-    `response`, `encode` and `cache` on them;
+  - HTTP request matchers on `tcp` and `udp` servers, and `rewrite`,
+    `request`, `response`, `encode` and `cache` on them;
   - `host` on `udp` servers;
   - two servers with the same `name`;
   - a TLS server without `host` that is not the first on a shared address

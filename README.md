@@ -88,7 +88,11 @@ pool web (least_conn)
   `Last-Modified` conditional requests, precompressed `.zst`/`.br`/`.gz`
   files, `index` files, `hide` patterns and an optional directory listing.
 - **Automatic HTTPS**: `tls = "auto"` obtains and renews certificates from
-  Let's Encrypt (or any ACME CA) with HTTP-01, swapped in without a restart.
+  Let's Encrypt (or any ACME CA) with HTTP-01, swapped in without a restart,
+  and redirects HTTP to HTTPS.
+- **Rewrites and redirects**: `rewrite` and `request.method` change the
+  request a route forwards or serves, `redirect` answers `301`/`302`/`308`
+  with `{host}`, `{path}`, `{query}` and `{uri}` placeholders.
 - **Also**: TLS with ALPN, connection limits, graceful shutdown with
   `grace_period`.
 
