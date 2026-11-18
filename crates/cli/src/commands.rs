@@ -116,7 +116,7 @@ async fn status(client: &AdminClient, raw: bool) -> Result<(), String> {
     if raw {
         println!(
             "{}",
-            serde_json::to_string_pretty(&status).unwrap_or_default()
+            serde_json::to_string_pretty(&status).map_err(|err| err.to_string())?
         );
         return Ok(());
     }
@@ -349,7 +349,7 @@ async fn config_show(cli: &Cli, client: &AdminClient, json: bool) -> Result<(), 
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&config).unwrap_or_default()
+            serde_json::to_string_pretty(&config).map_err(|err| err.to_string())?
         );
         return Ok(());
     }

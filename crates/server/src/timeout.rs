@@ -103,11 +103,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Timed<S> {
     }
 }
 
-/// Time of the last byte moved in either direction.
+/// Time of the last byte moved in either direction, and the bytes moved.
 #[derive(Debug)]
 pub(crate) struct Stamp {
     start: Instant,
     last_millis: AtomicU64,
+    read: AtomicU64,
+    written: AtomicU64,
 }
 
 impl Stamp {
@@ -115,7 +117,19 @@ impl Stamp {
         Arc::new(Self {
             start: Instant::now(),
             last_millis: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+            written: AtomicU64::new(0),
         })
+    }
+
+    /// Bytes read from the watched stream so far.
+    pub(crate) fn read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
+    }
+
+    /// Bytes written to the watched stream so far.
+    pub(crate) fn written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
     }
 
     fn touch(&self) {
@@ -166,9 +180,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let before = buf.filled().len();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
         if result.is_ready() {
             this.stamp.touch();
+            let read = buf.filled().len().saturating_sub(before);
+            this.stamp.read.fetch_add(read as u64, Ordering::Relaxed);
         }
         result
     }
@@ -182,8 +199,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if result.is_ready() {
+        if let Poll::Ready(written) = &result {
             this.stamp.touch();
+            if let Ok(written) = written {
+                this.stamp
+                    .written
+                    .fetch_add(*written as u64, Ordering::Relaxed);
+            }
         }
         result
     }

@@ -5,10 +5,15 @@
 //! directories on unix:
 //!
 //! ```text
-//! accounts/<CA URL without scheme, / as _>.json   account credentials
-//! <domain>/cert.pem                              certificate chain
-//! <domain>/key.pem                               private key
+//! accounts/<CA>.json        account credentials
+//! <CA>/<domain>/cert.pem    certificate chain
+//! <CA>/<domain>/key.pem     private key
 //! ```
+//!
+//! `<CA>` is the `ca` URL without `https://`, every character other than
+//! letters, digits, `.` and `-` replaced by `_`. Certificates are kept per CA,
+//! so switching `ca` (staging to production) obtains new ones instead of
+//! serving the old CA's.
 //!
 //! On start the stored certificates go into the resolvers right away. A
 //! background task then obtains the missing ones and the ones expiring
@@ -221,22 +226,18 @@ impl Drop for ClaimGuard {
     }
 }
 
-/// Certificate files of `[acme] storage`, see the module documentation.
+/// Certificate files of `[acme] storage` for one CA, see the module
+/// documentation.
 #[derive(Debug, Clone)]
 struct Storage {
     root: PathBuf,
+    /// `<CA>` of the module documentation.
+    ca_name: String,
 }
 
 impl Storage {
-    /// Directory of `domain`, refusing names that are not domain names so a
-    /// name can never escape `root`.
-    fn domain_dir(&self, domain: &str) -> io::Result<PathBuf> {
-        config::validate_domain(domain).map_err(io::Error::other)?;
-        Ok(self.root.join(domain))
-    }
-
-    fn account_path(&self, ca: &str) -> PathBuf {
-        let name: String = ca
+    fn new(root: PathBuf, ca: &str) -> Self {
+        let ca_name = ca
             .trim_start_matches("https://")
             .chars()
             .map(|c| {
@@ -247,7 +248,20 @@ impl Storage {
                 }
             })
             .collect();
-        self.root.join("accounts").join(format!("{name}.json"))
+        Self { root, ca_name }
+    }
+
+    /// Directory of `domain`, refusing names that are not domain names so a
+    /// name can never escape `root`.
+    fn domain_dir(&self, domain: &str) -> io::Result<PathBuf> {
+        config::validate_domain(domain).map_err(io::Error::other)?;
+        Ok(self.root.join(&self.ca_name).join(domain))
+    }
+
+    fn account_path(&self) -> PathBuf {
+        self.root
+            .join("accounts")
+            .join(format!("{}.json", self.ca_name))
     }
 
     /// Certificate chain and key of `domain`, if both files exist.
@@ -416,9 +430,7 @@ impl Manager {
         let settings = config.acme.clone();
         let manager = Self {
             ca_root: settings.ca_root.as_ref().map(|root| base.join(root)),
-            storage: Storage {
-                root: base.join(&settings.storage),
-            },
+            storage: Storage::new(base.join(&settings.storage), &settings.ca),
             challenge_port: ChallengePort::of(config),
             backoff_logged: Arc::default(),
             settings,
@@ -616,7 +628,7 @@ impl Manager {
             }
             .map_err(|err| err.to_string())
         };
-        let path = self.storage.account_path(&self.settings.ca);
+        let path = self.storage.account_path();
         match fs::read_to_string(&path) {
             Ok(text) => {
                 let credentials: AccountCredentials = serde_json::from_str(&text)
@@ -910,25 +922,31 @@ mod tests {
     #[test]
     fn storage_layout_and_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage {
-            root: dir.path().join("certs"),
-        };
+        let ca = "https://acme-v02.api.letsencrypt.org/directory";
+        let storage = Storage::new(dir.path().join("certs"), ca);
+        let ca_dir = "certs/acme-v02.api.letsencrypt.org_directory";
         storage.save("a.test", b"CERT", b"KEY").unwrap();
         assert_eq!(
-            fs::read(dir.path().join("certs/a.test/cert.pem")).unwrap(),
+            fs::read(dir.path().join(ca_dir).join("a.test/cert.pem")).unwrap(),
             b"CERT"
         );
         assert_eq!(
-            fs::read(dir.path().join("certs/a.test/key.pem")).unwrap(),
+            fs::read(dir.path().join(ca_dir).join("a.test/key.pem")).unwrap(),
             b"KEY"
         );
+        // Another CA (staging to production) does not see these certificates.
+        let staging = Storage::new(
+            dir.path().join("certs"),
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        assert!(staging.load("a.test").is_err());
         storage.save("a.test", b"CERT2", b"KEY2").unwrap();
         assert_eq!(
             storage.load("a.test").unwrap(),
             (b"CERT2".to_vec(), b"KEY2".to_vec())
         );
         assert!(storage.load("b.test").is_err());
-        let leftovers = fs::read_dir(dir.path().join("certs/a.test"))
+        let leftovers = fs::read_dir(dir.path().join(ca_dir).join("a.test"))
             .unwrap()
             .count();
         assert_eq!(leftovers, 2, "no temporary files are left behind");
@@ -936,7 +954,7 @@ mod tests {
         assert!(storage.load("..").is_err());
 
         assert_eq!(
-            storage.account_path("https://acme-v02.api.letsencrypt.org/directory"),
+            storage.account_path(),
             dir.path()
                 .join("certs/accounts/acme-v02.api.letsencrypt.org_directory.json")
         );
@@ -951,8 +969,10 @@ mod tests {
                     .mode()
                     & 0o777
             };
-            assert_eq!(mode("certs/a.test/key.pem"), 0o600);
-            assert_eq!(mode("certs/a.test"), 0o700);
+            let ca_dir = "certs/acme-v02.api.letsencrypt.org_directory";
+            assert_eq!(mode(&format!("{ca_dir}/a.test/key.pem")), 0o600);
+            assert_eq!(mode(&format!("{ca_dir}/a.test")), 0o700);
+            assert_eq!(mode(ca_dir), 0o700);
         }
     }
 

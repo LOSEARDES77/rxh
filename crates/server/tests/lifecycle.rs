@@ -96,6 +96,48 @@ async fn keep_alive_connections_do_not_block_shutdown() {
 }
 
 #[tokio::test]
+async fn first_request_during_shutdown_still_closes_the_connection() {
+    let backend = util::backend("ok").await;
+    let (proxy, shutdown, mut state) = util::spawn_controlled(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"{backend}\""
+    ));
+    state
+        .wait_for(|state| *state == State::Listening)
+        .await
+        .unwrap();
+
+    let stream = TcpStream::connect(proxy).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::task::spawn(connection);
+    // Let the server accept the connection before the shutdown.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Shutdown starts while the connection has not sent a request yet.
+    shutdown();
+    state
+        .wait_for(|state| *state == State::ShuttingDown(ShutdownState::PendingConnections(1)))
+        .await
+        .unwrap();
+
+    // Its first request is answered, then the connection is closed although
+    // the client keeps `sender` alive.
+    let response = sender
+        .send_request(Request::get("/").body(Empty::<Bytes>::new()).unwrap())
+        .await
+        .unwrap();
+    response.into_body().collect().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.wait_for(|state| *state == State::ShuttingDown(ShutdownState::Done)),
+    )
+    .await
+    .expect("the connection must close after its first request")
+    .unwrap();
+    drop(sender);
+}
+
+#[tokio::test]
 async fn max_connections_is_enforced() {
     let backend = util::backend("ok").await;
     let (proxy, _shutdown, mut state) = util::spawn_controlled(&format!(

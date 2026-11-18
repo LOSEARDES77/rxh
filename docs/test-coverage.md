@@ -2,6 +2,11 @@
 
 Measured 2026-11-18 on the tree that includes the virtual-hosts work (details in section 2).
 
+> **Stale numbers.** The measurement predates commit `42678d1` (which recorded it,
+> on top of `2ff3cdd`) and the work after it on the `caddy-parity` branch: the
+> streaming file server, includes and quick commands, layer 4 routing and PROXY
+> input, and ACME. Re-measure with section 1 before relying on section 2.
+
 ## 1. How to measure
 
 ```sh

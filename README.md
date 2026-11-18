@@ -36,6 +36,18 @@ pool web (least_conn)
 - **Layer 7 and layer 4.** HTTP reverse proxy, raw TCP proxy (with optional
   TLS termination and PROXY protocol v1/v2) and UDP proxy with per client
   sessions, all from one binary.
+- **Layer 4 routing**: `tcp` servers route by TLS SNI and ALPN (TLS
+  passthrough), detected protocol (`tls`, `http`, `ssh`) and HTTP `Host`, and
+  `http` and `tcp` servers accept an incoming PROXY v1/v2 header
+  (`proxy_protocol_in`) from `trusted_proxies`.
+- **Virtual hosts and request matchers**: several `http` servers share one
+  address, picked by `host` (exact or `*.wildcard`), with TLS certificates
+  chosen by SNI. Routes match on `host`, `path` patterns, `method`, `header`,
+  `query` and `remote_ip`.
+- **Upstreams over HTTPS, unix sockets and DNS**: `https://` backends with
+  `server_name`, custom CAs and client certificates, `unix//` sockets, and
+  pools filled from DNS `A`/`AAAA` or `SRV` records that refresh while
+  running.
 - **12 load balancing policies**, the same as Caddy: `random`,
   `random_choose`, `first`, `round_robin`, `weighted_round_robin` (smooth),
   `least_conn`, `ip_hash`, `client_ip_hash`, `uri_hash`, `query`, `header`,
@@ -46,23 +58,39 @@ pool web (least_conn)
   (failed dials, 5xx, slow responses, concurrency limits).
 - **Retries and failover**: `retries`, `try_duration`, `try_interval`.
   Failed dials and stale keep-alive connections move to another backend, and
-  `GET` requests are retried after a failed round trip.
+  `GET` requests are retried after a failed round trip. `retry_match`
+  chooses the retried methods and the response statuses that move a request
+  to another backend.
+- **Timeouts**: upstream `dial_timeout`, `response_header_timeout`,
+  `read_timeout` and `write_timeout`; listener `read_header_timeout` (also
+  bounding TLS handshakes and silent clients), `idle_timeout` and
+  `stream_timeout`.
+- **Observability**: Prometheus `/metrics` on the admin API (requests,
+  latency histogram, layer 4 connections, per upstream counters and health)
+  and text or JSON access logs to stdout, stderr or a file.
 - **Daemon and CLI**: `rxh start | stop | reload | status`, and
   `rxh upstream | pool | service` to manage peers, pools and listeners. The
   CLI edits the TOML file without losing your comments, validates it, then
-  applies the change live.
+  applies the change live. `include` globs split the configuration over
+  several files, and `rxh config show` prints the merged result.
+- **Quick commands**: `rxh file-server` and `rxh reverse-proxy` serve a
+  directory or proxy to backends right away, without a configuration file.
 - **Zero downtime reloads** (`SO_REUSEPORT`). An invalid configuration is
   rejected and the running one keeps serving.
 - **Admin API** on `127.0.0.1:2019` (JSON), with Caddy compatible
   `/reverse_proxy/upstreams`.
 - **HTTP done right**: keep-alive pools to backends, h2/h2c, WebSocket
   tunnels, hop-by-hop header stripping, `X-Forwarded-*` with
-  `trusted_proxies`, RFC 7239 `Forwarded`, `Via`, header rules and a response
-  cache.
+  `trusted_proxies`, RFC 7239 `Forwarded`, `Via`, header rules (`set`, `add`,
+  wildcard `remove`, regex `replace`), on the fly `zstd`/`br`/`gzip`
+  compression (`encode`) and a response cache.
+- **File server**: streamed files with range requests, `ETag` and
+  `Last-Modified` conditional requests, precompressed `.zst`/`.br`/`.gz`
+  files, `index` files, `hide` patterns and an optional directory listing.
 - **Automatic HTTPS**: `tls = "auto"` obtains and renews certificates from
   Let's Encrypt (or any ACME CA) with HTTP-01, swapped in without a restart.
-- **Also**: static file server with directory listing, TLS with ALPN,
-  connection limits, graceful shutdown with `grace_period`.
+- **Also**: TLS with ALPN, connection limits, graceful shutdown with
+  `grace_period`.
 
 ## Benchmarks
 

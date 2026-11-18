@@ -171,3 +171,48 @@ async fn idle_http_connections_are_closed_but_busy_ones_are_not() {
     let elapsed = closed_within_3s(&mut stream).await;
     assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
 }
+
+/// Connects and sends nothing; the proxy must hang up on its own.
+async fn silent_client_is_dropped(config: &str) {
+    let proxy = util::spawn(config)[0];
+    let mut stream = TcpStream::connect(proxy).await.expect("connect");
+    closed_within_3s(&mut stream).await;
+}
+
+#[tokio::test]
+async fn silent_http1_clients_are_dropped() {
+    let backend = util::backend("ok").await;
+    silent_client_is_dropped(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nread_header_timeout = \"200ms\"\nforward = \"{backend}\""
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn silent_http2_capable_clients_are_dropped() {
+    let backend = util::backend("ok").await;
+    silent_client_is_dropped(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nhttp2 = true\nread_header_timeout = \"200ms\"\nforward = \"{backend}\""
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn silent_tls_clients_are_dropped() {
+    let backend = util::backend("ok").await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let certificate =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("certificate");
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, certificate.cert.pem()).expect("write cert");
+    std::fs::write(&key, certificate.signing_key.serialize_pem()).expect("write key");
+    for protocol in ["http", "tcp"] {
+        silent_client_is_dropped(&format!(
+            "[[server]]\nlisten = \"127.0.0.1:0\"\nprotocol = \"{protocol}\"\n\
+             read_header_timeout = \"200ms\"\nforward = \"{backend}\"\n\
+             tls = {{ cert = {cert:?}, key = {key:?} }}"
+        ))
+        .await;
+    }
+}

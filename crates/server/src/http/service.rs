@@ -162,10 +162,19 @@ impl Activity {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    /// Waits until at least one request has been received.
+    /// Waits until at least one request has been received. Level triggered:
+    /// every waiter returns, however many there are.
     pub(crate) async fn first_request(&self) {
-        while self.requests.load(Ordering::Acquire) == 0 {
-            self.notify.notified().await;
+        loop {
+            let notified = self.notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            // Registered before the check, so a `notify_waiters` between the
+            // check and the await is not missed.
+            notified.as_mut().enable();
+            if self.requests.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -194,7 +203,7 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
     fn call(&self, request: Request<Incoming>) -> Self::Future {
         self.activity.requests.fetch_add(1, Ordering::Release);
-        self.activity.notify.notify_one();
+        self.activity.notify.notify_waiters();
 
         self.activity.in_flight.fetch_add(1, Ordering::Release);
         let in_flight = InFlight(Arc::clone(&self.activity));

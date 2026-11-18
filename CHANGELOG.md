@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+Caddy parity for HTTP routing, upstream transports, timeouts, observability,
+the file server and automatic HTTPS, plus layer 4 routing. Configuration
+files of 0.2.0 keep working, except for the stricter validation listed under
+Changed.
+
+### Added
+
+- Request matchers on routes: `host` (exact or `*.wildcard`, also server
+  wide), Caddy style `path` patterns, `method`, `header`, `query` and
+  `remote_ip`, ANDed with the `uri` prefix. `rxh service add --host`.
+- Virtual hosts: several `http` servers may share a `listen` address (one
+  socket, routes tried in order, each keeping its own settings), with TLS
+  certificates picked by SNI against `host`.
+- Upstream transports: `https://` backends with a pool `tls` table
+  (`server_name`, `insecure_skip_verify`, `ca`, `client_cert`/`client_key`),
+  `unix//path` backends for HTTP, TCP and health checks.
+- Dynamic upstreams: `[upstream.NAME.dynamic]` fills a pool from DNS `A`/`AAAA`
+  or `SRV` records and refreshes it, keeping the health and counters of
+  unchanged members.
+- Timeouts: upstream `response_header_timeout` (`504`), `read_timeout` and
+  `write_timeout`; server `read_header_timeout`, `idle_timeout` (also for
+  `tcp` connections) and `stream_timeout` (tunnels and `tcp` connections).
+- Observability: Prometheus `GET /metrics` on the admin API, and a `[log]`
+  table for text or JSON access logs to stdout, stderr or a file; every TCP
+  and UDP connection writes one record with its byte counts.
+- `retry_match = { method, status }`: methods retried after a failed round
+  trip and response statuses retried on another backend. `fallback` accepts
+  a nested table with its own `key`, `choose`, `secret` and `fallback`.
+- Header rules gain `add`, prefix wildcard `remove` (`x-internal-*`) and regex
+  `replace`, applied in the order remove, replace, set, add.
+- File server: `serve` takes a table (`root`, `browse`, `index`, `hide`,
+  `precompressed`); files stream with `Content-Length`, `Last-Modified`, weak
+  `ETag` and `Accept-Ranges`, conditional requests get `304`, single ranges
+  `206`/`416`, and precompressed `.zst`/`.br`/`.gz` files are served when the
+  client accepts them.
+- `encode = ["zstd", "br", "gzip"]` on a route compresses file and proxied
+  responses on the fly.
+- `include` globs split `upstream` and `server` tables over several files;
+  reloads re-read them and CLI edits change the file that defines the pool or
+  service (`--file` for new ones). `rxh config show [--json]` prints the
+  effective configuration.
+- Quick commands without a configuration file: `rxh file-server` and
+  `rxh reverse-proxy`.
+- Layer 4 routing: `tcp` servers take `match` entries with `sni`, `alpn`,
+  `protocol` (`tls`, `http`, `ssh`) and `http_host`, read within
+  `match_timeout` and replayed to the backend (TLS passthrough by SNI).
+- PROXY protocol input: `proxy_protocol_in = true` on `http` and `tcp`
+  servers, limited to `trusted_proxies` when set; the source address is the
+  client address everywhere.
+- Automatic HTTPS: `tls = "auto"` obtains and renews certificates for the
+  server's `host` names from an ACME CA with HTTP-01 (`[acme]` with `email`,
+  `ca`, `ca_root`, `storage`, `renew_before`, `http_port`), stored per CA and
+  swapped in without a restart.
+
+### Changed
+
+- `read_header_timeout` now also bounds the TLS handshake and the time to the
+  first complete request of a connection, HTTP/2 included. When unset, TLS
+  handshakes get 10 seconds and the first request head 30 seconds, so
+  clients that connect and send nothing no longer hold a connection slot.
+- `try_duration` also bounds round-trip and status retries, and round-trip
+  retries wait `try_interval` between attempts, like dial retries.
+- File routes answer methods other than `GET` and `HEAD` with `405`.
+- `tls` is an enum in the configuration model (`{ cert, key }` or `"auto"`);
+  existing TOML files are unaffected.
+- Stricter validation, so `rxh validate` rejects what the daemon would:
+  - HTTP request matchers on `tcp` and `udp` servers, and `request`,
+    `response`, `encode` and `cache` on them;
+  - `host` on `udp` servers;
+  - two servers with the same `name`;
+  - a TLS server without `host` that is not the first on a shared address
+    (its certificate would never be served);
+  - an invalid `health.body` regex and a backend listed twice in one pool.
+- Rust 1.100 toolchain (`rust-toolchain.toml`) and the latest dependency
+  releases; the file server's HTML assets are embedded without a minifying
+  build step.
+
 ## 0.2.0 (unreleased)
 
 RXH grows from an HTTP reverse proxy into a general reverse proxy and load

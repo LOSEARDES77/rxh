@@ -133,8 +133,9 @@ pub(crate) async fn proxy<S>(
         }
     };
 
-    // ponytail: byte counts are 0 when a timeout or error ends the copy,
-    // since the copy future is dropped; wrap the streams in counters if needed.
+    // Reads of `client` were sent upstream, writes to it were received; the
+    // stamp keeps the counts when a timeout or an error drops the copy.
+    let moved = || (stamp.read(), stamp.written());
     tokio::select! {
         result = copy => match result {
             Ok((sent, received)) => {
@@ -144,20 +145,23 @@ pub(crate) async fn proxy<S>(
                 });
             }
             Err(err) => {
-                json(Some(address), 0, 0);
+                let (sent, received) = moved();
+                json(Some(address), sent, received);
                 if text {
                     eprintln!("{peer} -> {log_name} TCP {address} closed: {err}");
                 }
             }
         },
         () = idle => {
-            json(Some(address), 0, 0);
+            let (sent, received) = moved();
+            json(Some(address), sent, received);
             if text {
                 println!("{peer} -> {log_name} TCP {address} closed: idle timeout");
             }
         }
         () = lifetime => {
-            json(Some(address), 0, 0);
+            let (sent, received) = moved();
+            json(Some(address), sent, received);
             if text {
                 println!("{peer} -> {log_name} TCP {address} closed: stream timeout");
             }

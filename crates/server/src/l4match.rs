@@ -137,6 +137,10 @@ where
     let read = async {
         let mut chunk = [0; 4096];
         loop {
+            // ponytail: `decide` reparses the whole buffer after every read, so
+            // a client trickling bytes costs O(n²) work, bounded by `max`
+            // (MAX_SNIFF, 16 KiB) and `limit` (match_timeout); keep parser
+            // state across reads if that ever shows up in profiles.
             if let Some(found) = decide(buffer) {
                 return Ok(Some(found));
             }

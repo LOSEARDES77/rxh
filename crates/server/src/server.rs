@@ -35,6 +35,14 @@ use crate::timeout::{Stamp, Watched};
 use crate::tls::{self, CertResolver};
 use crate::udp::{self, UdpSettings};
 
+/// Deadline for the TLS handshake when `read_header_timeout` is unset.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for the first request head of an HTTP connection when
+/// `read_header_timeout` is unset. Hyper applies the same default to later
+/// HTTP/1 request heads.
+const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Current state of a [`Server`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum State {
@@ -500,8 +508,16 @@ async fn handle_connection(
     let stream = Rewind::new(buffer, stream);
 
     match &context.tls {
-        Some(acceptor) => match acceptor.accept(stream).await {
-            Ok(stream) => {
+        Some(acceptor) => match tokio::time::timeout(
+            context
+                .read_header_timeout
+                .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT),
+            acceptor.accept(stream),
+        )
+        .await
+        {
+            Err(_) => eprintln!("{log_name} => TLS handshake with {peer} timed out"),
+            Ok(Ok(stream)) => {
                 let (_, connection) = stream.get_ref();
                 let handshake = Detected {
                     tls: true,
@@ -515,7 +531,7 @@ async fn handle_connection(
                 };
                 serve(stream, peer, local, &context, stop, Some(handshake)).await;
             }
-            Err(err) => eprintln!("{log_name} => TLS handshake with {peer} failed: {err}"),
+            Ok(Err(err)) => eprintln!("{log_name} => TLS handshake with {peer} failed: {err}"),
         },
         None => serve(stream, peer, local, &context, stop, None).await,
     }
@@ -586,6 +602,9 @@ async fn serve<S>(
             let stamp = Stamp::new();
             let io = TokioIo::new(Watched::new(stream, Arc::clone(&stamp)));
             let idle = context.idle_timeout.map(|idle| (idle, stamp));
+            let first_request = context
+                .read_header_timeout
+                .unwrap_or(DEFAULT_READ_HEADER_TIMEOUT);
 
             let result = if *http2 {
                 let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -598,6 +617,7 @@ async fn serve<S>(
                     builder.serve_connection_with_upgrades(io, service),
                     stop,
                     &activity,
+                    first_request,
                     idle,
                 )
                 .await
@@ -608,7 +628,7 @@ async fn serve<S>(
                     builder.header_read_timeout(timeout);
                 }
                 let connection = builder.serve_connection(io, service).with_upgrades();
-                drive_http(connection, stop, &activity, idle).await
+                drive_http(connection, stop, &activity, first_request, idle).await
             };
 
             if let Err(err) = result {
@@ -652,15 +672,19 @@ where
     }
 }
 
-/// Runs an HTTP connection. A connection without traffic and without requests
-/// in flight for `idle` is dropped. Once shutdown starts, the connection is closed
-/// after its current request; connections that never sent a request are left
-/// open until they send one, so clients that connected right before the
-/// shutdown still get an answer.
+/// Runs an HTTP connection. A connection that sends no complete request head
+/// within `first_request` is dropped: hyper's own header timer does not run
+/// while the HTTP/2 capable builder waits for the first bytes, nor before the
+/// first byte of an HTTP/1 request. A connection without traffic and without
+/// requests in flight for `idle` is dropped. Once shutdown starts, the
+/// connection is closed after its current request; connections that never
+/// sent a request are left open until they send one (within `first_request`),
+/// so clients that connected right before the shutdown still get an answer.
 async fn drive_http<C, E>(
     connection: C,
     mut stop: watch::Receiver<bool>,
     activity: &Activity,
+    first_request: Duration,
     idle: Option<(Duration, Arc<Stamp>)>,
 ) -> Result<(), String>
 where
@@ -679,6 +703,11 @@ where
     tokio::select! {
         result = connection.as_mut() => return result.map_err(|err| err.to_string()),
         () = idle => return Ok(()),
+        () = async {
+            if tokio::time::timeout(first_request, activity.first_request()).await.is_ok() {
+                std::future::pending::<()>().await;
+            }
+        } => return Err(format!("no request head within {first_request:?}")),
         () = async {
             let _ = stop.wait_for(|stopping| *stopping).await;
             activity.first_request().await;

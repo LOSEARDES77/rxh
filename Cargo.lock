@@ -1635,7 +1635,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rxh-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "clap",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "rxh-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "clap",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "rxh-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hmac",
  "http",
@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "rxh-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-compression",
  "bytes",

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 authors = ["Antonio Sarosi", "LOSEARDES77"]
@@ -11,8 +11,8 @@ repository = "https://github.com/LOSEARDES77/rxh"
 rust-version = "1.100"
 
 [workspace.dependencies]
-rxh-core = { path = "crates/core", version = "0.2.0" }
-rxh-server = { path = "crates/server", version = "0.2.0" }
+rxh-core = { path = "crates/core", version = "0.3.0" }
+rxh-server = { path = "crates/server", version = "0.3.0" }
 
 async-compression = { version = "0.4.52", features = ["tokio", "gzip", "zstd", "brotli"] }
 bytes = "1.12.2"
@@ -23,9 +23,9 @@ hmac = "0.13.0"
 http = "1.5.0"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
-instant-acme = { version = "0.8.5", features = ["rcgen"] }
 hyper = { version = "1.12.0", features = ["full"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
+instant-acme = { version = "0.8.5", features = ["rcgen"] }
 libc = "0.2.191"
 rcgen = "0.14.10"
 regex = "1.13.2"

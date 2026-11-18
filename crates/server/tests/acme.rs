@@ -171,8 +171,11 @@ async fn certificates_set_at_runtime_are_served_without_restart() {
 async fn daemon_serves_stored_certificates_and_fails_missing_ones() {
     let backend = util::backend("stored").await;
     let dir = tempfile::tempdir().unwrap();
-    // Relative storage: under the directory of the configuration file.
-    let stored = write_stored(&dir.path().join("certs"), "a.test");
+    // Relative storage: under the directory of the configuration file, one
+    // directory per CA.
+    let stored = write_stored(&dir.path().join("certs/127.0.0.1_1_directory"), "a.test");
+    // A certificate of another CA (say staging) is not served.
+    write_stored(&dir.path().join("certs/127.0.0.1_2_directory"), "b.test");
     let address = free_address();
     let http_port = free_address().port();
     let config = dir.path().join("rxh.toml");
@@ -202,7 +205,7 @@ async fn daemon_serves_stored_certificates_and_fails_missing_ones() {
     assert_eq!(presented, root);
     assert_eq!(body, "stored");
 
-    // b.test has no certificate and the CA is unreachable.
+    // b.test only has a certificate of another CA, and this CA is unreachable.
     assert!(https_get(address, "b.test", None).await.is_err());
     assert!(
         !daemon.is_finished(),
@@ -250,7 +253,11 @@ async fn pebble_issues_and_installs_a_certificate() {
     let daemon = tokio::task::spawn(Daemon::new(&config).run());
 
     let storage = dir.path().join("rxh-data/certificates");
-    let cert = storage.join("acme.rxh.test/cert.pem");
+    let ca_dir = directory.trim_start_matches("https://").replace(
+        |c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+        "_",
+    );
+    let cert = storage.join(&ca_dir).join("acme.rxh.test/cert.pem");
     for _ in 0..600 {
         if cert.exists() {
             break;
@@ -261,7 +268,7 @@ async fn pebble_issues_and_installs_a_certificate() {
         cert.exists(),
         "no certificate after 60 seconds, see the daemon log"
     );
-    assert!(storage.join("acme.rxh.test/key.pem").exists());
+    assert!(storage.join(&ca_dir).join("acme.rxh.test/key.pem").exists());
     let accounts = std::fs::read_dir(storage.join("accounts")).unwrap().count();
     assert_eq!(accounts, 1, "the account is stored");
 

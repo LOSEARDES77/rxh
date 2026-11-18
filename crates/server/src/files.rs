@@ -409,8 +409,9 @@ fn encode_path(path: &str) -> String {
     encoded
 }
 
-/// Decodes `%XX` escapes. Invalid escapes stay as they are.
-fn percent_decode(value: &str) -> String {
+/// Decodes `%XX` escapes. Invalid escapes stay as they are. Shared with
+/// the admin API's path segments.
+pub(crate) fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut at = 0;

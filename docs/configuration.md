@@ -176,10 +176,15 @@ never logged):
 
 ```text
 rxh-data/certificates/
-  accounts/acme-v02.api.letsencrypt.org_directory.json   account per CA
-  example.com/cert.pem                                   certificate chain
-  example.com/key.pem                                    private key
+  accounts/acme-v02.api.letsencrypt.org_directory.json              account per CA
+  acme-v02.api.letsencrypt.org_directory/example.com/cert.pem       certificate chain
+  acme-v02.api.letsencrypt.org_directory/example.com/key.pem        private key
 ```
+
+Accounts and certificates are kept per CA: the directory name is the `ca` URL
+without `https://`, other characters than letters, digits, `.` and `-`
+replaced by `_`. Switching `ca` (for example from staging to production)
+therefore obtains new certificates instead of serving the old CA's.
 
 ## `[upstream.NAME]`: load balancing pools
 
@@ -324,11 +329,11 @@ socket, except that `http` servers listing the same address share one socket
 |---|---|---|
 | `listen` | required | `"ip:port"` or a list of them. Port `0` picks a free port. |
 | `protocol` | `"http"` | `http`, `tcp` or `udp`. |
-| `name` | | Name shown in logs, in `rxh status`, and in `Forwarded: by=` and `Via`. |
+| `name` | | Name shown in logs, in `rxh status`, and in `Forwarded: by=` and `Via`. Must be unique: inline pools, metrics labels and `rxh service` use it. |
 | `forward` | | Proxy target: `"@pool"`, `"host:port"`, a list of backends, or an inline pool table. |
 | `serve` | | Serve static files: a directory, or a table, see [File server](#file-server) (http only). |
 | `uri` | `"/"` | Path prefix for the single `forward` or `serve` of this server (http only). |
-| `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. |
+| `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. Not allowed on `udp` servers. |
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
 | `match` | | List of patterns instead of `forward`/`serve`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
@@ -336,9 +341,9 @@ socket, except that `http` servers listing the same address share one socket
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
-| `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). |
+| `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). Set `trusted_proxies` too: with it empty any directly connecting client can spoof its address. |
 | `match_timeout` | `"3s"` | Time a client has to send the PROXY header (`proxy_protocol_in`) and, on `tcp` servers with layer 4 matchers, the first bytes the matchers look at. |
-| `read_header_timeout` | unset | Time a client has to send the request headers; slower clients are disconnected (http only). On a listener shared by several http servers, this and `idle_timeout` come from the first server. |
+| `read_header_timeout` | `"30s"` (TLS handshake `"10s"`) | Time a client has to send the request headers; slower clients are disconnected (http only). It also bounds the TLS handshake (`http` and `tcp` servers with `tls`) and the time to the first complete request head of a connection, HTTP/2 included, so clients that connect and send nothing are closed too. When unset, request heads get 30 seconds and TLS handshakes 10 seconds. On a listener shared by several http servers, this and `idle_timeout` come from the first server. |
 | `idle_timeout` | unset | Keep-alive HTTP connections without traffic and without requests in flight for this long are closed. For `tcp`, a connection with no traffic in either direction for this long is closed. |
 | `stream_timeout` | unset | Maximum lifetime of upgraded HTTP tunnels (WebSockets) and of `tcp` connections. |
 | `udp_idle_timeout` | `"60s"` | Idle time after which a UDP client session ends (udp only). |
@@ -360,7 +365,9 @@ name joins the server names.
 With TLS every server on the address needs its own `tls`, and the certificate
 is picked by the SNI name of the client against the servers' `host` patterns:
 an exact name beats a wildcard, and a client without SNI (or with a name that
-matches nothing) gets the first certificate loaded. `tls = "auto"` and
+matches nothing) gets the first certificate loaded. Only the first TLS server
+on an address may omit `host`: a later host-less server's certificate would
+never be served, so it is a validation error. `tls = "auto"` and
 `tls = { cert, key }` servers may share an address: each name gets the
 certificate of its own server, and the handshake for a `tls = "auto"` name
 fails (it never falls back to the first certificate) until its certificate
@@ -481,8 +488,9 @@ handshake and `alpn` matches the negotiated protocol. Entries using only
 `sni`, `alpn` or `protocol = "tls"` then need no extra read.
 
 HTTP request matchers (`uri`, `host`, `path`, `method`, `header`, `query`,
-`remote_ip`) are rejected on `tcp` servers, and layer 4 matchers on `http`
-and `udp` servers.
+`remote_ip`) are rejected on `tcp` and `udp` servers, and layer 4 matchers on
+`http` and `udp` servers. `request`, `response`, `encode` and `cache` only
+apply to `http` servers and are rejected elsewhere.
 
 ### PROXY protocol input
 
@@ -505,7 +513,11 @@ forward = "@web"
 ```
 
 If `trusted_proxies` is not empty, only peers in it may connect; others are
-closed. Servers sharing a listen address must agree on `proxy_protocol_in`,
+closed. **With an empty `trusted_proxies`, any client that can reach the
+listener directly can send its own PROXY header and claim any source
+address**, defeating `remote_ip`, `ip_hash`, logs and `X-Forwarded-For`. Set
+`trusted_proxies` to the balancer's addresses, or make sure only the balancer
+can reach the port. Servers sharing a listen address must agree on `proxy_protocol_in`,
 and the first one's `trusted_proxies` and `match_timeout` apply to the
 header.
 

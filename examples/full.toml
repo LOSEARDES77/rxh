@@ -106,11 +106,9 @@ unhealthy_request_count = 500  # concurrent requests per backend, 0 = no limit
 
 # Virtual host: "blog" and "edge" below list the same addresses, so they share
 # one socket. Routes are tried in file order, so this host-bound site comes
-# before the catch-all routes of "edge". With TLS, each server would have its
-# own `tls` and the certificate would be picked by SNI.
-
+# before the catch-all routes of "edge". Servers on one address use TLS all
+# or none, so `tls` here means a `tls` on both servers (see "docs" below).
 [[server]]
-
 name = "blog"
 listen = ["0.0.0.0:8100", "[::]:8100"]
 host = ["blog.example.com", "*.blog.example.com"]
@@ -126,7 +124,6 @@ read_header_timeout = "10s"    # clients must send request headers in time
 idle_timeout = "2m"            # close idle keep-alive connections
 stream_timeout = "1h"          # maximum lifetime of WebSocket tunnels
 trusted_proxies = ["private_ranges", "203.0.113.0/24"]
-# tls = { cert = "/etc/rxh/cert.pem", key = "/etc/rxh/key.pem" }  # or tls = "auto"
 
 [[server.match]]
 uri = "/api"
@@ -167,6 +164,17 @@ host = ["shop.example.com", "www.shop.example.com"]
 tls = "auto"
 forward = "@api"
 
+# A second HTTPS site on the same address, with certificate files. Servers on
+# one address use TLS all or none; the certificate is picked by SNI against
+# `host`, and only the first server may omit `host` (its certificate is the
+# default for clients without SNI).
+[[server]]
+name = "docs"
+listen = "0.0.0.0:443"
+host = "docs.example.com"
+tls = { cert = "/etc/rxh/docs.pem", key = "/etc/rxh/docs.key" }
+serve = { root = "/var/www/docs" }
+
 # TCP (layer 4) with PROXY protocol and an inline group.
 [[server]]
 name = "postgres"
@@ -180,7 +188,7 @@ forward = { policy = "first", backends = ["10.0.0.1:5432", "10.0.0.2:5432"], hea
 # TCP (layer 4) routing without terminating TLS: SNI, ALPN, protocol and
 # HTTP Host matchers on the first bytes, behind a PROXY protocol balancer.
 [[server]]
-name = "edge"
+name = "l4-edge"
 listen = "0.0.0.0:8443"
 protocol = "tcp"
 proxy_protocol_in = true       # every connection starts with a PROXY v1/v2 header

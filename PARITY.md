@@ -126,8 +126,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Host matchers (virtual hosts) | `host`, server level `host` | ✅ | Exact and `*.domain`. HTTP servers on the same `listen` address share one socket. |
 | Header, method, query, remote IP matchers | `header`, `method`, `query`, `remote_ip` | ✅ | AND across matchers, OR inside lists. No regex or percent decoding. |
 | Manual TLS certificates | `tls = { cert, key }` | ✅ | |
-| Automatic HTTPS (ACME) | `tls = "auto"`, `[acme]` (`email`, `ca`, `ca_root`, `storage`, `renew_before`, `http_port`) | 🟡 | HTTP-01 with any ACME CA (Let's Encrypt by default), one certificate per `host` name, stored as PEM, loaded on start, renewed in the background (daily check, `renew_before` 30 days, one-hour backoff per name that survives reloads) and swapped in without restart. Challenge-only listener (no `SO_REUSEPORT`) when nothing uses `http_port`. No TLS-ALPN-01 or DNS-01 (so no wildcards), no automatic HTTP to HTTPS redirect, no on-demand TLS, no ZeroSSL fallback, EAB or ARI. |
-| SNI with many certificates, mTLS | `tls` per server on a shared address | 🟡 | Certificate picked by SNI against `host` (exact beats wildcard, the first loaded certificate is the default, except for `tls = "auto"` names, whose handshakes fail until their certificate exists). No mTLS. |
+| Automatic HTTPS (ACME) | `tls = "auto"`, `[acme]` (`email`, `ca`, `ca_root`, `storage`, `renew_before`, `http_port`) | 🟡 | HTTP-01 with any ACME CA (Let's Encrypt by default), one certificate per `host` name, stored as PEM per CA (switching `ca` obtains new certificates), loaded on start, renewed in the background (daily check, `renew_before` 30 days, one-hour backoff per name that survives reloads) and swapped in without restart. Challenge-only listener (no `SO_REUSEPORT`) when nothing uses `http_port`. No TLS-ALPN-01 or DNS-01 (so no wildcards), no automatic HTTP to HTTPS redirect, no on-demand TLS, no ZeroSSL fallback, EAB or ARI. |
+| SNI with many certificates, mTLS | `tls` per server on a shared address | 🟡 | Certificate picked by SNI against `host` (exact beats wildcard, the first loaded certificate is the default and only the first TLS server on an address may omit `host`, except for `tls = "auto"` names, whose handshakes fail until their certificate exists). No mTLS. |
 | `file_server` with `browse`, `index`, `hide` | `serve` (string or table: `browse`, `index`, `hide`) | ✅ | Index files and directory listing. `hide` takes names and `*` globs matched per path component. |
 | Range requests, ETag, conditional requests | `serve` | ✅ | Streamed files, weak ETag, `Last-Modified`, `If-None-Match`, `If-Modified-Since`, `If-Range`, one range (several send the whole file). |
 | `file_server precompressed` | `serve.precompressed` | ✅ | `.zst`, `.br`, `.gz` next to the file. |
@@ -142,7 +142,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | caddy-l4 | RXH | Status | Notes |
 |---|---|---|---|
 | TCP proxy | `protocol = "tcp"` | ✅ | |
-| Server timeouts | `read_header_timeout`, `idle_timeout`, `stream_timeout` | ✅ | Unset by default. `idle_timeout` also closes idle `tcp` connections. |
+| Server timeouts | `read_header_timeout`, `idle_timeout`, `stream_timeout` | ✅ | `read_header_timeout` defaults to 30s and also bounds the TLS handshake (10s when unset) and the first request of a connection, HTTP/2 included; the others are unset by default. `idle_timeout` also closes idle `tcp` connections. |
 | UDP proxy | `protocol = "udp"` | ✅ | Per client sessions, `udp_idle_timeout`. |
 | TLS termination | `tls` on a `tcp` server | ✅ | |
 | PROXY protocol to upstreams | `proxy_protocol = "v1"` or `"v2"` | ✅ | |

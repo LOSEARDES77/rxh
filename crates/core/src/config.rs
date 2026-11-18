@@ -19,7 +19,7 @@
 //!
 //! [`Config::from_toml`] parses and validates a file in one step.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -184,9 +184,19 @@ impl Config {
 
         // Servers sharing a listen address, keyed by address and "is UDP".
         let mut listeners: HashMap<(SocketAddr, bool), (String, &Server)> = HashMap::new();
+        // Server names: inline pools, metrics, logs and `rxh service` use them as keys.
+        let mut names = HashMap::new();
 
         for (index, server) in self.servers.iter().enumerate() {
             let label = server.label(index);
+
+            if let Some(name) = &server.name
+                && let Some(first) = names.insert(name, index)
+            {
+                return invalid(format!(
+                    "{label}: the name {name:?} is already used by server[{first}]"
+                ));
+            }
 
             // Port 0 always gets its own socket, it is never shared.
             for &address in server.listen.iter().filter(|address| address.port() != 0) {
@@ -213,6 +223,14 @@ impl Config {
                          either all or none of the servers on it must set proxy_protocol_in"
                     ));
                 }
+                // The certificate of a host-less server is the listener's default
+                // only when it is set first; later ones would never be served.
+                if server.tls.is_some() && server.host.is_empty() {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         only the first TLS server on it may omit host"
+                    ));
+                }
             }
 
             for (name, value) in [
@@ -226,7 +244,22 @@ impl Config {
                 }
             }
 
+            if server.protocol == Protocol::Udp && !server.host.is_empty() {
+                return invalid(format!("{label}: host does not apply to udp servers"));
+            }
+
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+                if server.protocol != Protocol::Http && pattern.has_http_options() {
+                    return invalid(format!(
+                        "{label}: match[{pattern_index}]: request, response, encode and cache \
+                         only apply to http servers"
+                    ));
+                }
+                if server.protocol == Protocol::Udp && pattern.has_http_matchers() {
+                    return invalid(format!(
+                        "{label}: match[{pattern_index}]: udp servers take no request matchers"
+                    ));
+                }
                 if server.protocol == Protocol::Tcp {
                     if pattern.has_http_matchers() {
                         return invalid(format!(
@@ -808,6 +841,15 @@ impl Pattern {
             || !self.header.is_empty()
             || !self.query.is_empty()
             || !self.remote_ip.is_empty()
+    }
+
+    /// Returns true if the entry sets `request`, `response`, `encode` or
+    /// `cache`, which only HTTP servers use.
+    fn has_http_options(&self) -> bool {
+        !self.encode.is_empty()
+            || self.request != RequestConfig::default()
+            || self.response != ResponseConfig::default()
+            || self.cache != Cache::default()
     }
 }
 
@@ -1504,6 +1546,21 @@ impl UpstreamGroup {
             ));
         }
 
+        if let Some(body) = self
+            .health
+            .as_ref()
+            .and_then(|health| health.body.as_deref())
+        {
+            regex::Regex::new(body).map_err(|err| format!("health.body: {err}"))?;
+        }
+
+        let mut seen = HashSet::new();
+        for backend in &backends {
+            if !seen.insert(backend.address.as_str()) {
+                return Err(format!("backend {} is listed twice", backend.address));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1969,7 +2026,7 @@ pub fn validate_domain(name: &str) -> Result<(), String> {
 }
 
 /// Per-pattern request customization.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestConfig {
     /// Header rules.
@@ -1978,7 +2035,7 @@ pub struct RequestConfig {
 }
 
 /// Per-pattern response customization.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
     /// Header rules.
@@ -1987,7 +2044,7 @@ pub struct ResponseConfig {
 }
 
 /// Request header rules, applied before the request goes upstream.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestHeaders {
     /// `Forwarded` header (RFC 7239) behavior.
@@ -2065,7 +2122,7 @@ impl ResponseHeaders {
 }
 
 /// Response header rules, applied before the response goes to the client.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseHeaders {
     /// `Via` header behavior.
@@ -2094,7 +2151,7 @@ pub struct ResponseHeaders {
 }
 
 /// `Forwarded` header settings.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedHeader {
     /// Appends to client provided values instead of replacing them.
@@ -2115,7 +2172,7 @@ impl Default for ForwardedHeader {
 }
 
 /// `Via` response header settings.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ViaHeader {
     /// Appends this proxy to the `Via` header of responses.
@@ -2124,7 +2181,7 @@ pub struct ViaHeader {
 }
 
 /// `Server` response header settings.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerHeader {
     /// Replaces the upstream `Server` header with `rxh`.
@@ -2146,7 +2203,7 @@ impl Default for ServerHeader {
 }
 
 /// Response cache for `GET` requests.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Cache {
     /// Turns the cache on.
@@ -2542,7 +2599,8 @@ mod tests {
         };
 
         assert!(Config::from_toml(&format!("{http}{http}")).is_ok());
-        assert!(Config::from_toml(&format!("{tls}{tls}")).is_ok());
+        let named_tls = format!("{tls}host = \"b.test\"\n");
+        assert!(Config::from_toml(&format!("{tls}{named_tls}")).is_ok());
         // TCP and UDP sockets never conflict.
         assert!(Config::from_toml(&format!("{tcp}{udp}")).is_ok());
         assert!(Config::from_toml(&format!("{http}{udp}")).is_ok());
@@ -2555,6 +2613,77 @@ mod tests {
         assert!(error(format!("{tcp}{tcp}")).contains("only http servers can share"));
         assert!(error(format!("{udp}{udp}")).contains("only http servers can share"));
         assert!(error(format!("{http}{tls}")).contains("all or none"));
+        // A later host-less certificate would never be served.
+        assert!(error(format!("{named_tls}{tls}")).contains("only the first TLS server"));
+    }
+
+    #[test]
+    fn duplicate_server_names_are_rejected() {
+        let server = |name: &str, port: u16| {
+            format!(
+                "[[server]]\nname = \"{name}\"\nlisten = \"127.0.0.1:{port}\"\nforward = \"a:1\"\n"
+            )
+        };
+        assert!(Config::from_toml(&format!("{}{}", server("a", 1), server("b", 2))).is_ok());
+        let Err(ConfigError::Invalid(message)) =
+            Config::from_toml(&format!("{}{}", server("web", 1), server("web", 2)))
+        else {
+            panic!("duplicate names accepted");
+        };
+        assert!(message.contains("already used by server[0]"), "{message}");
+    }
+
+    #[test]
+    fn pool_checks_match_the_daemon() {
+        let error = |forward: &str| match Config::from_toml(&format!(
+            "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = {forward}\n"
+        )) {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+        let message = error("{ backends = [\"a:1\"], health = { body = \"(\" } }");
+        assert!(message.contains("health.body"), "{message}");
+        let message = error("{ backends = [\"a:1\", \"a:1\"] }");
+        assert!(message.contains("a:1 is listed twice"), "{message}");
+        // Port ranges expand before the comparison.
+        let message = error("{ backends = [\"a:1-3\", \"a:2\"] }");
+        assert!(message.contains("a:2 is listed twice"), "{message}");
+    }
+
+    #[test]
+    fn http_only_keys_are_rejected_elsewhere() {
+        let server = |protocol: &str, rest: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"{protocol}\"\n{rest}\n"
+            ))
+        };
+        for rest in [
+            "match = [{ forward = \"a:1\", request.headers.set = { x = \"1\" } }]",
+            "match = [{ forward = \"a:1\", response.headers.remove = [\"x\"] }]",
+            "match = [{ forward = \"a:1\", encode = [\"gzip\"] }]",
+            "match = [{ forward = \"a:1\", cache = { enabled = true } }]",
+            "forward = \"a:1\"\nencode = [\"gzip\"]",
+        ] {
+            for protocol in ["tcp", "udp"] {
+                let Err(ConfigError::Invalid(message)) = server(protocol, rest) else {
+                    panic!("{protocol}: accepted {rest}");
+                };
+                assert!(message.contains("only apply to http servers"), "{message}");
+            }
+            assert!(server("http", rest).is_ok(), "{rest}");
+        }
+        let Err(ConfigError::Invalid(message)) =
+            server("udp", "host = \"a.test\"\nforward = \"a:1\"")
+        else {
+            panic!("host accepted on udp");
+        };
+        assert!(message.contains("host does not apply"), "{message}");
+        let Err(ConfigError::Invalid(message)) = server("udp", "path = \"/a\"\nforward = \"a:1\"")
+        else {
+            panic!("request matcher accepted on udp");
+        };
+        assert!(message.contains("no request matchers"), "{message}");
+        assert!(server("tcp", "host = \"a.test\"\nforward = \"a:1\"").is_ok());
     }
 
     #[test]

@@ -40,6 +40,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::files;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
@@ -123,7 +124,7 @@ async fn handle(
     let decoded: Vec<String> = path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(percent_decode)
+        .map(files::percent_decode)
         .collect();
     let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
 
@@ -355,31 +356,6 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
     })
 }
 
-/// Decodes `%XX` escapes. Invalid escapes are kept as they are.
-fn percent_decode(segment: &str) -> String {
-    let bytes = segment.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let escaped = (bytes[index] == b'%')
-            .then(|| bytes.get(index + 1..index + 3))
-            .flatten()
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match escaped {
-            Some(byte) => {
-                decoded.push(byte);
-                index += 3;
-            }
-            None => {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
     let body = serde_json::to_vec_pretty(value).unwrap_or_else(|err| {
         format!("{{\"error\":\"serialization failed: {err}\"}}").into_bytes()
@@ -411,8 +387,8 @@ mod tests {
 
     #[test]
     fn decodes_percent_escapes() {
-        assert_eq!(percent_decode("server%5B0%5D%231"), "server[0]#1");
-        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(files::percent_decode("server%5B0%5D%231"), "server[0]#1");
+        assert_eq!(files::percent_decode("100%"), "100%");
     }
 
     #[test]

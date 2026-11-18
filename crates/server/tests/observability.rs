@@ -184,8 +184,12 @@ udp_idle_timeout = "300ms"
     tokio::task::spawn(Daemon::new(&config_path).run());
     util::eventually(async || TcpStream::connect(admin).await.is_ok()).await;
 
-    // Idle timeout: the proxy closes the connection.
+    // Idle timeout after some traffic: the proxy closes the connection and
+    // still logs the bytes moved.
     let mut stream = TcpStream::connect(idle).await.expect("connect");
+    stream.write_all(b"hi").await.expect("write");
+    let mut reply = [0; 4];
+    stream.read_exact(&mut reply).await.expect("echo");
     let mut rest = Vec::new();
     stream
         .read_to_end(&mut rest)
@@ -226,7 +230,8 @@ udp_idle_timeout = "300ms"
     let idle_line = by_server("l4-idle");
     assert_eq!(idle_line["protocol"], "tcp");
     assert_eq!(idle_line["upstream"], echo.to_string());
-    assert_eq!(idle_line["bytes_sent"], 0);
+    assert_eq!(idle_line["bytes_sent"], 2);
+    assert_eq!(idle_line["bytes_received"], 4);
     let broken_line = by_server("l4-broken");
     assert!(broken_line["upstream"].is_null());
     assert_eq!(broken_line["protocol"], "tcp");
