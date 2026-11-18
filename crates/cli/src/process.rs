@@ -15,9 +15,19 @@ pub(crate) enum DaemonSignal {
 }
 
 /// Forks into the background, writing the PID file and redirecting output to
-/// `log_file`. Must run before the Tokio runtime starts.
+/// `log_file`. Must run before the Tokio runtime starts, while the process
+/// has a single thread.
+///
+/// The PID file is locked here, in the foreground, so a second daemon with
+/// the same PID file fails with a visible error; the daemon keeps the lock
+/// until it exits. The PID is written before this process exits.
 #[cfg(unix)]
 pub(crate) fn daemonize(pid_file: &Path, log_file: &Path) -> io::Result<()> {
+    use std::fs::TryLockError;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::process;
+
     for path in [pid_file, log_file] {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -30,15 +40,86 @@ pub(crate) fn daemonize(pid_file: &Path, log_file: &Path) -> io::Result<()> {
         .create(true)
         .append(true)
         .open(log_file)?;
-    let errors = log.try_clone()?;
+    let mut pid = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(pid_file)?;
+    pid.try_lock().map_err(|err| match err {
+        TryLockError::WouldBlock => io::Error::other(format!(
+            "{} is locked, is rxh already running?",
+            pid_file.display()
+        )),
+        TryLockError::Error(err) => err,
+    })?;
+    let null = OpenOptions::new().read(true).open("/dev/null")?;
 
-    daemonize::Daemonize::new()
-        .working_directory(std::env::current_dir()?)
-        .pid_file(pid_file)
-        .stdout(log)
-        .stderr(errors)
-        .start()
-        .map_err(io::Error::other)
+    if let Some(child) = fork()? {
+        let mut status = 0;
+        // SAFETY: `status` is a valid out pointer and `child` is our child.
+        if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            return Err(io::Error::other("the background process failed to start"));
+        }
+        process::exit(0);
+    }
+
+    // First child: leave the terminal's session, then fork again so the
+    // daemon is not a session leader and never reacquires a terminal.
+    let daemon = (|| {
+        // SAFETY: setsid(2) takes no arguments; this child is not a process
+        // group leader, so it cannot fail with EPERM.
+        if unsafe { libc::setsid() } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        fork()
+    })();
+    match daemon {
+        Ok(Some(daemon)) => {
+            let written = pid.set_len(0).and_then(|()| writeln!(pid, "{daemon}"));
+            if let Err(err) = written {
+                eprintln!("cannot write {}: {err}", pid_file.display());
+                process::exit(1);
+            }
+            process::exit(0);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("cannot detach: {err}");
+            process::exit(1);
+        }
+    }
+
+    // SAFETY: umask(2) only sets the file mode creation mask.
+    unsafe { libc::umask(0o027) };
+    for (from, to) in [
+        (&null, libc::STDIN_FILENO),
+        (&log, libc::STDOUT_FILENO),
+        (&log, libc::STDERR_FILENO),
+    ] {
+        // SAFETY: both descriptors are open; dup2(2) atomically replaces `to`.
+        if unsafe { libc::dup2(from.as_raw_fd(), to) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // The lock lasts as long as the descriptor stays open: keep it for the
+    // daemon's lifetime. It is close-on-exec, like every std file.
+    std::mem::forget(pid);
+    Ok(())
+}
+
+/// Forks the process: `Some(child)` in the parent, `None` in the child.
+#[cfg(unix)]
+fn fork() -> io::Result<Option<libc::pid_t>> {
+    // SAFETY: callers run before any other thread exists, so the child gets
+    // a consistent copy of the whole process.
+    match unsafe { libc::fork() } {
+        -1 => Err(io::Error::last_os_error()),
+        0 => Ok(None),
+        child => Ok(Some(child)),
+    }
 }
 
 /// Background mode needs `fork`, which only exists on Unix.

@@ -732,7 +732,7 @@ async fn start_reload_and_stop_through_the_pid_file() {
         started.starts_with("Starting rxh in the background"),
         "{started}"
     );
-    wait_for_body(web, "backend-1").await;
+    // The PID is written before `rxh start` returns.
     let pid: u32 = std::fs::read_to_string(dir.join("run/nested/rxh.pid"))
         .expect("PID file written in a created directory")
         .trim()
@@ -740,6 +740,17 @@ async fn start_reload_and_stop_through_the_pid_file() {
         .expect("numeric PID");
     let _guard = Background(Some(pid));
     assert!(is_alive(pid));
+    wait_for_body(web, "backend-1").await;
+
+    // The daemon holds a lock on its PID file: a second one fails in the
+    // foreground and leaves the file alone.
+    let stderr = assert_failure(&rxh(dir, unused_admin, &start));
+    assert!(
+        stderr.contains("is locked, is rxh already running?"),
+        "{stderr}"
+    );
+    let unchanged = std::fs::read_to_string(dir.join("run/nested/rxh.pid")).expect("PID file");
+    assert_eq!(unchanged, format!("{pid}\n"));
 
     std::fs::write(dir.join("rxh.toml"), config(second)).expect("write");
     let mut reload_args = vec!["reload"];

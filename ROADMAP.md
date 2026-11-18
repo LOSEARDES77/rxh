@@ -164,8 +164,9 @@ A release people can run without reading the source.
 - [ ] Documentation site with a guide per use case (load balancer, TLS
       gateway, Docker, layer 4).
 - [ ] Hot binary upgrade: a new process takes over the listening sockets.
-- [ ] Security policy, `cargo audit` and `cargo deny` in CI, and an
-      external review of the TLS and admin surface.
+- [x] Security policy (`SECURITY.md`), `cargo audit` and `cargo deny` in CI
+      (`.github/workflows/audit.yml`, policy in `deny.toml`).
+- [ ] External review of the TLS and admin surface.
 
 ## Quality, in every milestone
 

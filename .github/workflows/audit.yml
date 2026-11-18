@@ -1,0 +1,34 @@
+name: Audit
+
+# Advisories are published without any change to this repository, so the
+# checks also run every day on the default branch.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # `--deny warnings` also fails on unmaintained, unsound and yanked crates.
+      - run: cargo audit --deny warnings
+
+  deny:
+    name: cargo deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

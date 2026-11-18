@@ -108,6 +108,10 @@ Changed.
   `fuzz` CI job runs each target for 60 seconds.
 - CI: a `bench-gate` job runs `rxh-bench --quick` and fails when RXH fails
   or cannot run a scenario. Caddy runs alongside for information only.
+- `SECURITY.md`: supported versions, private reporting through GitHub
+  security advisories, scope. An `Audit` workflow runs `cargo audit` and
+  `cargo deny` (policy in `deny.toml`: advisories, licenses, bans, sources)
+  on every push, pull request and daily.
 
 ### Changed
 
@@ -149,6 +153,13 @@ Changed.
 - Rust 1.100 toolchain (`rust-toolchain.toml`) and the latest dependency
   releases; the file server's HTML assets are embedded without a minifying
   build step.
+- Dropped the unmaintained `daemonize` (RUSTSEC-2025-0069) and
+  `rustls-pemfile` (RUSTSEC-2025-0134) crates. PEM files are read with
+  `rustls-pki-types`; `rxh start` forks with `libc` directly.
+- `rxh start` locks the PID file before forking: a second daemon with the
+  same PID file now fails in the foreground ("is locked, is rxh already
+  running?") instead of exiting silently in the background, and the PID file
+  is written before `rxh start` returns.
 
 ## 0.2.0 (unreleased)
 

@@ -18,6 +18,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
@@ -274,7 +275,7 @@ async fn pebble_issues_and_installs_a_certificate() {
 
     // The new certificate is served without a restart.
     let pem = std::fs::read(&cert).unwrap();
-    let leaf = rustls_pemfile::certs(&mut pem.as_slice())
+    let leaf = CertificateDer::pem_slice_iter(&pem)
         .next()
         .expect("a certificate")
         .unwrap();
