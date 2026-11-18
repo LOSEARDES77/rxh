@@ -90,7 +90,7 @@ pub(crate) fn signal(_pid_file: &Path, _signal: DaemonSignal) -> io::Result<i32>
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::Command;
 
     use super::*;
@@ -142,7 +142,23 @@ mod tests {
             (DaemonSignal::Terminate, libc::SIGTERM),
             (DaemonSignal::Reload, libc::SIGHUP),
         ] {
-            let mut child = Command::new("sleep").arg("30").spawn().expect("spawn");
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            // The test runner may ignore or block SIGHUP (`nohup`), and `exec`
+            // keeps both, so the child would survive the signal.
+            // SAFETY: only async-signal-safe calls between fork and exec,
+            // operating on a stack-local signal set.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::signal(expected, libc::SIG_DFL);
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, expected);
+                    libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().expect("spawn");
             let (_dir, path) = pid_file(&format!("{}\n", child.id()));
 
             let pid = signal(&path, daemon_signal).expect("signal sent");
