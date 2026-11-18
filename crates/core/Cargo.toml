@@ -1,0 +1,21 @@
+[package]
+name = "rxh-core"
+description = "Configuration model and load balancing policies for the RXH proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["load-balancer", "reverse-proxy", "proxy", "round-robin", "health-check"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+hmac.workspace = true
+http.workspace = true
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

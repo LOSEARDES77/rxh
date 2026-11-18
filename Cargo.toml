@@ -1,35 +1,45 @@
-[package]
-name = "rxh"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2024"
-license-file = "LICENSE"
-description = "HTTP reverse proxy & load balancer"
-repository = "https://github.com/antoniosarosi/rxh"
-readme = "README.md"
-keywords = ["reverse", "proxy", "http"]
-categories = ["web-programming::http-server", "network-programming"]
+license = "MIT"
+authors = ["Antonio Sarosi", "LOSEARDES77"]
+repository = "https://github.com/LOSEARDES77/rxh"
+rust-version = "1.88"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace.dependencies]
+rxh-core = { path = "crates/core", version = "0.2.0" }
+rxh-server = { path = "crates/server", version = "0.2.0" }
 
-[dependencies]
-tokio = { version = "1.50.0", features = ["full"] }
-hyper = { version = "1.8.1", features = ["full"] }
-http-body-util = "0.1.3"
 bytes = "1.11.1"
-http = "1.4.0"
-serde = { version = "1.0.228", features = ["derive"] }
-toml = "0.9.8"
-hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "client", "client-legacy", "http1", "http2"] }
-tokio-rustls = "0.26.4"
-rustls-pemfile = "2.2.0"
+clap = { version = "4.5.40", features = ["derive", "env"] }
 daemonize = "0.5.0"
-clap = { version = "4.5.40", features = ["derive"] }
+hmac = "0.12.1"
+http = "1.4.0"
+http-body-util = "0.1.3"
+hyper = { version = "1.8.1", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
 libc = "0.2.177"
 minify-html = "0.18.1"
-
-[build-dependencies]
-minify-html = "0.18.1"
-
-[dev-dependencies]
 rcgen = "0.14"
+regex = "1.12"
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
 tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-rustls = "0.26.4"
+toml = "0.9.8"
+toml_edit = "0.23"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

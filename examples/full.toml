@@ -1,0 +1,98 @@
+# Every RXH option with its default value or an example. Values in comments
+# are defaults. Durations accept ns, us, ms, s, m, h, d ("1m30s") or seconds.
+
+# Time open connections get to finish on stop/reload. Unset waits forever.
+# Top level keys must come before the first [table].
+grace_period = "30s"
+
+# Admin API, used by the `rxh` CLI. No authentication: keep it on loopback.
+[admin]
+enabled = true                 # default true
+listen = "127.0.0.1:2019"      # default, same as Caddy
+
+# Named load balancing group, referenced as "@api".
+[upstream.api]
+policy = "least_conn"          # random | random_choose | first | round_robin |
+                               # weighted_round_robin (default) | least_conn |
+                               # ip_hash | client_ip_hash | uri_hash | query |
+                               # header | cookie
+# choose = 2                   # random_choose sample size
+# key = "x-user"               # query/header/cookie name (cookie default "lb")
+# secret = "change-me"         # cookie HMAC secret
+# fallback = "random"          # used when the hash key is missing
+retries = 2                    # extra attempts after a failure (lb_retries)
+# try_duration = "5s"          # keep retrying this long (lb_try_duration)
+try_interval = "250ms"         # wait between attempts (lb_try_interval)
+dial_timeout = "3s"
+keepalive = "2m"               # idle upstream connection lifetime
+keepalive_idle_conns_per_host = 32
+h2c = false                    # cleartext HTTP/2 to backends
+backends = [
+    "127.0.0.1:8080",
+    { address = "127.0.0.1:8081", weight = 3 },
+    "127.0.0.1:9001-9003",     # port range
+]
+
+# Active health checks. Without `uri` they are TCP connect checks.
+[upstream.api.health]
+uri = "/health"
+# port = 9000                  # check another port of each backend
+# upstream = "10.0.0.9:9000"   # check one fixed address instead
+interval = "10s"               # default 30s
+timeout = "2s"                 # default 5s
+passes = 1
+fails = 2
+method = "GET"
+status = "2xx"                 # or a code like 200
+body = "ok"                    # regular expression
+headers = { Host = "api.internal" }
+# request_body = ""
+# follow_redirects = false
+
+# Passive health checks, based on real traffic.
+[upstream.api.passive]
+fail_duration = "30s"
+max_fails = 3
+unhealthy_status = ["5xx"]
+unhealthy_latency = "2s"
+unhealthy_request_count = 500  # concurrent requests per backend, 0 = no limit
+
+# HTTP server with several routes.
+[[server]]
+name = "edge"
+listen = ["0.0.0.0:8100", "[::]:8100"]
+max_connections = 1024
+http2 = true
+trusted_proxies = ["private_ranges", "203.0.113.0/24"]
+# tls = { cert = "/etc/rxh/cert.pem", key = "/etc/rxh/key.pem" }
+
+[[server.match]]
+uri = "/api"
+forward = "@api"
+request.headers.forwarded = { extend = true, by = "edge" }
+request.headers.set = { "x-proxied-by" = "rxh" }
+request.headers.remove = ["x-debug"]
+response.headers.via = { extend = true }
+response.headers.server = { override = true, version = false }
+response.headers.remove = ["x-powered-by"]
+cache = { enabled = true, ttl_seconds = 30, max_entries = 1024, max_body_bytes = 1048576 }
+
+[[server.match]]
+uri = "/"
+serve = "/var/www"
+
+# TCP (layer 4) with PROXY protocol and an inline group.
+[[server]]
+name = "postgres"
+listen = "0.0.0.0:5432"
+protocol = "tcp"
+proxy_protocol = "v2"
+forward = { policy = "first", backends = ["10.0.0.1:5432", "10.0.0.2:5432"], health = { interval = "5s" } }
+
+# UDP (layer 4), one session per client address.
+[[server]]
+name = "dns"
+listen = "0.0.0.0:5353"
+protocol = "udp"
+udp_idle_timeout = "30s"
+forward = { policy = "ip_hash", backends = ["10.0.0.53:53", "10.0.0.54:53"] }

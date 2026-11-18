@@ -1,8 +1,8 @@
+# Minimal configuration used by `rxh run` when no --config is given.
+# Serves the current directory on http://127.0.0.1:8100.
+# See examples/ for load balancing, TCP/UDP and health check setups.
+
 [[server]]
-
-listen = ["127.0.0.1:8100", "192.168.1.148:8100"]
-name = "rxh/main"
-
-match = [
-    { uri = "/", serve = "." },
-]
+name = "files"
+listen = "127.0.0.1:8100"
+serve = "."

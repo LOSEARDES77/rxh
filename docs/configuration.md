@@ -1,0 +1,186 @@
+# Configuration reference
+
+RXH reads one TOML file (`rxh.toml` by default, `-c` or `RXH_CONFIG` to
+change it). `rxh validate` checks a file without starting anything, and
+[`examples/full.toml`](../examples/full.toml) shows every option at once.
+
+Durations are strings like `250ms`, `5s`, `1m30s` or `2h` (units `ns`, `us`,
+`ms`, `s`, `m`, `h`, `d`), or plain integers meaning seconds. Unknown keys
+are errors, so typos do not go unnoticed.
+
+The file has four parts, and top level keys must come before the first table:
+
+```toml
+grace_period = "30s"     # top level options
+
+[admin]                  # admin API
+[upstream.NAME]          # named load balancing pools, any number
+[[server]]               # listeners, any number
+```
+
+## Top level
+
+| Key | Default | Description |
+|---|---|---|
+| `grace_period` | unset (wait forever) | Time open connections get to finish on stop or reload before they are closed. Idle keep-alive HTTP connections are closed right away. |
+
+## `[admin]`
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
+| `listen` | `"127.0.0.1:2019"` | Address of the admin API. It has no authentication, keep it on loopback. Changes need a restart. |
+
+## `[upstream.NAME]`: load balancing pools
+
+A pool is a group of backends plus the rules to choose between them. Servers
+use it with `forward = "@NAME"`. The same table can also be written inline in
+a server: `forward = { policy = "...", backends = [...] }`. Pool names
+appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
+`SERVER_NAME#PATTERN`.
+
+| Key | Default | Caddy equivalent | Description |
+|---|---|---|---|
+| `policy` | `"weighted_round_robin"` | `lb_policy` | Selection policy, see below. Aliases: `lb_policy`, `algorithm`. |
+| `backends` | `[]` | upstreams | List of `"host:port"` or `{ address = "host:port", weight = N }`. Port ranges `"host:8001-8004"` expand to several backends. Host names are resolved on each dial. Alias: `to`. |
+| `choose` | `2` | `random_choose <n>` | Sample size of `random_choose`. |
+| `key` | | `query [key]`, `header [field]`, `cookie [name]` | Query parameter, header or cookie name. Required for `query` and `header`; `cookie` defaults to `lb`. |
+| `secret` | `""` | `cookie name <secret>` | HMAC secret of the `cookie` policy. |
+| `fallback` | `"random"` | `fallback` | Policy used when the key of `query`, `header`, `uri_hash` or `cookie` is missing. |
+| `retries` | `0` | `lb_retries` | Extra attempts after a failure. |
+| `try_duration` | unset | `lb_try_duration` | Keep retrying for this long. Wins over `retries`. |
+| `try_interval` | `"250ms"` | `lb_try_interval` | Wait between attempts. |
+| `dial_timeout` | `"3s"` | `dial_timeout` | Connect timeout. |
+| `h2c` | `false` | `h2c://` | Speak cleartext HTTP/2 to the backends (one shared connection each). |
+| `keepalive` | `"2m"` | `keepalive` | How long idle upstream HTTP connections are kept. `"0s"` disables pooling. |
+| `keepalive_idle_conns_per_host` | `32` | `keepalive_idle_conns_per_host` | Idle connections kept per backend. |
+| `health` | | active health checks | Table, see below. |
+| `passive` | | passive health checks | Table, see below. |
+
+### Policies
+
+| Policy | Picks | Protocols |
+|---|---|---|
+| `random` | A random available backend. | all |
+| `random_choose` | The least loaded of `choose` random backends. | all |
+| `first` | The first available backend in order. Use it for primary/standby failover. | all |
+| `round_robin` | Each backend in turn, ignoring weights. | all |
+| `weighted_round_robin` | Each backend in proportion to its `weight`, smoothly interleaved. Weight 0 takes a backend out of rotation. | all |
+| `least_conn` | The backend with the fewest requests (HTTP) or connections (TCP/UDP) in flight. | all |
+| `ip_hash` | Rendezvous hash of the peer IP. | all |
+| `client_ip_hash` | Rendezvous hash of the client IP from `X-Forwarded-For`, when the peer is in `trusted_proxies`. | all |
+| `uri_hash` | Rendezvous hash of path and query. | http |
+| `query` | Rendezvous hash of query parameter `key`. | http |
+| `header` | Rendezvous hash of header `key`. | http |
+| `cookie` | The backend whose signed value is in cookie `key` (`lb` by default). New clients get one through `fallback` and a `Set-Cookie`. | http |
+
+Only available backends are picked: healthy for active and passive checks,
+and below `unhealthy_request_count`. When none is available the client gets
+`503` (HTTP) or the connection is closed (TCP/UDP).
+
+### `[upstream.NAME.health]`: active health checks
+
+Checks run in the background for every backend. With `uri` the check is an
+HTTP request; without it, a TCP connect.
+
+| Key | Default | Description |
+|---|---|---|
+| `uri` | | Path and query to request. |
+| `port` | backend port | Check this port on the backend host. |
+| `upstream` | | Check this fixed `host:port` for every backend. |
+| `interval` | `"30s"` | Time between checks. |
+| `timeout` | `"5s"` | Limit for one check. |
+| `passes` | `1` | Consecutive passes to mark a backend healthy. |
+| `fails` | `1` | Consecutive failures to mark a backend unhealthy. |
+| `method` | `"GET"` | HTTP method. |
+| `status` | `"2xx"` | Expected status: a code (`200`) or a class (`2xx`). |
+| `body` | | Regular expression the body must match. |
+| `headers` | `{}` | Extra request headers, for example `{ Host = "api.internal" }`. |
+| `request_body` | | Request body. |
+| `follow_redirects` | `false` | Follow redirects instead of failing on them. |
+
+### `[upstream.NAME.passive]`: passive health checks
+
+Failures in real traffic take a backend out of rotation for `fail_duration`.
+Failed dials always count.
+
+| Key | Default | Description |
+|---|---|---|
+| `fail_duration` | `"30s"` | How long a failure is remembered. |
+| `max_fails` | `1` | Failures within `fail_duration` that mark a backend down. |
+| `unhealthy_status` | `[]` | Statuses that count as failures, like `["5xx", 429]`. |
+| `unhealthy_latency` | unset | Responses slower than this (time to headers) count as failures. |
+| `unhealthy_request_count` | `0` | Requests in flight above which a backend is skipped. `0` means no limit. |
+
+## `[[server]]`: listeners
+
+Each `[[server]]` is a service. Every address in `listen` gets its own
+socket.
+
+| Key | Default | Description |
+|---|---|---|
+| `listen` | required | `"ip:port"` or a list of them. Port `0` picks a free port. |
+| `protocol` | `"http"` | `http`, `tcp` or `udp`. |
+| `name` | | Name shown in logs, in `rxh status`, and in `Forwarded: by=` and `Via`. |
+| `forward` | | Proxy target: `"@pool"`, `"host:port"`, a list of backends, or an inline pool table. |
+| `serve` | | Serve static files from this directory (http only). |
+| `uri` | `"/"` | Path prefix for the single `forward` or `serve` of this server (http only). |
+| `match` | | List of patterns instead of `forward`/`serve`/`uri`, see below (http only). |
+| `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
+| `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. |
+| `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
+| `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. |
+| `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
+| `udp_idle_timeout` | `"60s"` | Idle time after which a UDP client session ends (udp only). |
+| `request`, `response`, `cache` | | Same as in `match` entries, for the single pattern form. |
+
+A `tcp` or `udp` server takes exactly one `forward` and no `match`.
+
+### `match` entries (HTTP routes)
+
+Routes are tried in order; the first whose `uri` prefixes the request path
+wins. No match means `404`.
+
+```toml
+[[server]]
+listen = "0.0.0.0:80"
+match = [
+    { uri = "/api", forward = "@api" },
+    { uri = "/", serve = "/var/www" },
+]
+```
+
+| Key | Description |
+|---|---|
+| `uri` | Path prefix. Default `"/"`. |
+| `forward` / `serve` | Action, exactly one. |
+| `request.headers.set` | Headers to set on the upstream request, `{ name = "value" }`. |
+| `request.headers.remove` | Headers to remove from the upstream request. |
+| `request.headers.forwarded` | `{ extend = true, by = "name" }`: RFC 7239 `Forwarded` header. `extend = false` replaces client values. |
+| `response.headers.set` / `remove` | Same for the response. |
+| `response.headers.via` | `{ extend = true }` appends this proxy to `Via`. |
+| `response.headers.server` | `{ override = true, version = true }`: replace the backend `Server` header with `rxh/VERSION`. |
+| `cache` | `{ enabled = true, ttl_seconds = 30, max_entries = 1024, max_body_bytes = 1048576 }`: cache `200` responses to `GET` requests that have a `Content-Length` up to `max_body_bytes` and no `Set-Cookie`, `no-store` or `private`. |
+
+### Headers RXH sets on proxied requests
+
+| Header | Value |
+|---|---|
+| `X-Forwarded-For` | Client IP. Appended to the existing value only when the peer is trusted. |
+| `X-Forwarded-Proto` | `http` or `https`. |
+| `X-Forwarded-Host` | Original `Host`. |
+| `Forwarded` | `for="ip:port";by=NAME;host=HOST;proto=http` |
+| `Via` | `1.1 NAME` |
+| `Host` | Unchanged. HTTP/2 `:authority` becomes `Host` for HTTP/1.1 backends. |
+
+Hop-by-hop headers (`Connection`, `Keep-Alive`, `TE`, `Upgrade`, ... and every
+header listed in `Connection`) are removed in both directions, except what an
+upgrade (WebSocket) needs.
+
+## Reloads
+
+`rxh reload`, `SIGHUP` or `POST /reload` re-read the file. The new
+configuration starts next to the old one (listeners use `SO_REUSEPORT`), then
+the old one stops accepting and drains. If the new file is invalid, the reload
+fails and nothing changes. Backends added with `--no-save` are lost on reload;
+the default `rxh upstream add` saves them to the file first.

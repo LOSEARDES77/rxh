@@ -1,0 +1,40 @@
+[package]
+name = "rxh-cli"
+description = "RXH daemon and CLI: reverse proxy and layer 4 load balancer with live upstream management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["reverse-proxy", "load-balancer", "daemon", "cli", "caddy"]
+categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
+
+[[bin]]
+name = "rxh"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+bytes.workspace = true
+rxh-core.workspace = true
+rxh-server.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml_edit.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+daemonize.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

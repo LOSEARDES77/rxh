@@ -1,0 +1,558 @@
+//! One listening socket and the connections it accepts.
+//!
+//! A `[[server]]` with several `listen` addresses becomes several [`Server`]
+//! values (see [`crate::Master`]). Each one accepts connections, limits them
+//! to `max_connections`, and on shutdown stops accepting, lets open
+//! connections finish (up to `grace_period`) and reports progress through
+//! [`State`].
+
+use std::fs::File;
+use std::future::Future;
+use std::io::{self, BufReader};
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use rxh_core::config::{self, Action, Config, Protocol, ProxyProtocol};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+
+use crate::error::Error;
+use crate::http::service::{Activity, Service, Site};
+use crate::registry::{Group, Registry};
+use crate::tcp;
+use crate::udp::{self, UdpSettings};
+
+/// Current state of a [`Server`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum State {
+    /// Initialized but not accepting connections yet.
+    Starting,
+
+    /// Accepting connections.
+    Listening,
+
+    /// `max_connections` reached, new connections wait in the backlog.
+    MaxConnectionsReached(usize),
+
+    /// Graceful shutdown in progress.
+    ShuttingDown(ShutdownState),
+}
+
+/// Progress of a graceful shutdown.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ShutdownState {
+    /// No longer accepting, waiting for this many open connections.
+    PendingConnections(usize),
+
+    /// Shutdown complete.
+    Done,
+}
+
+/// What accepted TCP connections are handed to.
+#[derive(Clone)]
+enum Handler {
+    Http {
+        site: Arc<Site>,
+        http2: bool,
+    },
+    Tcp {
+        group: Arc<Group>,
+        proxy_protocol: Option<ProxyProtocol>,
+    },
+}
+
+enum Socket {
+    Tcp(TcpListener),
+    Udp(Arc<UdpSocket>, UdpSettings),
+}
+
+/// Shared by every connection task of one server.
+struct ConnectionContext {
+    handler: Handler,
+    tls: Option<TlsAcceptor>,
+    log_name: Arc<str>,
+}
+
+/// One listener. See the module documentation.
+pub struct Server {
+    state: watch::Sender<State>,
+    socket: Socket,
+    address: SocketAddr,
+    protocol: Protocol,
+    name: Option<String>,
+    log_name: Arc<str>,
+    max_connections: usize,
+    grace_period: Option<Duration>,
+    context: Option<Arc<ConnectionContext>>,
+    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl Server {
+    /// Binds the `replica`-th listen address of `config.servers[server_index]`
+    /// without accepting connections yet. Port 0 picks a free port, see
+    /// [`Server::socket_address`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `server_index` or `replica` are out of bounds.
+    pub fn init(
+        config: &Config,
+        registry: &Registry,
+        server_index: usize,
+        replica: usize,
+    ) -> Result<Self, Error> {
+        let server = &config.servers[server_index];
+        let requested = server.listen[replica];
+
+        let (socket, address) = match server.protocol {
+            Protocol::Udp => {
+                let socket = std::net::UdpSocket::bind(requested)?;
+                socket.set_nonblocking(true)?;
+                let socket = UdpSocket::from_std(socket)?;
+                let address = socket.local_addr()?;
+                (SocketKind::Udp(Arc::new(socket)), address)
+            }
+            Protocol::Http | Protocol::Tcp => {
+                let listener = bind_tcp(requested)?;
+                let address = listener.local_addr()?;
+                (SocketKind::Tcp(listener), address)
+            }
+        };
+
+        let log_name: Arc<str> = match &server.name {
+            Some(name) => format!("{address} ({name})"),
+            None => address.to_string(),
+        }
+        .into();
+
+        let forward_group = || -> Result<Arc<Group>, Error> {
+            let Action::Forward(forward) = &server.patterns[0].action else {
+                unreachable!("validation guarantees L4 servers forward")
+            };
+            registry.resolve(forward, server_index, server, 0)
+        };
+
+        let (socket, context) = match socket {
+            SocketKind::Udp(socket) => {
+                let settings = UdpSettings {
+                    group: forward_group()?,
+                    idle_timeout: server.udp_idle_timeout,
+                    max_sessions: server.max_connections,
+                    log_name: Arc::clone(&log_name),
+                };
+                (Socket::Udp(socket, settings), None)
+            }
+            SocketKind::Tcp(listener) => {
+                let handler = match server.protocol {
+                    Protocol::Tcp => Handler::Tcp {
+                        group: forward_group()?,
+                        proxy_protocol: server.proxy_protocol,
+                    },
+                    _ => Handler::Http {
+                        site: Arc::new(Site::build(
+                            server_index,
+                            server,
+                            registry,
+                            log_name.to_string(),
+                            address,
+                        )?),
+                        http2: server.http2,
+                    },
+                };
+                let context = ConnectionContext {
+                    tls: load_tls_acceptor(server)?,
+                    handler,
+                    log_name: Arc::clone(&log_name),
+                };
+                (Socket::Tcp(listener), Some(Arc::new(context)))
+            }
+        };
+
+        Ok(Self {
+            state: watch::channel(State::Starting).0,
+            socket,
+            address,
+            protocol: server.protocol,
+            name: server.name.clone(),
+            log_name,
+            max_connections: server.max_connections.max(1),
+            grace_period: config.grace_period,
+            context,
+            shutdown: Box::pin(std::future::pending()),
+        })
+    }
+
+    /// Starts the graceful shutdown when `future` completes.
+    #[must_use]
+    pub fn shutdown_on(mut self, future: impl Future + Send + 'static) -> Self {
+        self.shutdown = Box::pin(async move {
+            future.await;
+        });
+        self
+    }
+
+    /// Bound address, useful when listening on port 0.
+    #[must_use]
+    pub fn socket_address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Protocol of this listener.
+    #[must_use]
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    /// Server name from the configuration.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Receives [`State`] updates.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<State> {
+        self.state.subscribe()
+    }
+
+    /// Accepts connections until the shutdown future completes, then shuts
+    /// down gracefully.
+    pub async fn run(self) -> Result<(), Error> {
+        let Self {
+            state,
+            socket,
+            log_name,
+            max_connections,
+            grace_period,
+            context,
+            shutdown,
+            ..
+        } = self;
+
+        state.send_replace(State::Listening);
+        println!("{log_name} => Listening ({})", self.protocol);
+
+        let (socket, settings) = match socket {
+            Socket::Udp(socket, settings) => (socket, settings),
+            Socket::Tcp(listener) => {
+                let context = context.expect("TCP servers always have a connection context");
+                let mut connections = JoinSet::new();
+                let (stop, stop_receiver) = watch::channel(false);
+                let permits = Arc::new(Semaphore::new(max_connections));
+
+                tokio::select! {
+                    () = accept_loop(&listener, &state, &permits, max_connections, &mut connections, &context, &stop_receiver) => {}
+                    () = shutdown => println!("{log_name} => Received shutdown signal"),
+                }
+
+                // Stop accepting: new clients get "connection refused".
+                drop(listener);
+                while connections.try_join_next().is_some() {}
+
+                let pending = connections.len();
+                if pending > 0 {
+                    println!("{log_name} => Can't shutdown yet, {pending} pending connections");
+                    state.send_replace(State::ShuttingDown(ShutdownState::PendingConnections(
+                        pending,
+                    )));
+                    stop.send_replace(true);
+
+                    let drained = match grace_period {
+                        Some(grace) => tokio::time::timeout(grace, drain(&mut connections))
+                            .await
+                            .is_ok(),
+                        None => {
+                            drain(&mut connections).await;
+                            true
+                        }
+                    };
+                    if !drained {
+                        eprintln!(
+                            "{log_name} => Grace period over, closing {} connections",
+                            connections.len()
+                        );
+                        connections.abort_all();
+                        drain(&mut connections).await;
+                    }
+                }
+
+                state.send_replace(State::ShuttingDown(ShutdownState::Done));
+                println!("{log_name} => Shutdown complete");
+                return Ok(());
+            }
+        };
+
+        tokio::select! {
+            result = udp::serve(socket, settings) => {
+                if let Err(err) = result {
+                    eprintln!("{log_name} => UDP socket failed: {err}");
+                }
+            }
+            () = shutdown => println!("{log_name} => Received shutdown signal"),
+        }
+
+        state.send_replace(State::ShuttingDown(ShutdownState::Done));
+        println!("{log_name} => Shutdown complete");
+        Ok(())
+    }
+}
+
+enum SocketKind {
+    Tcp(TcpListener),
+    Udp(Arc<UdpSocket>),
+}
+
+fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+
+    // Lets a reloaded configuration bind the same ports before the old
+    // listeners close, so reloads drop no connections.
+    #[cfg(unix)]
+    socket.set_reuseport(true)?;
+
+    socket.bind(address)?;
+    socket.listen(1024)
+}
+
+async fn drain(connections: &mut JoinSet<()>) {
+    while connections.join_next().await.is_some() {}
+}
+
+async fn accept_loop(
+    listener: &TcpListener,
+    state: &watch::Sender<State>,
+    permits: &Arc<Semaphore>,
+    max_connections: usize,
+    connections: &mut JoinSet<()>,
+    context: &Arc<ConnectionContext>,
+    stop: &watch::Receiver<bool>,
+) {
+    loop {
+        while connections.try_join_next().is_some() {}
+
+        let full = permits.available_permits() == 0;
+        if full {
+            println!(
+                "{} => Reached max connections: {max_connections}",
+                context.log_name
+            );
+            state.send_replace(State::MaxConnectionsReached(max_connections));
+        }
+
+        let permit = Arc::clone(permits)
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+
+        if full {
+            println!("{} => Accepting connections again", context.log_name);
+            state.send_replace(State::Listening);
+        }
+
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                // Usually EMFILE or ECONNABORTED: back off instead of dying.
+                eprintln!("{} => accept failed: {err}", context.log_name);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        let _ = stream.set_nodelay(true);
+        let local = stream.local_addr().unwrap_or(peer);
+        connections.spawn(handle_connection(
+            stream,
+            peer,
+            local,
+            Arc::clone(context),
+            stop.clone(),
+            permit,
+        ));
+    }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    context: Arc<ConnectionContext>,
+    stop: watch::Receiver<bool>,
+    _permit: OwnedSemaphorePermit,
+) {
+    match &context.tls {
+        Some(acceptor) => match acceptor.accept(stream).await {
+            Ok(stream) => serve(stream, peer, local, &context, stop).await,
+            Err(err) => eprintln!(
+                "{} => TLS handshake with {peer} failed: {err}",
+                context.log_name
+            ),
+        },
+        None => serve(stream, peer, local, &context, stop).await,
+    }
+}
+
+async fn serve<S>(
+    stream: S,
+    peer: SocketAddr,
+    local: SocketAddr,
+    context: &ConnectionContext,
+    stop: watch::Receiver<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match &context.handler {
+        Handler::Tcp {
+            group,
+            proxy_protocol,
+        } => {
+            tcp::proxy(
+                stream,
+                peer,
+                local,
+                group,
+                *proxy_protocol,
+                &context.log_name,
+            )
+            .await;
+        }
+        Handler::Http { site, http2 } => {
+            let activity = Arc::new(Activity::default());
+            let service = Service {
+                site: Arc::clone(site),
+                peer,
+                local,
+                activity: Arc::clone(&activity),
+            };
+            let io = TokioIo::new(stream);
+
+            let result = if *http2 {
+                let mut builder = auto::Builder::new(TokioExecutor::new());
+                builder.http1().preserve_header_case(true);
+                drive_http(
+                    builder.serve_connection_with_upgrades(io, service),
+                    stop,
+                    &activity,
+                )
+                .await
+            } else {
+                let connection = hyper::server::conn::http1::Builder::new()
+                    .preserve_header_case(true)
+                    .serve_connection(io, service)
+                    .with_upgrades();
+                drive_http(connection, stop, &activity).await
+            };
+
+            if let Err(err) = result {
+                eprintln!("{} => connection from {peer}: {err}", context.log_name);
+            }
+        }
+    }
+}
+
+/// Graceful shutdown hook shared by the HTTP/1 and auto connection types.
+trait GracefulConnection: Future {
+    fn begin_graceful_shutdown(self: Pin<&mut Self>);
+}
+
+impl<I, S> GracefulConnection for hyper::server::conn::http1::UpgradeableConnection<I, S>
+where
+    Self: Future,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: hyper::service::HttpService<hyper::body::Incoming>,
+    S::ResBody: hyper::body::Body + 'static,
+    <S::ResBody as hyper::body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    fn begin_graceful_shutdown(self: Pin<&mut Self>) {
+        self.graceful_shutdown();
+    }
+}
+
+impl<I, S, E> GracefulConnection for auto::UpgradeableConnection<'_, I, S, E>
+where
+    Self: Future,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: hyper::service::HttpService<hyper::body::Incoming>,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    S::ResBody: hyper::body::Body + Send + 'static,
+    <S::ResBody as hyper::body::Body>::Data: Send,
+    <S::ResBody as hyper::body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    E: hyper::rt::bounds::Http2ServerConnExec<S::Future, S::ResBody>,
+{
+    fn begin_graceful_shutdown(self: Pin<&mut Self>) {
+        self.graceful_shutdown();
+    }
+}
+
+/// Runs an HTTP connection. Once shutdown starts, the connection is closed
+/// after its current request; connections that never sent a request are left
+/// open until they send one, so clients that connected right before the
+/// shutdown still get an answer.
+async fn drive_http<C, E>(
+    connection: C,
+    mut stop: watch::Receiver<bool>,
+    activity: &Activity,
+) -> Result<(), String>
+where
+    C: GracefulConnection<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut connection = std::pin::pin!(connection);
+
+    tokio::select! {
+        result = connection.as_mut() => return result.map_err(|err| err.to_string()),
+        () = async {
+            let _ = stop.wait_for(|stopping| *stopping).await;
+            activity.first_request().await;
+        } => {}
+    }
+
+    connection.as_mut().begin_graceful_shutdown();
+    connection.await.map_err(|err| err.to_string())
+}
+
+fn load_tls_acceptor(server: &config::Server) -> io::Result<Option<TlsAcceptor>> {
+    let Some(tls) = &server.tls else {
+        return Ok(None);
+    };
+
+    let mut cert_reader = BufReader::new(File::open(&tls.cert)?);
+    let mut key_reader = BufReader::new(File::open(&tls.key)?);
+
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)?;
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other(format!("no private key found in {}", tls.key)))?;
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(io::Error::other)?;
+
+    if server.protocol == Protocol::Http {
+        config.alpn_protocols = if server.http2 {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        };
+    }
+
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}

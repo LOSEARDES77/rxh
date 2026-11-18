@@ -1,0 +1,29 @@
+# systemd unit. Install with:
+#   sudo install -Dm755 target/release/rxh /usr/local/bin/rxh
+#   sudo install -Dm644 dist/rxh.service /etc/systemd/system/rxh.service
+#   sudo install -Dm644 rxh.toml /etc/rxh/rxh.toml
+#   sudo systemctl enable --now rxh
+# Manage it with `rxh status`, `rxh upstream add ...` and `systemctl reload rxh`.
+
+[Unit]
+Description=RXH reverse proxy and load balancer
+Documentation=https://github.com/LOSEARDES77/rxh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/rxh run --config /etc/rxh/rxh.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+DynamicUser=yes
+ConfigurationDirectory=rxh
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

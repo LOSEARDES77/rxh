@@ -1,0 +1,27 @@
+# Layer 4 load balancing: any TCP or UDP protocol (databases, Redis, MQTT,
+# game servers, DNS, syslog, ...).
+
+[upstream.redis]
+policy = "first"             # primary/replica failover
+backends = ["10.0.0.1:6379", "10.0.0.2:6379"]
+health = { interval = "2s", timeout = "1s" }   # TCP connect check
+
+[[server]]
+name = "redis"
+listen = "0.0.0.0:6379"
+protocol = "tcp"
+forward = "@redis"
+
+[[server]]
+name = "postgres-tls"
+listen = "0.0.0.0:15432"
+protocol = "tcp"
+tls = { cert = "/etc/rxh/cert.pem", key = "/etc/rxh/key.pem" }   # TLS termination
+proxy_protocol = "v1"
+forward = { policy = "least_conn", backends = ["10.0.0.11:5432", "10.0.0.12:5432"] }
+
+[[server]]
+name = "dns"
+listen = "0.0.0.0:53"
+protocol = "udp"
+forward = { policy = "round_robin", backends = ["1.1.1.1:53", "8.8.8.8:53"] }

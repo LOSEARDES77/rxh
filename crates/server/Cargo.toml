@@ -1,0 +1,36 @@
+[package]
+name = "rxh-server"
+description = "Runtime of the RXH proxy: HTTP reverse proxy, TCP/UDP load balancer, health checks and admin API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["reverse-proxy", "load-balancer", "tcp-proxy", "udp-proxy", "http"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+regex.workspace = true
+rustls-pemfile.workspace = true
+rxh-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+toml.workspace = true
+
+[build-dependencies]
+minify-html.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

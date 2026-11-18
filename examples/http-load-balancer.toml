@@ -1,0 +1,25 @@
+# HTTP load balancer with health checks and sticky sessions.
+#   rxh run -c examples/http-load-balancer.toml
+#   rxh upstream add web 127.0.0.1:3003      # add a peer, live
+#   rxh status
+
+[upstream.web]
+policy = "cookie"            # sticky sessions
+secret = "change-me"
+fallback = "least_conn"      # new visitors go to the least busy backend
+retries = 2
+backends = ["127.0.0.1:3001", "127.0.0.1:3002"]
+
+[upstream.web.health]
+uri = "/health"
+interval = "5s"
+
+[upstream.web.passive]
+fail_duration = "30s"
+max_fails = 3
+unhealthy_status = ["5xx"]
+
+[[server]]
+name = "web"
+listen = "0.0.0.0:8080"
+forward = "@web"

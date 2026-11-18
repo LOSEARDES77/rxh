@@ -1,0 +1,76 @@
+//! `rxh` binary: runs the proxy daemon and manages it from the command line.
+
+mod cli;
+mod client;
+mod commands;
+mod edit;
+mod process;
+
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::Parser;
+
+use crate::cli::{Cli, Command};
+
+fn main() -> ExitCode {
+    let mut cli = Cli::parse();
+
+    let result = match cli.command.take() {
+        None | Some(Command::Run) => run(&cli),
+        Some(Command::Start { log_file }) => start(&cli, log_file),
+        Some(command) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())
+            .and_then(|runtime| runtime.block_on(commands::execute(&cli, command))),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("rxh: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs the daemon in the foreground.
+fn run(cli: &Cli) -> Result<(), String> {
+    let path = commands::config_path(cli);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    runtime
+        .block_on(rxh_server::Daemon::new(path).run())
+        .map_err(|err| err.to_string())
+}
+
+/// Checks the configuration, forks into the background and runs the daemon.
+fn start(cli: &Cli, log_file: Option<PathBuf>) -> Result<(), String> {
+    let path = commands::config_path(cli);
+    let config = rxh_server::load_config(&path).map_err(|err| err.to_string())?;
+
+    // Fail in the foreground, where the user can see it, if another daemon
+    // already owns the admin address.
+    if config.admin.enabled {
+        TcpListener::bind(config.admin.listen).map_err(|err| {
+            format!(
+                "admin address {} is busy ({err}), is rxh already running?",
+                config.admin.listen
+            )
+        })?;
+    }
+
+    let log_file = log_file.unwrap_or_else(|| cli.pid_file.with_extension("log"));
+    println!(
+        "Starting rxh in the background (pid file {}, log {})",
+        cli.pid_file.display(),
+        log_file.display()
+    );
+    process::daemonize(&cli.pid_file, &log_file).map_err(|err| err.to_string())?;
+
+    run(cli)
+}
