@@ -484,7 +484,7 @@ fn describe_target(pattern: &rxh_core::config::Pattern) -> String {
             let addresses: Vec<&str> = group.backends.iter().map(|b| b.address.as_str()).collect();
             addresses.join(" ")
         }
-        Action::Serve(root) => format!("files {root}"),
+        Action::Serve(files) => format!("files {}", files.root),
     };
     if pattern.uri == "/" {
         target

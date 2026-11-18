@@ -137,7 +137,8 @@ forward = "@api"
 
 [[server.match]]
 uri = "/"
-serve = "/var/www"
+serve = { root = "/var/www", browse = false, index = ["index.html"], hide = [".git", "*.pem"], precompressed = ["zstd", "br", "gzip"] }
+encode = ["zstd", "gzip"]      # on the fly, for text-like responses (files and proxied)
 
 # TCP (layer 4) with PROXY protocol and an inline group.
 [[server]]

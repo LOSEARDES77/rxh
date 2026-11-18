@@ -168,6 +168,17 @@ impl Config {
                         "{label}: match[{pattern_index}]: response.headers: {err}"
                     ))
                 })?;
+                if let Action::Serve(files) = &pattern.action {
+                    for entry in &files.hide {
+                        if entry.is_empty() || entry.contains('/') {
+                            return invalid(format!(
+                                "{label}: match[{pattern_index}]: serve.hide entry {entry:?} \
+                                 must be a file name or a `*` glob without `/`"
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 let Action::Forward(forward) = &pattern.action else {
                     continue;
                 };
@@ -422,7 +433,9 @@ struct RawServer {
     #[serde(default, rename = "match")]
     patterns: Option<Vec<Pattern>>,
     forward: Option<Forward>,
-    serve: Option<String>,
+    serve: Option<FileServer>,
+    #[serde(default)]
+    encode: Vec<Encoding>,
     uri: Option<String>,
     #[serde(default, deserialize_with = "one_or_many")]
     host: Vec<String>,
@@ -485,6 +498,7 @@ impl TryFrom<RawServer> for Server {
             || !raw.remote_ip.is_empty()
             || raw.request.is_some()
             || raw.response.is_some()
+            || !raw.encode.is_empty()
             || raw.cache.is_some();
 
         let patterns = match (raw.patterns, inline_action) {
@@ -496,7 +510,7 @@ impl TryFrom<RawServer> for Server {
             (Some(_), None) if has_inline_options => {
                 return Err(String::from(
                     "'uri', 'path', 'method', 'header', 'query', 'remote_ip', 'request', \
-                     'response' and 'cache' go inside each 'match' entry",
+                     'response', 'encode' and 'cache' go inside each 'match' entry",
                 ));
             }
             (Some(patterns), None) if !patterns.is_empty() => patterns,
@@ -511,6 +525,7 @@ impl TryFrom<RawServer> for Server {
                 action,
                 request: raw.request.unwrap_or_default(),
                 response: raw.response.unwrap_or_default(),
+                encode: raw.encode,
                 cache: raw.cache.unwrap_or_default(),
             }],
             _ => return Err(String::from("missing 'match', 'forward' or 'serve'")),
@@ -601,9 +616,120 @@ pub struct Pattern {
     #[serde(default)]
     pub response: ResponseConfig,
 
+    /// Encodings to compress responses with, in order of preference. Applies
+    /// to files and proxied responses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encode: Vec<Encoding>,
+
     /// Response cache for this pattern.
     #[serde(default)]
     pub cache: Cache,
+}
+
+/// Content encoding RXH can produce.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Encoding {
+    /// Zstandard (`zstd`).
+    Zstd,
+
+    /// Brotli (`br`).
+    Br,
+
+    /// Gzip (`gzip`).
+    Gzip,
+}
+
+impl Encoding {
+    /// Token used in `Accept-Encoding` and `Content-Encoding`.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::Br => "br",
+            Self::Gzip => "gzip",
+        }
+    }
+}
+
+/// Settings of a `serve` action: `serve = "dir"` or a table.
+///
+/// ```toml
+/// serve = "/var/www"
+/// serve = { root = ".", browse = false, hide = [".git", "*.pem"], precompressed = ["br", "gzip"] }
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(from = "FileServerOption")]
+pub struct FileServer {
+    /// Directory the files come from.
+    pub root: String,
+
+    /// List directories that have no index file.
+    pub browse: bool,
+
+    /// Index file names tried in order for a directory.
+    pub index: Vec<String>,
+
+    /// File names or `*` globs, matched against every path component, that
+    /// answer 404 and are left out of listings.
+    pub hide: Vec<String>,
+
+    /// Look for `FILE.zst`, `FILE.br` and `FILE.gz` next to a file, in this
+    /// order of preference, when the client accepts the encoding.
+    pub precompressed: Vec<Encoding>,
+}
+
+impl FileServer {
+    /// Settings with every default for `root`.
+    #[must_use]
+    pub fn new(root: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            browse: true,
+            index: vec![String::from("index.html")],
+            hide: Vec::new(),
+            precompressed: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FileServerOption {
+    Root(String),
+    Table(FileServerTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileServerTable {
+    root: String,
+    #[serde(default = "default::true_value")]
+    browse: bool,
+    #[serde(default, deserialize_with = "one_or_many")]
+    index: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    hide: Vec<String>,
+    #[serde(default)]
+    precompressed: Vec<Encoding>,
+}
+
+impl From<FileServerOption> for FileServer {
+    fn from(option: FileServerOption) -> Self {
+        match option {
+            FileServerOption::Root(root) => Self::new(root),
+            FileServerOption::Table(table) => {
+                let mut server = Self::new(table.root);
+                server.browse = table.browse;
+                if !table.index.is_empty() {
+                    server.index = table.index;
+                }
+                server.hide = table.hide;
+                server.precompressed = table.precompressed;
+                server
+            }
+        }
+    }
 }
 
 /// Action executed when a [`Pattern`] matches.
@@ -614,7 +740,7 @@ pub enum Action {
     Forward(Forward),
 
     /// Serve static files from a root directory.
-    Serve(String),
+    Serve(FileServer),
 }
 
 /// Target of a `forward` action: a named group (`"@api"`) or an inline one.
@@ -2084,6 +2210,42 @@ mod tests {
                 "{extra}"
             );
         }
+    }
+
+    #[test]
+    fn serve_string_and_table() {
+        let config = Config::from_toml(
+            r#"
+[[server]]
+listen = "127.0.0.1:0"
+encode = ["zstd", "gzip"]
+serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
+"#,
+        )
+        .expect("valid");
+        let pattern = &config.servers[0].patterns[0];
+        assert_eq!(pattern.encode, [Encoding::Zstd, Encoding::Gzip]);
+        let Action::Serve(files) = &pattern.action else {
+            panic!("serve expected");
+        };
+        assert!(!files.browse);
+        assert_eq!(files.index, ["index.html"]);
+        assert_eq!(files.hide, [".git"]);
+        assert_eq!(files.precompressed, [Encoding::Br]);
+
+        let config = Config::from_toml("[[server]]\nlisten = \"127.0.0.1:0\"\nserve = \"/srv\"\n")
+            .expect("valid");
+        let Action::Serve(files) = &config.servers[0].patterns[0].action else {
+            panic!("serve expected");
+        };
+        assert!(files.browse && files.root == "/srv");
+
+        let slash =
+            "[[server]]\nlisten = \"127.0.0.1:0\"\nserve = { root = \".\", hide = [\"a/b\"] }\n";
+        assert!(Config::from_toml(slash).is_err());
+
+        let bad = "[[server]]\nlisten = \"127.0.0.1:0\"\nserve = { root = \".\", nope = 1 }\n";
+        assert!(Config::from_toml(bad).is_err());
     }
 
     #[test]

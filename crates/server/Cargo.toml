@@ -11,10 +11,12 @@ keywords = ["reverse-proxy", "load-balancer", "tcp-proxy", "udp-proxy", "http"]
 categories = ["network-programming", "web-programming::http-server"]
 
 [dependencies]
+async-compression.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hickory-resolver.workspace = true
+httpdate.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 regex.workspace = true

@@ -128,9 +128,10 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Manual TLS certificates | `tls = { cert, key }` | ✅ | |
 | Automatic HTTPS (ACME) | | ❌ | Large feature. |
 | SNI with many certificates, mTLS | `tls` per server on a shared address | 🟡 | Certificate picked by SNI against `host` (exact beats wildcard, first is the default). No mTLS. |
-| `file_server` with `browse` | `serve` | ✅ | Index files and directory listing. |
-| Range requests, ETag, precompressed files | | ❌ | |
-| `encode gzip zstd` | | ❌ | |
+| `file_server` with `browse`, `index`, `hide` | `serve` (string or table: `browse`, `index`, `hide`) | ✅ | Index files and directory listing. `hide` takes names and `*` globs matched per path component. |
+| Range requests, ETag, conditional requests | `serve` | ✅ | Streamed files, weak ETag, `Last-Modified`, `If-None-Match`, `If-Modified-Since`, `If-Range`, one range (several send the whole file). |
+| `file_server precompressed` | `serve.precompressed` | ✅ | `.zst`, `.br`, `.gz` next to the file. |
+| `encode zstd br gzip` | `encode` on a route | ✅ | Files and proxied responses; no minimum length or custom type list. |
 | `grace_period` | `grace_period` | ✅ | Default waits forever, like Caddy. Idle keep-alive connections close at once. |
 | Connection limit | `max_connections` | ➕ | |
 | Structured access logs | `[log]` `format = "json"`, `output`, `access` | ✅ | Text or JSON lines on stdout, stderr or a file; no field selection or rotation. |
@@ -175,10 +176,9 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). Ordered by value
 for a load balancer:
 
-1. Compression (`encode`), range requests and ETags for the file server.
-2. Automatic HTTPS with ACME.
-3. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-4. HTTP/3.
+1. Automatic HTTPS with ACME.
+2. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
+3. HTTP/3.
 
 ## Roadmap beyond Caddy
 

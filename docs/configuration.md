@@ -218,7 +218,7 @@ socket, except that `http` servers listing the same address share one socket
 | `protocol` | `"http"` | `http`, `tcp` or `udp`. |
 | `name` | | Name shown in logs, in `rxh status`, and in `Forwarded: by=` and `Via`. |
 | `forward` | | Proxy target: `"@pool"`, `"host:port"`, a list of backends, or an inline pool table. |
-| `serve` | | Serve static files from this directory (http only). |
+| `serve` | | Serve static files: a directory, or a table, see [File server](#file-server) (http only). |
 | `uri` | `"/"` | Path prefix for the single `forward` or `serve` of this server (http only). |
 | `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. |
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
@@ -232,7 +232,7 @@ socket, except that `http` servers listing the same address share one socket
 | `idle_timeout` | unset | Keep-alive HTTP connections without traffic and without requests in flight for this long are closed. For `tcp`, a connection with no traffic in either direction for this long is closed. |
 | `stream_timeout` | unset | Maximum lifetime of upgraded HTTP tunnels (WebSockets) and of `tcp` connections. |
 | `udp_idle_timeout` | `"60s"` | Idle time after which a UDP client session ends (udp only). |
-| `request`, `response`, `cache` | | Same as in `match` entries, for the single pattern form. |
+| `request`, `response`, `cache`, `encode` | | Same as in `match` entries, for the single pattern form. |
 
 A `tcp` or `udp` server takes exactly one `forward` and no `match`.
 
@@ -295,7 +295,8 @@ match = [
 | `header` | `{ name = "value" }`: the header must have this exact value (one of its values); `"*"` only requires the header. |
 | `query` | `{ key = "value" }`: same for query parameters (not percent decoded); `"*"` only requires the key. |
 | `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
-| `forward` / `serve` | Action, exactly one. |
+| `forward` / `serve` | Action, exactly one. `serve` is a directory or a [file server table](#file-server). |
+| `encode` | List of `zstd`, `br`, `gzip`: compress this route's responses (files and proxied) with the first one the client accepts in `Accept-Encoding`. Only text, JSON, JavaScript, XML, SVG and WebAssembly responses without a `Content-Encoding`, and never `206` or `304`. Removes `Content-Length`, adds `Vary: Accept-Encoding`, makes a strong `ETag` weak. |
 | `request.headers.set` | Headers to set on the upstream request, `{ name = "value" }`. |
 | `request.headers.add` | Headers to append a value to, keeping existing ones, `{ name = "value" }`. |
 | `request.headers.remove` | Headers to remove from the upstream request. A trailing `*` removes every header with that prefix (`"x-debug-*"`); `"*"` alone is rejected. |
@@ -321,6 +322,31 @@ match = [
     { forward = "@web" },
 ]
 ```
+
+### File server
+
+`serve = "/var/www"` serves a directory with every default below. The table
+form changes them:
+
+```toml
+serve = { root = ".", browse = true, index = ["index.html"], hide = [".git", "*.pem"], precompressed = ["zstd", "br", "gzip"] }
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `root` | required | Directory to serve. Paths that resolve outside it (`..`, symlinks) answer `404`. |
+| `browse` | `true` | List directories that have no index file. With `false` they answer `404`. |
+| `index` | `["index.html"]` | Index file names tried in order for a directory. |
+| `hide` | `[]` | File names or `*` globs matched against every component of the path; matching paths answer `404` and are left out of listings. |
+| `precompressed` | `[]` | `zstd`, `br`, `gzip`: when the client accepts it and `FILE.zst`, `FILE.br` or `FILE.gz` exists, that file is sent with `Content-Encoding` and `Vary: Accept-Encoding`, keeping the type of `FILE`. Tried in the listed order. |
+
+Files are streamed in chunks, never loaded in memory. Only `GET` and `HEAD`
+are allowed. Responses carry `Content-Length`, `Last-Modified`, a weak `ETag`
+(size and modification time) and `Accept-Ranges: bytes`. `If-None-Match` and
+`If-Modified-Since` give `304`. A single `Range` (`a-b`, `a-`, `-n`) gives
+`206` with `Content-Range`, a range outside the file gives `416`, and
+multiple ranges send the whole file. `If-Range` is honored with a
+`Last-Modified` date. Request paths are percent decoded.
 
 ### Headers RXH sets on proxied requests
 

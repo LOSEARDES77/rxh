@@ -12,16 +12,17 @@ use std::time::Duration;
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper::body::Incoming;
-use rxh_core::config::{self, Action, ConfigError, RequestHeaders, ResponseHeaders};
+use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders};
 use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::IpNet;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::error::Error;
-use crate::files;
+use crate::files::Files;
 use crate::http::body::Guarded;
 use crate::http::cache::Cache;
+use crate::http::encode;
 use crate::http::headers::{self, Replacement};
 use crate::http::proxy;
 use crate::http::response::{self, BoxResponse};
@@ -61,6 +62,7 @@ pub(crate) struct Route {
     pub(crate) request_replace: Vec<Replacement>,
     pub(crate) response_replace: Vec<Replacement>,
     pub(crate) cache: Option<Cache>,
+    pub(crate) encode: Vec<Encoding>,
 }
 
 /// What a route does.
@@ -70,7 +72,7 @@ pub(crate) enum RouteAction {
     Proxy(Arc<Group>),
 
     /// Static files from a directory.
-    Files(String),
+    Files(Files),
 }
 
 impl Site {
@@ -99,7 +101,7 @@ impl Site {
                     server,
                     pattern_index,
                 )?),
-                Action::Serve(root) => RouteAction::Files(root.clone()),
+                Action::Serve(root) => RouteAction::Files(Files::new(root)),
             };
 
             let invalid = |side: &str, err: String| {
@@ -126,6 +128,7 @@ impl Site {
                 request_replace,
                 response_replace,
                 cache: Cache::new(&pattern.cache),
+                encode: pattern.encode.clone(),
             });
         }
 
@@ -237,13 +240,27 @@ impl Service {
         };
         let version = request.version();
 
+        let accept_encoding = match route {
+            Some(route) if !route.encode.is_empty() => encode::accept_encoding(request.headers()),
+            _ => String::new(),
+        };
+
         let mut response = match route {
             None => response::not_found(),
             Some(route) => match &route.action {
                 RouteAction::Proxy(group) => proxy::forward(request, route, group, &self).await,
-                RouteAction::Files(root) => files::transfer(&path, root, &route.uri).await,
+                RouteAction::Files(files) => {
+                    files
+                        .transfer(&method, request.headers(), &path, &route.uri)
+                        .await
+                }
             },
         };
+        if let Some(route) = route
+            && !route.encode.is_empty()
+        {
+            response = encode::apply(response, &route.encode, &accept_encoding);
+        }
 
         let elapsed = started.elapsed();
         let status = response.status().as_u16();
