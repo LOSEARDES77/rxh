@@ -133,8 +133,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `encode gzip zstd` | | ❌ | |
 | `grace_period` | `grace_period` | ✅ | Default waits forever, like Caddy. Idle keep-alive connections close at once. |
 | Connection limit | `max_connections` | ➕ | |
-| Structured access logs | plain text lines | 🟡 | JSON logs planned. |
-| Prometheus metrics | | ❌ | |
+| Structured access logs | `[log]` `format = "json"`, `output`, `access` | ✅ | Text or JSON lines on stdout, stderr or a file; no field selection or rotation. |
+| Prometheus metrics | `GET /metrics` on the admin API | ✅ | Requests, latency histogram, L4 connections, per upstream requests, failures, in flight and health. |
 
 ## Layer 4 (Caddy needs the caddy-l4 plugin)
 
@@ -175,12 +175,11 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). Ordered by value
 for a load balancer:
 
-1. Prometheus metrics and JSON access logs.
-2. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
-3. Compression (`encode`), range requests and ETags for the file server.
-4. Automatic HTTPS with ACME.
-5. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
-6. HTTP/3.
+1. `lb_retry_match`, nested `fallback`, header `+`/regex operations.
+2. Compression (`encode`), range requests and ETags for the file server.
+3. Automatic HTTPS with ACME.
+4. Layer 4 matchers (SNI routing) and receiving PROXY protocol.
+5. HTTP/3.
 
 ## Roadmap beyond Caddy
 

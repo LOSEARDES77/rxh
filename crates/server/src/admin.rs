@@ -10,6 +10,7 @@
 //! | `GET`    | `/reverse_proxy/upstreams`    | Caddy compatible upstream list      |
 //! | `POST`   | `/pools/{name}/upstreams`     | Add `{"address", "weight"}`         |
 //! | `DELETE` | `/pools/{name}/upstreams`     | Remove `{"address"}`                |
+//! | `GET`    | `/metrics`                    | Prometheus metrics                  |
 //! | `POST`   | `/reload`                     | Reload the configuration file       |
 //! | `POST`   | `/stop`                       | Graceful shutdown                   |
 //!
@@ -128,6 +129,16 @@ async fn handle(
 
     let response = match (&method, segments.as_slice()) {
         (&Method::GET, [] | ["status"]) => json_response(StatusCode::OK, &status(&state)),
+        (&Method::GET, ["metrics"]) => {
+            let mut response = Response::new(Full::new(Bytes::from(
+                crate::metrics::global().render(&registry(&state)),
+            )));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/plain; version=0.0.4"),
+            );
+            response
+        }
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
         (&Method::GET, ["pools"]) => {
             let registry = registry(&state);

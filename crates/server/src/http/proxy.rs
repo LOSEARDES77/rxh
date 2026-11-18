@@ -23,7 +23,7 @@ use crate::http::body::{self, Guarded};
 use crate::http::cache::Cache;
 use crate::http::headers::{self, Forwarding};
 use crate::http::response::{self, BoxResponse};
-use crate::http::service::{Route, Service};
+use crate::http::service::{Route, Service, UpstreamAddress};
 use crate::http::transport::SendError;
 use crate::registry::Group;
 use crate::upstream::{self, DialError};
@@ -227,6 +227,9 @@ pub(crate) async fn forward(
         let (parts, _) = upstream_response.into_parts();
         let mut client_response = Response::from_parts(parts, body::empty());
         headers::prepare_response(&mut client_response, &route.response, &site.by);
+        client_response
+            .extensions_mut()
+            .insert(UpstreamAddress(selection.upstream.address().to_owned()));
         return client_response;
     }
 
@@ -245,6 +248,9 @@ pub(crate) async fn forward(
             .append(header::SET_COOKIE, cookie);
     }
 
+    client_response
+        .extensions_mut()
+        .insert(UpstreamAddress(selection.upstream.address().to_owned()));
     client_response.map(|body| Guarded::new(body, guard).boxed())
 }
 

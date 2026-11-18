@@ -174,6 +174,7 @@ a non-loopback `Host` or `Origin` are rejected.
 | `GET` | `/reverse_proxy/upstreams` | Caddy compatible upstream list |
 | `POST` | `/pools/{name}/upstreams` | Add `{"address": "host:port", "weight": 1}` |
 | `DELETE` | `/pools/{name}/upstreams` | Remove `{"address": "host:port"}` |
+| `GET` | `/metrics` | Prometheus metrics (text format 0.0.4) |
 | `POST` | `/reload` | Reload the configuration file |
 | `POST` | `/stop` | Graceful shutdown |
 

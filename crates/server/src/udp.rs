@@ -14,6 +14,8 @@ use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 
+use crate::log::{self, Logger};
+use crate::metrics;
 use crate::registry::Group;
 
 const MAX_DATAGRAM: usize = 65_535;
@@ -25,12 +27,19 @@ pub(crate) struct UdpSettings {
     pub(crate) idle_timeout: Duration,
     pub(crate) max_sessions: usize,
     pub(crate) log_name: Arc<str>,
+
+    /// Server name or listen address, for metrics and JSON lines.
+    pub(crate) server: Arc<str>,
+    pub(crate) logger: Arc<Logger>,
 }
 
 #[derive(Debug, Clone)]
 struct Session {
     backend: Arc<UdpSocket>,
     last_active: Arc<AtomicU64>,
+    started: Instant,
+    bytes_sent: Arc<AtomicU64>,
+    bytes_received: Arc<AtomicU64>,
 }
 
 type Sessions = Arc<Mutex<HashMap<SocketAddr, Session>>>;
@@ -77,7 +86,7 @@ pub(crate) async fn serve(socket: Arc<UdpSocket>, settings: UdpSettings) -> io::
                             session.clone(),
                             client,
                             epoch,
-                            settings.idle_timeout,
+                            settings.clone(),
                             guard,
                             Arc::clone(&sessions),
                         ));
@@ -98,11 +107,14 @@ pub(crate) async fn serve(socket: Arc<UdpSocket>, settings: UdpSettings) -> io::
         session
             .last_active
             .store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-        if let Err(err) = session.backend.send(&buffer[..len]).await {
-            eprintln!(
+        match session.backend.send(&buffer[..len]).await {
+            Ok(sent) => {
+                session.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+            }
+            Err(err) => eprintln!(
                 "{} => {client}: send to backend failed: {err}",
                 settings.log_name
-            );
+            ),
         }
     }
 }
@@ -134,15 +146,21 @@ async fn open_session(
 
     let backend = UdpSocket::bind(bind).await?;
     backend.connect(target).await?;
-    println!(
-        "{client} -> {} UDP session to {}",
-        settings.log_name,
-        upstream.address()
-    );
+    metrics::global().record_l4(&settings.server, "udp");
+    settings.logger.access_text(|| {
+        format!(
+            "{client} -> {} UDP session to {}",
+            settings.log_name,
+            upstream.address()
+        )
+    });
 
     let session = Session {
         backend: Arc::new(backend),
         last_active: Arc::default(),
+        started: Instant::now(),
+        bytes_sent: Arc::default(),
+        bytes_received: Arc::default(),
     };
     Ok((session, upstream))
 }
@@ -152,11 +170,12 @@ async fn reply_loop(
     session: Session,
     client: SocketAddr,
     epoch: Instant,
-    idle_timeout: Duration,
+    settings: UdpSettings,
     guard: RequestGuard,
     sessions: Sessions,
 ) {
     let mut buffer = vec![0; MAX_DATAGRAM];
+    let idle_timeout = settings.idle_timeout;
 
     loop {
         let last = Duration::from_millis(session.last_active.load(Ordering::Relaxed));
@@ -174,6 +193,9 @@ async fn reply_loop(
                 session
                     .last_active
                     .store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                session
+                    .bytes_received
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 if let Err(err) = listener.send_to(&buffer[..len], client).await {
                     eprintln!("UDP reply to {client} failed: {err}");
                 }
@@ -189,6 +211,19 @@ async fn reply_loop(
             }
         }
     }
+
+    settings.logger.access_json(|| {
+        serde_json::json!({
+            "ts": log::now(),
+            "server": &*settings.server,
+            "protocol": "udp",
+            "remote": client.to_string(),
+            "upstream": guard.upstream().address(),
+            "bytes_sent": session.bytes_sent.load(Ordering::Relaxed),
+            "bytes_received": session.bytes_received.load(Ordering::Relaxed),
+            "duration_ms": log::millis(session.started.elapsed()),
+        })
+    });
 
     sessions
         .lock()

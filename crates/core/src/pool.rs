@@ -136,6 +136,7 @@ pub struct Upstream {
     cookie: Option<String>,
     active: AtomicUsize,
     total: AtomicU64,
+    failure_total: AtomicU64,
     checked_healthy: AtomicBool,
     check_passes: AtomicU32,
     check_fails: AtomicU32,
@@ -155,6 +156,7 @@ impl Upstream {
             cookie,
             active: AtomicUsize::new(0),
             total: AtomicU64::new(0),
+            failure_total: AtomicU64::new(0),
             checked_healthy: AtomicBool::new(true),
             check_passes: AtomicU32::new(0),
             check_fails: AtomicU32::new(0),
@@ -231,6 +233,19 @@ impl Upstream {
         count
     }
 
+    /// Requests or connections served since start.
+    #[must_use]
+    pub fn total_requests(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Failures recorded since start, whether or not passive health checks
+    /// are enabled.
+    #[must_use]
+    pub fn total_failures(&self) -> u64 {
+        self.failure_total.load(Ordering::Relaxed)
+    }
+
     /// Failures currently remembered by passive health checks.
     #[must_use]
     pub fn fails(&self) -> u32 {
@@ -242,6 +257,7 @@ impl Upstream {
 
     /// Records a failed request or connection for passive health checks.
     pub fn record_failure(&self) {
+        self.failure_total.fetch_add(1, Ordering::Relaxed);
         let Some(passive) = &self.passive else {
             return;
         };

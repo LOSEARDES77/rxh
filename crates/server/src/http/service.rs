@@ -22,8 +22,11 @@ use crate::error::Error;
 use crate::files;
 use crate::http::body::Guarded;
 use crate::http::cache::Cache;
+use crate::http::headers;
 use crate::http::proxy;
 use crate::http::response::{self, BoxResponse};
+use crate::log::{self, Logger};
+use crate::metrics;
 use crate::registry::{Group, Registry};
 
 /// Settings of one `[[server]]`, shared by its routes. Several sites can
@@ -159,7 +162,12 @@ pub(crate) struct Service {
     pub(crate) peer: SocketAddr,
     pub(crate) local: SocketAddr,
     pub(crate) activity: Arc<Activity>,
+    pub(crate) logger: Arc<Logger>,
 }
+
+/// Response extension set by the proxy: address of the backend that served it.
+#[derive(Debug, Clone)]
+pub(crate) struct UpstreamAddress(pub(crate) String);
 
 impl hyper::service::Service<Request<Incoming>> for Service {
     type Response = BoxResponse;
@@ -199,7 +207,23 @@ impl Service {
             .iter()
             .find(|route| route.matcher.matches(&input));
 
-        let response = match route {
+        let server = route.map_or(&*self.log_name, |route| &*route.site.by);
+        // Only computed when a JSON line will be written.
+        let json = self.logger.is_json();
+        let client_ip = match route {
+            Some(route) if json => {
+                headers::client_ip(
+                    self.peer.ip(),
+                    request.headers(),
+                    &route.site.trusted_proxies,
+                )
+                .0
+            }
+            _ => self.peer.ip(),
+        };
+        let version = request.version();
+
+        let mut response = match route {
             None => response::not_found(),
             Some(route) => match &route.action {
                 RouteAction::Proxy(group) => proxy::forward(request, route, group, &self).await,
@@ -207,12 +231,36 @@ impl Service {
             },
         };
 
-        println!(
-            "{} -> {} {method} {uri} HTTP {} {:?}",
-            self.peer,
-            route.map_or(&*self.log_name, |route| &route.site.log_name),
-            response.status(),
-            started.elapsed()
+        let elapsed = started.elapsed();
+        let status = response.status().as_u16();
+        let upstream = response
+            .extensions_mut()
+            .remove::<UpstreamAddress>()
+            .map(|address| address.0);
+        metrics::global().record_http(server, status, elapsed);
+        self.logger.access(
+            || {
+                format!(
+                    "{} -> {} {method} {uri} HTTP {} {elapsed:?}",
+                    self.peer,
+                    route.map_or(&*self.log_name, |route| &route.site.log_name),
+                    response.status(),
+                )
+            },
+            || {
+                serde_json::json!({
+                    "ts": log::now(),
+                    "server": server,
+                    "remote": self.peer.to_string(),
+                    "client_ip": client_ip.to_string(),
+                    "method": method.as_str(),
+                    "uri": uri.to_string(),
+                    "proto": format!("{version:?}"),
+                    "status": status,
+                    "duration_ms": log::millis(elapsed),
+                    "upstream": upstream,
+                })
+            },
         );
 
         response

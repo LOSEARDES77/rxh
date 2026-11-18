@@ -8,12 +8,13 @@ Durations are strings like `250ms`, `5s`, `1m30s` or `2h` (units `ns`, `us`,
 `ms`, `s`, `m`, `h`, `d`), or plain integers meaning seconds. Unknown keys
 are errors, so typos do not go unnoticed.
 
-The file has four parts, and top level keys must come before the first table:
+The file has five parts, and top level keys must come before the first table:
 
 ```toml
 grace_period = "30s"     # top level options
 
 [admin]                  # admin API
+[log]                    # access logs
 [upstream.NAME]          # named load balancing pools, any number
 [[server]]               # listeners, any number
 ```
@@ -30,6 +31,47 @@ grace_period = "30s"     # top level options
 |---|---|---|
 | `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
 | `listen` | `"127.0.0.1:2019"` | Address of the admin API. It has no authentication, keep it on loopback. Changes need a restart. |
+
+## `[log]`
+
+| Key | Default | Description |
+|---|---|---|
+| `format` | `"text"` | `"text"` keeps one human readable line per request. `"json"` writes one JSON object per line. |
+| `output` | `"stdout"` | `"stdout"`, `"stderr"` or a file path (created if missing, always appended to). Only access lines go here; startup and error messages stay on stdout and stderr. |
+| `access` | `true` | `false` disables access lines. |
+
+JSON lines for HTTP requests have `ts` (RFC 3339 UTC with milliseconds),
+`server` (server name, or its listen address), `remote`, `client_ip` (after
+`trusted_proxies`), `method`, `uri`, `proto`, `status`, `duration_ms` (time
+until the response headers were ready) and `upstream` (backend address, or
+`null` for files, cache hits and errors). TCP connections have `ts`,
+`server`, `protocol`, `remote`, `upstream`, `bytes_sent` (client to backend),
+`bytes_received`, `duration_ms`; UDP sessions are logged when they end, with
+`protocol = "udp"`. Log files are opened when the configuration loads, so
+reload after rotating them.
+
+```json
+{"ts":"2025-01-01T12:00:00.123Z","server":"web","remote":"203.0.113.5:51000","client_ip":"203.0.113.5","method":"GET","uri":"/api/users","proto":"HTTP/1.1","status":200,"duration_ms":3.4,"upstream":"10.0.0.1:8080"}
+```
+
+### Metrics
+
+`GET /metrics` on the admin API returns Prometheus text format 0.0.4.
+Counters survive reloads; upstream series are read from the live pools.
+
+| Metric | Labels | Type |
+|---|---|---|
+| `rxh_build_info` | `version` | gauge, always 1 |
+| `rxh_http_requests_total` | `server`, `code` | counter |
+| `rxh_http_request_duration_seconds` | `server` | histogram, buckets 0.005 to 10 seconds |
+| `rxh_l4_connections_total` | `server`, `protocol` | counter (`tcp` connections, `udp` sessions) |
+| `rxh_upstream_requests_total` | `pool`, `upstream` | counter |
+| `rxh_upstream_failures_total` | `pool`, `upstream` | counter |
+| `rxh_upstream_active_requests` | `pool`, `upstream` | gauge |
+| `rxh_upstream_healthy` | `pool`, `upstream` | gauge, 1 or 0 |
+
+`server` is the server name, or its listen address when unnamed (requests that
+match no route use the listener name).
 
 ## `[upstream.NAME]`: load balancing pools
 

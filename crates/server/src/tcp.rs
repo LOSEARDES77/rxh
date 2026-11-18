@@ -3,12 +3,14 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rxh_core::config::ProxyProtocol;
 use rxh_core::pool::{SelectContext, Upstream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::log::{self, ListenerLog};
+use crate::metrics;
 use crate::registry::Group;
 use crate::timeout::{Stamp, Watched};
 use crate::upstream::{self, DialError};
@@ -31,10 +33,13 @@ pub(crate) async fn proxy<S>(
     group: &Group,
     proxy_protocol: Option<ProxyProtocol>,
     limits: Limits,
-    log_name: &str,
+    log: &ListenerLog,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let log_name = &*log.log_name;
+    let started = Instant::now();
+    metrics::global().record_l4(&log.server, "tcp");
     let context = SelectContext::l4(peer.ip());
     let dialer = &group.dialer;
 
@@ -45,14 +50,38 @@ pub(crate) async fn proxy<S>(
     )
     .await;
 
+    // Every way a connection can end writes one access record in JSON mode;
+    // text mode keeps the operational messages.
+    let json = |upstream: Option<&str>, sent: u64, received: u64| {
+        log.logger.access_json(|| {
+            serde_json::json!({
+                "ts": log::now(),
+                "server": &*log.server,
+                "protocol": "tcp",
+                "remote": peer.to_string(),
+                "upstream": upstream,
+                "bytes_sent": sent,
+                "bytes_received": received,
+                "duration_ms": log::millis(started.elapsed()),
+            })
+        });
+    };
+    let text = log.logger.is_text();
+
     let (selection, mut backend) = match dialed {
         Ok(dialed) => dialed,
         Err(DialError::NoUpstream) => {
-            eprintln!("{log_name} => {peer}: no upstreams available");
+            json(None, 0, 0);
+            if text {
+                eprintln!("{log_name} => {peer}: no upstreams available");
+            }
             return;
         }
         Err(DialError::Connect(err)) => {
-            eprintln!("{log_name} => {peer}: all dial attempts failed: {err}");
+            json(None, 0, 0);
+            if text {
+                eprintln!("{log_name} => {peer}: all dial attempts failed: {err}");
+            }
             return;
         }
     };
@@ -64,7 +93,10 @@ pub(crate) async fn proxy<S>(
         && let Err(err) = backend.write_all(&proxy_header(version, peer, local)).await
     {
         selection.upstream.record_failure();
-        eprintln!("{log_name} => {peer}: PROXY header to {address} failed: {err}");
+        json(Some(address), 0, 0);
+        if text {
+            eprintln!("{log_name} => {peer}: PROXY header to {address} failed: {err}");
+        }
         return;
     }
 
@@ -86,15 +118,35 @@ pub(crate) async fn proxy<S>(
         }
     };
 
+    // ponytail: byte counts are 0 when a timeout or error ends the copy,
+    // since the copy future is dropped; wrap the streams in counters if needed.
     tokio::select! {
         result = copy => match result {
             Ok((sent, received)) => {
-                println!("{peer} -> {log_name} TCP {address} sent {sent}B received {received}B");
+                json(Some(address), sent, received);
+                log.logger.access_text(|| {
+                    format!("{peer} -> {log_name} TCP {address} sent {sent}B received {received}B")
+                });
             }
-            Err(err) => eprintln!("{peer} -> {log_name} TCP {address} closed: {err}"),
+            Err(err) => {
+                json(Some(address), 0, 0);
+                if text {
+                    eprintln!("{peer} -> {log_name} TCP {address} closed: {err}");
+                }
+            }
         },
-        () = idle => println!("{peer} -> {log_name} TCP {address} closed: idle timeout"),
-        () = lifetime => println!("{peer} -> {log_name} TCP {address} closed: stream timeout"),
+        () = idle => {
+            json(Some(address), 0, 0);
+            if text {
+                println!("{peer} -> {log_name} TCP {address} closed: idle timeout");
+            }
+        }
+        () = lifetime => {
+            json(Some(address), 0, 0);
+            if text {
+                println!("{peer} -> {log_name} TCP {address} closed: stream timeout");
+            }
+        }
     }
 }
 

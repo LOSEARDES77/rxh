@@ -10,6 +10,12 @@ grace_period = "30s"
 enabled = true                 # default true
 listen = "127.0.0.1:2019"      # default, same as Caddy
 
+# Access logs. Metrics are served at http://127.0.0.1:2019/metrics.
+[log]
+format = "text"                # default; "json" writes one JSON object per line
+output = "stdout"              # default; "stderr" or a file path (appended)
+access = true                  # default; false disables access lines
+
 # Named load balancing group, referenced as "@api".
 [upstream.api]
 policy = "least_conn"          # random | random_choose | first | round_robin |

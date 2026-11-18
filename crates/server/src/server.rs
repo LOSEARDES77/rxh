@@ -25,6 +25,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::error::Error;
 use crate::http::service::{Activity, Route, Service, Site};
+use crate::log::{ListenerLog, Logger};
 use crate::registry::{Group, Registry};
 use crate::tcp;
 use crate::timeout::{Stamp, Watched};
@@ -80,7 +81,7 @@ enum Socket {
 struct ConnectionContext {
     handler: Handler,
     tls: Option<TlsAcceptor>,
-    log_name: Arc<str>,
+    log: ListenerLog,
     read_header_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
 }
@@ -148,6 +149,8 @@ impl Server {
             .collect();
         let name = (!names.is_empty()).then(|| names.join(", "));
         let log_name: Arc<str> = site_log_name(name.as_deref()).into();
+        let label: Arc<str> = name.clone().unwrap_or_else(|| address.to_string()).into();
+        let logger = Arc::new(Logger::new(&config.log)?);
 
         let forward_group = || -> Result<Arc<Group>, Error> {
             let Action::Forward(forward) = &server.patterns[0].action else {
@@ -163,6 +166,8 @@ impl Server {
                     idle_timeout: server.udp_idle_timeout,
                     max_sessions: server.max_connections,
                     log_name: Arc::clone(&log_name),
+                    server: Arc::clone(&label),
+                    logger: Arc::clone(&logger),
                 };
                 (Socket::Udp(socket, settings), None)
             }
@@ -197,7 +202,11 @@ impl Server {
                 let context = ConnectionContext {
                     tls: tls::acceptor(&servers)?,
                     handler,
-                    log_name: Arc::clone(&log_name),
+                    log: ListenerLog {
+                        log_name: Arc::clone(&log_name),
+                        server: Arc::clone(&label),
+                        logger: Arc::clone(&logger),
+                    },
                     read_header_timeout: server.read_header_timeout,
                     idle_timeout: server.idle_timeout,
                 };
@@ -379,7 +388,7 @@ async fn accept_loop(
         if full {
             println!(
                 "{} => Reached max connections: {max_connections}",
-                context.log_name
+                context.log.log_name
             );
             state.send_replace(State::MaxConnectionsReached(max_connections));
         }
@@ -390,7 +399,7 @@ async fn accept_loop(
             .expect("the semaphore is never closed");
 
         if full {
-            println!("{} => Accepting connections again", context.log_name);
+            println!("{} => Accepting connections again", context.log.log_name);
             state.send_replace(State::Listening);
         }
 
@@ -398,7 +407,7 @@ async fn accept_loop(
             Ok(accepted) => accepted,
             Err(err) => {
                 // Usually EMFILE or ECONNABORTED: back off instead of dying.
-                eprintln!("{} => accept failed: {err}", context.log_name);
+                eprintln!("{} => accept failed: {err}", context.log.log_name);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -430,7 +439,7 @@ async fn handle_connection(
             Ok(stream) => serve(stream, peer, local, &context, stop).await,
             Err(err) => eprintln!(
                 "{} => TLS handshake with {peer} failed: {err}",
-                context.log_name
+                context.log.log_name
             ),
         },
         None => serve(stream, peer, local, &context, stop).await,
@@ -459,7 +468,7 @@ async fn serve<S>(
                 group,
                 *proxy_protocol,
                 *limits,
-                &context.log_name,
+                &context.log,
             )
             .await;
         }
@@ -467,10 +476,11 @@ async fn serve<S>(
             let activity = Arc::new(Activity::default());
             let service = Service {
                 routes: Arc::clone(routes),
-                log_name: Arc::clone(&context.log_name),
+                log_name: Arc::clone(&context.log.log_name),
                 peer,
                 local,
                 activity: Arc::clone(&activity),
+                logger: Arc::clone(&context.log.logger),
             };
             let stamp = Stamp::new();
             let io = TokioIo::new(Watched::new(stream, Arc::clone(&stamp)));
@@ -501,7 +511,7 @@ async fn serve<S>(
             };
 
             if let Err(err) = result {
-                eprintln!("{} => connection from {peer}: {err}", context.log_name);
+                eprintln!("{} => connection from {peer}: {err}", context.log.log_name);
             }
         }
     }

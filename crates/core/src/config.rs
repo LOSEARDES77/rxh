@@ -69,6 +69,10 @@ pub struct Config {
     #[serde(default)]
     pub admin: Admin,
 
+    /// Access log settings.
+    #[serde(default)]
+    pub log: Log,
+
     /// Maximum time to wait for open connections during shutdown or reload.
     /// `None` waits forever, like Caddy's default.
     #[serde(
@@ -102,6 +106,10 @@ impl Config {
     /// Checks references and protocol constraints that serde cannot express.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |message: String| Err(ConfigError::Invalid(message));
+
+        if self.log.output.trim().is_empty() {
+            return invalid(String::from("log.output must not be empty"));
+        }
 
         for (name, group) in &self.upstreams {
             group
@@ -242,6 +250,45 @@ impl Default for Admin {
         Self {
             enabled: true,
             listen: default::admin_listen(),
+        }
+    }
+}
+
+/// Line format of access logs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human readable one line per request.
+    #[default]
+    Text,
+
+    /// One JSON object per line.
+    Json,
+}
+
+/// Access log settings, the `[log]` table.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Log {
+    /// Format of access lines.
+    #[serde(default)]
+    pub format: LogFormat,
+
+    /// `"stdout"`, `"stderr"` or the path of a file that is appended to.
+    #[serde(default = "default::log_output")]
+    pub output: String,
+
+    /// Writes one line per request or connection when true.
+    #[serde(default = "default::true_value")]
+    pub access: bool,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::Text,
+            output: default::log_output(),
+            access: true,
         }
     }
 }
@@ -1435,6 +1482,10 @@ mod default {
         1024
     }
 
+    pub fn log_output() -> String {
+        String::from("stdout")
+    }
+
     pub fn true_value() -> bool {
         true
     }
@@ -1773,5 +1824,16 @@ mod tests {
             assert_eq!(policy.name().parse::<Policy>(), Ok(policy));
         }
         assert_eq!("WRR".parse::<Policy>(), Ok(Policy::WeightedRoundRobin));
+    }
+
+    #[test]
+    fn log_table_parses_and_rejects_unknown_keys() {
+        let config =
+            Config::from_toml("[log]\nformat = \"json\"\noutput = \"/tmp/a.log\"").expect("valid");
+        assert_eq!(config.log.format, LogFormat::Json);
+        assert!(config.log.access);
+        assert_eq!(Config::default().log.output, "stdout");
+        assert!(Config::from_toml("[log]\nfile = \"x\"").is_err());
+        assert!(Config::from_toml("[log]\noutput = \"\"").is_err());
     }
 }
