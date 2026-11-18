@@ -44,7 +44,7 @@ The remaining rows of PARITY.md that a load balancer needs every day.
       and wildcard delete.
 - [ ] `max_conns_per_host`, request and response buffering, body size
       limit.
-- [ ] `rewrite`, `method`, redirects and HTTP to HTTPS redirect.
+- [x] `rewrite`, `method`, redirects and HTTP to HTTPS redirect.
 - [ ] `encode gzip zstd`; range requests, ETag and precompressed files in
       the file server.
 - [ ] Health check events (`healthy`, `unhealthy`) as hooks, not only log

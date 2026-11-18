@@ -629,6 +629,7 @@ fn describe_target(pattern: &rxh_core::config::Pattern) -> String {
             addresses.join(" ")
         }
         Action::Serve(files) => format!("files {}", files.root),
+        Action::Redirect(redirect) => format!("redirect {}", redirect.to),
     };
     if pattern.uri == "/" {
         target

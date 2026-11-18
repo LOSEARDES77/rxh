@@ -149,14 +149,27 @@ query = { "debug" = "*" }
 remote_ip = ["10.0.0.0/8", "::1/128"]
 forward = "@api"
 
+# The backend sees POST /v2/legacy/...; the query is kept unless the rewrite
+# has its own. Placeholders: {host}, {path}, {query}, {uri}.
+[[server.match]]
+uri = "/legacy"
+rewrite = "/v2{path}"
+request.method = "POST"
+forward = "@api"
+
+[[server.match]]
+uri = "/old"
+redirect = { to = "https://www.example.com/new{path}", status = 301 }  # 302 by default
+
 [[server.match]]
 uri = "/"
 serve = { root = "/var/www", browse = false, index = ["index.html"], hide = [".git", "*.pem"], precompressed = ["zstd", "br", "gzip"] }
 encode = ["zstd", "gzip"]      # on the fly, for text-like responses (files and proxied)
 
 # HTTPS with certificates from the [acme] CA for every name in `host` (exact
-# names only). A plain http server on `http_port` answers the challenges; if
-# nothing uses the port, rxh listens on 0.0.0.0:http_port while it issues.
+# names only). Plain HTTP requests for these names on `http_port` are
+# redirected to HTTPS (`https_redirect = false` turns it off) and the same
+# listener answers the challenges.
 [[server]]
 name = "shop"
 listen = "0.0.0.0:443"
@@ -173,6 +186,7 @@ name = "docs"
 listen = "0.0.0.0:443"
 host = "docs.example.com"
 tls = { cert = "/etc/rxh/docs.pem", key = "/etc/rxh/docs.key" }
+https_redirect = true          # opt in with certificate files
 serve = { root = "/var/www/docs" }
 
 # TCP (layer 4) with PROXY protocol and an inline group.

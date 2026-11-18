@@ -10,11 +10,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use http_body_util::BodyExt;
-use hyper::Request;
 use hyper::body::Incoming;
+use hyper::{Method, Request, StatusCode, Uri};
 use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders};
 use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::IpNet;
+use rxh_core::template::Template;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -58,6 +59,10 @@ pub(crate) struct Route {
     pub(crate) uri: String,
     pub(crate) matcher: RequestMatcher,
     pub(crate) action: RouteAction,
+    /// New URI of the request, see [`rewritten`].
+    pub(crate) rewrite: Option<Template>,
+    /// Method the request is forwarded or served with.
+    pub(crate) method: Option<Method>,
     pub(crate) request: RequestHeaders,
     pub(crate) response: ResponseHeaders,
     pub(crate) request_replace: Vec<Replacement>,
@@ -74,6 +79,24 @@ pub(crate) enum RouteAction {
 
     /// Static files from a directory.
     Files(Files),
+
+    /// Redirect to the rendered `to` with `status`.
+    Redirect { to: Template, status: StatusCode },
+}
+
+/// URI of a request for `uri` on `host` after `rewrite`: scheme and
+/// authority are kept, and so is the query unless the rewrite has its own.
+/// `None` if the result is not a valid URI.
+fn rewritten(rewrite: &Template, host: &str, uri: &Uri) -> Option<Uri> {
+    let mut target = rewrite.render(host, uri);
+    if let Some(query) = uri.query()
+        && !target.contains('?')
+    {
+        target = format!("{target}?{query}");
+    }
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(target.parse().ok()?);
+    Uri::from_parts(parts).ok()
 }
 
 impl Site {
@@ -95,6 +118,11 @@ impl Site {
         });
 
         for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+            let invalid = |key: &str, err: String| {
+                Error::Config(ConfigError::Invalid(format!(
+                    "match[{pattern_index}]: {key}: {err}"
+                )))
+            };
             let action = match &pattern.action {
                 Action::Forward(forward) => RouteAction::Proxy(registry.resolve(
                     forward,
@@ -103,17 +131,33 @@ impl Site {
                     pattern_index,
                 )?),
                 Action::Serve(root) => RouteAction::Files(Files::new(root)),
+                Action::Redirect(redirect) => RouteAction::Redirect {
+                    to: redirect
+                        .to
+                        .parse()
+                        .map_err(|err| invalid("redirect", err))?,
+                    status: StatusCode::from_u16(redirect.status)
+                        .map_err(|err| invalid("redirect", err.to_string()))?,
+                },
             };
+            let rewrite: Option<Template> = pattern
+                .rewrite
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|err| invalid("rewrite", err))?;
+            let method: Option<Method> = pattern
+                .request
+                .method
+                .as_ref()
+                .map(|method| Method::from_bytes(method.to_ascii_uppercase().as_bytes()))
+                .transpose()
+                .map_err(|err| invalid("request.method", err.to_string()))?;
 
-            let invalid = |side: &str, err: String| {
-                Error::Config(ConfigError::Invalid(format!(
-                    "match[{pattern_index}]: {side}.headers: {err}"
-                )))
-            };
             let request_replace = Replacement::compile(&pattern.request.headers.replace)
-                .map_err(|err| invalid("request", err))?;
+                .map_err(|err| invalid("request.headers", err))?;
             let response_replace = Replacement::compile(&pattern.response.headers.replace)
-                .map_err(|err| invalid("response", err))?;
+                .map_err(|err| invalid("response.headers", err))?;
 
             routes.push(Route {
                 site: Arc::clone(&site),
@@ -124,6 +168,8 @@ impl Site {
                     )))
                 })?,
                 action,
+                rewrite,
+                method,
                 request: pattern.request.headers.clone(),
                 response: pattern.response.headers.clone(),
                 request_replace,
@@ -217,7 +263,7 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 }
 
 impl Service {
-    async fn handle(self, request: Request<Incoming>) -> BoxResponse {
+    async fn handle(self, mut request: Request<Incoming>) -> BoxResponse {
         if let Some(response) = acme::challenge_response(request.method(), request.uri().path()) {
             return response;
         }
@@ -225,7 +271,6 @@ impl Service {
         let started = Instant::now();
         let method = request.method().clone();
         let uri = request.uri().clone();
-        let path = uri.path().to_owned();
 
         let input = MatchInput {
             method: &method,
@@ -259,15 +304,40 @@ impl Service {
             _ => String::new(),
         };
 
+        // The access log keeps the method and URI the client sent.
+        let host = input.host().unwrap_or("");
+        let location = match route.map(|route| &route.action) {
+            Some(RouteAction::Redirect { to, .. }) => to.render(host, &uri),
+            _ => String::new(),
+        };
+        let rewrite = route.and_then(|route| route.rewrite.as_ref());
+        let rewrite = rewrite.map(|rewrite| rewritten(rewrite, host, &uri));
+        let rewrite_failed = matches!(rewrite, Some(None));
+        if let Some(Some(rewritten)) = rewrite {
+            *request.uri_mut() = rewritten;
+        }
+        if let Some(method) = route.and_then(|route| route.method.as_ref()) {
+            *request.method_mut() = method.clone();
+        }
+
         let mut response = match route {
             None => response::not_found(),
+            Some(_) if rewrite_failed => {
+                response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST")
+            }
             Some(route) => match &route.action {
                 RouteAction::Proxy(group) => proxy::forward(request, route, group, &self).await,
                 RouteAction::Files(files) => {
                     files
-                        .transfer(&method, request.headers(), &path, &route.uri)
+                        .transfer(
+                            request.method(),
+                            request.headers(),
+                            request.uri().path(),
+                            &route.uri,
+                        )
                         .await
                 }
+                RouteAction::Redirect { status, .. } => response::redirect(*status, &location),
             },
         };
         if let Some(route) = route

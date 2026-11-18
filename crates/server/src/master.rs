@@ -118,6 +118,7 @@ impl Master {
     /// Validates `config`, builds its pools and binds its listeners.
     pub fn from_config(config: &Config) -> Result<Self, Error> {
         config.validate()?;
+        let config = &config.with_https_redirects();
         let registry = Arc::new(Registry::build(config)?);
         Self::init(config, registry)
     }

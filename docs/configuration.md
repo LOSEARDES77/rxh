@@ -131,7 +131,7 @@ forward = "@app"
 | `ca_root` | | PEM root certificate trusted for the CA's own HTTPS instead of the system roots, for test CAs like Pebble. Relative to the main file's directory. |
 | `storage` | `"rxh-data/certificates"` | Directory of the account and the certificates, relative to the directory of the main configuration file (to the current directory for `rxh reverse-proxy` and other runs without a file). |
 | `renew_before` | `"30d"` | Certificates expiring within this time are renewed. |
-| `http_port` | `80` | Port the CA connects to for HTTP-01 challenges. Change it only behind a port forward or for a test CA. |
+| `http_port` | `80` | Plain HTTP port: the CA connects to it for HTTP-01 challenges, and [`https_redirect`](#http-to-https-redirect) listens on it. Change it only behind a port forward or for a test CA. |
 
 - Every name in `host` must be an exact, fully qualified domain name (no
   wildcard, IP address or `localhost`); a `tls = "auto"` server without
@@ -142,8 +142,13 @@ forward = "@app"
     It must be reachable by the CA: one bound to a loopback address only, or
     with `proxy_protocol_in` without a balancer in front that sends the
     PROXY header, cannot pass validation.
-  - If no server of the configuration uses `http_port`, rxh opens a
-    challenge-only listener on `0.0.0.0:http_port` while it obtains
+  - The [HTTP to HTTPS redirect](#http-to-https-redirect), on by default
+    for `tls = "auto"` servers, is such a server: it listens on the
+    addresses of the TLS server with `http_port`, all the time. Port 80
+    usually needs root or `CAP_NET_BIND_SERVICE`; if it cannot be bound the
+    daemon does not start.
+  - With `https_redirect = false` and no server of the configuration on
+    `http_port`, rxh opens a challenge-only listener on `0.0.0.0:http_port` while it obtains
     certificates, and closes it afterwards. It never shares the port
     (no `SO_REUSEPORT`): if another process holds it, the attempt fails and
     is retried later. A reload that adds a server on that port closes it
@@ -332,12 +337,15 @@ socket, except that `http` servers listing the same address share one socket
 | `name` | | Name shown in logs, in `rxh status`, and in `Forwarded: by=` and `Via`. Must be unique: inline pools, metrics labels and `rxh service` use it. |
 | `forward` | | Proxy target: `"@pool"`, `"host:port"`, a list of backends, or an inline pool table. |
 | `serve` | | Serve static files: a directory, or a table, see [File server](#file-server) (http only). |
-| `uri` | `"/"` | Path prefix for the single `forward` or `serve` of this server (http only). |
+| `redirect` | | Answer with a redirect: `"target"` or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects) (http only). |
+| `uri` | `"/"` | Path prefix for the single `forward`, `serve` or `redirect` of this server (http only). |
+| `rewrite` | | New URI for the single `forward` or `serve`, same as in `match` entries (http only). |
 | `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. Not allowed on `udp` servers. |
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
-| `match` | | List of patterns instead of `forward`/`serve`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
+| `match` | | List of patterns instead of `forward`/`serve`/`redirect`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
+| `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
@@ -417,7 +425,9 @@ match = [
 | `header` | `{ name = "value" }`: the header must have this exact value (one of its values); `"*"` only requires the header. |
 | `query` | `{ key = "value" }`: same for query parameters (not percent decoded); `"*"` only requires the key. |
 | `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
-| `forward` / `serve` | Action, exactly one. `serve` is a directory or a [file server table](#file-server). |
+| `forward` / `serve` / `redirect` | Action, exactly one. `serve` is a directory or a [file server table](#file-server), `redirect` a target or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects). |
+| `rewrite` | New URI of the request before it is forwarded or served, see [Rewrites and redirects](#rewrites-and-redirects). |
+| `request.method` | Method the request is forwarded or served with instead of its own (upper cased), for example `"POST"`. |
 | `encode` | List of `zstd`, `br`, `gzip`: compress this route's responses (files and proxied) with the first one the client accepts in `Accept-Encoding`. Only text, JSON, JavaScript, XML, SVG and WebAssembly responses without a `Content-Encoding`, and never `206` or `304`. Removes `Content-Length`, adds `Vary: Accept-Encoding`, makes a strong `ETag` weak. |
 | `request.headers.set` | Headers to set on the upstream request, `{ name = "value" }`. |
 | `request.headers.add` | Headers to append a value to, keeping existing ones, `{ name = "value" }`. |
@@ -444,6 +454,79 @@ match = [
     { forward = "@web" },
 ]
 ```
+
+### Rewrites and redirects
+
+```toml
+[[server]]
+listen = "0.0.0.0:80"
+match = [
+    # GET /api/users?page=2 reaches the backend as POST /v2/api/users?page=2.
+    { uri = "/api", rewrite = "/v2{path}", request = { method = "POST" }, forward = "@api" },
+    # Single page application: every path under /app serves one file.
+    { path = "/app/*", rewrite = "/app.html", serve = "/var/www" },
+    { uri = "/old", redirect = "/new{path}" },                                   # 302
+    { host = "example.com", redirect = { to = "https://www.example.com{uri}", status = 301 } },
+    { forward = "@web" },
+]
+```
+
+`rewrite` and `redirect` targets take these placeholders:
+
+| Placeholder | Value |
+|---|---|
+| `{host}` | Host of the request (`Host` header or HTTP/2 `:authority`), without the port. |
+| `{path}` | Path of the request. |
+| `{query}` | Query string without `?`, empty when there is none. |
+| `{uri}` | Path, plus `?query` when there is one. |
+
+- `rewrite` must start with `/` and may carry a query
+  (`"/search?q={query}"`); without one the query of the request is kept. It
+  applies after the route is chosen, so routes are not matched again, and
+  it changes what `forward` sends upstream and which file `serve` looks up
+  (on a `serve` route with a `uri` prefix, the rewritten path must still
+  start with it). Access logs keep the method and URI the client sent. A request
+  whose rewrite is not a valid URI (only a malformed `Host` with `{host}`
+  can cause it) gets `400`.
+- `redirect` answers with an empty body and `Location` set to the rendered
+  target, which may be absolute or a path. `status` is `302` by default;
+  `301`, `303`, `307` and `308` are accepted. `rewrite` and `request.method`
+  are rejected on a `redirect` route.
+- Unknown placeholders, spaces and control characters are configuration
+  errors.
+
+### HTTP to HTTPS redirect
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+host = "example.com"
+tls = { cert = "cert.pem", key = "key.pem" }
+https_redirect = true    # implied by tls = "auto"
+forward = "@app"
+```
+
+`https_redirect` on a TLS `http` server makes rxh also listen for plain HTTP
+on the addresses of that server with the port replaced by `[acme] http_port`
+(80 by default; here `0.0.0.0:80`) and answer `308` with
+`Location: https://{host}{uri}`, plus `:port` when the server does not
+listen on 443 (the first port of `listen` is used).
+
+- It is on by default for `tls = "auto"` servers (`https_redirect = false`
+  turns it off) and off for servers with certificate files.
+- Only requests for the `host` names of the TLS server are redirected;
+  without `host`, every request is. Other requests get `404`.
+- Plain `http` servers of the configuration on the same address share the
+  socket and their routes go first, so they can keep serving some paths or
+  hosts over HTTP; a route there that matches everything disables the
+  redirect.
+- The redirect listener inherits `trusted_proxies`, `proxy_protocol_in`,
+  `max_connections` and the timeouts of the TLS server, and shows up as an
+  extra listener in `rxh status`.
+- `https_redirect = true` is a configuration error on servers without `tls`,
+  when every `listen` port is 0, and when a TLS or `tcp` server uses
+  `http_port`. The automatic redirect of `tls = "auto"` is skipped silently
+  in the last two cases.
 
 ### `match` entries of `tcp` servers (layer 4 routing)
 
@@ -489,7 +572,7 @@ handshake and `alpn` matches the negotiated protocol. Entries using only
 
 HTTP request matchers (`uri`, `host`, `path`, `method`, `header`, `query`,
 `remote_ip`) are rejected on `tcp` and `udp` servers, and layer 4 matchers on
-`http` and `udp` servers. `request`, `response`, `encode` and `cache` only
+`http` and `udp` servers. `rewrite`, `request`, `response`, `encode` and `cache` only
 apply to `http` servers and are rejected elsewhere.
 
 ### PROXY protocol input

@@ -13,6 +13,7 @@ pub mod matcher;
 pub mod net;
 pub mod pool;
 pub mod status;
+pub mod template;
 
 mod random;
 

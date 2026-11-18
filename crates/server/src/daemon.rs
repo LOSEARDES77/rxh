@@ -85,17 +85,20 @@ struct Generation {
 impl Generation {
     /// Starts `config`. Relative `[acme]` paths are joined to `base`.
     fn start(config: Config, previous: Option<&Registry>, base: &Path) -> Result<Self, Error> {
-        let registry = Arc::new(Registry::build(&config)?);
+        // What runs has the implicit HTTP to HTTPS redirect servers; what the
+        // admin API shows and edits is the configuration as written.
+        let effective = config.with_https_redirects();
+        let registry = Arc::new(Registry::build(&effective)?);
         if let Some(previous) = previous {
             registry.inherit_dynamic(previous);
         }
         let (stop, stopped) = oneshot::channel::<()>();
-        let master = Master::init(&config, Arc::clone(&registry))?.shutdown_on(async move {
+        let master = Master::init(&effective, Arc::clone(&registry))?.shutdown_on(async move {
             let _ = stopped.await;
         });
         let servers = master.servers();
         let mut health_checks = registry.start_background_tasks();
-        if let Some(acme) = acme::Manager::new(&config, &master, base) {
+        if let Some(acme) = acme::Manager::new(&effective, &master, base) {
             health_checks.spawn(acme.run());
         }
         let task = tokio::task::spawn(master.run());
@@ -258,7 +261,7 @@ impl Daemon {
         let config = load_config(path).map_err(|err| err.to_string())?;
         // A server taking over the port of the challenge-only listener must
         // be able to bind it.
-        acme::release_challenge_port(&config).await;
+        acme::release_challenge_port(&config.with_https_redirects()).await;
 
         if config.admin.listen != admin.listen {
             eprintln!("Main => [admin] changes take effect after a restart");
