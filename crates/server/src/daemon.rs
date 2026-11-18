@@ -16,6 +16,7 @@ use rxh_core::config::{Config, IncludedConfig};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::acme;
 use crate::admin::{self, AdminState, Control, Current};
 use crate::error::Error;
 use crate::include;
@@ -67,7 +68,7 @@ pub struct Daemon {
 #[derive(Debug, Clone)]
 enum Source {
     File(PathBuf),
-    Memory(Config),
+    Memory(Box<Config>),
 }
 
 /// One running configuration.
@@ -77,11 +78,13 @@ struct Generation {
     servers: Vec<ServerInfo>,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<(), Error>>,
+    /// Health checks, DNS refreshes and the ACME manager.
     health_checks: JoinSet<()>,
 }
 
 impl Generation {
-    fn start(config: Config, previous: Option<&Registry>) -> Result<Self, Error> {
+    /// Starts `config`. Relative `[acme]` paths are joined to `base`.
+    fn start(config: Config, previous: Option<&Registry>, base: &Path) -> Result<Self, Error> {
         let registry = Arc::new(Registry::build(&config)?);
         if let Some(previous) = previous {
             registry.inherit_dynamic(previous);
@@ -91,7 +94,10 @@ impl Generation {
             let _ = stopped.await;
         });
         let servers = master.servers();
-        let health_checks = registry.start_background_tasks();
+        let mut health_checks = registry.start_background_tasks();
+        if let Some(acme) = acme::Manager::new(&config, &master, base) {
+            health_checks.spawn(acme.run());
+        }
         let task = tokio::task::spawn(master.run());
 
         Ok(Self {
@@ -144,7 +150,7 @@ impl Daemon {
     #[must_use]
     pub fn from_config(config: Config) -> Self {
         Self {
-            source: Source::Memory(config),
+            source: Source::Memory(Box::new(config)),
         }
     }
 
@@ -154,12 +160,12 @@ impl Daemon {
         let config = match &self.source {
             Source::Memory(config) => {
                 config.validate()?;
-                config.clone()
+                Config::clone(config)
             }
             Source::File(path) => load_config(path)?,
         };
         let admin_settings = config.admin.clone();
-        let mut generation = Generation::start(config, None)?;
+        let mut generation = Generation::start(config, None, self.base_dir())?;
 
         let (control, mut controls) = mpsc::channel(8);
         let admin_state = Arc::new(AdminState {
@@ -229,6 +235,14 @@ impl Daemon {
         generation.stop().await
     }
 
+    /// Directory relative `[acme]` paths are resolved against: the one of
+    /// the configuration file, else the current directory.
+    fn base_dir(&self) -> &Path {
+        self.config_path()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""))
+    }
+
     fn config_path(&self) -> Option<&Path> {
         match &self.source {
             Source::File(path) => Some(path),
@@ -242,36 +256,44 @@ impl Daemon {
             .ok_or("no configuration file to reload")?;
         println!("Main => Reloading {}", path.display());
         let config = load_config(path).map_err(|err| err.to_string())?;
+        // A server taking over the port of the challenge-only listener must
+        // be able to bind it.
+        acme::release_challenge_port(&config).await;
 
         if config.admin.listen != admin.listen {
             eprintln!("Main => [admin] changes take effect after a restart");
         }
 
         let previous_registry = Arc::clone(&generation.registry);
-        let next = match Generation::start(config.clone(), Some(&previous_registry)) {
-            Ok(next) => next,
-            Err(Error::Io(err)) if err.kind() == io::ErrorKind::AddrInUse => {
-                // UDP sockets and platforms without SO_REUSEPORT cannot bind
-                // twice: stop first, then start, restoring the old
-                // configuration if the new one still fails.
-                let previous = Config::clone(&generation.config);
-                let old = std::mem::replace(generation, placeholder()?);
-                old.stop().await.map_err(|err| err.to_string())?;
-                match Generation::start(config, Some(&previous_registry)) {
-                    Ok(next) => next,
-                    Err(err) => {
-                        *generation = Generation::start(previous, Some(&previous_registry))
+        let next =
+            match Generation::start(config.clone(), Some(&previous_registry), self.base_dir()) {
+                Ok(next) => next,
+                Err(Error::Io(err)) if err.kind() == io::ErrorKind::AddrInUse => {
+                    // UDP sockets and platforms without SO_REUSEPORT cannot bind
+                    // twice: stop first, then start, restoring the old
+                    // configuration if the new one still fails.
+                    let previous = Config::clone(&generation.config);
+                    let old = std::mem::replace(generation, placeholder()?);
+                    old.stop().await.map_err(|err| err.to_string())?;
+                    match Generation::start(config, Some(&previous_registry), self.base_dir()) {
+                        Ok(next) => next,
+                        Err(err) => {
+                            *generation = Generation::start(
+                                previous,
+                                Some(&previous_registry),
+                                self.base_dir(),
+                            )
                             .map_err(|err| err.to_string())?;
-                        *admin
-                            .current
-                            .write()
-                            .unwrap_or_else(PoisonError::into_inner) = generation.current();
-                        return Err(err.to_string());
+                            *admin
+                                .current
+                                .write()
+                                .unwrap_or_else(PoisonError::into_inner) = generation.current();
+                            return Err(err.to_string());
+                        }
                     }
                 }
-            }
-            Err(err) => return Err(err.to_string()),
-        };
+                Err(err) => return Err(err.to_string()),
+            };
 
         let old = std::mem::replace(generation, next);
         *admin
@@ -291,7 +313,7 @@ impl Daemon {
 
 /// Empty generation used while swapping.
 fn placeholder() -> Result<Generation, String> {
-    Generation::start(Config::default(), None).map_err(|err| err.to_string())
+    Generation::start(Config::default(), None, Path::new("")).map_err(|err| err.to_string())
 }
 
 struct AbortOnDrop(JoinHandle<()>);

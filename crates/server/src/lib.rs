@@ -5,6 +5,7 @@
 //! [`rxh_core`]. This crate puts them on the network with [`tokio`] and
 //! [`hyper`].
 
+mod acme;
 mod admin;
 mod daemon;
 mod dynamic;

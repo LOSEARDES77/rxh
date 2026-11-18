@@ -20,6 +20,19 @@ format = "text"                # default; "json" writes one JSON object per line
 output = "stdout"              # default; "stderr" or a file path (appended)
 access = true                  # default; false disables access lines
 
+# Automatic HTTPS for servers with tls = "auto" (HTTP-01 challenges). The
+# account and the certificates are kept under `storage`; certificates are
+# renewed in the background, without restart. Registering the account
+# accepts the CA's terms of service.
+[acme]
+email = "ops@example.com"      # optional contact for expiry notices
+ca = "https://acme-v02.api.letsencrypt.org/directory"  # default, Let's Encrypt
+# ca = "https://acme-staging-v02.api.letsencrypt.org/directory"  # for testing
+# ca_root = "/etc/rxh/pebble.minica.pem"  # trust this root for the CA (test CAs)
+storage = "rxh-data/certificates"  # default, relative to this file
+renew_before = "30d"           # default; renew certificates expiring this soon
+http_port = 80                 # default; port the CA validates challenges on
+
 # Named load balancing group, referenced as "@api".
 [upstream.api]
 policy = "least_conn"          # random | random_choose | first | round_robin |
@@ -113,7 +126,7 @@ read_header_timeout = "10s"    # clients must send request headers in time
 idle_timeout = "2m"            # close idle keep-alive connections
 stream_timeout = "1h"          # maximum lifetime of WebSocket tunnels
 trusted_proxies = ["private_ranges", "203.0.113.0/24"]
-# tls = { cert = "/etc/rxh/cert.pem", key = "/etc/rxh/key.pem" }
+# tls = { cert = "/etc/rxh/cert.pem", key = "/etc/rxh/key.pem" }  # or tls = "auto"
 
 [[server.match]]
 uri = "/api"
@@ -143,6 +156,16 @@ forward = "@api"
 uri = "/"
 serve = { root = "/var/www", browse = false, index = ["index.html"], hide = [".git", "*.pem"], precompressed = ["zstd", "br", "gzip"] }
 encode = ["zstd", "gzip"]      # on the fly, for text-like responses (files and proxied)
+
+# HTTPS with certificates from the [acme] CA for every name in `host` (exact
+# names only). A plain http server on `http_port` answers the challenges; if
+# nothing uses the port, rxh listens on 0.0.0.0:http_port while it issues.
+[[server]]
+name = "shop"
+listen = "0.0.0.0:443"
+host = ["shop.example.com", "www.shop.example.com"]
+tls = "auto"
+forward = "@api"
 
 # TCP (layer 4) with PROXY protocol and an inline group.
 [[server]]

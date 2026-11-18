@@ -23,6 +23,7 @@ hmac = "0.13.0"
 http = "1.5.0"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
+instant-acme = { version = "0.8.5", features = ["rcgen"] }
 hyper = { version = "1.12.0", features = ["full"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
 libc = "0.2.191"
@@ -38,6 +39,7 @@ tokio-rustls = "0.26.6"
 toml = "1.2.1"
 toml_edit = "0.25.19"
 webpki-roots = "1.0.11"
+x509-parser = "0.18.1"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"

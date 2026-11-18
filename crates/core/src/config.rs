@@ -73,6 +73,10 @@ pub struct Config {
     #[serde(default)]
     pub log: Log,
 
+    /// Certificate authority settings for `tls = "auto"` servers.
+    #[serde(default)]
+    pub acme: Acme,
+
     /// Maximum time to wait for open connections during shutdown or reload.
     /// `None` waits forever, like Caddy's default.
     #[serde(
@@ -168,6 +172,9 @@ impl Config {
         if self.log.output.trim().is_empty() {
             return invalid(String::from("log.output must not be empty"));
         }
+        self.acme
+            .validate()
+            .map_err(|err| ConfigError::Invalid(format!("acme: {err}")))?;
 
         for (name, group) in &self.upstreams {
             group
@@ -323,6 +330,24 @@ impl Config {
 
             if server.protocol == Protocol::Udp && server.tls.is_some() {
                 return invalid(format!("{label}: TLS is not supported for UDP"));
+            }
+
+            if server.tls == Some(Tls::Auto) {
+                if server.protocol != Protocol::Http {
+                    return invalid(format!(
+                        "{label}: tls = \"auto\" only applies to http servers"
+                    ));
+                }
+                if server.host.is_empty() {
+                    return invalid(format!(
+                        "{label}: tls = \"auto\" needs the host names to certify in host"
+                    ));
+                }
+                for host in &server.host {
+                    validate_domain(host).map_err(|err| {
+                        ConfigError::Invalid(format!("{label}: tls = \"auto\": {err}"))
+                    })?;
+                }
             }
 
             if server.proxy_protocol.is_some() && server.protocol != Protocol::Tcp {
@@ -1760,15 +1785,187 @@ pub struct PassiveHealth {
     pub unhealthy_request_count: usize,
 }
 
-/// TLS certificate and key for incoming connections.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct Tls {
-    /// Path to a PEM encoded certificate chain.
-    pub cert: String,
+/// Certificate source of a server that terminates TLS.
+///
+/// ```toml
+/// tls = "auto"                                    # ACME, for every name in `host`
+/// tls = { cert = "cert.pem", key = "key.pem" }    # files
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tls {
+    /// Certificates obtained and renewed with ACME (HTTP-01) for every name
+    /// of the server's `host` list, see [`Acme`].
+    Auto,
 
-    /// Path to a PEM encoded private key.
-    pub key: String,
+    /// A PEM certificate chain and its PEM private key, read from files.
+    Files {
+        /// Path to a PEM encoded certificate chain.
+        cert: String,
+
+        /// Path to a PEM encoded private key.
+        key: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsFiles {
+    cert: String,
+    key: String,
+}
+
+impl Serialize for Tls {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Tls::Auto => serializer.serialize_str("auto"),
+            Tls::Files { cert, key } => TlsFiles {
+                cert: cert.clone(),
+                key: key.clone(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Tls {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Tls;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("\"auto\" or a table { cert, key }")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Tls, E> {
+                match value {
+                    "auto" => Ok(Tls::Auto),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Tls, A::Error> {
+                // Keeps the `deny_unknown_fields` errors of the table form.
+                let files =
+                    TlsFiles::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(Tls::Files {
+                    cert: files.cert,
+                    key: files.key,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The `[acme]` table: where `tls = "auto"` certificates come from and where
+/// they are kept.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Acme {
+    /// Contact address registered with the account, for expiry notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+
+    /// Directory URL of the certificate authority.
+    #[serde(default = "default::acme_ca")]
+    pub ca: String,
+
+    /// PEM file with the root certificate trusted for the CA's own HTTPS
+    /// endpoint instead of the system roots, for test CAs like Pebble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_root: Option<String>,
+
+    /// Directory of the account and the certificates. A relative path is
+    /// relative to the directory of the main configuration file.
+    #[serde(default = "default::acme_storage")]
+    pub storage: String,
+
+    /// Certificates expiring within this time are renewed.
+    #[serde(default = "default::acme_renew_before", with = "duration")]
+    pub renew_before: Duration,
+
+    /// Port the CA connects to for HTTP-01 challenges.
+    #[serde(default = "default::acme_http_port")]
+    pub http_port: u16,
+}
+
+impl Default for Acme {
+    fn default() -> Self {
+        Self {
+            email: None,
+            ca: default::acme_ca(),
+            ca_root: None,
+            storage: default::acme_storage(),
+            renew_before: default::acme_renew_before(),
+            http_port: default::acme_http_port(),
+        }
+    }
+}
+
+impl Acme {
+    fn validate(&self) -> Result<(), String> {
+        if !self.ca.starts_with("https://") {
+            return Err(format!("ca {:?} must be an https:// URL", self.ca));
+        }
+        if let Some(email) = &self.email
+            && (!email.contains('@') || email.contains(char::is_whitespace))
+        {
+            return Err(format!("email {email:?} is not an e-mail address"));
+        }
+        if self.storage.trim().is_empty() {
+            return Err(String::from("storage must not be empty"));
+        }
+        if self.renew_before.is_zero() {
+            return Err(String::from("renew_before must be greater than zero"));
+        }
+        if self.http_port == 0 {
+            return Err(String::from("http_port must not be 0"));
+        }
+        Ok(())
+    }
+}
+
+/// Checks that `name` is a DNS name a public CA can certify: ASCII letters,
+/// digits and hyphens in dot separated labels, no wildcard, no IP address.
+/// Also what makes the name safe as a directory name in the ACME storage.
+///
+/// # Errors
+///
+/// Returns a message naming the problem.
+pub fn validate_domain(name: &str) -> Result<(), String> {
+    let invalid = |why: &str| Err(format!("{name:?} {why}"));
+    if name.starts_with("*.") {
+        return invalid("is a wildcard, ACME HTTP-01 cannot certify wildcards");
+    }
+    if name.is_empty() || name.len() > 253 {
+        return invalid("is not a domain name (1 to 253 characters)");
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.len() < 2 {
+        return invalid("is not a fully qualified domain name");
+    }
+    for label in &labels {
+        let valid = !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        if !valid {
+            return invalid("is not a domain name (letters, digits and hyphens per label)");
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|tld| tld.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return invalid("is an IP address, not a domain name");
+    }
+    Ok(())
 }
 
 /// Per-pattern request customization.
@@ -2007,6 +2204,22 @@ mod default {
 
     pub fn uri() -> String {
         String::from("/")
+    }
+
+    pub fn acme_ca() -> String {
+        String::from("https://acme-v02.api.letsencrypt.org/directory")
+    }
+
+    pub fn acme_storage() -> String {
+        String::from("rxh-data/certificates")
+    }
+
+    pub fn acme_renew_before() -> Duration {
+        Duration::from_secs(30 * 24 * 60 * 60)
+    }
+
+    pub fn acme_http_port() -> u16 {
+        80
     }
 
     pub fn admin_listen() -> SocketAddr {
@@ -2342,6 +2555,88 @@ mod tests {
         assert!(error(format!("{tcp}{tcp}")).contains("only http servers can share"));
         assert!(error(format!("{udp}{udp}")).contains("only http servers can share"));
         assert!(error(format!("{http}{tls}")).contains("all or none"));
+    }
+
+    #[test]
+    fn tls_auto_and_acme_settings() {
+        let auto = |host: &str, extra: &str| {
+            format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = \"auto\"\n{host}{extra}"
+            )
+        };
+        let error = |text: String| match Config::from_toml(&text) {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("expected a validation error, got {other:?}\n{text}"),
+        };
+
+        let config = Config::from_toml(&auto("host = [\"a.test\", \"WWW.a.test\"]\n", "")).unwrap();
+        assert_eq!(config.servers[0].tls, Some(Tls::Auto));
+        assert_eq!(config.acme, Acme::default());
+        assert_eq!(
+            config.acme.ca,
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
+        assert_eq!(config.acme.storage, "rxh-data/certificates");
+        assert_eq!(config.acme.renew_before, Duration::from_secs(30 * 86_400));
+        assert_eq!(config.acme.http_port, 80);
+
+        // Round trip through serialization, as `rxh config show` does.
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("tls = \"auto\""), "{text}");
+        assert_eq!(
+            Config::from_toml(&text).unwrap().servers[0].tls,
+            Some(Tls::Auto)
+        );
+
+        // Files and auto may share a listener, each server keeps its source.
+        let files = "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                     host = \"b.test\"\ntls = { cert = \"c.pem\", key = \"k.pem\" }\n";
+        let mixed =
+            Config::from_toml(&format!("{}{files}", auto("host = \"a.test\"\n", ""))).unwrap();
+        assert!(matches!(&mixed.servers[1].tls, Some(Tls::Files { cert, .. }) if cert == "c.pem"));
+
+        assert!(error(auto("", "")).contains("needs the host names"));
+        assert!(error(auto("host = \"*.a.test\"\n", "")).contains("wildcard"));
+        assert!(error(auto("host = \"localhost\"\n", "")).contains("fully qualified"));
+        assert!(error(auto("host = \"10.0.0.1\"\n", "")).contains("IP address"));
+        assert!(error(auto("host = \"a_b.test\"\n", "")).contains("not a domain name"));
+        assert!(error(auto("host = \"-a.test\"\n", "")).contains("not a domain name"));
+        assert!(error(auto("host = \"a..test\"\n", "")).contains("not a domain name"));
+        assert!(
+            error(auto("host = \"a.test\"\nprotocol = \"tcp\"\n", ""))
+                .contains("only applies to http")
+        );
+
+        let with_acme = |table: &str| auto("host = \"a.test\"\n", &format!("[acme]\n{table}\n"));
+        let config = Config::from_toml(&with_acme(
+            "email = \"ops@a.test\"\nca = \"https://localhost:14000/dir\"\n\
+             ca_root = \"pebble.pem\"\nstorage = \"/var/lib/rxh\"\n\
+             renew_before = \"10d\"\nhttp_port = 5002",
+        ))
+        .unwrap();
+        assert_eq!(config.acme.email.as_deref(), Some("ops@a.test"));
+        assert_eq!(config.acme.ca_root.as_deref(), Some("pebble.pem"));
+        assert_eq!(config.acme.renew_before, Duration::from_secs(10 * 86_400));
+        assert_eq!(config.acme.http_port, 5002);
+
+        assert!(error(with_acme("ca = \"http://ca.test/dir\"")).contains("https://"));
+        assert!(error(with_acme("email = \"nobody\"")).contains("e-mail"));
+        assert!(error(with_acme("renew_before = \"0s\"")).contains("renew_before"));
+        assert!(error(with_acme("http_port = 0")).contains("http_port"));
+        assert!(error(with_acme("storage = \" \"")).contains("storage"));
+        assert!(Config::from_toml(&with_acme("typo = 1")).is_err());
+
+        // Only "auto" or a table, and the table still rejects unknown keys.
+        let tls = |value: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\ntls = {value}\n"
+            ))
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(tls("\"manual\"").contains("\"auto\" or a table"));
+        assert!(tls("{ cert = \"c\", key = \"k\", extra = 1 }").contains("unknown field"));
     }
 
     #[test]

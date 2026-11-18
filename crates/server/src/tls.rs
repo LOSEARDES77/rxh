@@ -1,11 +1,13 @@
 //! TLS termination: one [`ServerConfig`] per listener, with the certificate
 //! picked by SNI among the servers sharing the listener.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use rxh_core::config::{self, Protocol};
+use rxh_core::config::{self, Protocol, Tls};
 use rxh_core::matcher::HostPattern;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -15,7 +17,7 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 
 /// Picks a certificate by SNI. Exact host names beat wildcards; a client
 /// without SNI, or with a name that matches nothing, gets the default (first)
-/// certificate.
+/// certificate, except for names passed to [`CertResolver::reserve`].
 ///
 /// Certificates can be added or replaced while the listener runs, see
 /// [`CertResolver::set`].
@@ -24,12 +26,19 @@ pub struct CertResolver {
     provider: Arc<CryptoProvider>,
     // Copy on write: handshakes clone the `Arc` and never wait for a writer.
     certificates: RwLock<Arc<Certificates>>,
+    /// When a failed handshake was last logged, by server name.
+    failures_logged: Mutex<HashMap<String, Instant>>,
 }
+
+/// Minimum time between two "no certificate" lines for one name.
+const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default, Clone)]
 struct Certificates {
     hosts: Vec<(HostPattern, Arc<CertifiedKey>)>,
     default: Option<Arc<CertifiedKey>>,
+    /// Lowercase names that never get the default certificate.
+    reserved: Vec<String>,
 }
 
 impl CertResolver {
@@ -39,6 +48,7 @@ impl CertResolver {
         Self {
             provider,
             certificates: RwLock::default(),
+            failures_logged: Mutex::default(),
         }
     }
 
@@ -95,7 +105,27 @@ impl CertResolver {
         Ok(())
     }
 
-    fn select(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+    /// Makes the handshakes for `names` fail until a certificate covers them,
+    /// instead of serving the default certificate. Used for names whose
+    /// certificate is still being obtained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the certificate map lock is poisoned, which cannot happen
+    /// because nothing panics while holding it.
+    pub fn reserve(&self, names: &[String]) {
+        let mut guard = self
+            .certificates
+            .write()
+            .expect("nothing panics while holding the certificate lock");
+        let mut certificates = Certificates::clone(&guard);
+        certificates
+            .reserved
+            .extend(names.iter().map(|name| name.to_ascii_lowercase()));
+        *guard = Arc::new(certificates);
+    }
+
+    pub(crate) fn select(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
         let certificates = Arc::clone(
             &self
                 .certificates
@@ -110,40 +140,93 @@ impl CertResolver {
                 .find(|(pattern, _)| pattern.is_wildcard() == wildcard && pattern.matches(name))
                 .map(|(_, key)| Arc::clone(key))
         };
-        matching(false)
-            .or_else(|| matching(true))
-            .or_else(|| certificates.default.clone())
+        let found = matching(false).or_else(|| matching(true));
+        if found.is_some() {
+            return found;
+        }
+        if let Some(name) = server_name
+            && certificates
+                .reserved
+                .iter()
+                .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        {
+            return None;
+        }
+        certificates.default.clone()
+    }
+}
+
+impl CertResolver {
+    /// Throttles the failed handshake log to one line per name and
+    /// [`FAILURE_LOG_INTERVAL`].
+    fn should_log_failure(&self, name: &str, now: Instant) -> bool {
+        let mut logged = self
+            .failures_logged
+            .lock()
+            .expect("nothing panics while holding the failure log lock");
+        let name = name.to_ascii_lowercase();
+        if logged
+            .get(&name)
+            .is_some_and(|last| now.saturating_duration_since(*last) < FAILURE_LOG_INTERVAL)
+        {
+            return false;
+        }
+        // ponytail: forgets everything past 256 names, so random SNI from
+        // scanners cannot grow the map; such names log again sooner.
+        if logged.len() >= 256 {
+            logged.clear();
+        }
+        logged.insert(name, now);
+        true
     }
 }
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.select(client_hello.server_name())
+        let server_name = client_hello.server_name();
+        let key = self.select(server_name);
+        if key.is_none() {
+            let name = server_name.unwrap_or("a client without SNI");
+            if self.should_log_failure(name, Instant::now()) {
+                eprintln!("TLS => No certificate for {name}, failing the handshake");
+            }
+        }
+        key
     }
 }
 
-/// Builds the TLS acceptor of a listener shared by `servers`, or `None` if
-/// they do not use TLS (validation guarantees all or none of them do). ALPN
-/// follows the first server.
-pub(crate) fn acceptor(servers: &[&config::Server]) -> io::Result<Option<TlsAcceptor>> {
+/// Builds the TLS acceptor of a listener shared by `servers` and the
+/// resolver it picks certificates with, or `None` if they do not use TLS
+/// (validation guarantees all or none of them do). ALPN follows the first
+/// server. `tls = "auto"` servers start without certificates, the ACME
+/// manager adds them to the resolver.
+pub(crate) fn acceptor(
+    servers: &[&config::Server],
+) -> io::Result<Option<(TlsAcceptor, Arc<CertResolver>)>> {
     let Some(first) = servers.first().filter(|first| first.tls.is_some()) else {
         return Ok(None);
     };
 
     let builder = ServerConfig::builder().with_no_client_auth();
-    let resolver = CertResolver::new(Arc::clone(builder.crypto_provider()));
+    let resolver = Arc::new(CertResolver::new(Arc::clone(builder.crypto_provider())));
 
     for server in servers {
-        let Some(tls) = &server.tls else {
-            continue;
-        };
-        let key = resolver
-            .certified_key(&fs::read(&tls.cert)?, &fs::read(&tls.key)?)
-            .map_err(|err| io::Error::other(format!("{} / {}: {err}", tls.cert, tls.key)))?;
-        resolver.set(&server.host, key).map_err(io::Error::other)?;
+        match &server.tls {
+            None => {}
+            Some(Tls::Auto) => resolver.reserve(&server.host),
+            Some(Tls::Files { cert, key }) => {
+                let certified = resolver
+                    .certified_key(&fs::read(cert)?, &fs::read(key)?)
+                    .map_err(|err| io::Error::other(format!("{cert} / {key}: {err}")))?;
+                resolver
+                    .set(&server.host, certified)
+                    .map_err(io::Error::other)?;
+            }
+        }
     }
 
-    let mut config = builder.with_cert_resolver(Arc::new(resolver));
+    let mut config =
+        builder.with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
     config.alpn_protocols = match first.protocol {
         Protocol::Http if first.http2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         Protocol::Http => vec![b"http/1.1".to_vec()],
@@ -160,7 +243,7 @@ pub(crate) fn acceptor(servers: &[&config::Server]) -> io::Result<Option<TlsAcce
         }
     };
 
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+    Ok(Some((TlsAcceptor::from(Arc::new(config)), resolver)))
 }
 
 #[cfg(test)]
@@ -197,6 +280,28 @@ mod tests {
         assert!(is(resolver.select(Some("api.a.test")), &keys[0]));
         assert!(is(resolver.select(Some("other.test")), &keys[0]));
         assert!(is(resolver.select(None), &keys[0]));
+    }
+
+    #[test]
+    fn reserved_names_fail_until_set() {
+        let (resolver, keys) = resolver_with(&[&["a.test"]]);
+        resolver.reserve(&[String::from("Auto.test")]);
+        assert!(resolver.select(Some("auto.test")).is_none());
+        assert!(is(resolver.select(Some("other.test")), &keys[0]));
+        resolver
+            .set(&[String::from("auto.test")], Arc::clone(&keys[0]))
+            .unwrap();
+        assert!(is(resolver.select(Some("AUTO.test")), &keys[0]));
+    }
+
+    #[test]
+    fn failed_handshakes_log_once_per_interval() {
+        let (resolver, _) = resolver_with(&[]);
+        let start = Instant::now();
+        assert!(resolver.should_log_failure("a.test", start));
+        assert!(!resolver.should_log_failure("a.test", start + Duration::from_secs(59)));
+        assert!(resolver.should_log_failure("b.test", start));
+        assert!(resolver.should_log_failure("a.test", start + FAILURE_LOG_INTERVAL));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::proxy_protocol;
 use crate::registry::Registry;
 use crate::tcp;
 use crate::timeout::{Stamp, Watched};
-use crate::tls;
+use crate::tls::{self, CertResolver};
 use crate::udp::{self, UdpSettings};
 
 /// Current state of a [`Server`].
@@ -107,6 +107,7 @@ pub struct Server {
     max_connections: usize,
     grace_period: Option<Duration>,
     context: Option<Arc<ConnectionContext>>,
+    cert_resolver: Option<Arc<CertResolver>>,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
@@ -162,6 +163,7 @@ impl Server {
         let label: Arc<str> = name.clone().unwrap_or_else(|| address.to_string()).into();
         let logger = Arc::new(Logger::new(&config.log)?);
 
+        let mut cert_resolver = None;
         let (socket, context) = match socket {
             SocketKind::Udp(socket) => {
                 let settings = UdpSettings {
@@ -229,8 +231,12 @@ impl Server {
                         }
                     }
                 };
+                let tls = tls::acceptor(&servers)?.map(|(acceptor, resolver)| {
+                    cert_resolver = Some(resolver);
+                    acceptor
+                });
                 let context = ConnectionContext {
-                    tls: tls::acceptor(&servers)?,
+                    tls,
                     handler,
                     log: ListenerLog {
                         log_name: Arc::clone(&log_name),
@@ -257,6 +263,7 @@ impl Server {
             max_connections: server.max_connections.max(1),
             grace_period: config.grace_period,
             context,
+            cert_resolver,
             shutdown: Box::pin(std::future::pending()),
         })
     }
@@ -287,6 +294,13 @@ impl Server {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Certificate resolver of a listener that terminates TLS. Certificates
+    /// set on it apply to new handshakes right away.
+    #[must_use]
+    pub fn cert_resolver(&self) -> Option<&Arc<CertResolver>> {
+        self.cert_resolver.as_ref()
     }
 
     /// Receives [`State`] updates.

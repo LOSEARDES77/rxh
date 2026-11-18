@@ -126,8 +126,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Host matchers (virtual hosts) | `host`, server level `host` | ✅ | Exact and `*.domain`. HTTP servers on the same `listen` address share one socket. |
 | Header, method, query, remote IP matchers | `header`, `method`, `query`, `remote_ip` | ✅ | AND across matchers, OR inside lists. No regex or percent decoding. |
 | Manual TLS certificates | `tls = { cert, key }` | ✅ | |
-| Automatic HTTPS (ACME) | | ❌ | Large feature. |
-| SNI with many certificates, mTLS | `tls` per server on a shared address | 🟡 | Certificate picked by SNI against `host` (exact beats wildcard, first is the default). No mTLS. |
+| Automatic HTTPS (ACME) | `tls = "auto"`, `[acme]` (`email`, `ca`, `ca_root`, `storage`, `renew_before`, `http_port`) | 🟡 | HTTP-01 with any ACME CA (Let's Encrypt by default), one certificate per `host` name, stored as PEM, loaded on start, renewed in the background (daily check, `renew_before` 30 days, one-hour backoff per name that survives reloads) and swapped in without restart. Challenge-only listener (no `SO_REUSEPORT`) when nothing uses `http_port`. No TLS-ALPN-01 or DNS-01 (so no wildcards), no automatic HTTP to HTTPS redirect, no on-demand TLS, no ZeroSSL fallback, EAB or ARI. |
+| SNI with many certificates, mTLS | `tls` per server on a shared address | 🟡 | Certificate picked by SNI against `host` (exact beats wildcard, the first loaded certificate is the default, except for `tls = "auto"` names, whose handshakes fail until their certificate exists). No mTLS. |
 | `file_server` with `browse`, `index`, `hide` | `serve` (string or table: `browse`, `index`, `hide`) | ✅ | Index files and directory listing. `hide` takes names and `*` globs matched per path component. |
 | Range requests, ETag, conditional requests | `serve` | ✅ | Streamed files, weak ETag, `Last-Modified`, `If-None-Match`, `If-Modified-Since`, `If-Range`, one range (several send the whole file). |
 | `file_server precompressed` | `serve.precompressed` | ✅ | `.zst`, `.br`, `.gz` next to the file. |
@@ -179,8 +179,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). Ordered by value
 for a load balancer:
 
-1. Automatic HTTPS with ACME.
-2. HTTP/3.
+1. HTTP/3.
 
 ## Roadmap beyond Caddy
 

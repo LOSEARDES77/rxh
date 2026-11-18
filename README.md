@@ -59,6 +59,8 @@ pool web (least_conn)
   tunnels, hop-by-hop header stripping, `X-Forwarded-*` with
   `trusted_proxies`, RFC 7239 `Forwarded`, `Via`, header rules and a response
   cache.
+- **Automatic HTTPS**: `tls = "auto"` obtains and renews certificates from
+  Let's Encrypt (or any ACME CA) with HTTP-01, swapped in without a restart.
 - **Also**: static file server with directory listing, TLS with ALPN,
   connection limits, graceful shutdown with `grace_period`.
 

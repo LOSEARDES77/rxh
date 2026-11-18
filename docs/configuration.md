@@ -8,13 +8,14 @@ Durations are strings like `250ms`, `5s`, `1m30s` or `2h` (units `ns`, `us`,
 `ms`, `s`, `m`, `h`, `d`), or plain integers meaning seconds. Unknown keys
 are errors, so typos do not go unnoticed.
 
-The file has five parts, and top level keys must come before the first table:
+The file has six parts, and top level keys must come before the first table:
 
 ```toml
 grace_period = "30s"     # top level options
 
 [admin]                  # admin API
 [log]                    # access logs
+[acme]                   # automatic HTTPS (tls = "auto")
 [upstream.NAME]          # named load balancing pools, any number
 [[server]]               # listeners, any number
 ```
@@ -105,6 +106,80 @@ Counters survive reloads; upstream series are read from the live pools.
 
 `server` is the server name, or its listen address when unnamed (requests that
 match no route use the listener name).
+
+## `[acme]`: automatic HTTPS
+
+`tls = "auto"` on an `http` server obtains a certificate for every name of
+its `host` list from an ACME certificate authority (Let's Encrypt by default)
+with the HTTP-01 challenge, like Caddy's automatic HTTPS:
+
+```toml
+[acme]
+email = "ops@example.com"
+
+[[server]]
+listen = "0.0.0.0:443"
+host = ["example.com", "www.example.com"]
+tls = "auto"
+forward = "@app"
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `email` | | Contact address of the ACME account, for expiry notices. |
+| `ca` | `"https://acme-v02.api.letsencrypt.org/directory"` | Directory URL of the CA (must be `https://`). Let's Encrypt staging is `https://acme-staging-v02.api.letsencrypt.org/directory`. |
+| `ca_root` | | PEM root certificate trusted for the CA's own HTTPS instead of the system roots, for test CAs like Pebble. Relative to the main file's directory. |
+| `storage` | `"rxh-data/certificates"` | Directory of the account and the certificates, relative to the directory of the main configuration file (to the current directory for `rxh reverse-proxy` and other runs without a file). |
+| `renew_before` | `"30d"` | Certificates expiring within this time are renewed. |
+| `http_port` | `80` | Port the CA connects to for HTTP-01 challenges. Change it only behind a port forward or for a test CA. |
+
+- Every name in `host` must be an exact, fully qualified domain name (no
+  wildcard, IP address or `localhost`); a `tls = "auto"` server without
+  `host` is a validation error. Each name gets its own certificate and key.
+- Every `http` listener answers `GET /.well-known/acme-challenge/TOKEN` for
+  pending challenges before routing. Who answers on `http_port`:
+  - A plain (non-TLS) `http` server listening on `http_port` answers them.
+    It must be reachable by the CA: one bound to a loopback address only, or
+    with `proxy_protocol_in` without a balancer in front that sends the
+    PROXY header, cannot pass validation.
+  - If no server of the configuration uses `http_port`, rxh opens a
+    challenge-only listener on `0.0.0.0:http_port` while it obtains
+    certificates, and closes it afterwards. It never shares the port
+    (no `SO_REUSEPORT`): if another process holds it, the attempt fails and
+    is retried later. A reload that adds a server on that port closes it
+    first, and the new server answers the pending challenges. Port 80
+    usually needs root or `CAP_NET_BIND_SERVICE`.
+  - If only TLS or `tcp` servers use `http_port`, challenges cannot be
+    answered: rxh logs it and obtains nothing.
+- On start and reload, stored certificates are served right away. Missing
+  ones and ones expiring within `renew_before` are obtained in the
+  background and swapped in without a restart; a daily check renews them.
+  After a failed order a name waits an hour before the next one at the same
+  CA, also across reloads (logged once); changing `ca` or fixing a local
+  problem (blocked or busy `http_port`) and reloading retries at once. An
+  order that is running when the configuration reloads finishes, and the new
+  configuration picks the certificate up from the storage. A round gives up
+  after one minute for the account plus five minutes per name.
+  Until a name has a certificate its TLS handshakes fail and an error is
+  logged (once a minute per name). ACME errors never stop the daemon.
+- `renew_before` must be shorter than the certificate lifetime (90 days at
+  Let's Encrypt), else a certificate is renewed at every daily check and a
+  warning is logged.
+- The first issuance registers an account, which accepts the CA's terms of
+  service, and stores it for later runs.
+- Only the daemon (`rxh run`, `rxh start`) manages certificates; an embedded
+  `Master` serves `tls = "auto"` names only once a certificate is set through
+  `Master::cert_resolvers`.
+
+Storage layout (files `0600`, directories `0700` on unix; private keys are
+never logged):
+
+```text
+rxh-data/certificates/
+  accounts/acme-v02.api.letsencrypt.org_directory.json   account per CA
+  example.com/cert.pem                                   certificate chain
+  example.com/key.pem                                    private key
+```
 
 ## `[upstream.NAME]`: load balancing pools
 
@@ -257,7 +332,7 @@ socket, except that `http` servers listing the same address share one socket
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
 | `match` | | List of patterns instead of `forward`/`serve`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
-| `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. Servers sharing an address pick their certificate by SNI. |
+| `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header to the backend (tcp only). |
@@ -285,7 +360,11 @@ name joins the server names.
 With TLS every server on the address needs its own `tls`, and the certificate
 is picked by the SNI name of the client against the servers' `host` patterns:
 an exact name beats a wildcard, and a client without SNI (or with a name that
-matches nothing) gets the certificate of the first server.
+matches nothing) gets the first certificate loaded. `tls = "auto"` and
+`tls = { cert, key }` servers may share an address: each name gets the
+certificate of its own server, and the handshake for a `tls = "auto"` name
+fails (it never falls back to the first certificate) until its certificate
+exists.
 
 ```toml
 [[server]]

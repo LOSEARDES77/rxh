@@ -29,6 +29,7 @@ use tokio::sync::{broadcast, watch};
 use crate::error::Error;
 use crate::registry::Registry;
 use crate::server::{Server, State};
+use crate::tls::CertResolver;
 
 /// Description of a running listener, for status reports.
 #[derive(Debug, Clone)]
@@ -51,6 +52,9 @@ pub struct ServerInfo {
 pub struct Master {
     servers: Vec<Server>,
     infos: Vec<ServerInfo>,
+    /// Members (indexes into `config.servers`) and resolver of every TLS
+    /// listener.
+    resolvers: Vec<(Vec<usize>, Arc<CertResolver>)>,
     registry: Arc<Registry>,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
     shutdown_notify: broadcast::Sender<()>,
@@ -85,9 +89,13 @@ impl Master {
     pub fn init(config: &Config, registry: Arc<Registry>) -> Result<Self, Error> {
         let mut servers = Vec::new();
         let mut infos = Vec::new();
+        let mut resolvers = Vec::new();
 
         for (address, members) in listeners(config) {
             let server = Server::init(config, &registry, address, &members)?;
+            if let Some(resolver) = server.cert_resolver() {
+                resolvers.push((members, Arc::clone(resolver)));
+            }
             infos.push(ServerInfo {
                 address: server.socket_address(),
                 protocol: server.protocol(),
@@ -100,6 +108,7 @@ impl Master {
         Ok(Self {
             servers,
             infos,
+            resolvers,
             registry,
             shutdown: Box::pin(future::pending()),
             shutdown_notify: broadcast::channel(1).0,
@@ -117,6 +126,17 @@ impl Master {
     #[must_use]
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
+    }
+
+    /// Certificate resolvers of the TLS listeners that `config.servers[index]`
+    /// listens on, one per listen address.
+    #[must_use]
+    pub fn cert_resolvers(&self, index: usize) -> Vec<Arc<CertResolver>> {
+        self.resolvers
+            .iter()
+            .filter(|(members, _)| members.contains(&index))
+            .map(|(_, resolver)| Arc::clone(resolver))
+            .collect()
     }
 
     /// Starts the graceful shutdown of every server when `future` completes.

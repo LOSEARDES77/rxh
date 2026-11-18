@@ -18,6 +18,7 @@ use rxh_core::net::IpNet;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::acme;
 use crate::error::Error;
 use crate::files::Files;
 use crate::http::body::Guarded;
@@ -208,6 +209,10 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
 impl Service {
     async fn handle(self, request: Request<Incoming>) -> BoxResponse {
+        if let Some(response) = acme::challenge_response(request.method(), request.uri().path()) {
+            return response;
+        }
+
         let started = Instant::now();
         let method = request.method().clone();
         let uri = request.uri().clone();
