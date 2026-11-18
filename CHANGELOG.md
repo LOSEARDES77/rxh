@@ -72,6 +72,10 @@ Changed.
 - HTTP to HTTPS redirect: `https_redirect = true` on a TLS `http` server
   answers plain requests for its `host` names on `[acme] http_port` with
   `308` to `https://{host}{uri}`. On by default with `tls = "auto"`.
+- Health event hooks: `[upstream.NAME.health.hooks]` runs a `command`
+  (event in `RXH_EVENT`, `RXH_POOL`, `RXH_UPSTREAM`, `RXH_REASON`) and posts
+  JSON to a `webhook` when active checks mark a backend `healthy` or
+  `unhealthy`, in event order and without delaying the checks.
 
 ### Changed
 

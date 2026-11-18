@@ -330,6 +330,47 @@ HTTP request; without it, a TCP connect.
 | `headers` | `{}` | Extra request headers, for example `{ Host = "api.internal" }`. |
 | `request_body` | | Request body. |
 | `follow_redirects` | `false` | Follow redirects instead of failing on them. |
+| `hooks` | | Command and webhook for health events. Table, see below. |
+
+#### `[upstream.NAME.health.hooks]`: health event hooks
+
+When active checks mark a backend `healthy` or `unhealthy`, RXH writes the
+log line and then runs the pool's hooks. Hooks run in the background, one
+event after the other per pool and in the order the events happened, so a
+slow hook never delays the checks. Each run has 10 seconds; a hook that fails,
+times out or cannot be reached is logged to stderr and the next event still
+runs. Passive health checks do not fire hooks.
+
+| Key | Default | Description |
+|---|---|---|
+| `command` | `[]` | Program and arguments, run without a shell. Its stdout and stderr go to RXH's. |
+| `webhook` | | `http://` or `https://` URL that receives a JSON `POST` per event. HTTPS verifies the certificate against the public roots. |
+
+At least one of the two is required. The command gets the event in its
+environment: `RXH_EVENT` (`healthy` or `unhealthy`), `RXH_POOL`,
+`RXH_UPSTREAM` (the backend address) and `RXH_REASON` (why the last check
+failed, empty for `healthy`). It runs first; the webhook is called after it
+exits. The webhook body is:
+
+```json
+{"event":"unhealthy","pool":"api","upstream":"10.0.0.2:8080","reason":"status 503 Service Unavailable, expected 2xx"}
+```
+
+`reason` is left out for `healthy`. Any `2xx` answer counts as delivered;
+events are not retried.
+
+```toml
+[upstream.api]
+backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
+
+[upstream.api.health]
+uri = "/health"
+interval = "10s"
+
+[upstream.api.health.hooks]
+command = ["/usr/local/bin/page-oncall", "--service", "api"]
+webhook = "https://hooks.example.com/rxh"
+```
 
 ### `[upstream.NAME.passive]`: passive health checks
 

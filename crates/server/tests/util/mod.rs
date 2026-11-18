@@ -192,6 +192,28 @@ pub async fn interceptor() -> (SocketAddr, mpsc::Receiver<http::request::Parts>)
     (address, receiver)
 }
 
+/// Backend that forwards each request head and body to the returned channel
+/// and answers `status`.
+pub async fn body_interceptor(
+    status: u16,
+) -> (SocketAddr, mpsc::Receiver<(http::request::Parts, Bytes)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (sender, receiver) = mpsc::channel(16);
+    tokio::task::spawn(serve_http(listener, move |request: Request<Incoming>| {
+        let sender = sender.clone();
+        async move {
+            let (parts, body) = request.into_parts();
+            let body = body.collect().await.expect("body").to_bytes();
+            let _ = sender.send((parts, body)).await;
+            let mut response = Response::new(Full::default());
+            *response.status_mut() = StatusCode::from_u16(status).expect("valid status");
+            response
+        }
+    }));
+    (address, receiver)
+}
+
 /// Backend answering with the request body, and with the `Content-Length` it
 /// received (or `none`) in `x-request-length`. Also returns the number of
 /// requests whose head arrived.
