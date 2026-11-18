@@ -64,6 +64,9 @@ pub(crate) async fn forward(
         return cached;
     }
 
+    // What `handle_response` entries need from the request once it is gone.
+    let handled = (!route.handle_response.is_empty()).then(|| (head(&request), host(&request)));
+
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut request));
 
     let (mut parts, incoming) = request.into_parts();
@@ -292,6 +295,20 @@ pub(crate) async fn forward(
             .extensions_mut()
             .insert(UpstreamAddress(selection.upstream.address().to_owned()));
         return client_response;
+    }
+
+    let handler = route
+        .handle_response
+        .iter()
+        .find(|handler| handler.matches(&upstream_response));
+    if let (Some(handler), Some((request, host))) = (handler, &handled)
+        && let Some(mut replaced) = handler.apply(request, host, &mut upstream_response).await
+    {
+        // The upstream response is dropped unread.
+        replaced
+            .extensions_mut()
+            .insert(UpstreamAddress(selection.upstream.address().to_owned()));
+        return replaced;
     }
 
     let mut client_response = upstream_response.map(body::incoming);

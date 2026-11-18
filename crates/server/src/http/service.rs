@@ -28,6 +28,7 @@ use crate::http::encode;
 use crate::http::headers::{self, Replacement};
 use crate::http::proxy;
 use crate::http::response::{self, BoxResponse};
+use crate::http::response_handler::ResponseHandler;
 use crate::log::{self, Logger};
 use crate::metrics;
 use crate::registry::{Group, Registry};
@@ -69,6 +70,9 @@ pub(crate) struct Route {
     pub(crate) response: ResponseHeaders,
     pub(crate) request_replace: Vec<Replacement>,
     pub(crate) response_replace: Vec<Replacement>,
+    /// `handle_response` entries; the first one matching an upstream
+    /// response runs.
+    pub(crate) handle_response: Vec<ResponseHandler>,
     pub(crate) cache: Option<Cache>,
     pub(crate) encode: Vec<Encoding>,
 }
@@ -160,6 +164,12 @@ impl Site {
                 .map_err(|err| invalid("request.headers", err))?;
             let response_replace = Replacement::compile(&pattern.response.headers.replace)
                 .map_err(|err| invalid("response.headers", err))?;
+            let handle_response: Vec<ResponseHandler> = pattern
+                .handle_response
+                .iter()
+                .map(ResponseHandler::compile)
+                .collect::<Result<_, _>>()
+                .map_err(|err| invalid("handle_response", err))?;
 
             routes.push(Route {
                 site: Arc::clone(&site),
@@ -177,6 +187,7 @@ impl Site {
                 response: pattern.response.headers.clone(),
                 request_replace,
                 response_replace,
+                handle_response,
                 cache: Cache::new(&pattern.cache),
                 encode: pattern.encode.clone(),
             });

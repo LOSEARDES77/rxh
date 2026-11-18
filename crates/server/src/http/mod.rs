@@ -6,5 +6,6 @@ pub(crate) mod encode;
 pub(crate) mod headers;
 pub(crate) mod proxy;
 pub(crate) mod response;
+pub(crate) mod response_handler;
 pub(crate) mod service;
 pub(crate) mod transport;

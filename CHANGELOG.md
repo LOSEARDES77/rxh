@@ -59,6 +59,11 @@ Changed.
   served (the query is kept unless the rewrite has one) and
   `request.method` changes the method. Placeholders: `{host}`, `{path}`,
   `{query}`, `{uri}`.
+- `handle_response` on `forward` routes, for upstream responses matched by
+  `status` and `header`: `replace_status` and `copy_response` keep the
+  response (with another status), `serve` (with `rewrite`) and `redirect`
+  answer with a file or a redirect instead. `{status}` and `{header.NAME}`
+  placeholders allow error pages per status and `X-Accel-Redirect`.
 - `redirect = "target"` or `{ to, status }` as a route action next to
   `forward` and `serve`: answers `302` (or `301`, `303`, `307`, `308`) with
   the same placeholders in `Location`.

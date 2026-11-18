@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use http::Uri;
+use http::{HeaderMap, Uri};
 
 use crate::matcher;
 
@@ -13,6 +13,13 @@ use crate::matcher;
 /// - `{path}`: path of the URI.
 /// - `{query}`: query string without `?`, empty when there is none.
 /// - `{uri}`: path, plus `?query` when there is one.
+///
+/// Templates built with [`Template::for_response`] also take parts of an
+/// upstream response:
+///
+/// - `{status}`: status code of the response.
+/// - `{header.NAME}`: first value of the response header `NAME`, empty when
+///   it is missing or not text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Template {
     parts: Vec<Part>,
@@ -25,6 +32,8 @@ enum Part {
     Path,
     Query,
     Uri,
+    Status,
+    Header(String),
 }
 
 impl FromStr for Template {
@@ -33,6 +42,18 @@ impl FromStr for Template {
     /// Fails on unknown placeholders, on a `{` that is never closed and on
     /// control characters.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::parse(text, /* response= */ false)
+    }
+}
+
+impl Template {
+    /// Parses a template that may also use `{status}` and `{header.NAME}`.
+    /// Fails like [`Template::from_str`], and on invalid header names.
+    pub fn for_response(text: &str) -> Result<Self, String> {
+        Self::parse(text, /* response= */ true)
+    }
+
+    fn parse(text: &str, response: bool) -> Result<Self, String> {
         if text.is_empty() || text.contains(|c: char| c.is_control() || c == ' ') {
             return Err(format!(
                 "{text:?} must not be empty nor contain spaces or control characters"
@@ -52,12 +73,21 @@ impl FromStr for Template {
                 "path" => Part::Path,
                 "query" => Part::Query,
                 "uri" => Part::Uri,
-                other => {
-                    return Err(format!(
-                        "unknown placeholder {{{other}}} in {text:?}, expected {{host}}, \
-                         {{path}}, {{query}} or {{uri}}"
-                    ));
-                }
+                "status" if response => Part::Status,
+                other => match other.strip_prefix("header.") {
+                    Some(name) if response => {
+                        if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                            return Err(format!("invalid header name {name:?} in {text:?}"));
+                        }
+                        Part::Header(name.to_owned())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown placeholder {{{other}}} in {text:?}, expected {{host}}, \
+                             {{path}}, {{query}} or {{uri}}"
+                        ));
+                    }
+                },
             });
             rest = &rest[start + len + 1..];
         }
@@ -66,13 +96,28 @@ impl FromStr for Template {
         }
         Ok(Self { parts })
     }
-}
 
-impl Template {
     /// Fills the placeholders from a request to `host` (with or without
-    /// port) for `uri`.
+    /// port) for `uri`. Response placeholders are left empty.
     #[must_use]
     pub fn render(&self, host: &str, uri: &Uri) -> String {
+        self.fill(host, uri, None)
+    }
+
+    /// Same as [`Template::render`], with `{status}` and `{header.NAME}`
+    /// taken from the upstream response.
+    #[must_use]
+    pub fn render_response(
+        &self,
+        host: &str,
+        uri: &Uri,
+        status: u16,
+        headers: &HeaderMap,
+    ) -> String {
+        self.fill(host, uri, Some((status, headers)))
+    }
+
+    fn fill(&self, host: &str, uri: &Uri, response: Option<(u16, &HeaderMap)>) -> String {
         let mut text = String::new();
         for part in &self.parts {
             match part {
@@ -84,6 +129,17 @@ impl Template {
                     uri.path_and_query()
                         .map_or(uri.path(), |path_and_query| path_and_query.as_str()),
                 ),
+                Part::Status => {
+                    if let Some((status, _)) = response {
+                        text.push_str(&status.to_string());
+                    }
+                }
+                Part::Header(name) => {
+                    let value = response
+                        .and_then(|(_, headers)| headers.get(name))
+                        .and_then(|value| value.to_str().ok());
+                    text.push_str(value.unwrap_or_default());
+                }
             }
         }
         text
@@ -112,6 +168,32 @@ mod tests {
         );
         assert_eq!(render("/fixed", "a.test", "/x?q=1"), "/fixed");
         assert_eq!(render("{host}", "[::1]:80", "/"), "[::1]");
+    }
+
+    #[test]
+    fn response_placeholders_are_filled_from_the_response() {
+        let template = Template::for_response("/{status}.html|{header.X-File}|{path}").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-file", "/a.txt".parse().unwrap());
+        let uri: Uri = "/x".parse().unwrap();
+        assert_eq!(
+            template.render_response("a.test", &uri, 503, &headers),
+            "/503.html|/a.txt|/x"
+        );
+        assert_eq!(
+            template.render_response("a.test", &uri, 404, &HeaderMap::new()),
+            "/404.html||/x"
+        );
+    }
+
+    #[test]
+    fn response_placeholders_are_rejected_outside_response_templates() {
+        for text in ["/{status}", "/{header.x-file}"] {
+            assert!(text.parse::<Template>().is_err(), "{text:?}");
+        }
+        for text in ["/{header.}", "/{header.bad name}", "/{nope}"] {
+            assert!(Template::for_response(text).is_err(), "{text:?}");
+        }
     }
 
     #[test]
