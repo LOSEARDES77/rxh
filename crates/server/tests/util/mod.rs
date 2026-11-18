@@ -192,6 +192,34 @@ pub async fn interceptor() -> (SocketAddr, mpsc::Receiver<http::request::Parts>)
     (address, receiver)
 }
 
+/// Backend answering with the request body, and with the `Content-Length` it
+/// received (or `none`) in `x-request-length`. Also returns the number of
+/// requests whose head arrived.
+pub async fn echo_backend() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+    tokio::task::spawn(serve_http(listener, move |request: Request<Incoming>| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        async move {
+            let length = request
+                .headers()
+                .get("content-length")
+                .map_or("none", |value| value.to_str().expect("ascii"))
+                .to_owned();
+            let body = request.into_body().collect().await;
+            let body = body.map(|body| body.to_bytes()).unwrap_or_default();
+            let mut response = Response::new(Full::from(body));
+            response
+                .headers_mut()
+                .insert("x-request-length", length.parse().expect("valid"));
+            response
+        }
+    }));
+    (address, requests)
+}
+
 /// Backend answering every request with `status`.
 pub async fn status_backend(status: u16) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

@@ -1,17 +1,115 @@
 //! Body types shared by requests and responses.
 
+use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
+use http::HeaderMap;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Frame, SizeHint};
 use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
+/// Error of a [`Body`].
+// Not a `Box<dyn Error>`: rustc then rejects the service future as not `Send`.
+#[derive(Debug)]
+pub(crate) enum BodyError {
+    /// The connection the body comes from failed.
+    Hyper(hyper::Error),
+
+    /// Reading a file or compressing failed.
+    Io(std::io::Error),
+
+    /// The request body is larger than `request.max_body_size`.
+    TooLarge,
+}
+
+impl fmt::Display for BodyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hyper(err) => err.fmt(f),
+            Self::Io(err) => err.fmt(f),
+            Self::TooLarge => f.write_str("request body over max_body_size"),
+        }
+    }
+}
+
+impl std::error::Error for BodyError {}
+
 /// Boxed body used for every request sent upstream and every response.
-pub(crate) type Body = BoxBody<Bytes, hyper::Error>;
+pub(crate) type Body = BoxBody<Bytes, BodyError>;
+
+/// Boxes a body received by hyper.
+pub(crate) fn incoming(body: hyper::body::Incoming) -> Body {
+    body.map_err(BodyError::Hyper).boxed()
+}
+
+/// Reads `body` until it ends or `limit` bytes are held, and returns a body
+/// that yields the bytes read followed by the rest. A body that fits has an
+/// exact size, so it is sent with a `Content-Length`.
+pub(crate) async fn buffer(mut body: Body, limit: usize) -> Result<Body, BodyError> {
+    let mut data = BytesMut::new();
+    let mut trailers = None;
+    while data.len() < limit && !hyper::body::Body::is_end_stream(&body) {
+        match body.frame().await.transpose()?.map(Frame::into_data) {
+            Some(Ok(chunk)) => data.extend_from_slice(&chunk),
+            Some(Err(frame)) => {
+                // Trailers are the last frame.
+                trailers = frame.into_trailers().ok();
+                body = empty();
+            }
+            None => body = empty(),
+        }
+    }
+    let buffered = Buffered {
+        data: data.freeze(),
+        trailers,
+        rest: body,
+    };
+    Ok(buffered.boxed())
+}
+
+/// Body made by [`buffer`]: the buffered part, then the rest of the source.
+struct Buffered {
+    data: Bytes,
+    trailers: Option<HeaderMap>,
+    rest: Body,
+}
+
+impl hyper::body::Body for Buffered {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if !self.data.is_empty() {
+            return Poll::Ready(Some(Ok(Frame::data(std::mem::take(&mut self.data)))));
+        }
+        if let Some(trailers) = self.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        Pin::new(&mut self.rest).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_empty() && self.trailers.is_none() && self.rest.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = self.rest.size_hint();
+        let buffered = self.data.len() as u64;
+        // The upper bound first: `set_lower` asserts it stays below it.
+        if let Some(upper) = hint.upper() {
+            hint.set_upper(upper + buffered);
+        }
+        hint.set_lower(hint.lower() + buffered);
+        hint
+    }
+}
 
 /// Single chunk body.
 pub(crate) fn full(chunk: impl Into<Bytes>) -> Body {
@@ -45,7 +143,7 @@ impl<G> Guarded<G> {
 
 impl<G: Unpin> hyper::body::Body for Guarded<G> {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = BodyError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -70,8 +168,7 @@ impl<G: Unpin> hyper::body::Body for Guarded<G> {
 /// Size of the chunks [`ReaderBody`] reads.
 const CHUNK: usize = 64 * 1024;
 
-/// Body that streams everything an [`AsyncRead`] yields, in chunks. A read
-/// error ends the body early because hyper errors cannot be built here.
+/// Body that streams everything an [`AsyncRead`] yields, in chunks.
 pub(crate) struct ReaderBody<R> {
     reader: R,
     buf: Vec<u8>,
@@ -80,7 +177,7 @@ pub(crate) struct ReaderBody<R> {
 }
 
 /// Where a [`BodyReader`] leaves the original error of the body it wraps.
-pub(crate) type ErrorSlot = Arc<Mutex<Option<hyper::Error>>>;
+pub(crate) type ErrorSlot = Arc<Mutex<Option<BodyError>>>;
 
 impl<R> ReaderBody<R> {
     pub(crate) fn new(reader: R) -> Self {
@@ -92,8 +189,8 @@ impl<R> ReaderBody<R> {
         }
     }
 
-    /// Returns the error found in `slot` when a read fails, instead of ending
-    /// the body as if it were complete.
+    /// Returns the error found in `slot` when a read fails, instead of the
+    /// read error.
     pub(crate) fn with_source_error(mut self, slot: ErrorSlot) -> Self {
         self.source_error = Some(slot);
         self
@@ -108,7 +205,7 @@ impl<R> ReaderBody<R> {
 
 impl<R: AsyncRead + Unpin> hyper::body::Body for ReaderBody<R> {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = BodyError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -127,15 +224,10 @@ impl<R: AsyncRead + Unpin> hyper::body::Body for ReaderBody<R> {
                     .source_error
                     .as_ref()
                     .and_then(|slot| slot.lock().ok()?.take());
-                match source {
-                    Some(source) => Poll::Ready(Some(Err(source))),
-                    None => {
-                        // hyper errors cannot be built here: the connection is
-                        // aborted when a length was promised, else the body ends.
-                        eprintln!("read error on {}: {err}", this.label);
-                        Poll::Ready(None)
-                    }
-                }
+                Poll::Ready(Some(Err(source.unwrap_or_else(|| {
+                    eprintln!("read error on {}: {err}", this.label);
+                    BodyError::Io(err)
+                }))))
             }
         }
     }
