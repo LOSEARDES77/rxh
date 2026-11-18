@@ -87,7 +87,13 @@ struct Cli {
     #[arg(long, short, value_name = "N")]
     concurrency: Option<usize>,
 
-    /// Short runs (2s, 16 connections), for CI and smoke tests.
+    /// Idle keep-alive connections held open by the idle and memory
+    /// scenarios.
+    #[arg(long, value_name = "N")]
+    idle_connections: Option<usize>,
+
+    /// Short runs (2s, 16 connections, 1000 idle connections), for CI and
+    /// smoke tests.
     #[arg(long)]
     quick: bool,
 
@@ -135,6 +141,10 @@ async fn run(cli: Cli) -> ExitCode {
         concurrency: cli
             .concurrency
             .unwrap_or(if cli.quick { 16 } else { 32 })
+            .max(1),
+        idle_connections: cli
+            .idle_connections
+            .unwrap_or(if cli.quick { 1000 } else { 5000 })
             .max(1),
     };
     let scenarios = if cli.scenarios.is_empty() {

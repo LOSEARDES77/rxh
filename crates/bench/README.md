@@ -35,6 +35,7 @@ cargo build --release -p rxh-cli -p rxh-bench
 | `-s, --scenario NAME` | Run only this scenario. Repeat the flag to run several. The default is all scenarios. |
 | `-d, --duration SECONDS` | Load time per scenario. The default is 5, or 2 with `--quick`. |
 | `-c, --concurrency N` | Number of keep-alive client connections. The default is 32, or 16 with `--quick`. |
+| `--idle-connections N` | Idle keep-alive connections held open by `idle` and `memory`. The default is 5000, or 1000 with `--quick`. Each one takes a file descriptor in `rxh-bench` and in the proxy: raise `ulimit -n` if it is low. |
 | `--json FILE` | Also write the results as JSON. |
 
 The exit code is 1 when rxh fails a scenario or cannot run it (`n/a`,
@@ -64,6 +65,17 @@ into an rxh TOML file and an equivalent Caddyfile.
 | `failover` | `round_robin`, 2 retries, passive health (`fail_duration 10s`). One backend is killed after 1/3 of the run. | Client errors stay at or below 1%. |
 | `active-health` | `round_robin` with `/health` checked every second. One backend starts answering 503 on `/health`. | No more than one request per client connection reaches that backend 3 seconds after the flip. |
 | `tcp` | Layer 4 `round_robin` to 2 TCP echo servers. Each client reconnects every 50 round trips. | No echo errors, and both backends receive connections. Core Caddy has no layer 4 proxy, so this shows `n/a` unless you pass `--caddy-l4`. |
+| `tls` | TLS termination with a self-signed certificate for `localhost`, `round_robin` over 2 backends. Clients offer only `http/1.1` in ALPN and keep their connection. | No errors, and both backends get requests. |
+| `http2` | Same as `tls`, but clients offer only `h2`. Every 8 clients share one connection, one stream in flight each. | Every response came over HTTP/2, no errors, and both backends get requests. |
+| `large-body` | `round_robin` over 2 backends that echo the request body. Every request is a `POST` of 1 MiB. | Every response body is the request body, byte for byte. The notes give the MiB/s in each direction. |
+| `websocket` | `round_robin` over 2 backends. Each client upgrades `GET /` to a WebSocket, echoes 64 byte binary frames 50 times, closes and upgrades again. | No frame errors, and both backends get upgrades. |
+| `udp` | UDP `round_robin` to 2 echo servers. Each client is one long-lived session (one source port) sending 64 byte datagrams, and waits for each echo. | At most 1% of datagrams are lost (not echoed within 1 second), and both backends get sessions. Core Caddy shows `n/a` unless you pass `--caddy-l4`. |
+| `idle` | `round_robin` over 2 backends. `--idle-connections` keep-alive connections are opened (one `GET` each) and stay open while the normal load runs. | Every idle connection opens, still answers a `GET` after the load, and the load has no errors. |
+| `memory` | Same setup. The proxy's resident memory (RSS, summed over its processes) is read from `/proc` after 100 warm-up connections, then after `--idle-connections` more. | Every connection opens. The notes give the memory per idle connection; this is a measurement, not a verdict. The Req/s and latency columns are those of the first request on each connection. Linux only: elsewhere the scenario shows `n/a`. |
+
+rxh's `max_connections` defaults to 1024, so `idle` and `memory` set it to
+the number of connections they open (plus the load). NGINX gets
+`worker_connections` to match.
 
 ## NGINX and Traefik
 
@@ -80,9 +92,15 @@ so some scenarios show `n/a`:
 | retries and passive health | `proxy_next_upstream_tries`, `max_fails` | `retry` middleware, `passiveHealthCheck` |
 | active health | n/a (NGINX Plus) | `healthCheck` |
 | `tcp` | `stream` module | TCP router |
+| `udp` | `stream` module, `listen ... udp` | UDP router |
+| `tls`, `http2` | `listen ... ssl`, `http2 on` | router `tls: {}`, default certificate |
+| WebSocket | `Upgrade` and `Connection` headers set from the request | built in |
 
-NGINX runs with `worker_processes auto`, upstream keep-alive and a shared
-`zone`.
+NGINX runs with `worker_processes auto`, upstream keep-alive, a shared
+`zone`, no body size limit (`client_max_body_size 0`) and
+`keepalive_requests 1000000`: with the default of 1000, NGINX ends a shared
+HTTP/2 connection with `GOAWAY` and the streams in flight on it fail in the
+`http2` scenario.
 
 ## Charts
 
