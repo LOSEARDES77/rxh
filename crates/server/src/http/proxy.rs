@@ -14,12 +14,13 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::Version;
 use hyper::body::Incoming;
-use hyper::header::{self, HeaderValue};
+use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use rxh_core::address::BackendAddress;
 use rxh_core::config::RetryMatch;
 use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
+use tokio::sync::watch;
 
 use crate::http::body::{self, BodyError, Guarded};
 use crate::http::cache::Cache;
@@ -281,6 +282,7 @@ pub(crate) async fn forward(
             server_upgrade,
             (guard, permit),
             site.stream_timeout,
+            site.stream_close.clone(),
         ));
 
         let (parts, _) = upstream_response.into_parts();
@@ -327,6 +329,11 @@ pub(crate) async fn forward(
             }
         };
     }
+    if let Some(interval) = settings.flush_interval
+        && batches(client_response.headers())
+    {
+        client_response = client_response.map(|body| body::Batched::new(body, interval).boxed());
+    }
     headers::prepare_response(
         &mut client_response,
         &route.response,
@@ -350,6 +357,18 @@ pub(crate) async fn forward(
         .extensions_mut()
         .insert(UpstreamAddress(selection.upstream.address().to_owned()));
     client_response.map(|body| Guarded::new(body, (guard, permit)).boxed())
+}
+
+/// Whether `flush_interval` applies to a response with these headers. Like
+/// Caddy, streams of unknown length and server-sent events are always
+/// written as they come.
+fn batches(headers: &HeaderMap) -> bool {
+    let event_stream = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"));
+    headers.contains_key(header::CONTENT_LENGTH) && !event_stream
 }
 
 /// Buffers and caches the response when it is small and storable.
@@ -437,13 +456,14 @@ fn host<B>(request: &Request<B>) -> String {
 }
 
 /// Copies bytes both ways between an upgraded client and backend (WebSocket
-/// or any other protocol). Runs until either side closes or `stream_timeout`
-/// passes.
+/// or any other protocol). Runs until either side closes, `stream_timeout`
+/// passes, or `stream_close_delay` passes after the listener shut down.
 async fn tunnel(
     client: OnUpgrade,
     server: OnUpgrade,
     _guard: (RequestGuard, Permit),
     stream_timeout: Option<Duration>,
+    stream_close: Option<(Duration, watch::Receiver<bool>)>,
 ) {
     let (Ok(client), Ok(server)) = (client.await, server.await) else {
         return;
@@ -453,12 +473,26 @@ async fn tunnel(
     let mut server = TokioIo::new(server);
 
     let copy = tokio::io::copy_bidirectional(&mut client, &mut server);
-    let result = match stream_timeout {
-        Some(limit) => match tokio::time::timeout(limit, copy).await {
-            Ok(result) => result,
-            Err(_) => return,
-        },
-        None => copy.await,
+    let copy = async {
+        match stream_timeout {
+            Some(limit) => tokio::time::timeout(limit, copy).await.ok(),
+            None => Some(copy.await),
+        }
+    };
+    let closed = async {
+        let Some((delay, mut closing)) = stream_close else {
+            return std::future::pending().await;
+        };
+        // A dropped sender means the listener is gone too.
+        let _ = closing.wait_for(|closing| *closing).await;
+        tokio::time::sleep(delay).await;
+    };
+    let result = tokio::select! {
+        result = copy => result,
+        () = closed => None,
+    };
+    let Some(result) = result else {
+        return;
     };
     if let Err(err) = result {
         eprintln!("tunnel error: {err}");

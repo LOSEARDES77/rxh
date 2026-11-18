@@ -51,6 +51,7 @@ The remaining rows of PARITY.md that a load balancer needs every day.
       the file server.
 - [x] Health check events (`healthy`, `unhealthy`) as hooks, not only log
       lines.
+- [x] `stream_close_delay` and a configurable `flush_interval`.
 
 ## 0.4: performance
 

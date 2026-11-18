@@ -108,11 +108,11 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `read_timeout`, `write_timeout`, `response_header_timeout` | same names | ✅ | Unset by default. `response_header_timeout` gives `504`; read and write timeouts also apply to idle pooled connections and tunnels. |
 | `max_conns_per_host` | `max_conns_per_host` | ✅ | HTTP/1.1 connections per backend, idle ones included; requests over the limit wait for a free connection, like Caddy. Upgraded tunnels count. Not applied to `h2c` (one shared connection) or to `tcp`/`udp` servers. |
 | `proxy_protocol v1/v2` on HTTP transport | | ❌ | Supported on TCP servers. |
-| `flush_interval` | | 🟡 | Responses always stream immediately (Caddy's `-1`). |
+| `flush_interval` | `flush_interval` on a pool | ✅ | Unset streams immediately (Caddy's `-1`, so `-1` itself is not accepted). Like Caddy, server-sent events and responses without `Content-Length` are never batched. |
 | `request_buffers`, `response_buffers` | same names | ✅ | Bytes or a size (`"64KiB"`). A body that fits is sent with a `Content-Length`; the rest of a larger one is streamed. No `-1` (unlimited); buffered request bodies are not replayed on retries. |
 | `request_body { max_size }` | `request.max_body_size` on a route | ✅ | `413`, from `Content-Length` before dialing, or while streaming a body without one. |
 | `stream_timeout` | `stream_timeout` on the server | 🟡 | Server level option, also caps `tcp` connections. |
-| `stream_close_delay` | | ❌ | |
+| `stream_close_delay` | `stream_close_delay` on the server | 🟡 | Server level option, like `stream_timeout`. Unset keeps tunnels open across reloads (Caddy closes them at once, set `"0s"` for that). Not applied to `tcp` connections, which follow `grace_period`. |
 | `rewrite`, `method` | `rewrite`, `request.method` on a route | ✅ | `rewrite` is a path (optionally with a query) with `{host}`, `{path}`, `{query}` and `{uri}` placeholders; the query is kept unless the rewrite has one. Applied after routing (routes are not matched again), also on `serve` routes. No regex, `strip_prefix` or `replace`. |
 | `redir` | `redirect` on a route (`"target"` or `{ to, status }`) | ✅ | Same placeholders; `302` by default, `301`, `303`, `307` and `308` allowed. No `html` redirects. |
 | `handle_response`, `replace_status`, `copy_response` | `handle_response` list on a route, with `replace_status`, `copy_response`, `serve` + `rewrite` or `redirect` per entry | ✅ | Matchers: `status` (codes, classes) and `header`; first match wins. `{status}` and `{header.NAME}` placeholders cover error pages and `X-Accel-Redirect`. Handlers are a file or a redirect, not arbitrary routes: no `respond`, no second `forward`, no `copy_response_headers`. |

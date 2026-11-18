@@ -4,6 +4,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use http::HeaderMap;
@@ -11,6 +12,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Frame, SizeHint};
 use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+use tokio::time::Sleep;
 
 /// Error of a [`Body`].
 // Not a `Box<dyn Error>`: rustc then rejects the service future as not `Send`.
@@ -107,6 +109,105 @@ impl hyper::body::Body for Buffered {
             hint.set_upper(upper + buffered);
         }
         hint.set_lower(hint.lower() + buffered);
+        hint
+    }
+}
+
+/// Body that holds the data of `inner` back and yields it in batches: when
+/// `interval` has passed since the first byte of the batch, when [`CHUNK`]
+/// bytes are held, or when another frame or the end comes (Caddy
+/// `flush_interval`).
+pub(crate) struct Batched {
+    inner: Body,
+    interval: Duration,
+    held: BytesMut,
+    /// Trailers that arrived while data was held.
+    trailers: Option<Frame<Bytes>>,
+    deadline: Option<Pin<Box<Sleep>>>,
+    done: bool,
+}
+
+impl Batched {
+    pub(crate) fn new(inner: Body, interval: Duration) -> Self {
+        Self {
+            inner,
+            interval,
+            held: BytesMut::new(),
+            trailers: None,
+            deadline: None,
+            done: false,
+        }
+    }
+
+    fn flush(&mut self) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        self.deadline = None;
+        Poll::Ready(Some(Ok(Frame::data(self.held.split().freeze()))))
+    }
+}
+
+impl hyper::body::Body for Batched {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(trailers) = this.trailers.take() {
+            return Poll::Ready(Some(Ok(trailers)));
+        }
+        while !this.done {
+            match Pin::new(&mut this.inner).poll_frame(context) {
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        this.held.extend_from_slice(&data);
+                        if this.held.len() >= CHUNK {
+                            return this.flush();
+                        }
+                        if this.deadline.is_none() {
+                            this.deadline = Some(Box::pin(tokio::time::sleep(this.interval)));
+                        }
+                    }
+                    Err(frame) if this.held.is_empty() => return Poll::Ready(Some(Ok(frame))),
+                    Err(frame) => {
+                        this.trailers = Some(frame);
+                        return this.flush();
+                    }
+                },
+                // The held data is lost, but so is the response.
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => this.done = true,
+                Poll::Pending => {
+                    let due = this
+                        .deadline
+                        .as_mut()
+                        .is_some_and(|deadline| deadline.as_mut().poll(context).is_ready());
+                    return if due { this.flush() } else { Poll::Pending };
+                }
+            }
+        }
+        if this.held.is_empty() {
+            Poll::Ready(None)
+        } else {
+            this.flush()
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.held.is_empty() && self.trailers.is_none() && (self.done || self.inner.is_end_stream())
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.done {
+            return SizeHint::with_exact(self.held.len() as u64);
+        }
+        let mut hint = self.inner.size_hint();
+        let held = self.held.len() as u64;
+        if let Some(upper) = hint.upper() {
+            hint.set_upper(upper + held);
+        }
+        hint.set_lower(hint.lower() + held);
         hint
     }
 }
