@@ -8,7 +8,8 @@ layer 4.
 
 Run [`rxh-bench`](crates/bench/README.md) to check the load balancing rows
 against a real Caddy. It runs the same scenarios on both and reports
-correctness and performance side by side.
+correctness and performance side by side. CI runs `rxh-bench --quick` as a
+correctness gate for RXH; the Caddy results there are for information only.
 
 Legend: ✅ done · 🟡 partial · ❌ missing · ➕ RXH extension (Caddy has no
 equivalent in its core)

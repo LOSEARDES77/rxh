@@ -36,7 +36,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      # The benchmark tool has no tests and is not shipped; it stays out of the gate.
+      # The benchmark tool is not shipped and is exercised by bench-gate; it stays out of the gate.
       - run: >-
           cargo llvm-cov --workspace
           --ignore-filename-regex 'crates/bench/'
@@ -64,11 +64,11 @@ jobs:
             cargo +nightly fuzz run "$target" -- -max_total_time=60
           done
 
-  bench-smoke:
-    name: load balancing smoke test vs Caddy
+  bench-gate:
+    name: rxh-bench --quick (gates on RXH, Caddy for information)
     runs-on: ubuntu-latest
-    # Shared runners are noisy; the comparison informs, it does not gate.
-    continue-on-error: true
+    # The exit code reflects RXH only: a FAIL or n/a of RXH fails the job, Caddy
+    # results are printed for information. Speed is never part of a verdict.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

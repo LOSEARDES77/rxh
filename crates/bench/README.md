@@ -37,8 +37,12 @@ cargo build --release -p rxh-cli -p rxh-bench
 | `-c, --concurrency N` | Number of keep-alive client connections. The default is 32, or 16 with `--quick`. |
 | `--json FILE` | Also write the results as JSON. |
 
-The exit code is 1 when any scenario fails, so you can use the tool as a
-CI smoke test.
+The exit code is 1 when rxh fails a scenario or cannot run it (`n/a`,
+for example when its binary is missing), so the tool works as a
+correctness gate for rxh in CI: `rxh-bench --quick` runs in the CI
+workflow. The other proxies are reported for information only and never
+change the exit code. Verdicts are about behaviour, not speed, so a slow
+shared runner does not fail the run.
 
 A target that is missing, or that cannot run a scenario, appears as `n/a`.
 The other target still runs.
