@@ -48,6 +48,10 @@ Changed.
 - Layer 4 routing: `tcp` servers take `match` entries with `sni`, `alpn`,
   `protocol` (`tls`, `http`, `ssh`) and `http_host`, read within
   `match_timeout` and replayed to the backend (TLS passthrough by SNI).
+- PROXY protocol output on `http` servers: `proxy_protocol = "v1"` or `"v2"`
+  sends a PROXY header with the client address on every new connection to a
+  backend, like on `tcp` servers. Upstream keep-alive connections are then
+  kept per client connection. Rejected with `h2c` pools.
 - PROXY protocol input: `proxy_protocol_in = true` on `http` and `tcp`
   servers, limited to `trusted_proxies` when set; the source address is the
   client address everywhere.
@@ -90,6 +94,10 @@ Changed.
 
 ### Changed
 
+- `proxy_protocol` on a `tcp` server with TLS backends sends the header
+  before the TLS handshake, as the PROXY protocol requires, instead of inside
+  the TLS session. A backend that refuses the header now counts as a failed
+  dial and is retried on another backend.
 - Servers with `tls = "auto"` now listen on `[acme] http_port` (their own
   addresses with that port) all the time, to redirect to HTTPS and answer
   challenges, instead of opening a challenge-only listener on `0.0.0.0`

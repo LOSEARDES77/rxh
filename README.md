@@ -39,7 +39,8 @@ pool web (least_conn)
 - **Layer 4 routing**: `tcp` servers route by TLS SNI and ALPN (TLS
   passthrough), detected protocol (`tls`, `http`, `ssh`) and HTTP `Host`, and
   `http` and `tcp` servers accept an incoming PROXY v1/v2 header
-  (`proxy_protocol_in`) from `trusted_proxies`.
+  (`proxy_protocol_in`) from `trusted_proxies` and send one to their backends
+  (`proxy_protocol`).
 - **Virtual hosts and request matchers**: several `http` servers share one
   address, picked by `host` (exact or `*.wildcard`), with TLS certificates
   chosen by SNI. Routes match on `host`, `path` patterns, `method`, `header`,

@@ -49,6 +49,9 @@ pub(crate) struct Site {
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
 
+    /// PROXY protocol header sent on new connections to backends.
+    pub(crate) proxy_protocol: Option<config::ProxyProtocol>,
+
     /// Maximum lifetime of upgraded tunnels.
     pub(crate) stream_timeout: Option<Duration>,
 
@@ -125,6 +128,7 @@ impl Site {
             by: server.name.clone().unwrap_or_else(|| local.to_string()),
             trusted_proxies: server.trusted_proxies.clone(),
             tls: server.tls.is_some(),
+            proxy_protocol: server.proxy_protocol,
             stream_timeout: server.stream_timeout,
             stream_close: server
                 .stream_close_delay

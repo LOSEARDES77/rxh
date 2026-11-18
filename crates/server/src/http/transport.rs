@@ -3,6 +3,9 @@
 //! HTTP/1.1 connections are reused once the previous response body has been
 //! fully read. With `h2c = true` a single multiplexed HTTP/2 connection is
 //! shared per backend.
+//!
+//! Connections opened with a PROXY protocol header belong to the client
+//! connection the header describes, and are only reused for its requests.
 
 use std::collections::HashMap;
 use std::io;
@@ -20,7 +23,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::http::body::Body;
 use crate::stream::Dialer;
 
-type IdleMap = HashMap<String, Vec<Idle>>;
+/// Idle connections by [`key`].
+#[derive(Debug)]
+struct IdlePool {
+    lists: HashMap<Vec<u8>, Vec<Idle>>,
+    /// Last time expired connections of every key were dropped.
+    swept: Instant,
+}
+
+/// Key of the connections to `address` opened with `preface`.
+fn key(address: &str, preface: &[u8]) -> Vec<u8> {
+    [address.as_bytes(), b"\0", preface].concat()
+}
 
 #[derive(Debug)]
 struct Idle {
@@ -66,7 +80,7 @@ pub(crate) struct Transport {
     max_conns: usize,
     /// One semaphore of `max_conns` permits per backend address.
     limits: Mutex<HashMap<String, Arc<Semaphore>>>,
-    idle: Arc<Mutex<IdleMap>>,
+    idle: Arc<Mutex<IdlePool>>,
     http2: Mutex<HashMap<String, http2::SendRequest<Body>>>,
 }
 
@@ -79,7 +93,10 @@ impl Transport {
             h2c: settings.h2c,
             max_conns: settings.max_conns_per_host,
             limits: Mutex::default(),
-            idle: Arc::default(),
+            idle: Arc::new(Mutex::new(IdlePool {
+                lists: HashMap::new(),
+                swept: Instant::now(),
+            })),
             http2: Mutex::default(),
         }
     }
@@ -88,7 +105,12 @@ impl Transport {
     /// With `max_conns_per_host`, waits until the backend has a free slot.
     /// Errors here happen before the request is consumed, so they can be
     /// retried on another backend.
-    pub(crate) async fn connect(&self, address: &str) -> io::Result<Connection> {
+    ///
+    /// A non-empty `preface` (a PROXY protocol header) starts every new
+    /// connection, and only connections opened with the same one are reused.
+    /// It is not sent on `h2c` connections, which all clients share; the
+    /// configuration rejects that combination.
+    pub(crate) async fn connect(&self, address: &str, preface: &[u8]) -> io::Result<Connection> {
         if self.h2c {
             let existing = self
                 .http2
@@ -122,7 +144,7 @@ impl Transport {
         }
 
         let permit = self.acquire(address).await;
-        if let Some(sender) = self.take_idle(address) {
+        if let Some(sender) = self.take_idle(&key(address, preface)) {
             return Ok(Connection::Http1 {
                 sender,
                 reused: true,
@@ -131,7 +153,7 @@ impl Transport {
         }
 
         Ok(Connection::Http1 {
-            sender: self.dial_http1(address).await?,
+            sender: self.dial_http1(address, preface).await?,
             reused: false,
             permit,
         })
@@ -156,8 +178,12 @@ impl Transport {
         Some(Arc::new(permit))
     }
 
-    async fn dial_http1(&self, address: &str) -> io::Result<http1::SendRequest<Body>> {
-        let stream = self.dialer.dial(address).await?;
+    async fn dial_http1(
+        &self,
+        address: &str,
+        preface: &[u8],
+    ) -> io::Result<http1::SendRequest<Body>> {
+        let stream = self.dialer.dial_with_preface(address, preface).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
             .handshake(TokioIo::new(stream))
@@ -173,9 +199,9 @@ impl Transport {
         Ok(sender)
     }
 
-    fn take_idle(&self, address: &str) -> Option<http1::SendRequest<Body>> {
+    fn take_idle(&self, key: &[u8]) -> Option<http1::SendRequest<Body>> {
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        let list = idle.get_mut(address)?;
+        let list = idle.lists.get_mut(key)?;
         while let Some(entry) = list.pop() {
             if entry.since.elapsed() < self.keepalive && entry.sender.is_ready() {
                 return Some(entry.sender);
@@ -187,14 +213,13 @@ impl Transport {
     /// Puts the connection back in the idle pool once the response body has
     /// been read completely. `permit` is held until then, or until the
     /// connection closes.
-    fn recycle(&self, address: &str, mut sender: http1::SendRequest<Body>, permit: Permit) {
+    fn recycle(&self, key: Vec<u8>, mut sender: http1::SendRequest<Body>, permit: Permit) {
         let pooled = !self.keepalive.is_zero() && self.max_idle > 0;
         if !pooled && permit.is_none() {
             return;
         }
 
         let idle = Arc::clone(&self.idle);
-        let address = address.to_owned();
         let (keepalive, max_idle) = (self.keepalive, self.max_idle);
 
         tokio::task::spawn(async move {
@@ -204,8 +229,19 @@ impl Transport {
                 return;
             }
             let mut idle = idle.lock().unwrap_or_else(PoisonError::into_inner);
-            let list = idle.entry(address).or_default();
-            list.retain(|entry| entry.since.elapsed() < keepalive && !entry.sender.is_closed());
+            let fresh =
+                |entry: &Idle| entry.since.elapsed() < keepalive && !entry.sender.is_closed();
+            // With a PROXY header every client connection has its own key, which is
+            // never asked for again once the client is gone.
+            if idle.swept.elapsed() >= keepalive {
+                idle.lists.retain(|_, list| {
+                    list.retain(fresh);
+                    !list.is_empty()
+                });
+                idle.swept = Instant::now();
+            }
+            let list = idle.lists.entry(key).or_default();
+            list.retain(fresh);
             if list.len() < max_idle {
                 list.push(Idle {
                     sender,
@@ -220,6 +256,7 @@ impl Transport {
     pub(crate) async fn send(
         &self,
         address: &str,
+        preface: &[u8],
         connection: Connection,
         request: Request<Body>,
     ) -> Result<(Response<Incoming>, Permit), SendError> {
@@ -234,7 +271,7 @@ impl Transport {
                 permit,
             } => match sender.try_send_request(request).await {
                 Ok(response) => {
-                    self.recycle(address, sender, permit.clone());
+                    self.recycle(key(address, preface), sender, permit.clone());
                     Ok((response, permit))
                 }
                 Err(mut err) => match err.take_message() {
@@ -245,12 +282,14 @@ impl Transport {
         }
     }
 
-    /// Drops idle connections to `address`, after one of them was found dead.
-    pub(crate) fn forget(&self, address: &str) {
+    /// Drops the idle connections to `address` opened with `preface`, after
+    /// one of them was found dead.
+    pub(crate) fn forget(&self, address: &str, preface: &[u8]) {
         self.idle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(address);
+            .lists
+            .remove(&key(address, preface));
     }
 
     /// True when requests must be HTTP/2 with an absolute URI.

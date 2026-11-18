@@ -1,5 +1,5 @@
 //! PROXY protocol (HAProxy spec, versions 1 and 2): the header RXH sends to
-//! `tcp` backends, and the parser for the header clients send when a server
+//! backends, and the parser for the header clients send when a server
 //! sets `proxy_protocol_in`.
 
 use std::io;

@@ -107,7 +107,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `dial_timeout` | `dial_timeout` | ✅ | Default 3s. |
 | `read_timeout`, `write_timeout`, `response_header_timeout` | same names | ✅ | Unset by default. `response_header_timeout` gives `504`; read and write timeouts also apply to idle pooled connections and tunnels. |
 | `max_conns_per_host` | `max_conns_per_host` | ✅ | HTTP/1.1 connections per backend, idle ones included; requests over the limit wait for a free connection, like Caddy. Upgraded tunnels count. Not applied to `h2c` (one shared connection) or to `tcp`/`udp` servers. |
-| `proxy_protocol v1/v2` on HTTP transport | | ❌ | Supported on TCP servers. |
+| `proxy_protocol v1/v2` on HTTP transport | `proxy_protocol = "v1"` or `"v2"` on the server | 🟡 | Server level option, shared with `tcp` servers. Sent before the upstream TLS handshake; like Caddy, upstream keep-alive connections are kept per client connection. Not with `h2c` pools (rejected); active health checks send no header. |
 | `flush_interval` | `flush_interval` on a pool | ✅ | Unset streams immediately (Caddy's `-1`, so `-1` itself is not accepted). Like Caddy, server-sent events and responses without `Content-Length` are never batched. |
 | `request_buffers`, `response_buffers` | same names | ✅ | Bytes or a size (`"64KiB"`). A body that fits is sent with a `Content-Length`; the rest of a larger one is streamed. No `-1` (unlimited); buffered request bodies are not replayed on retries. |
 | `request_body { max_size }` | `request.max_body_size` on a route | ✅ | `413`, from `Content-Length` before dialing, or while streaming a body without one. |
@@ -148,7 +148,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Server timeouts | `read_header_timeout`, `idle_timeout`, `stream_timeout` | ✅ | `read_header_timeout` defaults to 30s and also bounds the TLS handshake (10s when unset) and the first request of a connection, HTTP/2 included; the others are unset by default. `idle_timeout` also closes idle `tcp` connections. |
 | UDP proxy | `protocol = "udp"` | ✅ | Per client sessions, `udp_idle_timeout`. |
 | TLS termination | `tls` on a `tcp` server | ✅ | |
-| PROXY protocol to upstreams | `proxy_protocol = "v1"` or `"v2"` | ✅ | |
+| PROXY protocol to upstreams | `proxy_protocol = "v1"` or `"v2"` | ✅ | Before the TLS handshake of TLS backends. |
 | Load balancing and health checks | same pools as HTTP | ✅ | Active TCP checks, passive dial failures. |
 | Matchers (SNI, HTTP, SSH, ...) and routing | `match = [{ sni, alpn, protocol, http_host, forward }]` on `tcp` servers | 🟡 | TLS passthrough by SNI/ALPN, `protocol` `tls`/`http`/`ssh`, HTTP/1 `Host`; first match wins, replayed bytes, `match_timeout`. No other caddy-l4 matchers (`remote_ip`, regexp, postgres, ...) and no subroutes. |
 | Receiving PROXY protocol | `proxy_protocol_in = true` (`http` and `tcp`) | ✅ | v1 and v2, gated by `trusted_proxies`; the source address is the client everywhere. |

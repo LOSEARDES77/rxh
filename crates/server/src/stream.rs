@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rxh_core::address::BackendAddress;
 use rxh_core::config::{UpstreamGroup, UpstreamTls};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -171,17 +171,27 @@ impl Dialer {
     /// reads and writes that make no progress for `read_timeout` and
     /// `write_timeout`.
     pub(crate) async fn dial(&self, address: &str) -> io::Result<Timed<UpstreamStream>> {
-        let stream = tokio::time::timeout(self.timeout, self.connect(address))
+        self.dial_with_preface(address, &[]).await
+    }
+
+    /// Same as [`Dialer::dial`], sending `preface` (a PROXY protocol header)
+    /// as the first bytes of the connection, before the TLS handshake.
+    pub(crate) async fn dial_with_preface(
+        &self,
+        address: &str,
+        preface: &[u8],
+    ) -> io::Result<Timed<UpstreamStream>> {
+        let stream = tokio::time::timeout(self.timeout, self.connect(address, preface))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))??;
         Ok(Timed::new(stream, self.read_timeout, self.write_timeout))
     }
 
-    async fn connect(&self, address: &str) -> io::Result<UpstreamStream> {
+    async fn connect(&self, address: &str, preface: &[u8]) -> io::Result<UpstreamStream> {
         let parsed = BackendAddress::parse(address)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
-        let (raw, host) = match parsed {
+        let (mut raw, host) = match parsed {
             BackendAddress::Tcp { host, port, .. } => {
                 let stream = TcpStream::connect((host.trim_matches(['[', ']']), port)).await?;
                 stream.set_nodelay(true)?;
@@ -199,6 +209,10 @@ impl Dialer {
                 ));
             }
         };
+
+        if !preface.is_empty() {
+            raw.write_all(preface).await?;
+        }
 
         let Some(tls) = &self.tls else {
             return Ok(match raw {
