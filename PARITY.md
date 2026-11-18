@@ -159,7 +159,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Caddy | RXH | Status | Notes |
 |---|---|---|---|
 | `caddy run` | `rxh run` (or plain `rxh`) | ✅ | |
-| `caddy start` | `rxh start` | ✅ | Unix only, PID file and log file. |
+| `caddy start` | `rxh start` | ✅ | Unix only, PID file and log file. The PID file is locked: a second `rxh start` with the same file fails. |
 | `caddy stop` | `rxh stop` | ✅ | Admin API, falls back to the PID file. |
 | `caddy reload` | `rxh reload`, `SIGHUP` | ✅ | Zero downtime (`SO_REUSEPORT`); an invalid file keeps the running config. |
 | `caddy validate` | `rxh validate` | ✅ | |

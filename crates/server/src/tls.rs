@@ -58,15 +58,19 @@ impl CertResolver {
     ///
     /// Fails if the PEM is invalid, has no key, or the key does not match.
     pub fn certified_key(&self, cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Arc<CertifiedKey>> {
-        let certs = rustls_pemfile::certs(&mut &*cert_pem)
+        use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let certs = CertificateDer::pem_slice_iter(cert_pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::other)?;
         if certs.is_empty() {
             return Err(io::Error::other("no certificate found"));
         }
-        let key = rustls_pemfile::private_key(&mut &*key_pem)
-            .map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::other("no private key found"))?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|err| match err {
+            pem::Error::NoItemsFound => io::Error::other("no private key found"),
+            err => io::Error::other(err),
+        })?;
         let key = CertifiedKey::from_der(certs, key, &self.provider).map_err(io::Error::other)?;
         Ok(Arc::new(key))
     }
@@ -292,6 +296,35 @@ mod tests {
             .set(&[String::from("auto.test")], Arc::clone(&keys[0]))
             .unwrap();
         assert!(is(resolver.select(Some("AUTO.test")), &keys[0]));
+    }
+
+    #[test]
+    fn certified_key_rejects_missing_or_mismatched_pem() {
+        let resolver = CertResolver::new(Arc::clone(ServerConfig::builder().crypto_provider()));
+        let first = rcgen::generate_simple_self_signed(vec![String::from("a.test")]).unwrap();
+        let second = rcgen::generate_simple_self_signed(vec![String::from("b.test")]).unwrap();
+        let cert = first.cert.pem();
+        let key = first.signing_key.serialize_pem();
+        assert!(
+            resolver
+                .certified_key(cert.as_bytes(), key.as_bytes())
+                .is_ok()
+        );
+
+        let error = |cert: &str, key: &str| {
+            resolver
+                .certified_key(cert.as_bytes(), key.as_bytes())
+                .expect_err("invalid pair")
+                .to_string()
+        };
+        assert_eq!(error("", &key), "no certificate found");
+        assert_eq!(error(&key, &key), "no certificate found");
+        assert_eq!(error(&cert, ""), "no private key found");
+        assert_eq!(error(&cert, &cert), "no private key found");
+        let truncated = &cert[..cert.len() / 2];
+        assert_ne!(error(truncated, &key), "no certificate found");
+        let other_key = second.signing_key.serialize_pem();
+        assert!(!error(&cert, &other_key).is_empty(), "the key must match");
     }
 
     #[test]

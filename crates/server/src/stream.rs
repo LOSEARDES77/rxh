@@ -20,7 +20,8 @@ use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::crypto::{self, CryptoProvider};
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
@@ -258,8 +259,12 @@ fn client_config(settings: &UpstreamTls, h2: bool) -> io::Result<ClientConfig> {
         (Some(cert), Some(key)) => {
             let key =
                 fs::read(key).map_err(|err| io::Error::new(err.kind(), format!("{key}: {err}")))?;
-            let key = rustls_pemfile::private_key(&mut key.as_slice())?
-                .ok_or_else(|| io::Error::other(format!("{cert}: no private key found")))?;
+            let key = PrivateKeyDer::from_pem_slice(&key).map_err(|err| match err {
+                pem::Error::NoItemsFound => {
+                    io::Error::other(format!("{cert}: no private key found"))
+                }
+                err => io::Error::other(err),
+            })?;
             builder
                 .with_client_auth_cert(read_certs(cert)?, key)
                 .map_err(io::Error::other)?
@@ -272,7 +277,9 @@ fn client_config(settings: &UpstreamTls, h2: bool) -> io::Result<ClientConfig> {
 
 fn read_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     let pem = fs::read(path).map_err(|err| io::Error::new(err.kind(), format!("{path}: {err}")))?;
-    let certs = rustls_pemfile::certs(&mut pem.as_slice()).collect::<Result<Vec<_>, _>>()?;
+    let certs = CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)?;
     if certs.is_empty() {
         return Err(io::Error::other(format!("{path}: no certificate found")));
     }

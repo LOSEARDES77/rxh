@@ -25,7 +25,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 instant-acme.workspace = true
 regex.workspace = true
-rustls-pemfile.workspace = true
 rxh-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
