@@ -133,8 +133,13 @@ pub(crate) async fn proxy<S>(
         result = copy => match result {
             Ok((sent, received)) => {
                 json(Some(address), sent, received);
-                log.logger.access_text(|| {
-                    format!("{peer} -> {log_name} TCP {address} sent {sent}B received {received}B")
+                log.logger.access_text(|line| {
+                    log::push(
+                        line,
+                        format_args!(
+                            "{peer} -> {log_name} TCP {address} sent {sent}B received {received}B"
+                        ),
+                    );
                 });
             }
             Err(err) => {

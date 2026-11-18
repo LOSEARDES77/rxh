@@ -11,10 +11,12 @@ use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use hyper::header::HeaderValue;
 use hyper::{Method, Request, StatusCode, Uri};
 use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders};
 use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::IpNet;
+use rxh_core::pool::Upstream;
 use rxh_core::template::Template;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
@@ -25,7 +27,7 @@ use crate::files::Files;
 use crate::http::body::Guarded;
 use crate::http::cache::Cache;
 use crate::http::encode;
-use crate::http::headers::{self, Replacement};
+use crate::http::headers::{self, Replacement, Via};
 use crate::http::proxy;
 use crate::http::response::{self, BoxResponse};
 use crate::http::response_handler::ResponseHandler;
@@ -42,6 +44,9 @@ pub(crate) struct Site {
 
     /// Proxy identifier for `Forwarded: by=` and `Via`.
     pub(crate) by: String,
+
+    /// `Via` entries naming `by`.
+    pub(crate) via: Via,
 
     /// Peers allowed to set `X-Forwarded-*`.
     pub(crate) trusted_proxies: Vec<IpNet>,
@@ -123,9 +128,11 @@ impl Site {
         closing: &watch::Receiver<bool>,
         routes: &mut Vec<Route>,
     ) -> Result<(), Error> {
+        let by = server.name.clone().unwrap_or_else(|| local.to_string());
         let site = Arc::new(Self {
             log_name,
-            by: server.name.clone().unwrap_or_else(|| local.to_string()),
+            via: Via::new(&by),
+            by,
             trusted_proxies: server.trusted_proxies.clone(),
             tls: server.tls.is_some(),
             proxy_protocol: server.proxy_protocol,
@@ -259,14 +266,17 @@ pub(crate) struct Service {
     /// Name of the listener, for requests that match no route.
     pub(crate) log_name: Arc<str>,
     pub(crate) peer: SocketAddr,
+    /// `X-Forwarded-For` entry of `peer`.
+    pub(crate) peer_ip: HeaderValue,
     pub(crate) local: SocketAddr,
     pub(crate) activity: Arc<Activity>,
     pub(crate) logger: Arc<Logger>,
 }
 
-/// Response extension set by the proxy: address of the backend that served it.
+/// Response extension set by the proxy for JSON access lines: the backend
+/// that served the response.
 #[derive(Debug, Clone)]
-pub(crate) struct UpstreamAddress(pub(crate) String);
+pub(crate) struct UpstreamAddress(pub(crate) Arc<Upstream>);
 
 impl hyper::service::Service<Request<Incoming>> for Service {
     type Response = BoxResponse;
@@ -384,16 +394,19 @@ impl Service {
         let upstream = response
             .extensions_mut()
             .remove::<UpstreamAddress>()
-            .map(|address| address.0);
+            .map(|upstream| upstream.0);
         metrics::global().record_http(server, status, elapsed);
         self.logger.access(
-            || {
-                format!(
-                    "{} -> {} {method} {uri} HTTP {} {elapsed:?}",
-                    self.peer,
-                    route.map_or(&*self.log_name, |route| &route.site.log_name),
-                    response.status(),
-                )
+            |line| {
+                log::push(
+                    line,
+                    format_args!(
+                        "{} -> {} {method} {uri} HTTP {} {elapsed:?}",
+                        self.peer,
+                        route.map_or(&*self.log_name, |route| &route.site.log_name),
+                        response.status(),
+                    ),
+                );
             },
             || {
                 serde_json::json!({
@@ -406,7 +419,7 @@ impl Service {
                     "proto": format!("{version:?}"),
                     "status": status,
                     "duration_ms": log::millis(elapsed),
-                    "upstream": upstream,
+                    "upstream": upstream.as_deref().map(Upstream::address),
                 })
             },
         );

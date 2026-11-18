@@ -6,7 +6,9 @@
 //! supplied `X-Forwarded-*` values are only kept when the peer is listed in
 //! `trusted_proxies`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 use hyper::HeaderMap;
@@ -42,6 +44,9 @@ pub(crate) struct Forwarding<'a> {
     /// Directly connected peer.
     pub peer: SocketAddr,
 
+    /// Canonical IP of `peer` as a header value, see [`peer_ip_value`].
+    pub peer_ip: &'a HeaderValue,
+
     /// Local socket that accepted the connection.
     pub local: SocketAddr,
 
@@ -51,14 +56,23 @@ pub(crate) struct Forwarding<'a> {
     /// True if the client connection uses TLS.
     pub tls: bool,
 
-    /// Proxy identifier for `Forwarded: by=` and `Via`.
+    /// Proxy identifier for `Forwarded: by=`.
     pub by: &'a str,
+
+    /// `Via` entries of the proxy.
+    pub via: &'a Via,
 
     /// User header rules.
     pub rules: &'a RequestHeaders,
 
     /// Compiled `rules.replace`.
     pub replace: &'a [Replacement],
+}
+
+/// `X-Forwarded-For` entry of a peer. Built once per client connection.
+pub(crate) fn peer_ip_value(peer: SocketAddr) -> HeaderValue {
+    HeaderValue::from_str(&peer.ip().to_canonical().to_string())
+        .expect("an IP address is visible ASCII")
 }
 
 /// Compiled `replace` rule of a header.
@@ -232,18 +246,17 @@ pub(crate) fn prepare_request(
         headers.insert(header::HOST, value);
     }
 
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .unwrap_or_else(|| forwarding.local.to_string());
+    // A clone shares the bytes of the request head: the host name is not copied.
+    let host: HeaderValue = match headers.get(header::HOST) {
+        Some(value) if value.to_str().is_ok() => value.clone(),
+        _ => HeaderValue::from_str(&forwarding.local.to_string())
+            .expect("a socket address is visible ASCII"),
+    };
     let proto = if forwarding.tls { "https" } else { "http" };
 
     set_x_forwarded(headers, client_ip, forwarding, &host, proto);
     set_forwarded(headers, forwarding, &host, proto);
-
-    let via = format!("{} {}", version_token(version), forwarding.by);
-    append_list(headers, header::VIA, &via);
+    forwarding.via.append_to(headers, version);
 
     let rules = forwarding.rules;
     apply_rules(
@@ -259,70 +272,95 @@ fn set_x_forwarded(
     headers: &mut HeaderMap,
     client_ip: IpAddr,
     forwarding: &Forwarding<'_>,
-    host: &str,
-    proto: &str,
+    host: &HeaderValue,
+    proto: &'static str,
 ) {
-    let peer = forwarding.peer.ip().to_canonical().to_string();
-
     if forwarding.trusted {
-        append_list(headers, X_FORWARDED_FOR, &peer);
+        append_list(headers, X_FORWARDED_FOR, forwarding.peer_ip);
+    } else if client_ip == forwarding.peer.ip() {
+        headers.insert(X_FORWARDED_FOR, forwarding.peer_ip.clone());
     } else {
-        insert(
+        set_built(
             headers,
             X_FORWARDED_FOR,
-            &client_ip.to_canonical().to_string(),
+            /* extend= */ false,
+            |value| {
+                push(value, format_args!("{}", client_ip.to_canonical()));
+            },
         );
     }
 
     if !(forwarding.trusted && headers.contains_key(&X_FORWARDED_PROTO)) {
-        insert(headers, X_FORWARDED_PROTO, proto);
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
     }
     if !(forwarding.trusted && headers.contains_key(&X_FORWARDED_HOST)) {
-        insert(headers, X_FORWARDED_HOST, host);
+        headers.insert(X_FORWARDED_HOST, host.clone());
     }
 }
 
 /// RFC 7239 `Forwarded` header.
-fn set_forwarded(headers: &mut HeaderMap, forwarding: &Forwarding<'_>, host: &str, proto: &str) {
+fn set_forwarded(
+    headers: &mut HeaderMap,
+    forwarding: &Forwarding<'_>,
+    host: &HeaderValue,
+    proto: &str,
+) {
     let by = forwarding
         .rules
         .forwarded
         .by
         .as_deref()
         .unwrap_or(forwarding.by);
-    let element = format!(
-        "for={};by={};host={};proto={proto}",
-        quote(&node(forwarding.peer)),
-        quote(by),
-        quote(host)
+    let host = host.to_str().expect("prepare_request checked the host");
+
+    set_built(
+        headers,
+        header::FORWARDED,
+        forwarding.rules.forwarded.extend,
+        |element| {
+            element.push_str("for=");
+            push_node(element, forwarding.peer);
+            element.push_str(";by=");
+            push_quoted(element, by);
+            element.push_str(";host=");
+            push_quoted(element, host);
+            element.push_str(";proto=");
+            element.push_str(proto);
+        },
     );
-
-    if forwarding.rules.forwarded.extend {
-        append_list(headers, header::FORWARDED, &element);
-    } else {
-        insert(headers, header::FORWARDED, &element);
-    }
 }
 
-/// Node identifier of RFC 7239 section 6: IPv6 goes in brackets.
-fn node(address: SocketAddr) -> String {
+/// Appends the node identifier of RFC 7239 section 6. It always has a colon,
+/// so it is always quoted, and IPv6 goes in brackets.
+fn push_node(out: &mut String, address: SocketAddr) {
     match address.ip().to_canonical() {
-        IpAddr::V4(ip) => format!("{ip}:{}", address.port()),
-        IpAddr::V6(ip) => format!("[{ip}]:{}", address.port()),
+        IpAddr::V4(ip) => push(out, format_args!("\"{ip}:{}\"", address.port())),
+        IpAddr::V6(ip) => push(out, format_args!("\"[{ip}]:{}\"", address.port())),
     }
 }
 
-/// Quotes a value unless it is a plain token (RFC 9110 section 5.6.2).
-fn quote(value: &str) -> String {
+/// Appends `value`, quoted unless it is a plain token (RFC 9110 section 5.6.2).
+fn push_quoted(out: &mut String, value: &str) {
     let is_token = !value.is_empty()
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
     if is_token {
-        value.to_owned()
-    } else {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+        out.push_str(value);
+        return;
     }
+    out.push('"');
+    for character in value.chars() {
+        if matches!(character, '\\' | '"') {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('"');
+}
+
+fn push(out: &mut String, arguments: fmt::Arguments<'_>) {
+    fmt::Write::write_fmt(out, arguments).expect("writing to a String cannot fail");
 }
 
 /// Rewrites the headers of an upstream response before it goes to the client.
@@ -330,59 +368,99 @@ pub(crate) fn prepare_response<B>(
     response: &mut Response<B>,
     rules: &ResponseHeaders,
     replace: &[Replacement],
-    received_by: &str,
+    via: &Via,
 ) {
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         remove_hop_by_hop(response.headers_mut());
     }
 
-    let via = format!("{} {received_by}", version_token(response.version()));
+    let version = response.version();
     let headers = response.headers_mut();
 
     if rules.server.should_override {
-        insert(
-            headers,
+        headers.insert(
             header::SERVER,
-            &response::server_header(rules.server.version),
+            response::server_header(rules.server.version),
         );
     }
     if rules.via.extend {
-        append_list(headers, header::VIA, &via);
+        via.append_to(headers, version);
     }
     apply_rules(headers, &rules.remove, replace, &rules.set, &rules.add);
 }
 
-fn version_token(version: Version) -> &'static str {
-    match version {
-        Version::HTTP_09 => "0.9",
-        Version::HTTP_10 => "1.0",
-        Version::HTTP_2 => "2",
-        Version::HTTP_3 => "3",
-        _ => "1.1",
+/// `Via` entries of a proxy, one per HTTP version. They are built once and
+/// shared by every message, which only bumps a reference count.
+#[derive(Debug)]
+pub(crate) struct Via([Option<HeaderValue>; 5]);
+
+impl Via {
+    const VERSIONS: [&'static str; 5] = ["0.9", "1.0", "1.1", "2", "3"];
+
+    /// Entries of the proxy called `by`.
+    pub(crate) fn new(by: &str) -> Self {
+        Self(Self::VERSIONS.map(|version| HeaderValue::from_str(&format!("{version} {by}")).ok()))
+    }
+
+    /// Adds the entry of a message received with `version` to its `Via` list.
+    fn append_to(&self, headers: &mut HeaderMap, version: Version) {
+        let index = match version {
+            Version::HTTP_09 => 0,
+            Version::HTTP_10 => 1,
+            Version::HTTP_2 => 3,
+            Version::HTTP_3 => 4,
+            _ => 2,
+        };
+        // `None` when `by` is not a valid header value: no entry, as before.
+        if let Some(entry) = &self.0[index] {
+            append_list(headers, header::VIA, entry);
+        }
     }
 }
 
-fn insert(headers: &mut HeaderMap, name: HeaderName, value: &str) {
-    if let Ok(value) = HeaderValue::from_str(value) {
+thread_local! {
+    /// Buffer header values are built in, so that building one does not
+    /// allocate once the buffer has grown.
+    static SCRATCH: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Sets `name` to the text written by `build`. With `extend` it goes after
+/// the values the header already has, as a comma separated list.
+fn set_built(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    extend: bool,
+    build: impl FnOnce(&mut String),
+) {
+    let value: Option<HeaderValue> = SCRATCH.with_borrow_mut(|scratch| {
+        scratch.clear();
+        if extend {
+            for previous in headers.get_all(&name) {
+                if let Ok(previous) = previous.to_str() {
+                    scratch.push_str(previous.trim());
+                    scratch.push_str(", ");
+                }
+            }
+        }
+        build(scratch);
+        HeaderValue::from_str(scratch).ok()
+    });
+    if let Some(value) = value {
         headers.insert(name, value);
     }
 }
 
 /// Appends `value` to a comma separated list header.
-fn append_list(headers: &mut HeaderMap, name: HeaderName, value: &str) {
-    let previous: Vec<&str> = headers
-        .get_all(&name)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .map(str::trim)
-        .collect();
-
-    let combined = if previous.is_empty() {
-        value.to_owned()
-    } else {
-        format!("{}, {value}", previous.join(", "))
-    };
-    insert(headers, name, &combined);
+fn append_list(headers: &mut HeaderMap, name: HeaderName, value: &HeaderValue) {
+    if !headers.contains_key(&name) {
+        headers.insert(name, value.clone());
+        return;
+    }
+    if let Ok(text) = value.to_str() {
+        set_built(headers, name, /* extend= */ true, |list| {
+            list.push_str(text);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -390,12 +468,15 @@ mod tests {
     use super::*;
 
     fn forwarding(rules: &RequestHeaders, trusted: bool) -> Forwarding<'_> {
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
         Forwarding {
-            peer: "10.0.0.2:5000".parse().unwrap(),
+            peer,
+            peer_ip: Box::leak(Box::new(peer_ip_value(peer))),
             local: "127.0.0.1:8080".parse().unwrap(),
             trusted,
             tls: false,
             by: "edge",
+            via: Box::leak(Box::new(Via::new("edge"))),
             rules,
             replace: &[],
         }
@@ -545,7 +626,93 @@ mod tests {
 
     #[test]
     fn ipv6_nodes_are_bracketed_and_quoted() {
-        assert_eq!(quote(&node("[::1]:80".parse().unwrap())), "\"[::1]:80\"");
-        assert_eq!(quote("rxh"), "rxh");
+        let mut node = String::new();
+        push_node(&mut node, "[::1]:80".parse().unwrap());
+        assert_eq!(node, "\"[::1]:80\"");
+        node.clear();
+        push_node(&mut node, "[::ffff:10.0.0.2]:80".parse().unwrap());
+        assert_eq!(node, "\"10.0.0.2:80\"");
+    }
+
+    #[test]
+    fn only_values_that_are_not_tokens_are_quoted_and_escaped() {
+        let quoted = |value: &str| {
+            let mut out = String::new();
+            push_quoted(&mut out, value);
+            out
+        };
+        assert_eq!(quoted("rxh"), "rxh");
+        assert_eq!(quoted(""), "\"\"");
+        assert_eq!(quoted("example.com:8080"), "\"example.com:8080\"");
+        assert_eq!(quoted(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn lists_are_extended_and_forwarded_is_replaced_unless_extend() {
+        let mut rules = RequestHeaders::default();
+        rules.forwarded.extend = false;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "example.com".parse().unwrap());
+        headers.append(header::VIA, "1.0 first".parse().unwrap());
+        headers.append(header::VIA, " 1.1 second ".parse().unwrap());
+        headers.insert(header::FORWARDED, "for=1.2.3.4".parse().unwrap());
+
+        let mut replaced = headers.clone();
+        prepare_request(
+            &mut replaced,
+            Version::HTTP_11,
+            &Uri::from_static("/"),
+            "10.0.0.2".parse().unwrap(),
+            &forwarding(&rules, false),
+        );
+        assert_eq!(replaced[header::VIA], "1.0 first, 1.1 second, 1.1 edge");
+        assert_eq!(replaced.get_all(header::VIA).iter().count(), 1);
+        assert_eq!(
+            replaced[header::FORWARDED],
+            "for=\"10.0.0.2:5000\";by=edge;host=example.com;proto=http"
+        );
+
+        rules.forwarded.extend = true;
+        rules.forwarded.by = Some("my proxy".into());
+        prepare_request(
+            &mut headers,
+            Version::HTTP_11,
+            &Uri::from_static("/"),
+            "10.0.0.2".parse().unwrap(),
+            &forwarding(&rules, false),
+        );
+        assert_eq!(
+            headers[header::FORWARDED],
+            "for=1.2.3.4, for=\"10.0.0.2:5000\";by=\"my proxy\";host=example.com;proto=http"
+        );
+    }
+
+    #[test]
+    fn missing_host_falls_back_to_the_local_address() {
+        let rules = RequestHeaders::default();
+        let mut headers = HeaderMap::new();
+        prepare_request(
+            &mut headers,
+            Version::HTTP_10,
+            &Uri::from_static("/"),
+            "10.0.0.2".parse().unwrap(),
+            &forwarding(&rules, false),
+        );
+        assert_eq!(headers[&X_FORWARDED_HOST], "127.0.0.1:8080");
+        assert_eq!(headers[header::VIA], "1.0 edge");
+    }
+
+    #[test]
+    fn response_gets_server_and_via() {
+        let mut response = Response::new(());
+        response
+            .headers_mut()
+            .insert(header::SERVER, "backend".parse().unwrap());
+        let mut rules = ResponseHeaders::default();
+        rules.via.extend = true;
+        prepare_response(&mut response, &rules, &[], &Via::new("edge"));
+        let server = format!("rxh/{}", crate::VERSION);
+        assert_eq!(response.headers()[header::SERVER], server.as_str());
+        assert_eq!(response.headers()[header::VIA], "1.1 edge");
     }
 }

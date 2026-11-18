@@ -1,5 +1,7 @@
 //! Access log sink: text or JSON lines on stdout, stderr or an appended file.
 
+use std::cell::RefCell;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +10,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rxh_core::config::{Log, LogFormat};
 use serde_json::Value;
+
+/// Capacity the line buffer of a thread may keep between lines.
+const MAX_KEPT_LINE: usize = 4096;
+
+thread_local! {
+    /// Buffer text access lines are built in, so that a line does not
+    /// allocate once the buffer has grown.
+    static LINE: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Appends formatted text to an access line.
+pub(crate) fn push(line: &mut String, arguments: fmt::Arguments<'_>) {
+    fmt::Write::write_fmt(line, arguments).expect("writing to a String cannot fail");
+}
 
 enum Sink {
     Stdout,
@@ -23,8 +39,8 @@ pub(crate) struct Logger {
     write_failed: AtomicBool,
 }
 
-impl std::fmt::Debug for Logger {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Logger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Logger")
             .field("format", &self.format)
             .field("access", &self.access)
@@ -55,25 +71,36 @@ impl Logger {
         })
     }
 
-    /// Writes an access line: `text` in text format, `json` in JSON format.
-    pub(crate) fn access(&self, text: impl FnOnce() -> String, json: impl FnOnce() -> Value) {
+    /// Writes an access line: the one `text` appends to its argument in text
+    /// format, `json` in JSON format.
+    pub(crate) fn access(&self, text: impl FnOnce(&mut String), json: impl FnOnce() -> Value) {
         match self.format {
             LogFormat::Text => self.access_text(text),
             LogFormat::Json => self.access_json(json),
         }
     }
 
-    /// Writes an access line in text format only.
-    pub(crate) fn access_text(&self, text: impl FnOnce() -> String) {
+    /// Writes the access line `text` appends to its argument, in text format
+    /// only.
+    pub(crate) fn access_text(&self, text: impl FnOnce(&mut String)) {
         if self.access && self.format == LogFormat::Text {
-            self.write(&text());
+            LINE.with_borrow_mut(|line| {
+                line.clear();
+                text(line);
+                line.push('\n');
+                self.write(line);
+                // One huge URI must not pin its memory to the thread.
+                line.shrink_to(MAX_KEPT_LINE);
+            });
         }
     }
 
     /// Writes an access line in JSON format only.
     pub(crate) fn access_json(&self, json: impl FnOnce() -> Value) {
         if self.access && self.format == LogFormat::Json {
-            self.write(&json().to_string());
+            let mut line = json().to_string();
+            line.push('\n');
+            self.write(&line);
         }
     }
 
@@ -87,8 +114,8 @@ impl Logger {
         self.format == LogFormat::Text
     }
 
+    /// Writes `line`, which ends with its newline.
     fn write(&self, line: &str) {
-        let line = format!("{line}\n");
         // A broken log output must not take requests down: report the first
         // failure and keep going.
         let result = match &self.sink {

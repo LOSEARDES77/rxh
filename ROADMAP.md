@@ -81,8 +81,10 @@ goal of this milestone is to close most of that gap and to keep it closed.
       allocator calls, and the access log takes 13% of the CPU.
 - [ ] One runtime per core with `SO_REUSEPORT` listeners, instead of one
       work-stealing runtime, if profiling shows contention.
-- [ ] Fewer allocations per request: reuse header maps and buffers, avoid
-      cloning addresses and host names on every pick.
+- [x] Fewer allocations per request: reuse header maps and buffers, avoid
+      cloning addresses and host names on every pick. 84 allocator calls per
+      request down to 26, and 7% more requests per second in the
+      `throughput` scenario: docs/profiling.md.
 - [ ] `splice` zero copy for TCP on Linux.
 - [ ] Upstream HTTP/2 connection pool with more than one connection per
       backend.

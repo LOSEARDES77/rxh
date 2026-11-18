@@ -672,11 +672,11 @@ impl Pool {
                 .iter()
                 .find(|upstream| upstream.is_available())
                 .cloned(),
-            Policy::RoundRobin => {
-                let order: Vec<usize> = (0..upstreams.len()).collect();
-                self.rotate(upstreams, &order)
+            Policy::RoundRobin => self.rotate(upstreams, upstreams.len(), |turn| turn),
+            Policy::WeightedRoundRobin => {
+                let order = &members.weighted_order;
+                self.rotate(upstreams, order.len(), |turn| order[turn])
             }
-            Policy::WeightedRoundRobin => self.rotate(upstreams, &members.weighted_order),
             Policy::LeastConn => pick_least_conn(upstreams),
             Policy::IpHash => pick_rendezvous(upstreams, ip_key(context.peer_ip).as_bytes()),
             Policy::ClientIpHash => {
@@ -698,13 +698,20 @@ impl Pool {
         picked.map(Selection::plain)
     }
 
-    fn rotate(&self, upstreams: &[Arc<Upstream>], order: &[usize]) -> Option<Arc<Upstream>> {
-        if order.is_empty() {
+    /// First available member of a cycle of `turns` turns, starting one turn
+    /// later on every call. `member` is the index of the member of a turn.
+    fn rotate(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        turns: usize,
+        member: impl Fn(usize) -> usize,
+    ) -> Option<Arc<Upstream>> {
+        if turns == 0 {
             return None;
         }
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
-        (0..order.len())
-            .map(|offset| &upstreams[order[(start + offset) % order.len()]])
+        (0..turns)
+            .map(|offset| &upstreams[member((start + offset) % turns)])
             .find(|upstream| upstream.is_available())
             .cloned()
     }

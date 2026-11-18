@@ -147,12 +147,15 @@ async fn open_session(
     let backend = UdpSocket::bind(bind).await?;
     backend.connect(target).await?;
     metrics::global().record_l4(&settings.server, "udp");
-    settings.logger.access_text(|| {
-        format!(
-            "{client} -> {} UDP session to {}",
-            settings.log_name,
-            upstream.address()
-        )
+    settings.logger.access_text(|line| {
+        log::push(
+            line,
+            format_args!(
+                "{client} -> {} UDP session to {}",
+                settings.log_name,
+                upstream.address()
+            ),
+        );
     });
 
     let session = Session {

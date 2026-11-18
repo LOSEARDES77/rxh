@@ -123,6 +123,16 @@ Changed.
 
 ### Changed
 
+- A proxied HTTP request makes 26 allocator calls instead of 84. The
+  forwarding headers and the text access line are written into buffers kept
+  per thread, values that never change (`Via`, `Server`, the peer IP) are
+  built once and shared, the request head is copied for a retry only when
+  one is possible, and backend addresses and host names are no longer copied
+  for every request. The `throughput` scenario of `rxh-bench` serves 7% more
+  requests per second (227 800 to 243 800). Headers sent to backends and
+  clients, and log lines, are unchanged. Numbers in
+  [docs/profiling.md](docs/profiling.md#after-fewer-allocations).
+
 - `rxh-bench` exits with 1 only when rxh fails a scenario or cannot run it
   (`n/a`); failures of Caddy, NGINX and Traefik are reported but no longer
   change the exit code.

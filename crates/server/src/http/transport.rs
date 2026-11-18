@@ -18,22 +18,35 @@ use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rxh_core::config::UpstreamGroup;
+use rxh_core::pool::Upstream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::http::body::Body;
 use crate::stream::Dialer;
 
-/// Idle connections by [`key`].
+/// Idle connections by backend address, then by the preface they were
+/// opened with. Two levels, so that a lookup borrows both keys instead of
+/// building one.
 #[derive(Debug)]
 struct IdlePool {
-    lists: HashMap<Vec<u8>, Vec<Idle>>,
+    lists: HashMap<String, HashMap<Vec<u8>, Vec<Idle>>>,
     /// Last time expired connections of every key were dropped.
     swept: Instant,
 }
 
-/// Key of the connections to `address` opened with `preface`.
-fn key(address: &str, preface: &[u8]) -> Vec<u8> {
-    [address.as_bytes(), b"\0", preface].concat()
+impl IdlePool {
+    /// List of the connections to `address` opened with `preface`. The keys
+    /// are only copied the first time they are seen.
+    fn list_mut(&mut self, address: &str, preface: &[u8]) -> &mut Vec<Idle> {
+        if !self.lists.contains_key(address) {
+            self.lists.insert(address.to_owned(), HashMap::new());
+        }
+        let prefaces = self.lists.get_mut(address).expect("inserted above");
+        if !prefaces.contains_key(preface) {
+            prefaces.insert(preface.to_owned(), Vec::new());
+        }
+        prefaces.get_mut(preface).expect("inserted above")
+    }
 }
 
 #[derive(Debug)]
@@ -144,7 +157,7 @@ impl Transport {
         }
 
         let permit = self.acquire(address).await;
-        if let Some(sender) = self.take_idle(&key(address, preface)) {
+        if let Some(sender) = self.take_idle(address, preface) {
             return Ok(Connection::Http1 {
                 sender,
                 reused: true,
@@ -164,13 +177,18 @@ impl Transport {
         if self.max_conns == 0 {
             return None;
         }
-        let semaphore = Arc::clone(
-            self.limits
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(address.to_owned())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.max_conns))),
-        );
+        let semaphore = {
+            let mut limits = self.limits.lock().unwrap_or_else(PoisonError::into_inner);
+            // The address is only copied for the first request to a backend.
+            match limits.get(address) {
+                Some(semaphore) => Arc::clone(semaphore),
+                None => {
+                    let semaphore = Arc::new(Semaphore::new(self.max_conns));
+                    limits.insert(address.to_owned(), Arc::clone(&semaphore));
+                    semaphore
+                }
+            }
+        };
         let permit = semaphore
             .acquire_owned()
             .await
@@ -199,9 +217,9 @@ impl Transport {
         Ok(sender)
     }
 
-    fn take_idle(&self, key: &[u8]) -> Option<http1::SendRequest<Body>> {
+    fn take_idle(&self, address: &str, preface: &[u8]) -> Option<http1::SendRequest<Body>> {
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        let list = idle.lists.get_mut(key)?;
+        let list = idle.lists.get_mut(address)?.get_mut(preface)?;
         while let Some(entry) = list.pop() {
             if entry.since.elapsed() < self.keepalive && entry.sender.is_ready() {
                 return Some(entry.sender);
@@ -213,7 +231,13 @@ impl Transport {
     /// Puts the connection back in the idle pool once the response body has
     /// been read completely. `permit` is held until then, or until the
     /// connection closes.
-    fn recycle(&self, key: Vec<u8>, mut sender: http1::SendRequest<Body>, permit: Permit) {
+    fn recycle(
+        &self,
+        upstream: &Arc<Upstream>,
+        preface: &[u8],
+        mut sender: http1::SendRequest<Body>,
+        permit: Permit,
+    ) {
         let pooled = !self.keepalive.is_zero() && self.max_idle > 0;
         if !pooled && permit.is_none() {
             return;
@@ -221,6 +245,10 @@ impl Transport {
 
         let idle = Arc::clone(&self.idle);
         let (keepalive, max_idle) = (self.keepalive, self.max_idle);
+        // The task shares the backend instead of copying its address. An
+        // empty preface, the usual one, is not allocated.
+        let upstream = Arc::clone(upstream);
+        let preface = preface.to_vec();
 
         tokio::task::spawn(async move {
             // Dropped last, after the connection is idle or closed.
@@ -234,13 +262,16 @@ impl Transport {
             // With a PROXY header every client connection has its own key, which is
             // never asked for again once the client is gone.
             if idle.swept.elapsed() >= keepalive {
-                idle.lists.retain(|_, list| {
-                    list.retain(fresh);
-                    !list.is_empty()
+                idle.lists.retain(|_, prefaces| {
+                    prefaces.retain(|_, list| {
+                        list.retain(fresh);
+                        !list.is_empty()
+                    });
+                    !prefaces.is_empty()
                 });
                 idle.swept = Instant::now();
             }
-            let list = idle.lists.entry(key).or_default();
+            let list = idle.list_mut(upstream.address(), &preface);
             list.retain(fresh);
             if list.len() < max_idle {
                 list.push(Idle {
@@ -255,7 +286,7 @@ impl Transport {
     /// permit until it is done with the response body or the upgraded tunnel.
     pub(crate) async fn send(
         &self,
-        address: &str,
+        upstream: &Arc<Upstream>,
         preface: &[u8],
         connection: Connection,
         request: Request<Body>,
@@ -271,7 +302,7 @@ impl Transport {
                 permit,
             } => match sender.try_send_request(request).await {
                 Ok(response) => {
-                    self.recycle(key(address, preface), sender, permit.clone());
+                    self.recycle(upstream, preface, sender, permit.clone());
                     Ok((response, permit))
                 }
                 Err(mut err) => match err.take_message() {
@@ -285,11 +316,10 @@ impl Transport {
     /// Drops the idle connections to `address` opened with `preface`, after
     /// one of them was found dead.
     pub(crate) fn forget(&self, address: &str, preface: &[u8]) {
-        self.idle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .lists
-            .remove(&key(address, preface));
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(prefaces) = idle.lists.get_mut(address) {
+            prefaces.remove(preface);
+        }
     }
 
     /// True when requests must be HTTP/2 with an absolute URI.

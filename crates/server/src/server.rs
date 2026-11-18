@@ -25,6 +25,7 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::error::Error;
+use crate::http::headers;
 use crate::http::service::{Activity, Route, Service, Site};
 use crate::l4match::{self, Detected, L4Matcher, Rewind};
 use crate::log::{ListenerLog, Logger};
@@ -602,6 +603,7 @@ async fn serve<S>(
                 routes: Arc::clone(routes),
                 log_name: Arc::clone(&context.log.log_name),
                 peer,
+                peer_ip: headers::peer_ip_value(peer),
                 local,
                 activity: Arc::clone(&activity),
                 logger: Arc::clone(&context.log.logger),
