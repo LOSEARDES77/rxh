@@ -77,6 +77,12 @@ Changed.
 - HTTP to HTTPS redirect: `https_redirect = true` on a TLS `http` server
   answers plain requests for its `host` names on `[acme] http_port` with
   `308` to `https://{host}{uri}`. On by default with `tls = "auto"`.
+- `flush_interval` on a pool writes responses with a `Content-Length` to
+  the client in batches collected for that long; server-sent events and
+  streams of unknown length are still written at once.
+- `stream_close_delay` on an `http` server closes upgraded tunnels
+  (WebSockets) that long after the listener stops on a reload or shutdown;
+  unset keeps them open as before.
 - Health event hooks: `[upstream.NAME.health.hooks]` runs a `command`
   (event in `RXH_EVENT`, `RXH_POOL`, `RXH_UPSTREAM`, `RXH_REASON`) and posts
   JSON to a `webhook` when active checks mark a backend `healthy` or

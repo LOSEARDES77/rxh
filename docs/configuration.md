@@ -221,6 +221,7 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `max_conns_per_host` | `0` | `max_conns_per_host` | Most HTTP/1.1 connections open to each backend, idle ones included. Requests over the limit wait for a free connection (they are not failed or sent elsewhere; use `passive.unhealthy_request_count` for that). Upgraded tunnels (WebSockets) count. `0` means no limit. Ignored with `h2c`, which shares one connection per backend, and on `tcp` and `udp` servers. |
 | `request_buffers` | `0` | `request_buffers` | [Size](#sizes): bytes of each request body read before a backend is picked and dialed. A body that fits is sent with a `Content-Length`; the rest of a larger one is streamed. `0` streams everything. Not applied to upgrades. |
 | `response_buffers` | `0` | `response_buffers` | [Size](#sizes): bytes of each response body read before the response goes to the client, which frees the backend from slow clients. Same rules as `request_buffers`; a backend failing meanwhile gives `502`. |
+| `flush_interval` | unset | `flush_interval` | Hold back response data and write it to the client in batches, at most this long after the first held byte (or as soon as 64 KiB are held, or the body ends). Only for responses with a `Content-Length` that are not `text/event-stream`; streams of unknown length and server-sent events are always written as they arrive, like in Caddy. Unset writes every chunk at once (Caddy's `-1`); `0` and negative values are rejected. |
 | `tls` | | `transport http { tls }` | Table of TLS client settings, see below. Setting it enables TLS for every backend, also without `https://`. |
 | `health` | | active health checks | Table, see below. |
 | `passive` | | passive health checks | Table, see below. |
@@ -234,6 +235,15 @@ backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
 max_conns_per_host = 8
 request_buffers = "64KiB"
 response_buffers = "1MiB"
+```
+
+Example: fewer, larger writes to clients of a backend that sends many small
+chunks:
+
+```toml
+[upstream.reports]
+backends = ["10.0.0.3:8080"]
+flush_interval = "100ms"
 ```
 
 ### Sizes
@@ -415,6 +425,7 @@ socket, except that `http` servers listing the same address share one socket
 | `read_header_timeout` | `"30s"` (TLS handshake `"10s"`) | Time a client has to send the request headers; slower clients are disconnected (http only). It also bounds the TLS handshake (`http` and `tcp` servers with `tls`) and the time to the first complete request head of a connection, HTTP/2 included, so clients that connect and send nothing are closed too. When unset, request heads get 30 seconds and TLS handshakes 10 seconds. On a listener shared by several http servers, this and `idle_timeout` come from the first server. |
 | `idle_timeout` | unset | Keep-alive HTTP connections without traffic and without requests in flight for this long are closed. For `tcp`, a connection with no traffic in either direction for this long is closed. |
 | `stream_timeout` | unset | Maximum lifetime of upgraded HTTP tunnels (WebSockets) and of `tcp` connections. |
+| `stream_close_delay` | unset | Upgraded HTTP tunnels (WebSockets) are closed this long after the listener stops, on a reload that replaces it or on shutdown; `"0s"` closes them at once, like Caddy's default. Spreading the reconnects of many clients over the delay avoids a thundering herd. Unset keeps tunnels open across reloads until either side ends them (on daemon exit they end with the process). Example: `stream_close_delay = "5m"` (http only). |
 | `udp_idle_timeout` | `"60s"` | Idle time after which a UDP client session ends (udp only). |
 | `request`, `response`, `cache`, `encode` | | Same as in `match` entries, for the single pattern form. |
 

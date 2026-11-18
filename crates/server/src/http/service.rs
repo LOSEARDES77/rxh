@@ -16,7 +16,7 @@ use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, Resp
 use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::IpNet;
 use rxh_core::template::Template;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
 use crate::acme;
@@ -51,6 +51,10 @@ pub(crate) struct Site {
 
     /// Maximum lifetime of upgraded tunnels.
     pub(crate) stream_timeout: Option<Duration>,
+
+    /// `stream_close_delay`, and the flag the listener raises when it shuts
+    /// down.
+    pub(crate) stream_close: Option<(Duration, watch::Receiver<bool>)>,
 }
 
 /// One compiled pattern.
@@ -113,6 +117,7 @@ impl Site {
         registry: &Registry,
         log_name: String,
         local: SocketAddr,
+        closing: &watch::Receiver<bool>,
         routes: &mut Vec<Route>,
     ) -> Result<(), Error> {
         let site = Arc::new(Self {
@@ -121,6 +126,9 @@ impl Site {
             trusted_proxies: server.trusted_proxies.clone(),
             tls: server.tls.is_some(),
             stream_timeout: server.stream_timeout,
+            stream_close: server
+                .stream_close_delay
+                .map(|delay| (delay, closing.clone())),
         });
 
         for (pattern_index, pattern) in server.patterns.iter().enumerate() {

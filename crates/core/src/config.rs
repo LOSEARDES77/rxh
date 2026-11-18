@@ -246,6 +246,12 @@ impl Config {
                 }
             }
 
+            if server.protocol != Protocol::Http && server.stream_close_delay.is_some() {
+                return invalid(format!(
+                    "{label}: stream_close_delay only applies to http servers"
+                ));
+            }
+
             if server.protocol == Protocol::Udp && !server.host.is_empty() {
                 return invalid(format!("{label}: host does not apply to udp servers"));
             }
@@ -680,6 +686,11 @@ pub struct Server {
     /// Maximum lifetime of upgraded HTTP tunnels and `tcp` connections.
     #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
     pub stream_timeout: Option<Duration>,
+
+    /// Time upgraded HTTP tunnels stay open once the listener shuts down or
+    /// is replaced by a reload. Unset keeps them open until they end.
+    #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    pub stream_close_delay: Option<Duration>,
 }
 
 impl Server {
@@ -749,6 +760,8 @@ struct RawServer {
     idle_timeout: Option<Duration>,
     #[serde(default, with = "duration::option")]
     stream_timeout: Option<Duration>,
+    #[serde(default, with = "duration::option")]
+    stream_close_delay: Option<Duration>,
 }
 
 impl TryFrom<RawServer> for Server {
@@ -848,6 +861,7 @@ impl TryFrom<RawServer> for Server {
             read_header_timeout: raw.read_header_timeout,
             idle_timeout: raw.idle_timeout,
             stream_timeout: raw.stream_timeout,
+            stream_close_delay: raw.stream_close_delay,
         })
     }
 }
@@ -1709,6 +1723,16 @@ pub struct UpstreamGroup {
     )]
     pub response_buffers: usize,
 
+    /// Responses with a `Content-Length` are written to the client in
+    /// batches collected for this long. Unset writes every chunk at once
+    /// (Caddy `flush_interval -1`).
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub flush_interval: Option<Duration>,
+
     /// Backends. Port ranges such as `10.0.0.1:8001-8004` expand to many.
     #[serde(default, alias = "to")]
     pub backends: Vec<Backend>,
@@ -1864,6 +1888,7 @@ impl UpstreamGroup {
             max_conns_per_host: 0,
             request_buffers: 0,
             response_buffers: 0,
+            flush_interval: None,
             backends,
             health: None,
             passive: None,
@@ -1945,6 +1970,7 @@ impl UpstreamGroup {
             ("response_header_timeout", self.response_header_timeout),
             ("read_timeout", self.read_timeout),
             ("write_timeout", self.write_timeout),
+            ("flush_interval", self.flush_interval),
         ] {
             if value.is_some_and(|value| value.is_zero()) {
                 return Err(format!("{name} must be greater than zero"));
@@ -3936,6 +3962,76 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
             (0, 0, 0)
         );
         assert_eq!(RequestConfig::default().max_body_size, None);
+    }
+
+    #[test]
+    fn flush_interval_and_stream_close_delay_parse() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            stream_close_delay = "5s"
+            forward = { backends = ["127.0.0.1:1"], flush_interval = "100ms" }
+            "#,
+        )
+        .unwrap();
+
+        let server = &config.servers[0];
+        assert_eq!(server.stream_close_delay, Some(Duration::from_secs(5)));
+        let Action::Forward(Forward::Inline(group)) = &server.patterns[0].action else {
+            panic!("expected an inline pool");
+        };
+        assert_eq!(group.flush_interval, Some(Duration::from_millis(100)));
+
+        // Zero closes tunnels right away, like Caddy's default.
+        let config = Config::from_toml(
+            "[[server]]\nlisten = \"127.0.0.1:0\"\nstream_close_delay = \"0s\"\nforward = \"a:1\"",
+        )
+        .unwrap();
+        assert_eq!(config.servers[0].stream_close_delay, Some(Duration::ZERO));
+
+        // Off by default.
+        assert_eq!(UpstreamGroup::default().flush_interval, None);
+        let config =
+            Config::from_toml("[[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"a:1\"").unwrap();
+        assert_eq!(config.servers[0].stream_close_delay, None);
+    }
+
+    #[test]
+    fn invalid_flush_interval_and_stream_close_delay_are_rejected() {
+        let server = |options: &str| format!("[[server]]\nlisten = \"127.0.0.1:1\"\n{options}");
+        let pool = |options: &str| {
+            server(&format!(
+                "forward = \"@pool\"\n[upstream.pool]\nbackends = [\"a:1\"]\n{options}"
+            ))
+        };
+        for (text, expected) in [
+            (
+                pool("flush_interval = \"0s\""),
+                "flush_interval must be greater than zero",
+            ),
+            (pool("flush_interval = -1"), "flush_interval"),
+            (pool("flush_interval = \"soon\""), "invalid duration"),
+            (
+                server("stream_close_delay = \"later\"\nforward = \"127.0.0.1:2\""),
+                "invalid duration",
+            ),
+            (
+                server(
+                    "protocol = \"tcp\"\nstream_close_delay = \"1s\"\nforward = \"127.0.0.1:2\"",
+                ),
+                "stream_close_delay only applies to http servers",
+            ),
+            (
+                server(
+                    "protocol = \"udp\"\nstream_close_delay = \"1s\"\nforward = \"127.0.0.1:2\"",
+                ),
+                "stream_close_delay only applies to http servers",
+            ),
+        ] {
+            let message = invalid(&text);
+            assert!(message.contains(expected), "{text}: {message}");
+        }
     }
 
     #[test]

@@ -116,6 +116,8 @@ pub struct Server {
     grace_period: Option<Duration>,
     context: Option<Arc<ConnectionContext>>,
     cert_resolver: Option<Arc<CertResolver>>,
+    /// Raised on shutdown, for `stream_close_delay`.
+    closing: watch::Sender<bool>,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
@@ -172,6 +174,7 @@ impl Server {
         let logger = Arc::new(Logger::new(&config.log)?);
 
         let mut cert_resolver = None;
+        let closing = watch::Sender::new(false);
         let (socket, context) = match socket {
             SocketKind::Udp(socket) => {
                 let settings = UdpSettings {
@@ -230,6 +233,7 @@ impl Server {
                                 registry,
                                 site_log_name(member.name.as_deref()),
                                 address,
+                                &closing.subscribe(),
                                 &mut routes,
                             )?;
                         }
@@ -272,6 +276,7 @@ impl Server {
             grace_period: config.grace_period,
             context,
             cert_resolver,
+            closing,
             shutdown: Box::pin(std::future::pending()),
         })
     }
@@ -327,6 +332,7 @@ impl Server {
             max_connections,
             grace_period,
             context,
+            closing,
             shutdown,
             ..
         } = self;
@@ -349,6 +355,7 @@ impl Server {
 
                 // Stop accepting: new clients get "connection refused".
                 drop(listener);
+                closing.send_replace(true);
                 while connections.try_join_next().is_some() {}
 
                 let pending = connections.len();
