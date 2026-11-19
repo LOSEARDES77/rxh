@@ -179,6 +179,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Environment variables in the config (`{$VAR}`, `{env.*}`, `{file.*}`) | `{env.NAME}`, `{file.PATH}` in any string value | 🟡 | Replaced when the file loads and on every reload, in the main and included files; secret files relative to the file that names them, trailing newlines dropped. An unset variable or unreadable file is an error: no `{$VAR:default}`. Not replaced in `POST /load` uploads, and not at request time. |
 | Effective config | `rxh config show [--json]` | ➕ | Daemon `/config` when reachable, else the merged files. |
 | Live status table | `rxh status` | ➕ | |
+| `caddy completion`, `caddy manpage` | `rxh completions SHELL`, `rxh man [--dir DIR]` | ✅ | Generated from the clap definition: bash, zsh, fish, elvish, PowerShell (no nushell); `rxh man` prints rxh(1), `--dir` writes it plus one page per subcommand. |
 | Certificate list with expiry | `rxh cert list [--json]`, `GET /certificates`; `rxh cert reload`, `POST /certificates/reload` | ➕ | Every certificate of every TLS listener (files and ACME): names, hosts, expiry, days left, source file, OCSP staple. Traefik shows certificates in its dashboard only. |
 
 ## Next steps

@@ -9,6 +9,10 @@ Changed.
 
 ### Added
 
+- `rxh completions SHELL` prints the completion script for bash, zsh, fish,
+  elvish or PowerShell, and `rxh man` prints the rxh(1) man page
+  (`rxh man --dir DIR` writes `rxh.1` and one `rxh-COMMAND.1` page per
+  command and subcommand), both generated from the command line definition.
 - `{env.NAME}` and `{file.PATH}` placeholders in any string value of the
   configuration file and its included files: the environment variable, or
   the contents of the file without trailing newlines (relative to the

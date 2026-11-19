@@ -12,7 +12,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use rxh_core::config::{AdminListen, BasicAuth, Config};
 
 use crate::cli::{Cli, Command};
@@ -42,6 +42,8 @@ fn main() -> ExitCode {
             })
         }
         Some(Command::HashPassword) => hash_password(),
+        Some(Command::Completions { shell }) => completions(shell),
+        Some(Command::Man { dir }) => man(dir.as_deref()),
         Some(command) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -97,6 +99,43 @@ fn hash_password() -> Result<(), String> {
     }
     println!("{}", BasicAuth::hash_password(password)?);
     Ok(())
+}
+
+/// `rxh completions`: prints the completion script of `shell`.
+fn completions(shell: clap_complete::Shell) -> Result<(), String> {
+    use std::io::Write;
+
+    // `generate` panics on write errors (a closed pipe), so render to memory.
+    let mut script: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "rxh", &mut script);
+    io::stdout()
+        .write_all(&script)
+        .map_err(|err| format!("cannot write the completions: {err}"))
+}
+
+/// `rxh man`: prints `rxh.1`, or writes every page into `dir`.
+fn man(dir: Option<&Path>) -> Result<(), String> {
+    let mut command = Cli::command().disable_help_subcommand(true);
+    command.build();
+    let result = match dir {
+        None => man_page(command).render(&mut io::stdout()),
+        Some(dir) => std::fs::create_dir_all(dir).and_then(|()| write_man_pages(command, dir)),
+    };
+    result.map_err(|err| format!("cannot write the man pages: {err}"))
+}
+
+/// Writes the page of `command` and of each of its subcommands into `dir`.
+fn write_man_pages(command: clap::Command, dir: &Path) -> io::Result<()> {
+    for subcommand in command.get_subcommands() {
+        write_man_pages(subcommand.clone(), dir)?;
+    }
+    man_page(command).generate_to(dir).map(|_| ())
+}
+
+/// The page of a built command, with the `rxh VERSION` footer that clap_mangen
+/// would otherwise leave as the bare subcommand name.
+fn man_page(command: clap::Command) -> clap_mangen::Man {
+    clap_mangen::Man::new(command).source(format!("rxh {}", rxh_server::VERSION))
 }
 
 /// Runs a configuration that has no file in the foreground.
