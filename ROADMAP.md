@@ -109,7 +109,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
       RFC 2136).
 - [x] mTLS on listeners with the four Traefik modes, and the client
       certificate subject passed to backends.
-- [ ] TLS options: minimum version, cipher suites, curves. OCSP stapling.
+- [x] TLS options: minimum version, cipher suites, curves. OCSP stapling.
 - [ ] Certificate reload without restart, and `rxh cert` commands to list
       certificates and expiry dates.
 - [ ] IP allow and deny lists, rate limiting, concurrent connection limit

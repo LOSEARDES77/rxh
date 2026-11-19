@@ -30,6 +30,7 @@ use crate::http::headers;
 use crate::http::service::{Activity, Route, Service, Site};
 use crate::l4match::{self, Detected, L4Matcher, Rewind};
 use crate::log::{ListenerLog, Logger};
+use crate::ocsp;
 use crate::proxy_protocol;
 use crate::registry::Registry;
 use crate::tcp;
@@ -135,6 +136,8 @@ pub struct Server {
     grace_period: Option<Duration>,
     context: Option<Arc<ConnectionContext>>,
     cert_resolver: Option<Arc<CertResolver>>,
+    /// Keeps OCSP responses stapled to the certificates of `cert_resolver`.
+    ocsp_stapling: bool,
     /// False for replicas, which do not repeat the messages of the first
     /// listener.
     announce: bool,
@@ -300,6 +303,10 @@ impl Server {
             grace_period: config.grace_period,
             context,
             cert_resolver,
+            ocsp_stapling: server
+                .tls_options
+                .as_ref()
+                .is_none_or(|options| options.ocsp_stapling),
             announce: true,
             closing,
             shutdown: Box::pin(std::future::pending()),
@@ -341,6 +348,7 @@ impl Server {
             grace_period: replica.grace_period,
             context: Some(replica.context),
             cert_resolver: None,
+            ocsp_stapling: false,
             announce: false,
             closing: replica.closing,
             shutdown: Box::pin(std::future::pending()),
@@ -399,11 +407,19 @@ impl Server {
             permits,
             grace_period,
             context,
+            cert_resolver,
+            ocsp_stapling,
             announce,
             closing,
             shutdown,
             ..
         } = self;
+
+        // Dropped, and so aborted, when the listener stops.
+        let mut background = JoinSet::new();
+        if ocsp_stapling && let Some(resolver) = cert_resolver {
+            background.spawn(ocsp::run(resolver));
+        }
 
         state.send_replace(State::Listening);
         if announce {

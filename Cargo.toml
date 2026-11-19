@@ -15,6 +15,7 @@ rxh-core = { path = "crates/core", version = "0.3.0" }
 rxh-server = { path = "crates/server", version = "0.3.0" }
 
 async-compression = { version = "0.4.52", features = ["tokio", "gzip", "zstd", "brotli"] }
+aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys"] }
 bytes = "1.12.2"
 clap = { version = "4.6.8", features = ["derive", "env"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

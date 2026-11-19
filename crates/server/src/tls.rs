@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use hyper::header::HeaderValue;
-use rxh_core::config::{self, ClientAuth, Protocol, Tls};
+use rxh_core::config::{self, ClientAuth, Protocol, Tls, TlsOptions, TlsVersion};
 use rxh_core::matcher::HostPattern;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
@@ -19,7 +19,7 @@ use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert, WebPkiClient
 use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{
     self, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig, ServerConnection,
-    SignatureScheme,
+    SignatureScheme, SupportedProtocolVersion,
 };
 
 use crate::acme;
@@ -140,6 +140,41 @@ impl CertResolver {
         certificates
             .reserved
             .extend(names.iter().map(|name| name.to_ascii_lowercase()));
+        *guard = Arc::new(certificates);
+    }
+
+    /// Every distinct certificate served.
+    pub(crate) fn keys(&self) -> Vec<Arc<CertifiedKey>> {
+        let certificates = Arc::clone(
+            &self
+                .certificates
+                .read()
+                .expect("nothing panics while holding the certificate lock"),
+        );
+        let mut keys: Vec<Arc<CertifiedKey>> = Vec::new();
+        let served = certificates.hosts.iter().map(|(_, key)| key);
+        for key in served.chain(&certificates.default) {
+            if !keys.iter().any(|known| Arc::ptr_eq(known, key)) {
+                keys.push(Arc::clone(key));
+            }
+        }
+        keys
+    }
+
+    /// Serves `new` wherever `old` is served. Does nothing if `old` was
+    /// replaced in the meantime.
+    pub(crate) fn replace(&self, old: &Arc<CertifiedKey>, new: Arc<CertifiedKey>) {
+        let mut guard = self
+            .certificates
+            .write()
+            .expect("nothing panics while holding the certificate lock");
+        let mut certificates = Certificates::clone(&guard);
+        let served = certificates.hosts.iter_mut().map(|(_, key)| key);
+        for key in served.chain(&mut certificates.default) {
+            if Arc::ptr_eq(key, old) {
+                *key = Arc::clone(&new);
+            }
+        }
         *guard = Arc::new(certificates);
     }
 
@@ -314,10 +349,33 @@ pub(crate) fn client_subject(connection: &ServerConnection) -> Option<HeaderValu
     HeaderValue::from_bytes(certificate.subject().to_string().as_bytes()).ok()
 }
 
+/// The crypto provider `default` narrowed to the cipher suites and curves of
+/// `options`.
+fn provider_with(default: &CryptoProvider, options: &TlsOptions) -> CryptoProvider {
+    let mut provider = default.clone();
+    if !options.cipher_suites.is_empty() {
+        // Rustls calls the TLS 1.3 suites `TLS13_*`, IANA `TLS_*`.
+        provider.cipher_suites.retain(|suite| {
+            let name = format!("{:?}", suite.suite()).replacen("TLS13_", "TLS_", 1);
+            options.cipher_suites.contains(&name)
+        });
+    }
+    if !options.curves.is_empty() {
+        provider.kx_groups.retain(|group| {
+            let name = format!("{:?}", group.name());
+            options
+                .curves
+                .iter()
+                .any(|curve| curve.eq_ignore_ascii_case(&name))
+        });
+    }
+    provider
+}
+
 /// Builds the TLS acceptor of a listener shared by `servers` and the
 /// resolver it picks certificates with, or `None` if they do not use TLS
-/// (validation guarantees all or none of them do). ALPN and `client_auth`
-/// follow the first server. `tls = "auto"` servers start without certificates, the ACME
+/// (validation guarantees all or none of them do). ALPN, `client_auth` and
+/// `tls_options` follow the first server. `tls = "auto"` servers start without certificates, the ACME
 /// manager adds them to the resolver.
 pub(crate) fn acceptor(
     servers: &[&config::Server],
@@ -326,8 +384,16 @@ pub(crate) fn acceptor(
         return Ok(None);
     };
 
-    let builder = ServerConfig::builder();
-    let provider = Arc::clone(builder.crypto_provider());
+    let options = first.tls_options.clone().unwrap_or_default();
+    let default = Arc::clone(ServerConfig::builder().crypto_provider());
+    let provider = Arc::new(provider_with(&default, &options));
+    let versions: &[&SupportedProtocolVersion] = match options.min_version {
+        TlsVersion::V1_2 => rustls::DEFAULT_VERSIONS,
+        TlsVersion::V1_3 => &[&rustls::version::TLS13],
+    };
+    let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(versions)
+        .map_err(|err| io::Error::other(format!("tls_options: {err}")))?;
     let builder = match &first.client_auth {
         None => builder.with_no_client_auth(),
         Some(client_auth) => {
@@ -474,6 +540,49 @@ mod tests {
         assert!(!resolver.should_log_failure("a.test", start + Duration::from_secs(59)));
         assert!(resolver.should_log_failure("b.test", start));
         assert!(resolver.should_log_failure("a.test", start + FAILURE_LOG_INTERVAL));
+    }
+
+    #[test]
+    fn every_tls_option_name_is_known_to_the_provider() {
+        let default = Arc::clone(ServerConfig::builder().crypto_provider());
+        for suite in TlsOptions::CIPHER_SUITES {
+            let options = TlsOptions {
+                cipher_suites: vec![suite.to_owned()],
+                ..TlsOptions::default()
+            };
+            let provider = provider_with(&default, &options);
+            assert_eq!(provider.cipher_suites.len(), 1, "{suite}");
+        }
+        for curve in TlsOptions::CURVES {
+            let options = TlsOptions {
+                curves: vec![curve.to_ascii_uppercase()],
+                ..TlsOptions::default()
+            };
+            let provider = provider_with(&default, &options);
+            assert_eq!(provider.kx_groups.len(), 1, "{curve}");
+        }
+
+        let untouched = provider_with(&default, &TlsOptions::default());
+        assert_eq!(untouched.cipher_suites.len(), default.cipher_suites.len());
+        assert_eq!(untouched.kx_groups.len(), default.kx_groups.len());
+    }
+
+    #[test]
+    fn replace_swaps_one_certificate_everywhere() {
+        let (resolver, keys) = resolver_with(&[&["a.test", "b.test"], &["c.test"]]);
+        assert_eq!(resolver.keys().len(), 2, "one entry per certificate");
+        let stapled = Arc::new(CertifiedKey {
+            ocsp: Some(vec![1]),
+            ..CertifiedKey::clone(&keys[0])
+        });
+        resolver.replace(&keys[0], Arc::clone(&stapled));
+        for name in [Some("a.test"), Some("b.test"), None] {
+            assert!(is(resolver.select(name), &stapled), "{name:?}");
+        }
+        assert!(is(resolver.select(Some("c.test")), &keys[1]));
+        // The old certificate is gone: replacing it again changes nothing.
+        resolver.replace(&keys[0], Arc::clone(&keys[1]));
+        assert!(is(resolver.select(Some("a.test")), &stapled));
     }
 
     #[test]

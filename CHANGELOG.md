@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- `tls_options = { min_version, cipher_suites, curves, ocsp_stapling }` on
+  servers with `tls`: the lowest TLS version accepted (`"1.2"`, the default,
+  or `"1.3"`), the cipher suites offered (IANA names) and the key exchange
+  groups offered (`X25519MLKEM768`, `X25519`, `secp256r1`, `secp384r1`).
+- OCSP stapling, on by default on every TLS listener
+  (`tls_options = { ocsp_stapling = false }` turns it off): certificates
+  that name an OCSP responder get its answer stapled to the handshake,
+  fetched in the background and refreshed halfway through its validity.
 - `client_auth = { mode, ca, header }` on servers with `tls`: mutual TLS with
   the four Traefik modes, `"request"`, `"require"`, `"verify_if_given"` and
   `"require_and_verify"` (default). `ca` lists the PEM files of the
