@@ -23,6 +23,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
+use crate::acme;
 use crate::error::Error;
 use crate::http::headers;
 use crate::http::service::{Activity, Route, Service, Site};
@@ -608,6 +609,10 @@ async fn handle_connection(
             Err(_) => eprintln!("{log_name} => TLS handshake with {peer} timed out"),
             Ok(Ok(stream)) => {
                 let (_, connection) = stream.get_ref();
+                // A TLS-ALPN-01 validation ends with the handshake.
+                if connection.alpn_protocol() == Some(acme::TLS_ALPN_PROTOCOL) {
+                    return;
+                }
                 let handshake = Detected {
                     tls: true,
                     sni: connection.server_name().map(str::to_owned),

@@ -15,6 +15,8 @@ use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
 use tokio_rustls::rustls::sign::CertifiedKey;
 
+use crate::acme;
+
 /// Picks a certificate by SNI. Exact host names beat wildcards; a client
 /// without SNI, or with a name that matches nothing, gets the default (first)
 /// certificate, except for names passed to [`CertResolver::reserve`].
@@ -50,6 +52,10 @@ impl CertResolver {
             certificates: RwLock::default(),
             failures_logged: Mutex::default(),
         }
+    }
+
+    pub(crate) fn provider(&self) -> &CryptoProvider {
+        &self.provider
     }
 
     /// Parses a PEM certificate chain and its PEM private key.
@@ -188,6 +194,14 @@ impl CertResolver {
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let server_name = client_hello.server_name();
+        // A TLS-ALPN-01 validation only ever sees the challenge certificate,
+        // and nothing else ever does (RFC 8737, section 3).
+        if client_hello
+            .alpn()
+            .is_some_and(|mut protocols| protocols.any(|p| p == acme::TLS_ALPN_PROTOCOL))
+        {
+            return acme::challenge_certificate(server_name?);
+        }
         let key = self.select(server_name);
         if key.is_none() {
             let name = server_name.unwrap_or("a client without SNI");
@@ -231,7 +245,7 @@ pub(crate) fn acceptor(
 
     let mut config =
         builder.with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
-    config.alpn_protocols = match first.protocol {
+    let mut alpn_protocols = match first.protocol {
         Protocol::Http if first.http2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         Protocol::Http => vec![b"http/1.1".to_vec()],
         // A `tcp` server offers the protocols its `alpn` matchers expect, in
@@ -246,6 +260,12 @@ pub(crate) fn acceptor(
             protocols
         }
     };
+    // Lets a CA negotiate the TLS-ALPN-01 protocol; the resolver fails such
+    // handshakes unless a challenge is pending for the name.
+    if servers.iter().any(|server| server.tls == Some(Tls::Auto)) {
+        alpn_protocols.push(acme::TLS_ALPN_PROTOCOL.to_vec());
+    }
+    config.alpn_protocols = alpn_protocols;
 
     Ok(Some((TlsAcceptor::from(Arc::new(config)), resolver)))
 }

@@ -9,6 +9,9 @@ Changed.
 
 ### Added
 
+- `[acme] challenge = "tls-alpn-01"` (default `"http-01"`): `tls = "auto"`
+  certificates validated with the ACME TLS-ALPN-01 challenge, answered by
+  the TLS listener itself on port 443, so no plain HTTP port is needed.
 - Criterion micro benchmarks of `Pool::select` for every load balancing
   policy with 4 and 64 backends: `cargo bench -p rxh-core --bench policies`.
   `cargo test` runs each once as a check.

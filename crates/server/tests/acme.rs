@@ -1,5 +1,6 @@
 //! `tls = "auto"`: stored certificates, runtime swaps through the resolver
-//! and, against a local Pebble CA, the whole ACME HTTP-01 flow.
+//! and, against a local Pebble CA, the whole ACME flow with HTTP-01 and
+//! TLS-ALPN-01.
 
 mod util;
 
@@ -233,24 +234,40 @@ async fn daemon_serves_stored_certificates_and_fails_missing_ones() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Pebble ACME server, see the doc comment"]
 async fn pebble_issues_and_installs_a_certificate() {
+    pebble_issues("http-01", free_address()).await;
+}
+
+/// Same as [`pebble_issues_and_installs_a_certificate`] with TLS-ALPN-01,
+/// which Pebble validates on port 5001: the TLS server itself listens there
+/// and nothing listens on `http_port`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Pebble ACME server, see the doc comment"]
+async fn pebble_issues_a_certificate_with_tls_alpn_01() {
+    pebble_issues("tls-alpn-01", "127.0.0.1:5001".parse().unwrap()).await;
+    assert!(
+        std::net::TcpListener::bind("0.0.0.0:5002").is_ok(),
+        "TLS-ALPN-01 opens no HTTP challenge listener"
+    );
+}
+
+async fn pebble_issues(challenge: &str, address: SocketAddr) {
     let root = std::env::var("RXH_PEBBLE_ROOT").expect("RXH_PEBBLE_ROOT: pebble.minica.pem path");
     let directory = std::env::var("RXH_PEBBLE_DIRECTORY")
         .unwrap_or_else(|_| String::from("https://localhost:14000/dir"));
     let backend = util::backend("pebble").await;
-    let dir = tempfile::tempdir().unwrap();
-    let address = free_address();
+    let dir = tempfile::tempdir().expect("temporary directory");
     let config = dir.path().join("rxh.toml");
     std::fs::write(
         &config,
         format!(
             "[admin]\nenabled = false\n\
              [acme]\nca = {directory:?}\nca_root = {root:?}\nhttp_port = 5002\n\
-             email = \"test@rxh.test\"\n\
+             email = \"test@rxh.test\"\nchallenge = {challenge:?}\n\
              [[server]]\nlisten = \"{address}\"\nhost = \"acme.rxh.test\"\n\
              tls = \"auto\"\nforward = \"{backend}\"\n"
         ),
     )
-    .unwrap();
+    .expect("write the configuration");
     let daemon = tokio::task::spawn(Daemon::new(&config).run());
 
     let storage = dir.path().join("rxh-data/certificates");
@@ -270,15 +287,17 @@ async fn pebble_issues_and_installs_a_certificate() {
         "no certificate after 60 seconds, see the daemon log"
     );
     assert!(storage.join(&ca_dir).join("acme.rxh.test/key.pem").exists());
-    let accounts = std::fs::read_dir(storage.join("accounts")).unwrap().count();
+    let accounts = std::fs::read_dir(storage.join("accounts"))
+        .expect("accounts directory")
+        .count();
     assert_eq!(accounts, 1, "the account is stored");
 
     // The new certificate is served without a restart.
-    let pem = std::fs::read(&cert).unwrap();
+    let pem = std::fs::read(&cert).expect("read the certificate");
     let leaf = CertificateDer::pem_slice_iter(&pem)
         .next()
         .expect("a certificate")
-        .unwrap();
+        .expect("valid PEM");
     let mut served = None;
     for _ in 0..50 {
         if let Ok(result) = https_get(address, "acme.rxh.test", None).await {
