@@ -18,7 +18,6 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use rxh_core::config::{Action, Config, ConfigError, Protocol, ProxyProtocol};
 use rxh_core::net::IpNet;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
@@ -555,7 +554,7 @@ async fn serve<S>(
     stop: watch::Receiver<bool>,
     handshake: Option<Detected>,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: tcp::Client + Send + 'static,
 {
     match &context.handler {
         Handler::Tcp {

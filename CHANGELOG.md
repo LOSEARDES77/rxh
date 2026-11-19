@@ -120,6 +120,10 @@ Changed.
   security advisories, scope. An `Audit` workflow runs `cargo audit` and
   `cargo deny` (policy in `deny.toml`: advisories, licenses, bans, sources)
   on every push, pull request and daily.
+- Zero copy for `tcp` servers on Linux: connections with plain TCP on both
+  sides (no TLS termination, no upstream TLS, `host:port` backends) are
+  relayed with `splice(2)`, so the bytes stay in the kernel. Other
+  connections and other systems keep the buffered copy. No configuration.
 
 ### Changed
 

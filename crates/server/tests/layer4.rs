@@ -325,3 +325,90 @@ async fn tcp_with_tls_termination_routes_by_handshake_sni() {
         assert_eq!(received, reply, "{name}");
     }
 }
+
+/// Backend that reads each connection to end of file, then sends everything
+/// back and closes: it answers only to clients whose half-close gets through.
+async fn tcp_echo_after_eof() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                stream.write_all(&received).await.unwrap();
+            });
+        }
+    });
+    address
+}
+
+/// Megabytes through the relay in both directions, with the half-close of
+/// the client reaching the backend. `routing` is the `forward` or `match`
+/// line of the server, given the backend.
+async fn large_payload_round_trip(routing: impl Fn(SocketAddr) -> String) {
+    let routing = routing(tcp_echo_after_eof().await);
+    let proxy = util::spawn(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nprotocol = \"tcp\"\n{routing}"
+    ))[0];
+
+    let payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i: u32| (i % 251) as u8).collect();
+    let stream = TcpStream::connect(proxy).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    let sent = payload.clone();
+    let writing = tokio::spawn(async move {
+        writer.write_all(&sent).await.unwrap();
+        writer.shutdown().await.unwrap();
+    });
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), reader.read_to_end(&mut received))
+        .await
+        .expect("the backend answers after the half-close")
+        .unwrap();
+    writing.await.unwrap();
+    assert_eq!(received.len(), payload.len());
+    assert!(received == payload, "the payload came back altered");
+}
+
+#[tokio::test]
+async fn tcp_relays_large_payloads_and_half_close() {
+    large_payload_round_trip(|backend| format!("forward = \"{backend}\"")).await;
+}
+
+#[tokio::test]
+async fn tcp_relays_large_payloads_after_sniffing() {
+    // A `match` list makes the proxy read ahead; those bytes must reach the
+    // backend first, exactly once.
+    large_payload_round_trip(|backend| {
+        let dead = util::dead_address();
+        format!(
+            "match = [{{ protocol = \"ssh\", forward = \"{dead}\" }}, {{ forward = \"{backend}\" }}]"
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tcp_upstream_read_timeout_closes_the_connection() {
+    // The backend accepts and stays silent.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            open.push(stream);
+        }
+    });
+    let proxy = util::spawn(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nprotocol = \"tcp\"\n\
+         forward = {{ backends = [\"{backend}\"], read_timeout = \"200ms\" }}"
+    ))[0];
+
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    stream.write_all(b"hello").await.unwrap();
+    let mut buffer = [0; 16];
+    let read = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+        .await
+        .expect("the proxy gives up on the silent backend");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
