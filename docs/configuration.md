@@ -575,6 +575,7 @@ socket, except that `http` servers listing the same address share one socket
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
 | `client_auth` | | `{ mode, ca, header }`: ask clients for a certificate in the TLS handshake, see [Client certificates (mTLS)](#client-certificates-mtls) (servers with `tls` only). |
+| `tls_options` | | `{ min_version, cipher_suites, curves, ocsp_stapling }`: what the TLS handshake accepts, and OCSP stapling, see [TLS options](#tls-options) (servers with `tls` only). |
 | `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
@@ -645,7 +646,7 @@ forward = "@b"
 
 It is a validation error to share an address between an `http` server and a
 `tcp` server, between two `tcp` servers or two `udp` servers, or between `http`
-servers with and without `tls` or with different `client_auth` tables. TCP and UDP sockets never conflict, so a `udp`
+servers with and without `tls` or with different `client_auth` or `tls_options` tables. TCP and UDP sockets never conflict, so a `udp`
 server may use the address of a `tcp` or `http` server. Port `0` is never
 shared: every port `0` entry gets its own free port.
 
@@ -698,6 +699,83 @@ The handshake happens before the request names a host, so `http` servers
 sharing a listen address must have the same `client_auth` table. Use
 different addresses for different policies. The `ca` files are read when the
 listener starts. There is no revocation check (CRL or OCSP).
+
+### TLS options
+
+`tls_options` on a server with `tls` (files or `"auto"`, `http` or `tcp`)
+narrows what its TLS handshakes accept. Without it a server takes TLS 1.2
+and 1.3 with every cipher suite and curve below, which are all safe today:
+set it to follow a stricter policy, not to fix a default.
+
+| Key | Default | Description |
+|---|---|---|
+| `min_version` | `"1.2"` | Lowest TLS version accepted: `"1.2"` or `"1.3"`. TLS 1.0 and 1.1 are not implemented. |
+| `cipher_suites` | all | List of the cipher suites offered, by IANA name, see below. The client's order of preference decides among them. TLS 1.2 clients need one of the `TLS_ECDHE_*` suites for the key type of the certificate (`ECDSA` or `RSA`), TLS 1.3 clients one of the first three; a list without TLS 1.3 suites is rejected with `min_version = "1.3"`. |
+| `curves` | all | List of the key exchange groups offered: `"X25519MLKEM768"` (post-quantum hybrid, TLS 1.3 only), `"X25519"`, `"secp256r1"`, `"secp384r1"`. Case insensitive. The client's order of preference decides among them. |
+| `ocsp_stapling` | `true` | Staple OCSP responses to the handshakes, see [OCSP stapling](#ocsp-stapling). |
+
+Cipher suites:
+
+| TLS 1.3 | TLS 1.2 |
+|---|---|
+| `TLS_AES_256_GCM_SHA384` | `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` |
+| `TLS_AES_128_GCM_SHA256` | `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` |
+| `TLS_CHACHA20_POLY1305_SHA256` | `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` |
+| | `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` |
+| | `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` |
+| | `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` |
+
+```toml
+# TLS 1.3 only, on the two classic curves.
+[[server]]
+listen = "0.0.0.0:443"
+host = "example.com"
+tls = "auto"
+tls_options = { min_version = "1.3", curves = ["X25519", "secp384r1"] }
+forward = "@app"
+
+# AES-256 only, for both protocol versions, and no OCSP requests.
+[[server]]
+listen = "0.0.0.0:8443"
+tls = { cert = "/etc/rxh/internal.pem", key = "/etc/rxh/internal.key" }
+forward = "@internal"
+
+[server.tls_options]
+cipher_suites = [
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+]
+ocsp_stapling = false
+```
+
+A client that shares no version, cipher suite or curve with the server
+fails the handshake. Like `client_auth`, the handshake happens before the
+request names a host, so `http` servers sharing a listen address must have
+the same `tls_options` table.
+
+#### OCSP stapling
+
+A certificate can name the OCSP responder of its authority, which says
+whether the certificate has been revoked. With stapling rxh asks the
+responder itself and sends the signed answer in the handshake, so clients
+neither wait for the responder nor tell it which sites they visit. It is on
+for every TLS listener, with certificates from files and from ACME alike,
+and does nothing for certificates that name no responder (Let's Encrypt
+stopped naming one in 2025).
+
+- The answer is fetched in the background with an HTTP `POST` to the
+  responder when the listener starts, so the first handshakes may go
+  without it, and again halfway through its validity (checked every hour).
+- When the responder fails or says anything but `good`, the last answer
+  stays stapled until it expires; then handshakes go on without one. Each
+  failure is logged (`OCSP => http://...: reason`).
+- The certificate file must hold the certificate of the issuer after the
+  server certificate (a full chain), as the request is built from both.
+  Only `http://` responders are asked, which is what authorities use.
+- rxh does not verify the signature of the answer: the clients do.
+- `ocsp_stapling = false` stops the requests, for hosts that cannot reach
+  the responder.
 
 ### `match` entries (HTTP routes)
 

@@ -231,6 +231,12 @@ impl Config {
                          the servers on it must have the same client_auth"
                     ));
                 }
+                if server.tls_options != first.tls_options {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         the servers on it must have the same tls_options"
+                    ));
+                }
                 if server.proxy_protocol_in != first.proxy_protocol_in {
                     return invalid(format!(
                         "{label}: listen address {address} is shared with {first_label}, \
@@ -429,6 +435,15 @@ impl Config {
                     .map_err(|err| ConfigError::Invalid(format!("{label}: client_auth: {err}")))?;
             }
 
+            if let Some(tls_options) = &server.tls_options {
+                if server.tls.is_none() {
+                    return invalid(format!("{label}: tls_options needs tls"));
+                }
+                tls_options
+                    .validate()
+                    .map_err(|err| ConfigError::Invalid(format!("{label}: tls_options: {err}")))?;
+            }
+
             if server.tls == Some(Tls::Auto) {
                 if server.protocol != Protocol::Http {
                     return invalid(format!(
@@ -548,6 +563,7 @@ impl Config {
                 name: None,
                 tls: None,
                 client_auth: None,
+                tls_options: None,
                 https_redirect: None,
                 ..server.clone()
             });
@@ -710,6 +726,11 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_auth: Option<ClientAuth>,
 
+    /// Protocol versions, cipher suites and curves of the TLS handshake, and
+    /// OCSP stapling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_options: Option<TlsOptions>,
+
     /// Redirects plain HTTP requests for this TLS server to HTTPS, see
     /// [`Config::with_https_redirects`]. Unset means on with `tls = "auto"`
     /// and off otherwise.
@@ -809,6 +830,7 @@ struct RawServer {
     name: Option<String>,
     tls: Option<Tls>,
     client_auth: Option<ClientAuth>,
+    tls_options: Option<TlsOptions>,
     https_redirect: Option<bool>,
     #[serde(default = "default::true_value")]
     http2: bool,
@@ -919,6 +941,7 @@ impl TryFrom<RawServer> for Server {
             name: raw.name,
             tls: raw.tls,
             client_auth: raw.client_auth,
+            tls_options: raw.tls_options,
             https_redirect: raw.https_redirect,
             http2: raw.http2,
             trusted_proxies,
@@ -2596,6 +2619,110 @@ impl ClientAuth {
     }
 }
 
+/// Lowest TLS version a server accepts.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsVersion {
+    /// TLS 1.2 and 1.3.
+    #[default]
+    #[serde(rename = "1.2")]
+    V1_2,
+
+    /// TLS 1.3 only.
+    #[serde(rename = "1.3")]
+    V1_3,
+}
+
+/// The `tls_options` table of a TLS server: what its handshakes accept.
+///
+/// ```toml
+/// tls_options = { min_version = "1.3", curves = ["X25519", "secp384r1"] }
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsOptions {
+    /// Lowest protocol version accepted.
+    #[serde(default)]
+    pub min_version: TlsVersion,
+
+    /// Cipher suites offered, from [`TlsOptions::CIPHER_SUITES`]. Empty
+    /// means all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cipher_suites: Vec<String>,
+
+    /// Key exchange groups offered, from [`TlsOptions::CURVES`] in any
+    /// case. Empty means all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub curves: Vec<String>,
+
+    /// Fetches OCSP responses for the certificates and staples them to the
+    /// handshakes.
+    #[serde(default = "default::true_value")]
+    pub ocsp_stapling: bool,
+}
+
+impl Default for TlsOptions {
+    fn default() -> Self {
+        Self {
+            min_version: TlsVersion::default(),
+            cipher_suites: Vec::new(),
+            curves: Vec::new(),
+            ocsp_stapling: true,
+        }
+    }
+}
+
+impl TlsOptions {
+    /// Cipher suites of `cipher_suites`, by their IANA names. The first
+    /// three are the TLS 1.3 suites.
+    pub const CIPHER_SUITES: [&str; 9] = [
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_AES_128_GCM_SHA256",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    ];
+
+    /// Key exchange groups of `curves`, by their IANA names.
+    pub const CURVES: [&str; 4] = ["X25519MLKEM768", "X25519", "secp256r1", "secp384r1"];
+
+    fn validate(&self) -> Result<(), String> {
+        for suite in &self.cipher_suites {
+            if !Self::CIPHER_SUITES.contains(&suite.as_str()) {
+                return Err(format!(
+                    "unknown cipher suite {suite:?}, expected one of {}",
+                    Self::CIPHER_SUITES.join(", ")
+                ));
+            }
+        }
+        for curve in &self.curves {
+            if !Self::CURVES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(curve))
+            {
+                return Err(format!(
+                    "unknown curve {curve:?}, expected one of {}",
+                    Self::CURVES.join(", ")
+                ));
+            }
+        }
+        // TLS 1.2 suites are the ones named after their key exchange.
+        let tls13 = |suite: &String| !suite.contains("_WITH_");
+        if self.min_version == TlsVersion::V1_3
+            && !self.cipher_suites.is_empty()
+            && !self.cipher_suites.iter().any(tls13)
+        {
+            return Err(String::from(
+                "min_version \"1.3\" needs a TLS 1.3 cipher suite in cipher_suites",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The `[acme]` table: where `tls = "auto"` certificates come from and where
 /// they are kept.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -3817,6 +3944,100 @@ mod tests {
         assert_eq!(decode_base64("+/8=").unwrap(), [0xfb, 0xff]);
         assert_eq!(decode_base64("Z"), None);
         assert_eq!(decode_base64("Zm9v-mFy"), None);
+    }
+
+    #[test]
+    fn tls_options_values_and_rejections() {
+        let server = |extra: &str| {
+            format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{extra}\n"
+            )
+        };
+        let parse = |extra: &str| Config::from_toml(&server(extra));
+        let error = |extra: &str| match parse(extra) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected an error for {extra}"),
+        };
+
+        assert_eq!(parse("").unwrap().servers[0].tls_options, None);
+        let defaults = TlsOptions::default();
+        assert_eq!(defaults.min_version, TlsVersion::V1_2);
+        assert!(defaults.ocsp_stapling);
+        let config = parse("tls_options = {}").unwrap();
+        assert_eq!(config.servers[0].tls_options, Some(defaults));
+
+        let config = parse(
+            "tls_options = { min_version = \"1.3\", ocsp_stapling = false, \
+             cipher_suites = [\"TLS_AES_256_GCM_SHA384\"], curves = [\"x25519\", \"secp384r1\"] }",
+        )
+        .unwrap();
+        let expected = TlsOptions {
+            min_version: TlsVersion::V1_3,
+            cipher_suites: vec![String::from("TLS_AES_256_GCM_SHA384")],
+            curves: vec![String::from("x25519"), String::from("secp384r1")],
+            ocsp_stapling: false,
+        };
+        assert_eq!(config.servers[0].tls_options, Some(expected.clone()));
+        // Round trip through serialization, as `rxh config show` does.
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.servers[0].tls_options, Some(expected));
+
+        for suite in TlsOptions::CIPHER_SUITES {
+            parse(&format!(
+                "tls_options = {{ cipher_suites = [\"{suite}\"] }}"
+            ))
+            .unwrap();
+        }
+        for curve in TlsOptions::CURVES {
+            parse(&format!("tls_options = {{ curves = [\"{curve}\"] }}")).unwrap();
+        }
+        parse("protocol = \"tcp\"\ntls_options = { min_version = \"1.2\" }").unwrap();
+
+        assert!(error("tls_options = { min_version = \"1.1\" }").contains("unknown variant"));
+        assert!(error("tls_options = { min_version = 1.3 }").contains("tls_options"));
+        assert!(error("tls_options = { nope = 1 }").contains("unknown field"));
+        assert!(
+            error("tls_options = { cipher_suites = [\"TLS_RSA_WITH_AES_128_CBC_SHA\"] }")
+                .contains("tls_options: unknown cipher suite \"TLS_RSA_WITH_AES_128_CBC_SHA\"")
+        );
+        assert!(
+            error("tls_options = { curves = [\"secp521r1\"] }")
+                .contains("tls_options: unknown curve \"secp521r1\"")
+        );
+        assert!(
+            error(
+                "tls_options = { min_version = \"1.3\", \
+                 cipher_suites = [\"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\"] }"
+            )
+            .contains("needs a TLS 1.3 cipher suite")
+        );
+
+        let plain = "[[server]]\nlisten = \"127.0.0.1:80\"\nforward = \"a:1\"\n\
+                     tls_options = { min_version = \"1.3\" }\n";
+        let err = Config::from_toml(plain).unwrap_err().to_string();
+        assert!(err.contains("tls_options needs tls"), "{err}");
+
+        // Servers sharing an address share the handshake, so the options too.
+        let shared = |first: &str, second: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nhost = \"a.test\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{first}\n\
+                 [[server]]\nlisten = \"127.0.0.1:443\"\nhost = \"b.test\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{second}\n"
+            ))
+        };
+        let same = "tls_options = { min_version = \"1.3\" }";
+        shared(same, same).unwrap();
+        let err = shared(same, "").unwrap_err().to_string();
+        assert!(err.contains("must have the same tls_options"), "{err}");
+
+        // The plain HTTP redirect companion of a TLS server has no handshake.
+        let redirect = parse(&format!("https_redirect = true\n{same}"))
+            .unwrap()
+            .with_https_redirects();
+        assert_eq!(redirect.servers[1].tls_options, None);
+        redirect.validate().unwrap();
     }
 
     #[test]

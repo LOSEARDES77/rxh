@@ -1827,6 +1827,7 @@ name = "rxh-server"
 version = "0.3.0"
 dependencies = [
  "async-compression",
+ "aws-lc-rs",
  "bytes",
  "hickory-resolver",
  "hmac",
@@ -1856,6 +1857,7 @@ dependencies = [
 name = "rxh-test-util"
 version = "0.3.0"
 dependencies = [
+ "rcgen",
  "tokio",
 ]
 

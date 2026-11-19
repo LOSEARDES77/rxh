@@ -1,12 +1,13 @@
 [package]
 name = "rxh-test-util"
-description = "Test helpers shared by the RXH crates: misbehaving backends, a DNS server and free addresses"
+description = "Test helpers shared by the RXH crates: misbehaving backends, a DNS server, OCSP fixtures and free addresses"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
+rcgen.workspace = true
 tokio.workspace = true
 
 [lints]

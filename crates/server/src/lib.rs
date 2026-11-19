@@ -23,6 +23,7 @@ mod l4match;
 mod log;
 mod master;
 mod metrics;
+mod ocsp;
 mod per_core;
 mod proxy_protocol;
 mod registry;
