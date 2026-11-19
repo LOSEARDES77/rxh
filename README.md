@@ -53,7 +53,9 @@ pool web (least_conn)
   `random_choose`, `first`, `round_robin`, `weighted_round_robin` (smooth),
   `least_conn`, `ip_hash`, `client_ip_hash`, `uri_hash`, `query`, `header`,
   and `cookie` sticky sessions. Hash policies use rendezvous hashing, so
-  adding a backend only moves the keys it takes over.
+  adding a backend only moves the keys it takes over, or a Maglev table
+  (`hash_type = "maglev"`), with optional bounded loads
+  (`hash_balance_factor`).
 - **Health checks.** Active HTTP checks (path, port, method, headers, status,
   body regex) or TCP connect checks, plus passive checks on real traffic
   (failed dials, 5xx, slow responses, concurrency limits).

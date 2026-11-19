@@ -1009,6 +1009,8 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `health` | | active health checks | Table, see below. |
 | `passive` | | passive health checks | Table, see below. |
 | `circuit_breaker` | | Traefik `CircuitBreaker` | Table, see below. |
+| `hash_type` | `"rendezvous"` | HAProxy `hash-type`, Envoy `MAGLEV` | How the hash policies map a key to a backend: `"rendezvous"` or `"maglev"`, see [Consistent hashing](#consistent-hashing). |
+| `hash_balance_factor` | unset | HAProxy `hash-balance-factor` | Bounded loads for the hash policies: the most a backend may carry, in percent of the average load, see [Consistent hashing](#consistent-hashing). At least `100`. |
 | `slow_start` | unset | Nginx Plus `slow_start` | Duration over which a backend that joins the pool at runtime or comes back healthy ramps up to its full share of the traffic, see [Slow start](#slow-start). `0` is rejected. |
 
 Example: at most 8 connections per backend, uploads up to 64 KiB buffered
@@ -1236,6 +1238,46 @@ failure; `latency` has no effect. `udp` sessions never report a success, so
 do not set a breaker on pools used by `udp` servers. The state is per
 backend and per process, starts closed after a reload, and is shown as
 `circuit` (`closed`, `open`, `half_open`) in `GET /pools` of the admin API.
+
+### Consistent hashing
+
+The hash policies (`ip_hash`, `client_ip_hash`, `uri_hash`, `query` and
+`header`) are consistent: a key stays on its backend while that backend is
+available, and adding or removing a backend moves only a small share of the
+keys. Two settings of the pool tune them, at every level of a `fallback`
+chain. Hash policies ignore `weight`.
+
+```toml
+[upstream.cache]
+policy = "uri_hash"
+backends = ["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"]
+hash_type = "maglev"
+hash_balance_factor = 125
+```
+
+`hash_type` chooses how a key finds its backend:
+
+- `"rendezvous"` (default): highest random weight hashing, computed over
+  the backends on each request. Removing a backend moves its keys only.
+- `"maglev"`: a lookup table of 65537 entries (Google's Maglev, the default
+  size of Envoy), built when the members of the pool change, where every
+  backend owns an almost equal share. A pick costs the same with any number
+  of backends; a membership change can move a few keys between the other
+  backends too.
+
+`hash_balance_factor` adds bounded loads (HAProxy `hash-balance-factor`,
+Envoy `hash_balance_factor`), with either hash type. It is the most a
+backend may carry, in percent of the average number of requests (HTTP) or
+connections (TCP/UDP) in flight per available backend: with `125`, no
+backend takes more than 1.25 times the average. A key whose backend is at
+the bound goes to the next backend of that key, always the same one, and
+comes back when the load drops. This keeps a hot key from overloading one
+backend, at the price of some stickiness. `100` spreads the load evenly;
+values below are rejected. Without it, a key never leaves an available
+backend.
+
+With both hash types, the keys of a backend that is unavailable or at the
+bound go to the next backend in rendezvous order.
 
 ### Slow start
 

@@ -2528,6 +2528,16 @@ pub struct UpstreamGroup {
     )]
     pub slow_start: Option<Duration>,
 
+    /// How the hash policies map a key to a backend.
+    #[serde(default)]
+    pub hash_type: HashType,
+
+    /// Bounded loads for the hash policies, in percent of the average load
+    /// of the available backends (HAProxy `hash-balance-factor`): a backend
+    /// at the bound passes its keys on to the next backend of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_balance_factor: Option<u32>,
+
     /// TLS settings for connections to the backends. Setting this table
     /// enables TLS even without `https://` backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2678,6 +2688,8 @@ impl UpstreamGroup {
             passive: None,
             circuit_breaker: None,
             slow_start: None,
+            hash_type: HashType::default(),
+            hash_balance_factor: None,
             tls: None,
             dynamic: None,
         }
@@ -2794,6 +2806,12 @@ impl UpstreamGroup {
             return Err(String::from("slow_start must be above 0"));
         }
 
+        if self.hash_balance_factor.is_some_and(|factor| factor < 100) {
+            return Err(String::from(
+                "hash_balance_factor must be at least 100 (percent of the average load)",
+            ));
+        }
+
         if let Some(health) = &self.health
             && (health.passes == 0 || health.fails == 0)
         {
@@ -2898,6 +2916,18 @@ impl From<BackendOption> for Backend {
             BackendOption::Weighted { address, weight } => Backend { address, weight },
         }
     }
+}
+
+/// Algorithm mapping the key of a hash policy to a backend.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HashType {
+    /// Highest random weight hashing, computed over the members on each pick.
+    #[default]
+    Rendezvous,
+
+    /// Maglev lookup table, rebuilt when the members change.
+    Maglev,
 }
 
 /// Load balancing policy. Names match Caddy's `lb_policy` values.
@@ -4845,6 +4875,37 @@ mod tests {
         assert!(
             matches!(&config.servers[0].patterns[0].action, Action::Forward(Forward::Group(name)) if name == "db")
         );
+    }
+
+    #[test]
+    fn hash_type_and_balance_factor_keys() {
+        let parse = |keys: &str| {
+            Config::from_toml(&format!(
+                "[upstream.api]\nbackends = [\"127.0.0.1:81\"]\npolicy = \"ip_hash\"\n{keys}\n"
+            ))
+        };
+
+        let group = &parse("").unwrap().upstreams["api"];
+        assert_eq!(group.hash_type, HashType::Rendezvous);
+        assert_eq!(group.hash_balance_factor, None);
+
+        let group = &parse("hash_type = \"maglev\"\nhash_balance_factor = 125")
+            .unwrap()
+            .upstreams["api"];
+        assert_eq!(group.hash_type, HashType::Maglev);
+        assert_eq!(group.hash_balance_factor, Some(125));
+        assert_eq!(
+            parse("hash_balance_factor = 100").unwrap().upstreams["api"].hash_balance_factor,
+            Some(100)
+        );
+
+        let invalid = |keys: &str| parse(keys).unwrap_err().to_string();
+        assert!(
+            invalid("hash_balance_factor = 99")
+                .contains("hash_balance_factor must be at least 100")
+        );
+        assert!(!invalid("hash_balance_factor = 1.5").is_empty());
+        assert!(!invalid("hash_type = \"ketama\"").is_empty());
     }
 
     #[test]
