@@ -59,7 +59,8 @@ pool web (least_conn)
 - **Health checks.** Active HTTP checks (path, port, method, headers, status,
   body regex) or TCP connect checks, plus passive checks on real traffic
   (failed dials, 5xx, slow responses, concurrency limits).
-- **Retries and failover**: `retries`, `try_duration`, `try_interval`.
+- **Retries and failover**: `retries`, `try_duration`, `try_interval`,
+  retry budgets (`retry_budget`) and hedged requests (`hedge_delay`).
   Failed dials and stale keep-alive connections move to another backend, and
   `GET` requests are retried after a failed round trip. `retry_match`
   chooses the retried methods and the response statuses that move a request

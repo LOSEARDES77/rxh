@@ -2353,6 +2353,54 @@ impl RetryMatch {
     }
 }
 
+/// Bound on the retries and hedges of a pool in flight at the same time
+/// (Envoy `retry_budget`), so that retries cannot multiply the load of
+/// backends that are already failing.
+///
+/// ```toml
+/// retry_budget = { percent = 20, min_retries = 3 }
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetryBudget {
+    /// Most requests retrying at once, in percent of the requests in flight
+    /// on the pool (Envoy `budget_percent`).
+    #[serde(default = "default::retry_budget_percent")]
+    pub percent: f64,
+
+    /// Requests that may always retry at once, whatever `percent` allows
+    /// (Envoy `min_retry_concurrency`).
+    #[serde(default = "default::retry_budget_min_retries")]
+    pub min_retries: usize,
+}
+
+impl Default for RetryBudget {
+    fn default() -> Self {
+        Self {
+            percent: default::retry_budget_percent(),
+            min_retries: default::retry_budget_min_retries(),
+        }
+    }
+}
+
+impl RetryBudget {
+    fn validate(&self) -> Result<(), String> {
+        if !(0.0..=100.0).contains(&self.percent) {
+            return Err(String::from(
+                "retry_budget.percent must be between 0 and 100",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Requests that may be retrying at once while `active` are in flight.
+    #[must_use]
+    pub fn limit(&self, active: usize) -> usize {
+        let share = (active as f64 * self.percent / 100.0) as usize;
+        share.max(self.min_retries)
+    }
+}
+
 impl UpstreamGroup {
     /// Secret of the first `cookie` policy of the chain (the group's policy,
     /// then its fallbacks), if any: backends carry cookie values only then.
@@ -2423,6 +2471,21 @@ pub struct UpstreamGroup {
         with = "duration"
     )]
     pub try_interval: Duration,
+
+    /// Bound on the retries and hedges in flight at once (Envoy
+    /// `retry_budget`). Unset leaves them bounded per request only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_budget: Option<RetryBudget>,
+
+    /// A retryable HTTP request without response headers after this long
+    /// is also sent to a second backend, and the first response wins
+    /// (Envoy `hedge_policy`).
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hedge_delay: Option<Duration>,
 
     /// Upstream connect timeout.
     #[serde(default = "default::dial_timeout", with = "duration")]
@@ -2686,6 +2749,8 @@ impl UpstreamGroup {
             retries: 0,
             try_duration: None,
             try_interval: default::try_interval(),
+            retry_budget: None,
+            hedge_delay: None,
             dial_timeout: default::dial_timeout(),
             response_header_timeout: None,
             read_timeout: None,
@@ -2790,6 +2855,7 @@ impl UpstreamGroup {
             ("read_timeout", self.read_timeout),
             ("write_timeout", self.write_timeout),
             ("flush_interval", self.flush_interval),
+            ("hedge_delay", self.hedge_delay),
         ] {
             if value.is_some_and(|value| value.is_zero()) {
                 return Err(format!("{name} must be greater than zero"));
@@ -2808,6 +2874,9 @@ impl UpstreamGroup {
 
         if let Some(retry_match) = &self.retry_match {
             retry_match.validate()?;
+        }
+        if let Some(budget) = &self.retry_budget {
+            budget.validate()?;
         }
 
         if let Some(passive) = &self.passive
@@ -4675,6 +4744,14 @@ mod default {
         Duration::from_secs(5)
     }
 
+    pub fn retry_budget_percent() -> f64 {
+        20.0
+    }
+
+    pub fn retry_budget_min_retries() -> usize {
+        3
+    }
+
     pub fn keepalive() -> Duration {
         Duration::from_secs(120)
     }
@@ -4935,6 +5012,52 @@ mod tests {
         );
         assert!(!invalid("hash_balance_factor = 1.5").is_empty());
         assert!(!invalid("hash_type = \"ketama\"").is_empty());
+    }
+
+    #[test]
+    fn retry_budget_and_hedge_delay_keys() {
+        let parse = |keys: &str| {
+            Config::from_toml(&format!(
+                "[upstream.api]\nbackends = [\"127.0.0.1:81\"]\n{keys}\n"
+            ))
+        };
+        let group = &parse("").unwrap().upstreams["api"];
+        assert_eq!((group.retry_budget, group.hedge_delay), (None, None));
+
+        let group = &parse("retry_budget = {}\nhedge_delay = \"50ms\"")
+            .unwrap()
+            .upstreams["api"];
+        let budget = group.retry_budget.unwrap();
+        assert_eq!((budget.percent, budget.min_retries), (20.0, 3));
+        assert_eq!(group.hedge_delay, Some(Duration::from_millis(50)));
+
+        let group = &parse("retry_budget = { percent = 0.5, min_retries = 0 }")
+            .unwrap()
+            .upstreams["api"];
+        let budget = group.retry_budget.unwrap();
+        assert_eq!((budget.percent, budget.min_retries), (0.5, 0));
+        assert_eq!(
+            (budget.limit(199), budget.limit(200), budget.limit(1000)),
+            (0, 1, 5)
+        );
+        assert_eq!(
+            RetryBudget::default().limit(10),
+            3,
+            "min_retries is a floor"
+        );
+        assert_eq!(RetryBudget::default().limit(100), 20);
+
+        let invalid = |keys: &str| parse(keys).unwrap_err().to_string();
+        for percent in ["-1", "100.5", "nan"] {
+            assert!(
+                invalid(&format!("retry_budget = {{ percent = {percent} }}"))
+                    .contains("retry_budget.percent must be between 0 and 100")
+            );
+        }
+        assert!(invalid("retry_budget = { min_retries = -1 }").contains("min_retries"));
+        assert!(invalid("retry_budget = { burst = 1 }").contains("burst"));
+        assert!(invalid("hedge_delay = \"0s\"").contains("hedge_delay must be greater than zero"));
+        assert!(!invalid("hedge_delay = \"soon\"").is_empty());
     }
 
     #[test]

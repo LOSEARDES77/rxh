@@ -22,7 +22,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use rxh_core::address::BackendAddress;
 use rxh_core::config::RetryMatch;
-use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
+use rxh_core::pool::{RequestGuard, RetryPermit, SelectContext, Selection, Upstream};
 use tokio::sync::watch;
 
 use crate::http::body::{self, BodyError, Guarded};
@@ -31,7 +31,7 @@ use crate::http::headers::{self, Forwarding};
 use crate::http::mirror::{self, Mirror};
 use crate::http::response::{self, BoxResponse};
 use crate::http::service::{Route, Service, Site, UpstreamAddress};
-use crate::http::transport::{Permit, SendError};
+use crate::http::transport::{Connection, Permit, SendError};
 use crate::proxy_protocol;
 use crate::registry::Group;
 use crate::upstream::{self, DialError};
@@ -196,8 +196,13 @@ pub(crate) async fn forward(
         .unwrap_or_default();
     let preface = &preface;
     let mut stale_attempts = 0;
-    // Like Caddy, HTTPS backends get their own host as `Host` unless the user sets it.
-    let rewrite_host = group.dialer.is_tls() && !sets_host(route);
+    let exchange = Exchange {
+        group,
+        site,
+        preface,
+        // Like Caddy, HTTPS backends get their own host as `Host` unless the user sets it.
+        rewrite_host: group.dialer.is_tls() && !sets_host(route),
+    };
 
     // Like Caddy, bodyless requests with a retryable method (safe methods
     // unless `retry_match.method` says otherwise) are retried on another
@@ -209,8 +214,8 @@ pub(crate) async fn forward(
     if settings.try_duration.is_some() {
         round_trip_retries = round_trip_retries.max(1);
     }
-    // The head is only copied when the settings allow a retry at all.
-    let replay = (round_trip_retries > 0
+    // The head is only copied when the settings allow a retry or a hedge.
+    let replay = ((round_trip_retries > 0 || settings.hedge_delay.is_some())
         && client_upgrade.is_none()
         && retry_match.retries_method(outgoing.method())
         && hyper::body::Body::is_end_stream(outgoing.body()))
@@ -223,8 +228,13 @@ pub(crate) async fn forward(
                 .is_none_or(|limit| first_try.elapsed() + settings.try_interval < limit)
     };
 
-    // Loops only when a pooled connection turned out to be closed before the
-    // request was written, so retrying is safe for any method.
+    // Counts the request against `retry_budget` from its first retry or hedge.
+    let mut retry_permit: Option<RetryPermit> = None;
+    // A request is hedged once, on its first attempt.
+    let mut hedge_delay = settings.hedge_delay;
+
+    // Loops for retries, and when a pooled connection turned out to be closed
+    // before the request was written, which is safe for any method.
     let (selection, guard, started, (mut upstream_response, permit)) = loop {
         let context = SelectContext {
             peer_ip: connection.peer.ip(),
@@ -237,6 +247,7 @@ pub(crate) async fn forward(
         let dialed = upstream::connect_with_retries(
             &group.pool,
             &context,
+            &mut retry_permit,
             |upstream: Arc<Upstream>| async move {
                 transport.connect(upstream.address(), preface).await
             },
@@ -249,33 +260,59 @@ pub(crate) async fn forward(
             Err(DialError::Connect(_)) => return response::bad_gateway(),
         };
 
+        let first = Arc::clone(&selection.upstream);
+        let primary = exchange.round_trip(selection, guard, upstream_connection, outgoing);
+        let attempt = match (hedge_delay.take(), &replay) {
+            (Some(delay), Some(head)) => {
+                let hedge = async {
+                    let request = rebuild(head);
+                    let context = SelectContext {
+                        peer_ip: connection.peer.ip(),
+                        client_ip,
+                        uri: Some(request.uri()),
+                        headers: Some(request.headers()),
+                        secure: site.tls,
+                    };
+                    let (selection, guard) = exchange.acquire_other(&context, &first)?;
+                    if !group.pool.allow_retry(&mut retry_permit) {
+                        return None;
+                    }
+                    let address = selection.upstream.address();
+                    match transport.connect(address, preface).await {
+                        Ok(connection) => Some(
+                            exchange
+                                .round_trip(selection, guard, connection, request)
+                                .await,
+                        ),
+                        Err(err) => {
+                            selection.upstream.record_failure();
+                            eprintln!("{} => hedge dial {address} failed: {err}", site.log_name);
+                            None
+                        }
+                    }
+                };
+                race(primary, delay, hedge).await
+            }
+            _ => primary.await,
+        };
+        let Attempt {
+            selection,
+            guard,
+            started,
+            sent,
+        } = attempt;
         let address = selection.upstream.address();
-        if rewrite_host {
-            set_backend_host(&mut outgoing, address);
-        }
-        let started = Instant::now();
-
-        let sent = transport.send(&selection.upstream, preface, upstream_connection, outgoing);
-        let sent = match group.pool.settings().response_header_timeout {
-            Some(limit) => match tokio::time::timeout(limit, sent).await {
-                Ok(sent) => sent,
-                Err(_) => {
-                    selection.upstream.record_failure();
-                    eprintln!(
-                        "{} => upstream {address} sent no response headers within {limit:?}",
-                        site.log_name
-                    );
-                    return response::gateway_timeout();
-                }
-            },
-            None => sent.await,
+        // The attempt already told passive health checks and the log.
+        let Some(sent) = sent else {
+            return response::gateway_timeout();
         };
 
         match sent {
             Ok((unwanted, _))
                 if replay.is_some()
                     && in_budget(round_trip_retries)
-                    && retry_match.retries_status(unwanted.status().as_u16()) =>
+                    && retry_match.retries_status(unwanted.status().as_u16())
+                    && group.pool.allow_retry(&mut retry_permit) =>
             {
                 // The response is dropped unread; another backend gets the request.
                 selection
@@ -306,7 +343,10 @@ pub(crate) async fn forward(
                 selection.upstream.record_failure();
                 eprintln!("{} => upstream {address} failed: {err}", site.log_name);
                 match &replay {
-                    Some(head) if in_budget(round_trip_retries) => {
+                    Some(head)
+                        if in_budget(round_trip_retries)
+                            && group.pool.allow_retry(&mut retry_permit) =>
+                    {
                         round_trip_retries -= 1;
                         tokio::time::sleep(settings.try_interval).await;
                         outgoing = rebuild(head);
@@ -329,7 +369,7 @@ pub(crate) async fn forward(
         tokio::task::spawn(tunnel(
             client_upgrade,
             server_upgrade,
-            (guard, permit),
+            (guard, permit, retry_permit),
             site.stream_timeout,
             site.stream_close.clone(),
         ));
@@ -399,7 +439,123 @@ pub(crate) async fn forward(
     }
 
     note_upstream(&mut client_response, connection, &selection.upstream);
-    client_response.map(|body| Guarded::new(body, (guard, permit)).boxed())
+    client_response.map(|body| Guarded::new(body, (guard, permit, retry_permit)).boxed())
+}
+
+/// One request sent to one backend.
+struct Attempt {
+    selection: Selection,
+    guard: RequestGuard,
+    started: Instant,
+    /// `None` when `response_header_timeout` passed first.
+    sent: Option<Result<(Response<Incoming>, Permit), SendError>>,
+}
+
+impl Attempt {
+    fn got_response(&self) -> bool {
+        matches!(self.sent, Some(Ok(_)))
+    }
+}
+
+/// What every attempt of a request shares.
+#[derive(Clone, Copy)]
+struct Exchange<'a> {
+    group: &'a Group,
+    site: &'a Site,
+    preface: &'a [u8],
+    rewrite_host: bool,
+}
+
+impl Exchange<'_> {
+    /// Sends `request` on `connection` and waits for the response headers,
+    /// for `response_header_timeout` at most.
+    async fn round_trip(
+        self,
+        selection: Selection,
+        guard: RequestGuard,
+        connection: Connection,
+        mut request: Request<body::Body>,
+    ) -> Attempt {
+        let address = selection.upstream.address();
+        if self.rewrite_host {
+            set_backend_host(&mut request, address);
+        }
+        let started = Instant::now();
+
+        let transport = &self.group.transport;
+        let sent = transport.send(&selection.upstream, self.preface, connection, request);
+        let sent = match self.group.pool.settings().response_header_timeout {
+            Some(limit) => match tokio::time::timeout(limit, sent).await {
+                Ok(sent) => Some(sent),
+                Err(_) => {
+                    selection.upstream.record_failure();
+                    eprintln!(
+                        "{} => upstream {address} sent no response headers within {limit:?}",
+                        self.site.log_name
+                    );
+                    None
+                }
+            },
+            None => Some(sent.await),
+        };
+        Attempt {
+            selection,
+            guard,
+            started,
+            sent,
+        }
+    }
+
+    /// Backend for a hedge: one the policy picks that is not `first`, without
+    /// waiting in the queue. `None` when the policy keeps picking `first`,
+    /// as hash and sticky policies do.
+    fn acquire_other(
+        self,
+        context: &SelectContext<'_>,
+        first: &Arc<Upstream>,
+    ) -> Option<(Selection, RequestGuard)> {
+        let pool = &self.group.pool;
+        for _ in 0..pool.upstreams().len() {
+            let acquired = pool.try_acquire(context)?;
+            if !Arc::ptr_eq(&acquired.0.upstream, first) {
+                return Some(acquired);
+            }
+        }
+        None
+    }
+}
+
+/// Runs `primary`; when it is not done after `delay`, runs `hedge` next to
+/// it. The first attempt with a response wins and the other one is dropped,
+/// which cancels its request. Without a response the outcome of `primary`
+/// stands. `hedge` resolves to `None` when it could not be sent.
+async fn race(
+    primary: impl Future<Output = Attempt>,
+    delay: Duration,
+    hedge: impl Future<Output = Option<Attempt>>,
+) -> Attempt {
+    let mut primary = std::pin::pin!(primary);
+    tokio::select! {
+        attempt = &mut primary => return attempt,
+        () = tokio::time::sleep(delay) => {}
+    }
+    let mut hedge = std::pin::pin!(hedge);
+    let hedged = tokio::select! {
+        attempt = &mut primary => {
+            if attempt.got_response() {
+                return attempt;
+            }
+            return match hedge.await {
+                Some(hedged) if hedged.got_response() => hedged,
+                _ => attempt,
+            };
+        }
+        hedged = &mut hedge => hedged,
+    };
+    match hedged {
+        Some(hedged) if hedged.got_response() => hedged,
+        _ => primary.await,
+    }
 }
 
 /// Answer to a request whose body could not be read.
@@ -572,7 +728,7 @@ fn host<B>(request: &Request<B>) -> String {
 async fn tunnel(
     client: OnUpgrade,
     server: OnUpgrade,
-    _guard: (RequestGuard, Permit),
+    _guard: (RequestGuard, Permit, Option<RetryPermit>),
     stream_timeout: Option<Duration>,
     stream_close: Option<(Duration, watch::Receiver<bool>)>,
 ) {

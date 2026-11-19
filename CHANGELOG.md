@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- Retry budgets and hedged requests: `retry_budget = { percent = 20,
+  min_retries = 3 }` on a pool bounds the requests retrying at the same
+  time to a share of the requests in flight, so retries cannot multiply the
+  load of failing backends. `hedge_delay = "100ms"` sends a retryable HTTP
+  request that has no response headers after the delay to a second backend
+  as well and uses the first response. Hedges count against the budget.
 - Per backend connection limits with a queue: `max_connections` on a pool
   caps the requests in flight on each backend, and `queue_size` lets the
   requests over it wait up to `queue_timeout` (default 5s) for a free

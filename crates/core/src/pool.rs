@@ -717,6 +717,17 @@ impl Drop for RequestGuard {
     }
 }
 
+/// A request counted against the `retry_budget` of its pool, from its first
+/// retry or hedge until it is dropped. See [`Pool::allow_retry`].
+#[derive(Debug)]
+pub struct RetryPermit(Arc<AtomicUsize>);
+
+impl Drop for RetryPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Immutable member list, swapped as a whole on changes.
 #[derive(Debug, Default)]
 struct Members {
@@ -758,6 +769,8 @@ pub struct Pool {
     /// Requests waiting in [`Pool::acquire`].
     queued: AtomicUsize,
     released: Arc<Notify>,
+    /// Requests holding a [`RetryPermit`].
+    retrying: Arc<AtomicUsize>,
 }
 
 impl Pool {
@@ -777,6 +790,7 @@ impl Pool {
             allow_unix: true,
             queued: AtomicUsize::new(0),
             released: Arc::default(),
+            retrying: Arc::default(),
         };
 
         let mut upstreams: Vec<Arc<Upstream>> = Vec::with_capacity(backends.len());
@@ -1108,6 +1122,32 @@ impl Pool {
             }
             released.await;
         }
+    }
+
+    /// Whether a request may be sent again, as a retry or as a hedge, within
+    /// the `retry_budget` of the pool. A request counts against the budget
+    /// from its first retry until `permit` is dropped, so one that holds a
+    /// permit may always go on. Always true without a budget.
+    #[must_use]
+    pub fn allow_retry(&self, permit: &mut Option<RetryPermit>) -> bool {
+        let Some(budget) = &self.settings.retry_budget else {
+            return true;
+        };
+        if permit.is_some() {
+            return true;
+        }
+        let active: usize = self
+            .members()
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.active_requests())
+            .sum();
+        if self.retrying.fetch_add(1, Ordering::Relaxed) >= budget.limit(active) {
+            self.retrying.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        *permit = Some(RetryPermit(Arc::clone(&self.retrying)));
+        true
     }
 
     /// True when a member would take requests if it were not at
@@ -1510,7 +1550,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::config::{DynamicUpstreams, PassiveHealth};
+    use crate::config::{DynamicUpstreams, PassiveHealth, RetryBudget};
 
     fn group(policy: Policy, backends: &[(&str, u32)]) -> UpstreamGroup {
         let mut group = UpstreamGroup::with_backends(
@@ -1811,6 +1851,38 @@ mod tests {
             assert!(poll(waiting.as_mut()).is_pending());
         }
         assert_eq!(pool.status().queued, 0);
+    }
+
+    #[test]
+    fn retry_budget_bounds_concurrent_retries() {
+        let mut group = group(Policy::RoundRobin, &[("10.0.0.1:80", 1)]);
+        assert!(
+            Pool::new("p", &group).unwrap().allow_retry(&mut None),
+            "no budget, no bound"
+        );
+
+        group.retry_budget = Some(RetryBudget {
+            percent: 50.0,
+            min_retries: 1,
+        });
+        let pool = Pool::new("p", &group).unwrap();
+        let (mut first, mut second, mut third) = (None, None, None);
+        assert!(pool.allow_retry(&mut first));
+        assert!(pool.allow_retry(&mut first), "counted once per request");
+        assert!(!pool.allow_retry(&mut second), "min_retries is used up");
+        assert!(second.is_none());
+
+        // Four requests in flight: half as many may retry.
+        let guards: Vec<RequestGuard> = (0..4)
+            .map(|_| pool.try_acquire(&context()).unwrap().1)
+            .collect();
+        assert!(pool.allow_retry(&mut second));
+        assert!(!pool.allow_retry(&mut third));
+        drop(guards);
+
+        drop(first);
+        drop(second);
+        assert!(pool.allow_retry(&mut third), "finished retries give back");
     }
 
     #[test]

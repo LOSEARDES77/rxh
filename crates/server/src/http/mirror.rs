@@ -107,9 +107,13 @@ async fn copy(group: &Group, mut request: Request<Body>, client: &Client) -> Res
         headers: Some(request.headers()),
         secure: client.secure,
     };
-    let dialed = upstream::connect_with_retries(&group.pool, &context, |upstream| async move {
-        group.transport.connect(upstream.address(), preface).await
-    })
+    let mut retry_permit = None;
+    let dialed = upstream::connect_with_retries(
+        &group.pool,
+        &context,
+        &mut retry_permit,
+        |upstream| async move { group.transport.connect(upstream.address(), preface).await },
+    )
     .await;
     let (selection, _guard, connection) = match dialed {
         Ok(dialed) => dialed,
