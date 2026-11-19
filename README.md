@@ -245,11 +245,16 @@ reachable address.
 | `GET` | `/certificates` | Certificates served, with expiry dates |
 | `POST` | `/certificates/reload` | Read the certificate files again |
 | `POST` | `/reload` | Reload the configuration file |
+| `POST` | `/load` | Run the configuration in the body (TOML or JSON), without writing the file |
+| `PATCH` | `/config/upstream/{name}` | Merge the body into one pool |
+| `PATCH` | `/config/server/{name or index}` | Merge the body into one server |
 | `POST` | `/stop` | Graceful shutdown |
 
 ```bash
 curl -s localhost:2019/pools/web | jq
 curl -s -X POST localhost:2019/pools/web/upstreams -d '{"address":"10.0.0.13:8080"}'
+curl -s -X POST localhost:2019/load --data-binary @new.toml
+curl -s -X PATCH localhost:2019/config/upstream/web -d '{"policy":"least_conn"}'
 ```
 
 ## Project layout

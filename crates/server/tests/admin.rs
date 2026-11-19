@@ -440,6 +440,194 @@ async fn busy_admin_address_fails_startup_with_a_hint() {
     assert!(err.contains("is another rxh running?"), "{err}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn load_runs_the_uploaded_configuration_until_the_next_reload() {
+    let first = util::backend("first").await;
+    let second = util::backend("second").await;
+    let (admin, web, other) = (free_address(), free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config_path = directory.path().join("rxh.toml");
+    let file = format!(
+        "[admin]\nlisten = \"{admin}\"\n\
+         [acme.dns]\nprovider = \"cloudflare\"\napi_token = \"real-secret\"\n\
+         [[server]]\nlisten = \"{web}\"\nforward = \"{first}\"\n"
+    );
+    fs::write(&config_path, &file).expect("write");
+    let _daemon = start(&config_path, admin).await;
+    assert_eq!(body_of(web).await, "first");
+
+    // TOML, with an `[admin]` table that would cut the API off: ignored.
+    let upload = format!(
+        "[admin]\nenabled = false\n[[server]]\nlisten = \"{web}\"\nforward = \"{second}\"\n"
+    );
+    let (status, json) = send(admin, Method::POST, "/load", &upload).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["loaded"], true);
+    util::eventually(async || body_of(web).await == "second").await;
+    let (status, config) = get(admin, "/config").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["admin"]["listen"], admin.to_string());
+    assert_eq!(config["acme"]["dns"], Value::Null, "the upload has no DNS");
+    assert_eq!(fs::read_to_string(&config_path).expect("read"), file);
+
+    // Rejected uploads leave the running configuration alone.
+    let rejected = [
+        (String::from("[[server]]\nlisten = 1"), "invalid TOML body"),
+        (String::from("{\"server\": 1}"), "invalid JSON body"),
+        (String::from("{\"nope\": 1}"), "nope"),
+        (String::from("include = [\"conf.d/*.toml\"]\n"), "include"),
+        (
+            format!("[[server]]\nlisten = \"{web}\"\nforward = \"@missing\"\n"),
+            "missing",
+        ),
+        // A listener that cannot bind: the address is the admin API's.
+        (
+            format!("[[server]]\nlisten = \"{admin}\"\nforward = \"{first}\"\n"),
+            "",
+        ),
+    ];
+    for (body, expected) in rejected {
+        let (status, json) = send(admin, Method::POST, "/load", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+        assert!(error_text(&json).contains(expected), "{json}");
+        assert_eq!(body_of(web).await, "second");
+    }
+    let huge = format!("# {}\n", "x".repeat(5 * 1024 * 1024));
+    let (status, json) = send(admin, Method::POST, "/load", &huge).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        error_text(&json).starts_with("could not read body"),
+        "{json}"
+    );
+
+    // Without a body it reloads the file, as `/reload` does.
+    let (status, json) = send(admin, Method::POST, "/load", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["reloaded"], true);
+    util::eventually(async || body_of(web).await == "first").await;
+
+    // What `GET /config` prints loads again, as JSON, and the redacted
+    // secret is the running one afterwards.
+    let (_, mut config) = get(admin, "/config").await;
+    assert_eq!(config["acme"]["dns"]["api_token"], "***");
+    config["server"][0]["listen"] = Value::from(vec![other.to_string()]);
+    let (status, json) = send(admin, Method::POST, "/load", &config.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    util::eventually(async || TcpStream::connect(web).await.is_err()).await;
+    assert_eq!(body_of(other).await, "first");
+    let (_, config) = get(admin, "/config").await;
+    assert_eq!(config["acme"]["dns"]["api_token"], "***");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_works_without_a_configuration_file() {
+    let backend = util::backend("uploaded").await;
+    let (admin, web) = (free_address(), free_address());
+    let config = Config::from_toml(&format!("[admin]\nlisten = \"{admin}\"\n")).expect("valid");
+    let _daemon = tokio::task::spawn(Daemon::from_config(config).run());
+    util::eventually(async || TcpStream::connect(admin).await.is_ok()).await;
+
+    let upload = format!("[[server]]\nlisten = \"{web}\"\nforward = \"{backend}\"\n");
+    let (status, json) = send(admin, Method::POST, "/load", &upload).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(body_of(web).await, "uploaded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn patch_changes_one_pool_or_one_server() {
+    let first = util::backend("first").await;
+    let second = util::backend("second").await;
+    let (admin, web, moved) = (free_address(), free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config_path = directory.path().join("rxh.toml");
+    let file = format!(
+        "[admin]\nlisten = \"{admin}\"\n\
+         [upstream.api]\nbackends = [\"{first}\"]\n\
+         [upstream.spare]\nbackends = [\"{second}\"]\n\
+         [[server]]\nname = \"web\"\nlisten = \"{web}\"\nforward = \"@api\"\n"
+    );
+    fs::write(&config_path, &file).expect("write");
+    let _daemon = start(&config_path, admin).await;
+    let patch = async |uri: &str, body: &str| send(admin, Method::PATCH, uri, body).await;
+
+    // One key of a pool; the backend added at runtime stays a member.
+    let add = format!("{{\"address\": \"{second}\"}}");
+    let (status, _) = send(admin, Method::POST, "/pools/api/upstreams", &add).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, json) = patch("/config/upstream/api", r#"{"policy": "first"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["patched"], true);
+    let (_, pool) = get(admin, "/pools/api").await;
+    assert_eq!(pool["policy"], "first");
+    assert_eq!(addresses(&pool), [first.to_string(), second.to_string()]);
+    for _ in 0..4 {
+        assert_eq!(body_of(web).await, "first", "`first` never rotates");
+    }
+    assert_eq!(fs::read_to_string(&config_path).expect("read"), file);
+
+    // A TOML body, replacing the member list.
+    let backends = format!("backends = [\"{second}\"]\n");
+    let (status, json) = patch("/config/upstream/api", &backends).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    util::eventually(async || body_of(web).await == "second").await;
+    let (_, config) = get(admin, "/config").await;
+    assert_eq!(config["upstream"]["api"]["policy"], "first", "kept");
+
+    // A server by name, then by index.
+    let listen = format!("{{\"listen\": [\"{moved}\"]}}");
+    let (status, json) = patch("/config/server/web", &listen).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    util::eventually(async || TcpStream::connect(web).await.is_err()).await;
+    assert_eq!(body_of(moved).await, "second");
+    let (status, json) = patch("/config/server/0", r#"{"name": "front"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let (_, status) = get(admin, "/status").await;
+    assert_eq!(status["servers"][0]["name"], "front");
+    assert_eq!(status["servers"][0]["listen"], moved.to_string());
+
+    // Unknown targets.
+    for (uri, expected) in [
+        ("/config/upstream/nope", "no pool named nope"),
+        ("/config/server/web", "no server named web"),
+        ("/config/server/1", "no server named 1"),
+        (
+            "/config/admin/listen",
+            "no route for PATCH /config/admin/listen",
+        ),
+        ("/config/upstream", "no route for PATCH /config/upstream"),
+    ] {
+        let (status, json) = patch(uri, "{}").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {json}");
+        assert_eq!(error_text(&json), expected);
+    }
+
+    // Rejected patches leave the running configuration alone.
+    for (uri, body, expected) in [
+        ("/config/upstream/api", "{oops", "invalid JSON body"),
+        ("/config/upstream/api", "= 1", "invalid TOML body"),
+        ("/config/upstream/api", r#"{"polcy": "random"}"#, "polcy"),
+        ("/config/upstream/api", r#"{"policy": 3}"#, "invalid patch"),
+        (
+            "/config/server/front",
+            r#"{"match": [{"forward": "@gone"}]}"#,
+            "gone",
+        ),
+        ("/config/server/front", r#"{"listen": null}"#, "listen"),
+    ] {
+        let (status, json) = patch(uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+        assert!(error_text(&json).contains(expected), "{json}");
+        assert_eq!(body_of(moved).await, "second");
+    }
+
+    // A reload goes back to the file.
+    let (status, _) = send(admin, Method::POST, "/reload", "").await;
+    assert_eq!(status, StatusCode::OK);
+    util::eventually(async || body_of(web).await == "first").await;
+    let (_, pool) = get(admin, "/pools/api").await;
+    assert_eq!(pool["policy"], "weighted_round_robin");
+}
+
 const TOKEN: &str = "s3cret-admin-token-0123";
 
 #[tokio::test(flavor = "multi_thread")]
@@ -461,6 +649,8 @@ async fn token_is_required_on_every_route_when_set() {
         (Method::GET, "/metrics"),
         (Method::GET, "/config"),
         (Method::POST, "/reload"),
+        (Method::POST, "/load"),
+        (Method::PATCH, "/config/upstream/api"),
         (Method::POST, "/stop"),
     ] {
         for headers in [

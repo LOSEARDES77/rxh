@@ -3151,6 +3151,21 @@ impl AcmeDns {
         }
     }
 
+    /// Puts back the secrets of `running` where this table has the `***`
+    /// of [`AcmeDns::redact`], so a redacted copy can be loaded again.
+    pub fn restore_redacted(&mut self, running: &Self) {
+        let secrets = [
+            (&mut self.api_token, &running.api_token),
+            (&mut self.secret_access_key, &running.secret_access_key),
+            (&mut self.tsig_secret, &running.tsig_secret),
+        ];
+        for (secret, running) in secrets {
+            if secret.as_deref() == Some("***") {
+                secret.clone_from(running);
+            }
+        }
+    }
+
     /// The decoded `tsig_secret`, if there is one.
     ///
     /// # Errors
@@ -4727,6 +4742,23 @@ mod tests {
         assert_eq!(redacted.tsig_secret.as_deref(), Some("***"));
         assert_eq!(redacted.tsig_key.as_deref(), Some("rxh."));
         assert_eq!(redacted.api_token, None);
+
+        // Loading the redacted copy again keeps the running secret; a new
+        // secret and a removed one are taken as sent.
+        let running = rfc2136.acme.dns.clone().unwrap();
+        let mut restored = redacted.clone();
+        restored.restore_redacted(&running);
+        assert_eq!(restored, running);
+        let mut changed = redacted.clone();
+        changed.tsig_secret = Some(String::from("bmV3"));
+        changed.restore_redacted(&running);
+        assert_eq!(changed.tsig_secret.as_deref(), Some("bmV3"));
+        let mut other = redacted;
+        other.api_token = Some(String::from("***"));
+        other.tsig_secret = None;
+        other.restore_redacted(&running);
+        assert_eq!(other.api_token, None, "nothing to restore from");
+        assert_eq!(other.tsig_secret, None);
     }
 
     #[test]

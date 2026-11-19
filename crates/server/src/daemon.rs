@@ -307,6 +307,17 @@ impl Daemon {
                         let _ = reply.send(outcome);
                         continue;
                     }
+                    Control::Apply(change, reply) => {
+                        println!("Main => Applying a configuration change from the admin API");
+                        // Patched on top of the live members, so backends
+                        // added at runtime survive the swap.
+                        let outcome = match change.apply(&generation.current().live_config()) {
+                            Ok(config) => self.apply(config, &mut generation, &admin_state).await,
+                            Err(message) => Err(message),
+                        };
+                        let _ = reply.send(outcome);
+                        continue;
+                    }
                 },
                 _ = polls.tick(), if generation.config.watch => {
                     if !watcher.as_mut().is_some_and(Watcher::poll) {
@@ -364,6 +375,16 @@ impl Daemon {
             .ok_or("no configuration file to reload")?;
         println!("Main => Reloading {}", path.display());
         let config = load_config(path).map_err(|err| err.to_string())?;
+        self.apply(config, generation, admin).await
+    }
+
+    /// Swaps the running generation for one of `config`, which is valid.
+    async fn apply(
+        &self,
+        config: Config,
+        generation: &mut Generation,
+        admin: &AdminState,
+    ) -> Result<(), String> {
         // A server taking over the port of the challenge-only listener must
         // be able to bind it.
         acme::release_challenge_port(&config.with_https_redirects()).await;
