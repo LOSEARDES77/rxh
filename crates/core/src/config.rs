@@ -80,6 +80,10 @@ pub struct Config {
     #[serde(default)]
     pub acme: Acme,
 
+    /// Routes to Docker containers, taken from their `rxh.*` labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<Docker>,
+
     /// Maximum time to wait for open connections during shutdown or reload.
     /// `None` waits forever, like Caddy's default.
     #[serde(
@@ -190,6 +194,11 @@ impl Config {
         self.acme
             .validate()
             .map_err(|err| ConfigError::Invalid(format!("acme: {err}")))?;
+        if let Some(docker) = &self.docker {
+            docker
+                .validate()
+                .map_err(|err| ConfigError::Invalid(format!("docker: {err}")))?;
+        }
 
         for (name, group) in &self.upstreams {
             group
@@ -813,6 +822,53 @@ impl Default for Log {
             format: LogFormat::Text,
             output: default::log_output(),
             access: true,
+        }
+    }
+}
+
+/// Docker provider (`[docker]`): running containers labelled `rxh.enable=true`
+/// become pools and servers, followed live through the Docker events.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Docker {
+    /// Docker Engine API: `unix:///path/to/docker.sock` or `tcp://host:port`.
+    #[serde(default = "default::docker_endpoint")]
+    pub endpoint: String,
+
+    /// Address of the HTTP servers made from `rxh.http.host` labels.
+    #[serde(default = "default::docker_listen")]
+    pub listen: SocketAddr,
+}
+
+impl Default for Docker {
+    fn default() -> Self {
+        Self {
+            endpoint: default::docker_endpoint(),
+            listen: default::docker_listen(),
+        }
+    }
+}
+
+impl Docker {
+    fn validate(&self) -> Result<(), String> {
+        let valid = match self.endpoint.split_once("://") {
+            Some(("unix", path)) => path.starts_with('/'),
+            Some(("tcp", address)) => matches!(
+                BackendAddress::parse(address),
+                Ok(BackendAddress::Tcp {
+                    scheme: Scheme::Bare,
+                    ..
+                })
+            ),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(format!(
+                "endpoint must be unix:///path or tcp://host:port, got {:?}",
+                self.endpoint
+            ))
         }
     }
 }
@@ -4041,6 +4097,14 @@ mod default {
         String::from("/")
     }
 
+    pub fn docker_endpoint() -> String {
+        String::from("unix:///var/run/docker.sock")
+    }
+
+    pub fn docker_listen() -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], 80))
+    }
+
     pub fn acme_ca() -> String {
         String::from("https://acme-v02.api.letsencrypt.org/directory")
     }
@@ -5225,6 +5289,53 @@ mod tests {
 
         assert!(IncludedConfig::from_toml("[admin]\nenabled = false\n").is_err());
         assert!(IncludedConfig::from_toml("include = [\"x\"]\n").is_err());
+    }
+
+    #[test]
+    fn docker_section_has_defaults_and_validates_the_endpoint() {
+        assert_eq!(Config::from_toml("").expect("valid").docker, None);
+
+        let config = Config::from_toml("[docker]\n").expect("valid");
+        let docker = config.docker.as_ref().expect("enabled by the table");
+        assert_eq!(docker.endpoint, "unix:///var/run/docker.sock");
+        assert_eq!(docker.listen, "0.0.0.0:80".parse().expect("address"));
+        let text = toml::to_string(&config).expect("serializes");
+        assert_eq!(
+            Config::from_toml(&text).expect("round trip").docker,
+            config.docker
+        );
+
+        for endpoint in [
+            "unix:///run/user/1000/docker.sock",
+            "tcp://127.0.0.1:2375",
+            "tcp://docker:2375",
+        ] {
+            let text =
+                format!("[docker]\nendpoint = \"{endpoint}\"\nlisten = \"127.0.0.1:8080\"\n");
+            let docker = Config::from_toml(&text)
+                .expect(endpoint)
+                .docker
+                .expect("set");
+            assert_eq!(docker.endpoint, endpoint);
+            assert_eq!(docker.listen.port(), 8080);
+        }
+
+        for endpoint in [
+            "",
+            "/var/run/docker.sock",
+            "unix://relative.sock",
+            "tcp://docker",
+            "http://127.0.0.1:2375",
+            "tcp://unix//x",
+        ] {
+            let err = Config::from_toml(&format!("[docker]\nendpoint = \"{endpoint}\"\n"))
+                .expect_err(endpoint)
+                .to_string();
+            assert!(err.contains("docker: endpoint must be"), "{err}");
+        }
+        assert!(Config::from_toml("[docker]\nlisten = \"80\"\n").is_err());
+        assert!(Config::from_toml("[docker]\nnetwork = \"web\"\n").is_err());
+        assert!(IncludedConfig::from_toml("[docker]\n").is_err());
     }
 
     #[test]

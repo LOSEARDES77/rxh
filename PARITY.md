@@ -217,7 +217,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 
 | Feature | Inspired by | Notes |
 |---|---|---|
-| Docker provider: discover containers and route by labels | Traefik Docker provider | Labels like `rxh.enable=true`, `rxh.http.host=app.example.com`, `rxh.http.port=8080`, `rxh.pool=web`, `rxh.policy=least_conn`, `rxh.tcp.listen=:5432`; watch the Docker socket for start/stop events and update pools live. |
+| Docker provider: discover containers and route by labels | Traefik Docker provider | Done: `[docker]` (`endpoint`, `listen`) routes to the running containers labelled `rxh.enable=true` from `rxh.http.host`, `rxh.http.port`, `rxh.tcp.listen`, `rxh.tcp.port`, `rxh.pool` and `rxh.policy`, and follows the `start` and `die` events of the Docker API (unix socket or plain TCP). Containers are dynamic members of their pool: replicas come and go without touching the listeners, which are swapped like a reload only when a pool or its hosts, address or policy change. Opt-in only (no `exposedByDefault`), a container is HTTP or TCP, and unlike Traefik there are no labels for TLS, middlewares, path rules, weights or the network to use (first network by name); the generated routes are plain HTTP on one address. No TLS to the Docker API, no UDP routes. |
 | Docker image and Compose examples with tags | Traefik images (`traefik:v3`, `v3.x`) | Publish `rxh:latest`, `rxh:0.x`, `rxh:0.x.y` and `-alpine`/distroless variants for amd64 and arm64 on GHCR and Docker Hub from CI on release tags. |
 | Docker Swarm, Podman and Kubernetes Ingress / Gateway API providers | Traefik | |
 | Consul, etcd and Nomad service discovery | Traefik, HAProxy | |

@@ -1389,3 +1389,206 @@ async fn sd_notify_reports_readiness_reloads_and_stopping() {
     signal("-TERM");
     assert_eq!(receive(), "STOPPING=1");
 }
+
+/// One entry of the Docker container list: a container named `id` whose only
+/// port is the one of `backend`, with `rxh.enable=true` and `labels`.
+fn docker_container(id: &str, backend: SocketAddr, labels: &[(&str, &str)]) -> serde_json::Value {
+    let mut all = serde_json::Map::new();
+    all.insert("rxh.enable".into(), "true".into());
+    for (key, value) in labels {
+        all.insert((*key).into(), (*value).into());
+    }
+    serde_json::json!({
+        "Id": id,
+        "Names": [format!("/{id}")],
+        "Labels": all,
+        "Ports": [{ "PrivatePort": backend.port(), "Type": "tcp" }],
+        "HostConfig": { "NetworkMode": "bridge" },
+        "NetworkSettings": { "Networks": { "bridge": { "IPAddress": backend.ip().to_string() } } },
+    })
+}
+
+fn docker_list(containers: &[&serde_json::Value]) -> String {
+    serde_json::to_string(containers).expect("serializes")
+}
+
+async fn get_host(address: SocketAddr, host: &str) -> Option<String> {
+    let stream = TcpStream::connect(address).await.ok()?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .ok()?;
+    tokio::task::spawn(connection);
+    let request = hyper::Request::get("/")
+        .header("host", host)
+        .body(Empty::<Bytes>::new())
+        .ok()?;
+    let response = sender.send_request(request).await.ok()?;
+    let body = response.into_body().collect().await.ok()?.to_bytes();
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Waits until `tries` requests in a row for `host` are answered by exactly
+/// the backends in `expected`, each of them at least once.
+async fn wait_for_backends(address: SocketAddr, host: &str, expected: &[&str], tries: usize) {
+    let mut last = Vec::new();
+    for _ in 0..100 {
+        let mut seen = Vec::new();
+        for _ in 0..tries {
+            let body = get_host(address, host).await.unwrap_or_default();
+            if !seen.contains(&body) {
+                seen.push(body);
+            }
+        }
+        seen.sort();
+        if seen == expected {
+            return;
+        }
+        last = seen;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{host} on {address} is served by {last:?}, expected {expected:?}");
+}
+
+/// Starts the daemon with its standard output in `stdout.log`.
+fn start_daemon_logged(directory: &Path) -> Daemon {
+    let log = std::fs::File::create(directory.join("stdout.log")).expect("log file");
+    Daemon(
+        Command::new(RXH)
+            .current_dir(directory)
+            .args(["run", "--config", "rxh.toml"])
+            .stdout(log)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon starts"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn docker_containers_are_routed_by_their_labels_and_followed_live() {
+    let docker = rxh_test_util::DockerApi::start().await;
+    let (a, b, db, file) = (
+        backend("a").await,
+        backend("b").await,
+        backend("db").await,
+        backend("file").await,
+    );
+    let (admin, web, tcp) = (free_address(), free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\
+             [docker]\nendpoint = \"{}\"\nlisten = \"{web}\"\n\
+             [[server]]\nlisten = \"{web}\"\nhost = \"file.test\"\nforward = \"{file}\"\n",
+            docker.endpoint()
+        ),
+    )
+    .expect("write config");
+    // How often the listeners were rebuilt for Docker.
+    let route_updates = || {
+        std::fs::read_to_string(dir.join("stdout.log"))
+            .expect("log")
+            .matches("Docker containers changed, updating the routes")
+            .count()
+    };
+
+    let app = [("rxh.http.host", "app.test"), ("rxh.pool", "app")];
+    let app_a = docker_container("app-a", a, &app);
+    let app_b = docker_container("app-b", b, &app);
+    // Running before the daemon starts.
+    docker.publish(&docker_list(&[&app_a]), "start", "app-a");
+    let _daemon = start_daemon_logged(dir);
+    wait_for_backends(web, "app.test", &["a"], 1).await;
+    // Servers of the file share the address with the ones of the containers.
+    assert_eq!(get_host(web, "file.test").await.as_deref(), Some("file"));
+    assert_eq!(route_updates(), 1);
+
+    let pools = assert_success(&rxh(dir, admin, &["status"]));
+    assert!(
+        pools.contains("app") && pools.contains(&a.to_string()),
+        "{pools}"
+    );
+
+    // A replica joins the pool without rebuilding the listeners.
+    docker.publish(&docker_list(&[&app_a, &app_b]), "start", "app-b");
+    wait_for_backends(web, "app.test", &["a", "b"], 20).await;
+    assert_eq!(route_updates(), 1);
+
+    // A container that died leaves at once, even while Docker still lists it.
+    docker.publish(&docker_list(&[&app_a, &app_b]), "die", "app-a");
+    wait_for_backends(web, "app.test", &["b"], 20).await;
+    assert_eq!(route_updates(), 1);
+
+    // A TCP route, next to a container whose labels cannot be routed.
+    let database = docker_container("db", db, &[("rxh.tcp.listen", &tcp.to_string())]);
+    let broken = docker_container(
+        "broken",
+        db,
+        &[("rxh.http.host", "broken.test"), ("rxh.tcp.listen", ":1")],
+    );
+    docker.publish(&docker_list(&[&app_b, &database, &broken]), "start", "db");
+    wait_for_body(tcp, "db").await;
+    assert_eq!(route_updates(), 2);
+    wait_for_backends(web, "app.test", &["b"], 5).await;
+    assert_ne!(get_host(web, "broken.test").await.as_deref(), Some("db"));
+
+    // The last containers stop: their routes go away, the file's stay.
+    docker.publish("[]", "die", "app-b");
+    for _ in 0..250 {
+        if get_host(web, "app.test").await.as_deref() != Some("b") && try_get(tcp).await.is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(get_host(web, "app.test").await.as_deref(), Some("b"));
+    assert_eq!(try_get(tcp).await, None);
+    assert_eq!(get_host(web, "file.test").await.as_deref(), Some("file"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn docker_provider_waits_for_docker_and_stops_with_its_section() {
+    let (a, file) = (backend("a").await, backend("file").await);
+    let (admin, web, docker_address) = (free_address(), free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let config = |docker: &str| {
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n{docker}\
+             [[server]]\nlisten = \"{web}\"\nhost = \"file.test\"\nforward = \"{file}\"\n"
+        )
+    };
+    let with_docker =
+        format!("[docker]\nendpoint = \"tcp://{docker_address}\"\nlisten = \"{web}\"\n");
+    std::fs::write(dir.join("rxh.toml"), config(&with_docker)).expect("write config");
+
+    // Nothing answers on the endpoint: the daemon serves the file anyway.
+    let _daemon = start_daemon(dir);
+    wait_for_backends(web, "file.test", &["file"], 1).await;
+
+    // Docker comes up later and its containers are picked up.
+    let docker = rxh_test_util::DockerApi::start_on(docker_address).await;
+    let container = docker_container("app", a, &[("rxh.http.host", "app.test")]);
+    docker.publish(&docker_list(&[&container]), "start", "app");
+    wait_for_backends(web, "app.test", &["a"], 1).await;
+
+    // Without `[docker]` the routes of the containers are dropped.
+    std::fs::write(dir.join("rxh.toml"), config("")).expect("write config");
+    assert_success(&rxh(dir, admin, &["reload"]));
+    assert_ne!(get_host(web, "app.test").await.as_deref(), Some("a"));
+    assert_eq!(get_host(web, "file.test").await.as_deref(), Some("file"));
+
+    // And an invalid endpoint is refused before the daemon starts.
+    std::fs::write(
+        dir.join("rxh.toml"),
+        config("[docker]\nendpoint = \"docker.sock\"\n"),
+    )
+    .expect("write config");
+    let output = rxh(dir, admin, &["validate", "-c", "rxh.toml"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("docker: endpoint must be"),
+        "{}",
+        stderr_of(&output)
+    );
+}

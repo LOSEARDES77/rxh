@@ -10,6 +10,7 @@ mod admin;
 mod change;
 mod daemon;
 mod dns01;
+mod docker;
 mod dynamic;
 mod error;
 mod files;
