@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- Consistent hashing with bounded loads and Maglev: on a pool with a hash
+  policy, `hash_balance_factor = 125` keeps every backend at or below 125%
+  of the average load by passing the keys of a busy backend on to the next
+  one, and `hash_type = "maglev"` maps keys through a Maglev lookup table
+  instead of rendezvous hashing.
+
 - Drain and maintenance states: `rxh upstream drain web 10.0.0.1:80`,
   `rxh upstream maintenance` and `rxh upstream ready` (admin API
   `PUT /pools/{name}/upstreams/state`) take a backend out of rotation while

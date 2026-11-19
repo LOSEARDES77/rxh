@@ -17,7 +17,9 @@ use http::{HeaderMap, Uri};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::config::{Backend, CircuitBreaker, Fallback, PassiveHealth, Policy, UpstreamGroup};
+use crate::config::{
+    Backend, CircuitBreaker, Fallback, HashType, PassiveHealth, Policy, UpstreamGroup,
+};
 use crate::random;
 
 /// Default cookie name of the `cookie` policy, same as Caddy.
@@ -680,15 +682,26 @@ struct Members {
     upstreams: Vec<Arc<Upstream>>,
     /// Smooth weighted round robin order, as indexes into `upstreams`.
     weighted_order: Vec<usize>,
+    /// Maglev lookup table, as indexes into `upstreams`. Empty unless the
+    /// pool uses `hash_type = "maglev"`.
+    maglev: Vec<u32>,
 }
 
 impl Members {
-    fn new(upstreams: Vec<Arc<Upstream>>) -> Self {
+    fn new(upstreams: Vec<Arc<Upstream>>, hash_type: HashType) -> Self {
         let weights: Vec<u32> = upstreams.iter().map(|upstream| upstream.weight).collect();
         let weighted_order = smooth_weighted_order(&weights);
+        let maglev = match hash_type {
+            HashType::Rendezvous => Vec::new(),
+            HashType::Maglev => {
+                let hashes: Vec<u64> = upstreams.iter().map(|u| u.address_hash).collect();
+                maglev_table(&hashes, MAGLEV_TABLE_SIZE)
+            }
+        };
         Self {
             upstreams,
             weighted_order,
+            maglev,
         }
     }
 }
@@ -731,7 +744,7 @@ impl Pool {
             upstreams.push(Arc::new(pool.make_upstream(backend)));
         }
         *pool.members.write().unwrap_or_else(PoisonError::into_inner) =
-            Arc::new(Members::new(upstreams));
+            Arc::new(Members::new(upstreams, pool.settings.hash_type));
 
         Ok(pool)
     }
@@ -865,7 +878,7 @@ impl Pool {
             upstream.start_ramp();
             upstreams.push(Arc::new(upstream));
         }
-        *guard = Arc::new(Members::new(upstreams));
+        *guard = Arc::new(Members::new(upstreams, self.settings.hash_type));
         Ok(())
     }
 
@@ -903,7 +916,7 @@ impl Pool {
                 .zip(&guard.upstreams)
                 .all(|(new, old)| Arc::ptr_eq(new, old));
         if !unchanged {
-            *guard = Arc::new(Members::new(upstreams));
+            *guard = Arc::new(Members::new(upstreams, self.settings.hash_type));
         }
     }
 
@@ -946,7 +959,7 @@ impl Pool {
                 upstreams.push(Arc::new(rebuilt));
             }
         }
-        *guard = Arc::new(Members::new(upstreams));
+        *guard = Arc::new(Members::new(upstreams, self.settings.hash_type));
     }
 
     /// Copies the operator state of the members of `previous`, the same pool
@@ -986,7 +999,7 @@ impl Pool {
             .cloned()
             .collect();
         let removed = upstreams.len() != before;
-        *guard = Arc::new(Members::new(upstreams));
+        *guard = Arc::new(Members::new(upstreams, self.settings.hash_type));
         removed
     }
 
@@ -1017,6 +1030,8 @@ impl Pool {
             None => slow_start(|ready| pick_random(upstreams, ready)).map(Selection::plain),
         };
 
+        let hash = |key: &[u8]| pick_hash(members, key, self.settings.hash_balance_factor);
+
         let picked = match node.policy {
             Policy::Cookie => return self.select_cookie(node, members, context, missing),
             Policy::Random => slow_start(|ready| pick_random(upstreams, ready)),
@@ -1034,20 +1049,18 @@ impl Pool {
                 slow_start(|ready| self.rotate(upstreams, order.len(), |turn| order[turn], ready))
             }
             Policy::LeastConn => slow_start(|ready| pick_least_conn(upstreams, ready)),
-            Policy::IpHash => pick_rendezvous(upstreams, ip_key(context.peer_ip).as_bytes()),
-            Policy::ClientIpHash => {
-                pick_rendezvous(upstreams, ip_key(context.client_ip).as_bytes())
-            }
+            Policy::IpHash => hash(ip_key(context.peer_ip).as_bytes()),
+            Policy::ClientIpHash => hash(ip_key(context.client_ip).as_bytes()),
             Policy::UriHash => match context.uri.and_then(Uri::path_and_query) {
-                Some(path) => pick_rendezvous(upstreams, path.as_str().as_bytes()),
+                Some(path) => hash(path.as_str().as_bytes()),
                 None => return missing(),
             },
             Policy::Query => match query_value(node.key, context) {
-                Some(value) => pick_rendezvous(upstreams, value.as_bytes()),
+                Some(value) => hash(value.as_bytes()),
                 None => return missing(),
             },
             Policy::Header => match header_value(node.key, context) {
-                Some(value) => pick_rendezvous(upstreams, value.as_bytes()),
+                Some(value) => hash(value.as_bytes()),
                 None => return missing(),
             },
         };
@@ -1240,16 +1253,89 @@ fn pick_least_conn(upstreams: &[Arc<Upstream>], ready: Ready<'_>) -> Option<Arc<
     best.cloned()
 }
 
-/// Highest random weight (rendezvous) hashing: the same key keeps mapping to
+/// Backend of a key for the hash policies. The same key keeps mapping to
 /// the same backend while it is available, and only keys owned by a removed
 /// backend move when membership changes.
-fn pick_rendezvous(upstreams: &[Arc<Upstream>], key: &[u8]) -> Option<Arc<Upstream>> {
+///
+/// The owner of a key is its entry in the Maglev table when the pool has
+/// one, otherwise the member with the highest random weight (rendezvous
+/// hashing). When the owner is unavailable, or at the load bound of
+/// `balance_factor`, the key goes to the next member in rendezvous order.
+fn pick_hash(members: &Members, key: &[u8], balance_factor: Option<u32>) -> Option<Arc<Upstream>> {
     let key_hash = hash_bytes(key);
+    let upstreams = &members.upstreams;
+
+    // Consistent hashing with bounded loads: no backend takes more than
+    // `balance_factor` percent of the average load, this request included.
+    let bound = balance_factor.map(|factor| {
+        let available = upstreams.iter().filter(|upstream| upstream.is_available());
+        let (count, load) = available.fold((0, 1), |(count, load), upstream| {
+            (count + 1, load + upstream.active_requests())
+        });
+        let factor = usize::try_from(factor).unwrap_or(usize::MAX);
+        load.saturating_mul(factor).div_ceil(100 * count.max(1))
+    });
+    let fits = |upstream: &Upstream| bound.is_none_or(|bound| upstream.active_requests() < bound);
+
+    let owner = match members.maglev.len() {
+        0 => None,
+        size => usize::try_from(key_hash % (size as u64))
+            .ok()
+            .and_then(|slot| usize::try_from(members.maglev[slot]).ok()),
+    };
+    if let Some(upstream) = owner.map(|index| &upstreams[index])
+        && upstream.is_available()
+        && fits(upstream)
+    {
+        return Some(Arc::clone(upstream));
+    }
+
+    // Members over the bound stay candidates, after the others: the loads
+    // move while they are read, so the bound can leave nobody.
     upstreams
         .iter()
         .filter(|upstream| upstream.is_available())
-        .max_by_key(|upstream| mix(key_hash ^ mix(upstream.address_hash)))
+        .max_by_key(|upstream| (fits(upstream), mix(key_hash ^ mix(upstream.address_hash))))
         .cloned()
+}
+
+/// Entries of the Maglev table, a prime as the algorithm requires. Same
+/// default as Envoy.
+const MAGLEV_TABLE_SIZE: usize = 65_537;
+
+/// Maglev lookup table (Eisenbud et al., NSDI 2016, section 3.4) of `size`
+/// entries, a prime, over members given by their hashes: each entry is the
+/// index of a member. Members take turns claiming the next free entry of
+/// their own permutation of the table, so every member owns an almost equal
+/// share, and a membership change moves few entries besides those of the
+/// member that left. Empty without members.
+fn maglev_table(hashes: &[u64], size: usize) -> Vec<u32> {
+    const FREE: u32 = u32::MAX;
+
+    let reduce = |hash: u64, modulus: usize| {
+        usize::try_from(hash % (modulus as u64)).expect("a remainder of a usize fits in usize")
+    };
+    // Next entry each member wants, and the step to the one after.
+    let mut wanted: Vec<(usize, usize)> = hashes
+        .iter()
+        .map(|hash| (reduce(*hash, size), reduce(mix(*hash), size - 1) + 1))
+        .collect();
+    let mut table = vec![FREE; if hashes.is_empty() { 0 } else { size }];
+    let mut free = table.len();
+
+    while free > 0 {
+        for (member, (entry, step)) in (0_u32..).zip(&mut wanted) {
+            while table[*entry] != FREE {
+                *entry = (*entry + *step) % size;
+            }
+            table[*entry] = member;
+            free -= 1;
+            if free == 0 {
+                break;
+            }
+        }
+    }
+    table
 }
 
 /// FNV-1a, finished with [`mix`] for good bit dispersion.
@@ -1527,6 +1613,124 @@ mod tests {
         assert_eq!(pick(&pool, &context()), "b:1");
         drop(guard);
         assert_eq!(pick(&pool, &context()), "a:1");
+    }
+
+    #[test]
+    fn maglev_table_gives_equal_shares() {
+        let hashes: Vec<u64> = (0..7_u8).map(|member| hash_bytes(&[member])).collect();
+        let table = maglev_table(&hashes, MAGLEV_TABLE_SIZE);
+        assert_eq!(table.len(), MAGLEV_TABLE_SIZE);
+        let mut shares = [0_usize; 7];
+        for member in &table {
+            shares[usize::try_from(*member).unwrap()] += 1;
+        }
+        // Members claim entries in turns, so shares differ by one at most.
+        let fair = MAGLEV_TABLE_SIZE / 7;
+        assert!(
+            shares.iter().all(|share| (fair..=fair + 1).contains(share)),
+            "{shares:?}"
+        );
+
+        // Members with the same hash want the same entries and still end.
+        assert_eq!(maglev_table(&[1, 1, 1], 13).len(), 13);
+        assert!(maglev_table(&[], 13).is_empty());
+    }
+
+    #[test]
+    fn maglev_is_sticky_and_moves_few_keys() {
+        let mut group = group(
+            Policy::IpHash,
+            &[("a:1", 1), ("b:1", 1), ("c:1", 1), ("d:1", 1)],
+        );
+        group.hash_type = HashType::Maglev;
+        let pool = Pool::new("t", &group).unwrap();
+        let owners = |pool: &Pool| -> Vec<String> {
+            (0..2000_u16)
+                .map(|key| {
+                    let [high, low] = key.to_be_bytes();
+                    pick(pool, &SelectContext::l4(IpAddr::from([10, 0, high, low])))
+                })
+                .collect()
+        };
+
+        let before = owners(&pool);
+        assert_eq!(before, owners(&pool), "same IP must stick");
+        for address in ["a:1", "b:1", "c:1", "d:1"] {
+            let share = before.iter().filter(|owner| *owner == address).count();
+            assert!(
+                (400..=600).contains(&share),
+                "{address} owns {share} of 2000"
+            );
+        }
+
+        // An unavailable owner hands its keys over and takes them back.
+        pool.set_state("d:1", BackendState::Maintenance);
+        let without: Vec<String> = owners(&pool);
+        for (old, new) in before.iter().zip(&without) {
+            assert_ne!(new, "d:1");
+            assert!(old == "d:1" || old == new, "{old} lost a key to {new}");
+        }
+        pool.set_state("d:1", BackendState::Ready);
+        assert_eq!(before, owners(&pool));
+
+        // Removing a member rebuilds the table: besides its own keys, only
+        // a few move.
+        assert!(pool.remove("d:1"));
+        let moved = before
+            .iter()
+            .zip(owners(&pool))
+            .filter(|(old, new)| *old != "d:1" && **old != *new)
+            .count();
+        assert!(
+            moved < 100,
+            "{moved} of 2000 keys moved between other backends"
+        );
+    }
+
+    #[test]
+    fn bounded_loads_move_keys_off_busy_backends() {
+        for hash_type in [HashType::Rendezvous, HashType::Maglev] {
+            let mut group = group(Policy::IpHash, &[("a:1", 1), ("b:1", 1), ("c:1", 1)]);
+            group.hash_type = hash_type;
+            let context = SelectContext::l4(IpAddr::from([10, 0, 0, 1]));
+
+            // Without a bound the key stays, whatever the load.
+            let unbounded = Pool::new("t", &group).unwrap();
+            let owner = unbounded.select(&context).unwrap().upstream;
+            let _busy: Vec<RequestGuard> = (0..4).map(|_| owner.start_request()).collect();
+            assert_eq!(pick(&unbounded, &context), owner.address());
+
+            group.hash_balance_factor = Some(125);
+            let pool = Pool::new("t", &group).unwrap();
+            let owner = pool.select(&context).unwrap().upstream;
+            assert_eq!(owner.address(), pick(&unbounded, &context));
+
+            // 2 of 2 requests in flight are on the owner: with this one the
+            // bound is 125% of 3 / 3, rounded up to 2.
+            let mut busy = vec![owner.start_request(), owner.start_request()];
+            let second = pool.select(&context).unwrap().upstream;
+            assert_ne!(second.address(), owner.address());
+            assert_eq!(
+                pick(&pool, &context),
+                second.address(),
+                "the next one is stable"
+            );
+
+            // With 3 requests on each of the two, the bound is 125% of 7 / 3,
+            // rounded up to 3: the last backend takes over.
+            busy.push(owner.start_request());
+            busy.extend((0..3).map(|_| second.start_request()));
+            let third = pick(&pool, &context);
+            assert!(third != owner.address() && third != second.address());
+
+            // An unavailable backend does not count in the average.
+            pool.set_state(&third, BackendState::Maintenance);
+            assert_eq!(pick(&pool, &context), owner.address());
+            pool.set_state(&third, BackendState::Ready);
+
+            drop(busy);
+            assert_eq!(pick(&pool, &context), owner.address());
+        }
     }
 
     #[test]
