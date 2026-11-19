@@ -30,10 +30,16 @@ pub(crate) fn builder() -> http::response::Builder {
     Response::builder().header(header::SERVER, server_header(true))
 }
 
+/// Response extension of the responses RXH generates itself, the ones
+/// `error_pages` may replace. Upstream responses never carry it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Generated;
+
 /// Plain text response with the given status.
 pub(crate) fn plain(status: StatusCode, text: &'static str) -> BoxResponse {
     let mut response = Response::new(body::full(text));
     *response.status_mut() = status;
+    response.extensions_mut().insert(Generated);
     let headers = response.headers_mut();
     headers.insert(header::SERVER, server_header(true));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));

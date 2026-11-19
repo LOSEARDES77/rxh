@@ -1429,6 +1429,7 @@ socket, except that `http` servers listing the same address share one socket
 | `rate_limit` | | `{ rate, per, burst, key }`: requests each client may send, see [Rate limits](#rate-limits) (http only). |
 | `basic_auth` | | `{ users, realm }`: ask for a user name and password, see [Basic auth](#basic-auth) (http only). |
 | `forward_auth` | | `{ url, copy_headers, timeout }`: let an external service (Authelia, Authentik, oauth2-proxy) decide, see [Forward auth](#forward-auth) (http only). |
+| `error_pages` | | `{ "404" = "404.html", "5xx" = "50x.html" }`: files replacing the body of the errors rxh answers itself, see [Error pages](#error-pages) (http only). |
 | `max_connections_per_ip` | | Concurrent connections of one client IP; more are closed on accept, see [Connections per client](#connections-per-client) (http and tcp). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header with the client address on every new connection to a backend, see [PROXY protocol output](#proxy-protocol-output) (http and tcp). |
 | `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). Set `trusted_proxies` too: with it empty any directly connecting client can spoof its address. |
@@ -2208,11 +2209,49 @@ handle_response = [
   answers any request method, and it cannot be outside the root whatever
   the backend puts in a header.
 - Only responses of a backend are handled: the `502`, `503` and `504` that
-  rxh answers itself when no backend can be reached are not. Passive health
+  rxh answers itself when no backend can be reached are not (use
+  [`error_pages`](#error-pages) for those). Passive health
   checks and `retry_match` see the upstream status, not the replaced one.
 - An entry without action or with two, a `replace_status` outside `200` to
   `599`, `copy_response = false`, `rewrite` without `serve` and
   `handle_response` on a `serve` or `redirect` route are configuration
+  errors.
+
+### Error pages
+
+`error_pages` on an `http` server replaces the body of the error responses
+rxh generates itself (Nginx `error_page`, Traefik `errors`) with a file. Keys
+are a status code (`"404"`) or a class (`"5xx"`) from `4xx` and `5xx`;
+values are file paths, relative to the working directory like `serve`.
+
+```toml
+[[server]]
+listen = "0.0.0.0:80"
+forward = "@app"
+error_pages = { "404" = "/srv/errors/404.html", "503" = "/srv/errors/maintenance.html", "5xx" = "/srv/errors/50x.html" }
+```
+
+- An exact code wins over its class; a status with no page keeps the
+  default plain text body.
+- The pages cover what rxh answers on its own: `404` when no route
+  matches, `403` from `ip_allow` and `ip_deny`, `429` from `rate_limit`,
+  `401` from `basic_auth`, `413` from `max_body_size`, `400` for invalid
+  requests, `502`, `503` and `504` when no backend can be reached or
+  answers in time, and the `404`, `405` and `400` of the file server.
+- Responses of a backend, of a `forward_auth` service and the `416` of
+  range requests are never replaced: handle backend errors with
+  [`handle_response`](#handling-upstream-responses).
+- The status and the other headers stay (`Retry-After`,
+  `WWW-Authenticate`, `Allow`); `Content-Type` comes from the file
+  extension, as in the file server. `encode`, `cors` and
+  `security_headers` apply to the page as to any response.
+- Files are read once, when the server starts and on every reload. A file
+  that cannot be read fails the start or the reload; edit a page and
+  reload to send the new version.
+- Requests that match no route of a listener shared by several servers
+  get the pages of the first of them.
+- A key outside `4xx` and `5xx` (`"302"`, `"2xx"`), an invalid status, an
+  empty path and `error_pages` on `tcp` or `udp` servers are configuration
   errors.
 
 ### HTTP to HTTPS redirect

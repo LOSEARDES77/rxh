@@ -339,6 +339,12 @@ impl Config {
                 server.cors.as_ref(),
             )
             .map_err(|err| ConfigError::Invalid(format!("{label}: {err}")))?;
+            if !server.error_pages.is_empty() && server.protocol != Protocol::Http {
+                return invalid(format!("{label}: error_pages only applies to http servers"));
+            }
+            server
+                .error_page_matchers()
+                .map_err(|err| ConfigError::Invalid(format!("{label}: error_pages: {err}")))?;
             match server.max_connections_per_ip {
                 Some(0) => {
                     return invalid(format!(
@@ -1297,6 +1303,13 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cors: Option<Cors>,
 
+    /// Pages replacing the body of the error responses RXH generates itself
+    /// (http only): a status code (`"404"`) or class (`"5xx"`) mapped to a
+    /// file path. An exact code wins over its class. See
+    /// [`Server::error_page_matchers`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, String>,
+
     /// Maximum number of concurrent connections of one client IP (http and
     /// tcp).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1346,6 +1359,35 @@ impl Server {
             Some(name) => format!("server[{index}] ({name})"),
             None => format!("server[{index}]"),
         }
+    }
+
+    /// The `error_pages` of the server as status matchers and file paths,
+    /// exact codes first so they win over their class.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a key that is not a `4xx` or `5xx` code or class, or on an
+    /// empty path.
+    pub fn error_page_matchers(&self) -> Result<Vec<(StatusMatcher, &str)>, String> {
+        let mut pages = Vec::with_capacity(self.error_pages.len());
+        for (status, file) in &self.error_pages {
+            let matcher: StatusMatcher = status.parse()?;
+            let class = match matcher {
+                StatusMatcher::Code(code) => code / 100,
+                StatusMatcher::Class(class) => class,
+            };
+            if !(4..=5).contains(&class) {
+                return Err(format!(
+                    "{status:?}: only 4xx and 5xx statuses have error pages"
+                ));
+            }
+            if file.is_empty() {
+                return Err(format!("{status:?}: empty file path"));
+            }
+            pages.push((matcher, file.as_str()));
+        }
+        pages.sort_by_key(|(matcher, _)| matches!(matcher, StatusMatcher::Class(_)));
+        Ok(pages)
     }
 }
 
@@ -1405,6 +1447,8 @@ struct RawServer {
     forward_auth: Option<ForwardAuth>,
     security_headers: Option<SecurityHeaders>,
     cors: Option<Cors>,
+    #[serde(default)]
+    error_pages: BTreeMap<String, String>,
     max_connections_per_ip: Option<usize>,
     proxy_protocol: Option<ProxyProtocol>,
     #[serde(default)]
@@ -1524,6 +1568,7 @@ impl TryFrom<RawServer> for Server {
             forward_auth: raw.forward_auth,
             security_headers: raw.security_headers,
             cors: raw.cors,
+            error_pages: raw.error_pages,
             max_connections_per_ip: raw.max_connections_per_ip,
             proxy_protocol: raw.proxy_protocol,
             proxy_protocol_in: raw.proxy_protocol_in,
@@ -7599,6 +7644,71 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
                      match = [{ forward = \"127.0.0.1:2\", cors = { origins = [] } }]",
                 ),
                 "match[0]: cors: origins must not be empty",
+            ),
+        ] {
+            let err = invalid(&text);
+            assert!(err.contains(expected), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn error_pages() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            forward = "127.0.0.1:8080"
+            error_pages = { "5xx" = "/srv/50x.html", "404" = "/srv/404.html", "4XX" = "4xx.txt", 503 = "/srv/503.html" }
+            "#,
+        )
+        .unwrap();
+        let server = &config.servers[0];
+        // Exact codes come first, so 503 wins over 5xx.
+        assert_eq!(
+            server.error_page_matchers().unwrap(),
+            [
+                (StatusMatcher::Code(404), "/srv/404.html"),
+                (StatusMatcher::Code(503), "/srv/503.html"),
+                (StatusMatcher::Class(4), "4xx.txt"),
+                (StatusMatcher::Class(5), "/srv/50x.html"),
+            ]
+        );
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.servers[0].error_pages, server.error_pages);
+
+        let invalid = |text: &str| Config::from_toml(text).unwrap_err().to_string();
+        let http = "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n";
+        for (text, expected) in [
+            (
+                format!("{http}error_pages = {{ \"302\" = \"/a\" }}"),
+                "error_pages: \"302\": only 4xx and 5xx statuses have error pages",
+            ),
+            (
+                format!("{http}error_pages = {{ \"2xx\" = \"/a\" }}"),
+                "only 4xx and 5xx statuses",
+            ),
+            (
+                format!("{http}error_pages = {{ \"600\" = \"/a\" }}"),
+                "error_pages: invalid status \"600\"",
+            ),
+            (
+                format!("{http}error_pages = {{ \"oops\" = \"/a\" }}"),
+                "invalid status \"oops\"",
+            ),
+            (
+                format!("{http}error_pages = {{ \"404\" = \"\" }}"),
+                "error_pages: \"404\": empty file path",
+            ),
+            (
+                format!("{http}error_pages = {{ \"404\" = 1 }}"),
+                "error_pages",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n\
+                     forward = \"127.0.0.1:2\"\nerror_pages = { \"5xx\" = \"/a\" }",
+                ),
+                "error_pages only applies to http servers",
             ),
         ] {
             let err = invalid(&text);

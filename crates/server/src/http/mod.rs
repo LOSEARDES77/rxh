@@ -5,6 +5,7 @@ pub(crate) mod body;
 pub(crate) mod cache;
 pub(crate) mod cors;
 pub(crate) mod encode;
+pub(crate) mod error_pages;
 pub(crate) mod headers;
 pub(crate) mod mirror;
 pub(crate) mod proxy;
