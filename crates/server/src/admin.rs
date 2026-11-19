@@ -15,7 +15,16 @@
 //! | `GET`    | `/certificates`               | Certificates served, with expiry    |
 //! | `POST`   | `/certificates/reload`        | Read certificate files again        |
 //! | `POST`   | `/reload`                     | Reload the configuration file       |
+//! | `POST`   | `/load`                       | Run the configuration in the body   |
+//! | `PATCH`  | `/config/upstream/{name}`     | Merge the body into one pool        |
+//! | `PATCH`  | `/config/server/{name}`       | Merge the body into one server      |
 //! | `POST`   | `/stop`                       | Graceful shutdown                   |
+//!
+//! `/load` takes a whole configuration and the `PATCH` routes a JSON merge
+//! patch (RFC 7396), as JSON or TOML. Both validate and swap like a reload,
+//! and neither writes the configuration file: the next reload or restart
+//! goes back to it. `/load` without a body reloads the file. A server is
+//! addressed by `name`, else by its index.
 //!
 //! With `[admin] token` every request must carry `Authorization: Bearer
 //! <token>`. Without it, TCP requests whose `Host` or `Origin` is not a
@@ -51,6 +60,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::change::{self, Change, Section};
 use crate::files;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
@@ -59,11 +69,17 @@ use crate::tls::{self, CertificateInfo};
 
 const MAX_BODY: usize = 64 * 1024;
 
+/// Limit for the bodies that carry configuration.
+const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
+
 /// Requests from the admin API to the daemon loop.
 #[derive(Debug)]
 pub(crate) enum Control {
     /// Reload the configuration file and report the outcome.
     Reload(oneshot::Sender<Result<(), String>>),
+
+    /// Run a changed configuration and report the outcome.
+    Apply(Change, oneshot::Sender<Result<(), String>>),
 
     /// Shut down gracefully.
     Stop,
@@ -74,6 +90,19 @@ pub(crate) struct Current {
     pub(crate) config: Arc<Config>,
     pub(crate) registry: Arc<Registry>,
     pub(crate) servers: Vec<ServerInfo>,
+}
+
+impl Current {
+    /// Running configuration with live pool membership.
+    pub(crate) fn live_config(&self) -> Config {
+        let mut config = Config::clone(&self.config);
+        for (name, group) in &mut config.upstreams {
+            if let Some(live) = self.registry.get(name) {
+                *group = live.pool.to_group();
+            }
+        }
+        config
+    }
 }
 
 /// State shared by admin requests.
@@ -298,17 +327,25 @@ async fn handle(
                 Err(response) => *response,
             }
         }
-        (&Method::POST, ["reload" | "load"]) => {
-            let (reply, outcome) = oneshot::channel();
-            if state.control.send(Control::Reload(reply)).await.is_err() {
-                error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down")
-            } else {
-                match outcome.await {
-                    Ok(Ok(())) => json_response(StatusCode::OK, &json!({ "reloaded": true })),
-                    Ok(Err(message)) => error(StatusCode::BAD_REQUEST, &message),
-                    Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down"),
-                }
+        (&Method::POST, ["reload"]) => control(&state, Control::Reload, "reloaded").await,
+        (&Method::POST, ["load"]) => match read_body(request, MAX_CONFIG_BODY).await {
+            // Without a body `/load` is the `/reload` it was before uploads.
+            Ok(body) if body.trim_ascii().is_empty() => {
+                control(&state, Control::Reload, "reloaded").await
             }
+            Ok(body) => match change::parse::<Config>(&body) {
+                Ok(config) => {
+                    let change = Change::Load(Box::new(config));
+                    control(&state, |reply| Control::Apply(change, reply), "loaded").await
+                }
+                Err(message) => error(StatusCode::BAD_REQUEST, &message),
+            },
+            Err(response) => *response,
+        },
+        (&Method::PATCH, ["config", section, key]) if Section::from_segment(section).is_some() => {
+            let section = Section::from_segment(section).expect("checked by the guard");
+            let key = (*key).to_owned();
+            patch(&state, section, key, request).await
         }
         (&Method::GET, ["certificates"]) => json_response(StatusCode::OK, &certificates(&state)),
         (&Method::POST, ["certificates", "reload"]) => reload_certificates(&state),
@@ -323,6 +360,54 @@ async fn handle(
     };
 
     Ok(response)
+}
+
+/// Sends a request to the daemon loop and answers with its outcome:
+/// `{"<done>": true}`, or `400` with the reason it was rejected.
+async fn control(
+    state: &AdminState,
+    request: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Control,
+    done: &str,
+) -> Response<Full<Bytes>> {
+    let (reply, outcome) = oneshot::channel();
+    if state.control.send(request(reply)).await.is_err() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down");
+    }
+    match outcome.await {
+        Ok(Ok(())) => json_response(StatusCode::OK, &json!({ done: true })),
+        Ok(Err(message)) => error(StatusCode::BAD_REQUEST, &message),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down"),
+    }
+}
+
+async fn patch(
+    state: &AdminState,
+    section: Section,
+    key: String,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let known = {
+        let current = state.current.read().unwrap_or_else(PoisonError::into_inner);
+        change::exists(&current.config, section, &key)
+    };
+    if !known {
+        return error(StatusCode::NOT_FOUND, &change::missing(section, &key));
+    }
+    let body = match read_body(request, MAX_CONFIG_BODY).await {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let patch = match change::parse::<serde_json::Value>(&body) {
+        Ok(patch) if patch.is_object() => patch,
+        Ok(_) => return error(StatusCode::BAD_REQUEST, "the patch must be an object"),
+        Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+    };
+    let change = Change::Patch {
+        section,
+        key,
+        patch,
+    };
+    control(state, |reply| Control::Apply(change, reply), "patched").await
 }
 
 fn registry(state: &AdminState) -> Arc<Registry> {
@@ -455,13 +540,11 @@ fn status(state: &AdminState) -> serde_json::Value {
 /// Running configuration with live pool membership and without the secrets
 /// of the DNS provider.
 fn live_config(state: &AdminState) -> Config {
-    let current = state.current.read().unwrap_or_else(PoisonError::into_inner);
-    let mut config = Config::clone(&current.config);
-    for (name, group) in &mut config.upstreams {
-        if let Some(live) = current.registry.get(name) {
-            *group = live.pool.to_group();
-        }
-    }
+    let mut config = state
+        .current
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .live_config();
     if let Some(dns) = &mut config.acme.dns {
         dns.redact();
     }
@@ -531,7 +614,20 @@ fn is_local_request<B>(request: &Request<B>, listen: SocketAddr) -> bool {
 async fn read_json<T: for<'de> Deserialize<'de>>(
     request: Request<Incoming>,
 ) -> Result<T, Box<Response<Full<Bytes>>>> {
-    let body = Limited::new(request.into_body(), MAX_BODY)
+    let body = read_body(request, MAX_BODY).await?;
+    serde_json::from_slice(&body).map_err(|err| {
+        Box::new(error(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid JSON body: {err}"),
+        ))
+    })
+}
+
+async fn read_body(
+    request: Request<Incoming>,
+    limit: usize,
+) -> Result<Bytes, Box<Response<Full<Bytes>>>> {
+    let body = Limited::new(request.into_body(), limit)
         .collect()
         .await
         .map_err(|err| {
@@ -539,14 +635,8 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
                 StatusCode::BAD_REQUEST,
                 &format!("could not read body: {err}"),
             ))
-        })?
-        .to_bytes();
-    serde_json::from_slice(&body).map_err(|err| {
-        Box::new(error(
-            StatusCode::BAD_REQUEST,
-            &format!("invalid JSON body: {err}"),
-        ))
-    })
+        })?;
+    Ok(body.to_bytes())
 }
 
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {

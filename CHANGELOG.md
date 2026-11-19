@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- `POST /load` on the admin API runs the configuration sent in the body,
+  TOML or JSON (what `GET /config` prints loads again), with the validation
+  and rollback of a reload. `PATCH /config/upstream/{name}` and
+  `PATCH /config/server/{name or index}` merge a JSON merge patch (RFC 7396,
+  JSON or TOML) into one pool or server. Neither writes the configuration
+  file: the next reload or restart goes back to it. `[admin]` of an upload
+  is ignored, `include` is rejected, and `***` secrets keep their running
+  value. `POST /load` without a body still reloads the file.
 - `watch = true`: the daemon reloads when the configuration file or one of
   its included files changes (added and removed include matches too), with
   the validation and rollback of `rxh reload`. Contents are polled every

@@ -175,6 +175,52 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 - `GET /config` shows the token as `***`. Keep the configuration file
   readable by the daemon's user only.
 
+### Changing the configuration through the API
+
+`POST /load` runs the configuration in the request body instead of the
+running one. `PATCH /config/upstream/{name}` and `PATCH /config/server/{name}`
+change one pool or one server. All three validate the result and swap to it
+like `rxh reload`: zero downtime, and a rejected change (`400` with the
+reason) leaves the running configuration untouched.
+
+```bash
+# A whole configuration, TOML or JSON.
+curl -X POST localhost:2019/load --data-binary @new.toml
+curl -s localhost:2019/config > running.json   # edit it, then:
+curl -X POST localhost:2019/load --data-binary @running.json
+
+# One pool: only the keys in the body change.
+curl -X PATCH localhost:2019/config/upstream/api -d '{"policy": "least_conn"}'
+curl -X PATCH localhost:2019/config/upstream/api \
+  -d '{"backends": ["10.0.0.1:8080", "10.0.0.2:8080"], "health": null}'
+
+# One server, by name or by its position in `GET /config`.
+curl -X PATCH localhost:2019/config/server/web -d '{"max_connections": 2000}'
+curl -X PATCH localhost:2019/config/server/0 --data-binary 'name = "front"'
+```
+
+- **Nothing is written to disk.** The change lives until the next reload
+  (`rxh reload`, `SIGHUP`, `POST /reload`, an edit seen by `watch = true`) or
+  restart, which read the configuration file again. To make a change
+  permanent, edit the file or use `rxh pool`, `rxh upstream` and
+  `rxh service`.
+- A body that starts with `{` is JSON, anything else is TOML, whatever the
+  `Content-Type`. Bodies are limited to 4 MiB.
+- `POST /load`: `[admin]` in the body is ignored, the API keeps the address
+  and token it started with. `include` is rejected, send the merged
+  configuration. Secrets sent as the `***` of `GET /config` keep their
+  running value. Without a body, `/load` reloads the file like `/reload`.
+- `PATCH` is a JSON merge patch ([RFC 7396](https://www.rfc-editor.org/rfc/rfc7396)):
+  tables merge key by key, `null` removes a key (back to its default), arrays
+  and other values are replaced whole. It is merged into the pool or server
+  as `GET /config` prints it, so use those keys: `policy` rather than
+  `lb_policy`, and the routes of a server under `match` even when the file
+  has a bare `forward`. Backends added through `POST /pools/{name}/upstreams`
+  are kept.
+- `PATCH` answers `404` for a pool or server that does not exist; it does not
+  create or delete them (upload a configuration for that). Inline `forward`
+  groups are part of their server.
+
 ## `[log]`
 
 | Key | Default | Description |
