@@ -435,7 +435,7 @@ pub(crate) fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn content_type(path: &Path) -> &'static str {
+pub(crate) fn content_type(path: &Path) -> &'static str {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
     match extension.to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
@@ -472,6 +472,7 @@ fn not_found_html(home: &str) -> BoxResponse {
     response::builder()
         .status(http::StatusCode::NOT_FOUND)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .extension(response::Generated)
         .body(body::full(html))
         .expect("static headers are valid")
 }

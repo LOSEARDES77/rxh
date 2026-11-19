@@ -31,6 +31,7 @@ use crate::http::body::Guarded;
 use crate::http::cache::Cache;
 use crate::http::cors::Cors;
 use crate::http::encode;
+use crate::http::error_pages::ErrorPages;
 use crate::http::headers::{self, Forwarding, Replacement, Via};
 use crate::http::mirror::Mirror;
 use crate::http::proxy;
@@ -73,6 +74,9 @@ pub(crate) struct Site {
     /// own.
     pub(crate) security_headers: Option<SecurityHeaders>,
     pub(crate) cors: Option<Cors>,
+
+    /// Server `error_pages`, for the error responses RXH generates itself.
+    pub(crate) error_pages: ErrorPages,
 
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
@@ -231,6 +235,9 @@ impl Site {
             forward_auth: forward_auth(&server.forward_auth, "")?,
             security_headers: server.security_headers,
             cors: server.cors.as_ref().map(Cors::new),
+            error_pages: ErrorPages::load(server).map_err(|err| {
+                Error::Config(ConfigError::Invalid(format!("error_pages: {err}")))
+            })?,
             tls: server.tls.is_some(),
             client_subject_header: server
                 .client_auth
@@ -572,6 +579,11 @@ impl Service {
                 RouteAction::Redirect { status, .. } => response::redirect(*status, &location),
             },
         };
+        // Requests no route matches get the pages of the first server of the
+        // listener, like the default server of Nginx.
+        if let Some(route) = route.or(self.routes.first()) {
+            route.site.error_pages.apply(&mut response);
+        }
         if let Some(route) = route
             && !route.encode.is_empty()
         {

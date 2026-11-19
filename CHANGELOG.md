@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- Custom error pages: `error_pages = { "404" = "404.html", "5xx" =
+  "50x.html" }` on an `http` server replaces the body of the error
+  responses rxh answers itself (no matching route, IP lists, rate limits,
+  basic auth, body size limits, `502`, `503` and `504` without a backend,
+  file server errors). Status and headers are kept; backend responses are
+  untouched. Pages are read at start and on reload.
 - Retry budgets and hedged requests: `retry_budget = { percent = 20,
   min_retries = 3 }` on a pool bounds the requests retrying at the same
   time to a share of the requests in flight, so retries cannot multiply the
