@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- OpenTelemetry tracing: a `[tracing]` table (`endpoint`, `service_name`,
+  `sample_ratio`) sends one span per HTTP request to an OTLP/HTTP
+  collector in JSON. The W3C `traceparent` of the caller is continued, or
+  a trace is started, and backends receive a `traceparent` naming the span
+  of rxh as their parent. JSON access lines gain `trace_id`.
 - More layer 4 matchers in the `match` entries of `tcp` servers:
   `remote_ip` (client networks, the PROXY protocol source with
   `proxy_protocol_in`), `regexp` with `regexp_count` (a regular expression

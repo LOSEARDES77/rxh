@@ -12,6 +12,7 @@ use std::time::Duration;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue};
+use hyper::http::uri::Authority;
 use hyper::{HeaderMap, Method, Request, StatusCode, Uri};
 use rxh_core::config::{
     self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders, SecurityHeaders,
@@ -20,6 +21,7 @@ use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::{self, IpNet};
 use rxh_core::pool::Upstream;
 use rxh_core::template::Template;
+use serde_json::Value;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
@@ -41,6 +43,7 @@ use crate::http::response_handler::ResponseHandler;
 use crate::log::{self, Logger};
 use crate::metrics;
 use crate::registry::{Registry, Split};
+use crate::tracer::{Span, Trace, Tracer};
 
 /// Settings of one `[[server]]`, shared by its routes. Several sites can
 /// share one listener, each route keeps its own site.
@@ -406,6 +409,8 @@ pub(crate) struct Service {
     pub(crate) local: SocketAddr,
     pub(crate) activity: Arc<Activity>,
     pub(crate) logger: Arc<Logger>,
+    /// Set when the `[tracing]` table is.
+    pub(crate) tracer: Option<Arc<Tracer>>,
 }
 
 /// Response extension set by the proxy for JSON access lines: the backend
@@ -476,6 +481,11 @@ impl Service {
         }
 
         let started = Instant::now();
+        let trace = self
+            .tracer
+            .as_ref()
+            .map(|tracer| tracer.start(request.headers_mut()));
+        let sampled = trace.as_ref().is_some_and(Trace::is_sampled);
         let method = request.method().clone();
         let uri = request.uri().clone();
 
@@ -494,7 +504,7 @@ impl Service {
         // Only computed when an IP list, a rate limit or a JSON line needs it.
         let json = self.logger.is_json();
         let client_ip = match route {
-            Some(route) if json || route.needs_client_ip() => {
+            Some(route) if json || sampled || route.needs_client_ip() => {
                 headers::client_ip(
                     self.peer.ip(),
                     request.headers(),
@@ -518,6 +528,7 @@ impl Service {
 
         // The access log keeps the method and URI the client sent.
         let host = input.host().unwrap_or("");
+        let span_host = sampled.then(|| host.to_owned());
         let location = match route.map(|route| &route.action) {
             Some(RouteAction::Redirect { to, .. }) => to.render(host, &uri),
             _ => String::new(),
@@ -606,6 +617,60 @@ impl Service {
             .remove::<UpstreamAddress>()
             .map(|upstream| upstream.0);
         metrics::global().record_http(server, status, elapsed);
+        if let (Some(tracer), Some(trace)) = (&self.tracer, &trace)
+            && let Some(host) = span_host
+        {
+            let authority: Option<Authority> = host.parse().ok();
+            let mut attributes: Vec<(&'static str, Value)> = vec![
+                ("http.request.method", method.as_str().into()),
+                (
+                    "url.scheme",
+                    if route.is_some_and(|route| route.site.tls) {
+                        "https"
+                    } else {
+                        "http"
+                    }
+                    .into(),
+                ),
+                ("url.path", uri.path().into()),
+                (
+                    "network.protocol.version",
+                    format!("{version:?}").trim_start_matches("HTTP/").into(),
+                ),
+                (
+                    "server.address",
+                    authority.as_ref().map_or(&*host, Authority::host).into(),
+                ),
+                ("client.address", client_ip.to_string().into()),
+                ("http.response.status_code", status.into()),
+                ("rxh.server", server.into()),
+            ];
+            if let Some(port) = authority.as_ref().and_then(Authority::port_u16) {
+                attributes.push(("server.port", port.into()));
+            }
+            if let Some(query) = uri.query() {
+                attributes.push(("url.query", query.into()));
+            }
+            if let Some(route) = route {
+                attributes.push(("http.route", route.uri.as_str().into()));
+            }
+            if let Some(upstream) = &upstream {
+                attributes.push(("rxh.upstream", upstream.address().into()));
+            }
+            let name = match route {
+                Some(route) => format!("{method} {}", route.uri),
+                None => method.to_string(),
+            };
+            tracer.finish(
+                trace,
+                Span {
+                    name,
+                    elapsed,
+                    error: status >= 500,
+                    attributes,
+                },
+            );
+        }
         self.logger.access(
             |line| {
                 log::push(
@@ -630,6 +695,7 @@ impl Service {
                     "status": status,
                     "duration_ms": log::millis(elapsed),
                     "upstream": upstream.as_deref().map(Upstream::address),
+                    "trace_id": trace.as_ref().map(Trace::id),
                 })
             },
         );

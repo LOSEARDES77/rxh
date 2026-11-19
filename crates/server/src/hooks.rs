@@ -42,8 +42,9 @@ pub(crate) struct Hooks {
     webhook: Option<Webhook>,
 }
 
+/// An `http://` or `https://` URL that JSON documents are posted to.
 #[derive(Debug)]
-struct Webhook {
+pub(crate) struct Webhook {
     uri: Uri,
     address: String,
     dialer: Dialer,
@@ -52,22 +53,7 @@ struct Webhook {
 impl Hooks {
     /// Prepares `settings`, which passed configuration validation.
     pub(crate) fn new(settings: &HealthHooks) -> Self {
-        let webhook = settings.webhook.as_deref().map(|webhook| {
-            let uri: Uri = webhook.parse().expect("validated webhook URL");
-            let https = uri.scheme_str() == Some("https");
-            let host = uri.host().expect("validated webhook URL has a host");
-            let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-            let group = UpstreamGroup {
-                tls: https.then(UpstreamTls::default),
-                dial_timeout: HOOK_TIMEOUT,
-                ..UpstreamGroup::default()
-            };
-            Webhook {
-                address: format!("{host}:{port}"),
-                dialer: Dialer::new(&group).expect("default TLS settings read no files"),
-                uri,
-            }
-        });
+        let webhook = settings.webhook.as_deref().map(Webhook::new);
         Self {
             command: settings.command.clone(),
             webhook,
@@ -84,9 +70,12 @@ impl Hooks {
             eprintln!("{} => health hook command failed: {err}", event.pool);
         }
         if let Some(webhook) = &self.webhook
-            && let Err(err) = tokio::time::timeout(HOOK_TIMEOUT, webhook.post(event))
+            && let Err(err) = webhook
+                .post(
+                    serde_json::to_vec(event).expect("events serialize to JSON"),
+                    "rxh-health-hook",
+                )
                 .await
-                .unwrap_or_else(|_| Err(format!("no answer within {HOOK_TIMEOUT:?}")))
         {
             eprintln!(
                 "{} => health hook webhook {} failed: {err}",
@@ -121,7 +110,37 @@ impl Hooks {
 }
 
 impl Webhook {
-    async fn post(&self, event: &Event) -> Result<(), String> {
+    /// Prepares `url`, which passed configuration validation.
+    pub(crate) fn new(url: &str) -> Self {
+        let uri: Uri = url.parse().expect("validated URL");
+        let https = uri.scheme_str() == Some("https");
+        let host = uri.host().expect("validated URL has a host");
+        let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+        let group = UpstreamGroup {
+            tls: https.then(UpstreamTls::default),
+            dial_timeout: HOOK_TIMEOUT,
+            ..UpstreamGroup::default()
+        };
+        Self {
+            address: format!("{host}:{port}"),
+            dialer: Dialer::new(&group).expect("default TLS settings read no files"),
+            uri,
+        }
+    }
+
+    pub(crate) fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    /// Posts the JSON document `body`. Anything but a 2xx answer within
+    /// [`HOOK_TIMEOUT`] is an error.
+    pub(crate) async fn post(&self, body: Vec<u8>, user_agent: &'static str) -> Result<(), String> {
+        tokio::time::timeout(HOOK_TIMEOUT, self.send(body, user_agent))
+            .await
+            .unwrap_or_else(|_| Err(format!("no answer within {HOOK_TIMEOUT:?}")))
+    }
+
+    async fn send(&self, body: Vec<u8>, user_agent: &'static str) -> Result<(), String> {
         let stream = self
             .dialer
             .dial(&self.address)
@@ -132,12 +151,11 @@ impl Webhook {
             .map_err(|err| err.to_string())?;
         tokio::task::spawn(connection);
 
-        let body = serde_json::to_vec(event).expect("events serialize to JSON");
         let path = self.uri.path_and_query().map_or("/", |path| path.as_str());
         let host = self
             .uri
             .authority()
-            .expect("validated webhook URL has a host")
+            .expect("validated URL has a host")
             .as_str();
         let request = Request::post(path)
             .header(header::HOST, host)
@@ -145,10 +163,7 @@ impl Webhook {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )
-            .header(
-                header::USER_AGENT,
-                HeaderValue::from_static("rxh-health-hook"),
-            )
+            .header(header::USER_AGENT, HeaderValue::from_static(user_agent))
             .body(Full::new(Bytes::from(body)))
             .map_err(|err| err.to_string())?;
         let status = sender

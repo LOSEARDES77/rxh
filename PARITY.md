@@ -248,7 +248,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 
 | Feature | Inspired by | Notes |
 |---|---|---|
-| OpenTelemetry tracing (W3C trace context propagation) | Traefik, Envoy | |
+| OpenTelemetry tracing (W3C trace context propagation) | Traefik, Envoy | Done: `[tracing]` sends one server span per HTTP request over OTLP/HTTP JSON and continues or starts the `traceparent` sent to backends, with parent-based ratio sampling (`sample_ratio`). No OTLP/gRPC, no collector headers, no per-attempt client spans, no layer 4 spans. |
 | Dashboard web UI and management UI | Traefik dashboard, Nginx Proxy Manager | Future plan: an NPM-like UI on top of the admin API (hosts, certificates, access lists, live health). |
 | Access log filters and sampling | Traefik access logs | |
 | Health check events to webhooks | Caddy events, HAProxy agent checks | |

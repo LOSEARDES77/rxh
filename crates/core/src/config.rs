@@ -76,6 +76,10 @@ pub struct Config {
     #[serde(default)]
     pub log: Log,
 
+    /// OpenTelemetry tracing of HTTP requests. Off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<Tracing>,
+
     /// Certificate authority settings for `tls = "auto"` servers.
     #[serde(default)]
     pub acme: Acme,
@@ -209,6 +213,11 @@ impl Config {
         self.admin
             .validate()
             .map_err(|err| ConfigError::Invalid(format!("admin: {err}")))?;
+        if let Some(tracing) = &self.tracing {
+            tracing
+                .validate()
+                .map_err(|err| ConfigError::Invalid(format!("tracing: {err}")))?;
+        }
         self.acme
             .validate()
             .map_err(|err| ConfigError::Invalid(format!("acme: {err}")))?;
@@ -941,6 +950,57 @@ impl Default for Log {
             access: true,
         }
     }
+}
+
+/// OpenTelemetry tracing, the `[tracing]` table: one span per HTTP request,
+/// sent to a collector over OTLP/HTTP in JSON, and W3C `traceparent`
+/// propagation to the backends.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Tracing {
+    /// `http://` or `https://` URL of the OTLP traces endpoint, like
+    /// `http://127.0.0.1:4318/v1/traces`.
+    pub endpoint: String,
+
+    /// `service.name` of the spans.
+    #[serde(default = "default::service_name")]
+    pub service_name: String,
+
+    /// Share of the traces started here that are sampled, from 0 to 1.
+    /// Requests that arrive with a `traceparent` keep its sampling decision.
+    #[serde(default = "default::sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+impl Tracing {
+    fn validate(&self) -> Result<(), String> {
+        validate_http_url("endpoint", &self.endpoint)?;
+        if self.service_name.trim().is_empty() {
+            return Err(String::from("service_name must not be empty"));
+        }
+        if !(0.0..=1.0).contains(&self.sample_ratio) {
+            return Err(format!(
+                "sample_ratio must be between 0 and 1, got {}",
+                self.sample_ratio
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Checks that the `value` of `key` is an `http://` or `https://` URL with a
+/// host.
+fn validate_http_url(key: &str, value: &str) -> Result<(), String> {
+    let uri: http::Uri = value
+        .parse()
+        .map_err(|err| format!("{key} {value:?}: {err}"))?;
+    let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
+    if !scheme_ok || uri.host().is_none_or(str::is_empty) {
+        return Err(format!(
+            "{key} must be an http:// or https:// URL, got {value:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Docker provider (`[docker]`): running containers labelled `rxh.enable=true`
@@ -3409,15 +3469,7 @@ impl HealthHooks {
             ));
         }
         if let Some(webhook) = &self.webhook {
-            let uri: http::Uri = webhook
-                .parse()
-                .map_err(|err| format!("health.hooks.webhook {webhook:?}: {err}"))?;
-            let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
-            if !scheme_ok || uri.host().is_none_or(str::is_empty) {
-                return Err(format!(
-                    "health.hooks.webhook must be an http:// or https:// URL, got {webhook:?}"
-                ));
-            }
+            validate_http_url("health.hooks.webhook", webhook)?;
         }
         Ok(())
     }
@@ -4886,6 +4938,14 @@ mod default {
         true
     }
 
+    pub fn service_name() -> String {
+        String::from("rxh")
+    }
+
+    pub fn sample_ratio() -> f64 {
+        1.0
+    }
+
     pub fn one() -> u32 {
         1
     }
@@ -5879,6 +5939,63 @@ mod tests {
         // Port ranges expand before the comparison.
         let message = error("{ backends = [\"a:1-3\", \"a:2\"] }");
         assert!(message.contains("a:2 is listed twice"), "{message}");
+    }
+
+    #[test]
+    fn tracing_parses_and_validates() {
+        assert!(Config::from_toml("").unwrap().tracing.is_none());
+
+        let parse = |tracing: &str| Config::from_toml(&format!("[tracing]\n{tracing}\n"));
+        let tracing = parse("endpoint = \"http://127.0.0.1:4318/v1/traces\"")
+            .unwrap()
+            .tracing
+            .unwrap();
+        assert_eq!(tracing.endpoint, "http://127.0.0.1:4318/v1/traces");
+        assert_eq!(tracing.service_name, "rxh");
+        assert_eq!(tracing.sample_ratio, 1.0);
+
+        let tracing = parse(
+            "endpoint = \"https://otel.test/v1/traces\"\nservice_name = \"edge\"\nsample_ratio = 0",
+        )
+        .unwrap()
+        .tracing
+        .unwrap();
+        assert_eq!(tracing.service_name, "edge");
+        assert_eq!(tracing.sample_ratio, 0.0);
+
+        let error = |tracing: &str| match parse(tracing) {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("{tracing}: expected a validation error, got {other:?}"),
+        };
+        for endpoint in [
+            "grpc://otel.test:4317",
+            "/v1/traces",
+            "otel.test:4318",
+            "http://",
+        ] {
+            let message = error(&format!("endpoint = \"{endpoint}\""));
+            assert!(
+                message.contains("tracing: endpoint"),
+                "{endpoint}: {message}"
+            );
+        }
+        let endpoint = "endpoint = \"http://otel.test/\"";
+        assert!(
+            error(&format!("{endpoint}\nservice_name = \" \"")).contains("tracing: service_name")
+        );
+        for ratio in ["1.5", "-0.1", "nan", "inf"] {
+            let message = error(&format!("{endpoint}\nsample_ratio = {ratio}"));
+            assert!(
+                message.contains("tracing: sample_ratio"),
+                "{ratio}: {message}"
+            );
+        }
+        // The endpoint is required, unknown keys are rejected.
+        assert!(matches!(parse(""), Err(ConfigError::Toml(_))));
+        assert!(matches!(
+            parse(&format!("{endpoint}\nprotocol = \"grpc\"")),
+            Err(ConfigError::Toml(_))
+        ));
     }
 
     #[test]
