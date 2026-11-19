@@ -9,6 +9,9 @@ Changed.
 
 ### Added
 
+- Criterion micro benchmarks of `Pool::select` for every load balancing
+  policy with 4 and 64 backends: `cargo bench -p rxh-core --bench policies`.
+  `cargo test` runs each once as a check.
 - Benchmark history: `crates/bench/release.sh` runs `rxh-bench --docker` for
   a release and keeps the JSON in `docs/bench/history`, and
   `rxh-bench --history DIR` renders rxh's numbers across releases with

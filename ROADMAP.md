@@ -98,7 +98,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] Benchmark history: run `rxh-bench --docker` on a fixed machine for
       every release and keep the JSON, so regressions are visible:
       `crates/bench/release.sh`, docs/bench/history.
-- [ ] Criterion micro benchmarks for the policies in `rxh-core`.
+- [x] Criterion micro benchmarks for the policies in `rxh-core`:
+      `crates/core/benches/policies.rs`, docs/benchmarks.md.
 
 ## 0.5: TLS and security
 
