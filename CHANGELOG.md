@@ -9,6 +9,17 @@ Changed.
 
 ### Added
 
+- `security_headers = "basic" | "strict" | "off"` on `http` servers and on
+  their `match` entries: presets of `X-Content-Type-Options`,
+  `X-Frame-Options`, `Referrer-Policy`, HSTS (TLS servers only) and, with
+  `strict`, a same-origin `Content-Security-Policy`,
+  `Cross-Origin-Opener-Policy` and `Permissions-Policy`. Headers the
+  response already has are kept.
+- `cors = { origins, methods, headers, expose_headers, credentials,
+  max_age }` on `http` servers and on their `match` entries: RXH answers
+  preflights itself (`204`, before authentication) and sets the
+  `Access-Control-*` headers of allowed origins, exact or
+  `https://*.example.com`, replacing the backend's.
 - `basic_auth = { users, realm }` on `http` servers and on their `match`
   entries: HTTP Basic authentication against bcrypt password hashes, `401`
   with `WWW-Authenticate` for everybody else. `rxh hash-password` hashes a
