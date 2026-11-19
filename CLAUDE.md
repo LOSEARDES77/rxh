@@ -35,7 +35,9 @@ Passing tests are not enough. After implementing a feature, exercise it end
 to end against a real `rxh` process: build the binary, write a temporary
 configuration in a temporary directory, start test backends, send real
 requests (`curl`, `openssl s_client`, `nc`) and compare the result with what
-the task asked for. Stop every process you started. When the feature cannot
+the task asked for. Stop every process you started. Never build or run under
+emulation (QEMU, `docker buildx` for another architecture): it takes hours.
+Check the native architecture only and say the others were not run. When the feature cannot
 run on this machine (CI workflows, registries, cloud providers), say so and
 state what was checked instead.
 
