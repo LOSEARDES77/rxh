@@ -28,7 +28,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::error::Error;
 use crate::registry::Registry;
-use crate::server::{Server, State};
+use crate::server::{Replica, Server, State};
 use crate::tls::CertResolver;
 
 /// Description of a running listener, for status reports.
@@ -56,6 +56,9 @@ pub struct Master {
     /// listener.
     resolvers: Vec<(Vec<usize>, Arc<CertResolver>)>,
     registry: Arc<Registry>,
+    /// False for replicas, which do not repeat the messages of the first
+    /// master.
+    announce: bool,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
     shutdown_notify: broadcast::Sender<()>,
 }
@@ -110,6 +113,40 @@ impl Master {
             infos,
             resolvers,
             registry,
+            announce: true,
+            shutdown: Box::pin(future::pending()),
+            shutdown_notify: broadcast::channel(1).0,
+        })
+    }
+
+    /// What [`Master::from_replicas`] needs to run the same listeners in
+    /// another runtime. UDP listeners are left out: they keep one socket.
+    #[must_use]
+    pub fn replicas(&self) -> Vec<Replica> {
+        self.servers.iter().filter_map(Server::replica).collect()
+    }
+
+    /// Binds one more listener per entry of `replicas`, in the current
+    /// runtime, next to the ones of the [`Master`] they come from.
+    pub fn from_replicas(replicas: &[Replica], registry: Arc<Registry>) -> Result<Self, Error> {
+        let mut servers = Vec::new();
+        let mut infos = Vec::new();
+        for replica in replicas {
+            let server = Server::from_replica(replica)?;
+            infos.push(ServerInfo {
+                address: server.socket_address(),
+                protocol: server.protocol(),
+                name: server.name().map(str::to_owned),
+                state: server.subscribe(),
+            });
+            servers.push(server);
+        }
+        Ok(Self {
+            servers,
+            infos,
+            resolvers: Vec::new(),
+            registry,
+            announce: false,
             shutdown: Box::pin(future::pending()),
             shutdown_notify: broadcast::channel(1).0,
         })
@@ -174,6 +211,7 @@ impl Master {
     /// Runs every server until the shutdown future completes or a server
     /// fails, then waits for all of them to finish.
     pub async fn run(self) -> Result<(), Error> {
+        let announce = self.announce;
         let mut set = tokio::task::JoinSet::new();
         for server in self.servers {
             set.spawn(server.run());
@@ -186,7 +224,11 @@ impl Master {
                 eprintln!("Master => A server failed, shutting down the rest: {err}");
                 first_error = Some(err);
             }
-            () = self.shutdown => println!("Master => Sending shutdown signal to all servers"),
+            () = self.shutdown => {
+                if announce {
+                    println!("Master => Sending shutdown signal to all servers");
+                }
+            }
         }
 
         let _ = self.shutdown_notify.send(());

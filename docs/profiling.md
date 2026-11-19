@@ -283,6 +283,8 @@ In order of expected gain. Each one maps to an item of the
    workers. Upstream connections and the idle pool should be per runtime too,
    so that the upstream task and the `recycle` step stay on the same thread.
    The target is the cost of the one worker run, 14 µs, on every core.
+   Done as an option, see
+   [After: one runtime per core](#after-one-runtime-per-core).
 2. **Fewer allocations per request**, starting with the largest:
    - Build `Forwarded`, `X-Forwarded-*` and `Via` into one reused buffer and
      precompute the parts that never change for a connection (peer address,
@@ -375,6 +377,61 @@ allocator functions of glibc, not with uprobes: total calls over 8 seconds
 divided by the requests served. `crates/server/tests/allocations.rs` keeps
 the count from growing back: it fails above 40 calls per request.
 
+## After: one runtime per core
+
+Recommendation 1 was applied on 2026-11-19, on the same machine, as an
+option: `runtime = "per_core"` (see
+[configuration.md](configuration.md#runtime)). The default stays `"shared"`,
+the work-stealing runtime measured above.
+
+Same scenario and the same binary for both columns, `rxh-bench -s throughput
+-d 12`, RXH pinned to CPU 0 to N-1 with `taskset`. Each value is the mean of
+two runs, taken in turns; the two runs differ by less than 5%, except
+`shared` on 1 CPU with 32 connections (52 992 and 60 569).
+
+| CPUs | Connections | Requests/s shared | Requests/s per core | Gain | p99 shared | p99 per core | CPU per request shared | CPU per request per core |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32 | 56 780 | 64 488 | +14% | 0.76 ms | 0.64 ms | 14.6 µs | 12.7 µs |
+| 2 | 32 | 112 838 | 122 196 | +8% | 0.45 ms | 0.40 ms | 14.4 µs | 13.4 µs |
+| 4 | 32 | 196 159 | 217 408 | +11% | 0.26 ms | 0.23 ms | 16.5 µs | 15.3 µs |
+| 8 | 32 | 150 530 | 283 822 | +89% | 0.61 ms | 0.35 ms | 19.3 µs | 18.3 µs |
+| 16 | 32 | 140 607 | 275 178 | +96% | 0.69 ms | 0.35 ms | 24.5 µs | 23.1 µs |
+| 32 | 32 | 242 740 | 300 696 | +24% | 0.39 ms | 0.23 ms | 31.8 µs | 25.6 µs |
+| 1 | 256 | 59 552 | 61 474 | +3% | 43.05 ms | 4.94 ms | 13.7 µs | 13.4 µs |
+| 4 | 256 | 199 211 | 207 236 | +4% | 2.49 ms | 1.50 ms | 16.8 µs | 16.1 µs |
+| 16 | 256 | 311 580 | 391 492 | +26% | 1.65 ms | 1.44 ms | 31.0 µs | 22.4 µs |
+| 32 | 256 | 333 417 | 389 366 | +17% | 1.33 ms | 1.29 ms | 39.0 µs | 31.6 µs |
+
+What the numbers say:
+
+- **`per_core` was faster in every configuration**: 3% to 96% more requests
+  per second, and a lower p99 everywhere. With all 32 CPUs it serves 24%
+  more requests over 32 connections and 17% more over 256.
+- **The dip of the shared runtime is gone.** With 32 connections the shared
+  runtime serves fewer requests on 8 or 16 CPUs than on 4. The per core
+  runtimes do not: 284 000 on 8 CPUs against 151 000.
+- **CPU per request falls, but not to the 14 µs target.** With 32 CPUs a
+  request costs 25.6 µs instead of 31.8 (32 connections) and 31.6 instead of
+  39.0 (256 connections). The cost still grows with the number of CPUs. This
+  was not profiled again. The load generator and the backends run on the
+  other side of every loopback socket and are not pinned, CPUs 16 to 31 are
+  the hyperthreads of 0 to 15, and the counters and pools are still shared
+  by all runtimes: each may explain a part.
+- **One CPU with 256 connections**: the same throughput, and a p99 of 4.9 ms
+  instead of 43 ms.
+
+Why it is not the default:
+
+- This workload suits it: every connection is equally busy. The kernel
+  assigns a connection to a listener by a hash of the client address and
+  port, and a runtime never takes work from another. A few busy connections
+  on the same runtime would share one CPU. That case was not measured.
+- The threads are not pinned to CPUs; the scheduler may move them.
+- Only `throughput` was measured: no TLS, HTTP/2, bodies or TCP.
+
+`crates/cli/tests/daemon.rs` checks that the daemon runs one runtime per CPU
+and that each keeps its own upstream connections.
+
 ## Limits
 
 - One scenario: small `GET` requests, cleartext HTTP/1.1, keep-alive on both
@@ -459,6 +516,8 @@ export RXH_REAL=$PWD/$B/rxh
 RXH_CPUS=0-3 $B/rxh-bench -s throughput -d 20 --no-caddy --rxh docs/profiling/rxh-wrap.sh
 RXH_EXTRA='[log]\naccess = false' \
   $B/rxh-bench -s throughput -d 20 --no-caddy --rxh docs/profiling/rxh-wrap.sh
+RXH_TOP='runtime = "per_core"' RXH_CPUS=0-7 \
+  $B/rxh-bench -s throughput -d 12 --no-caddy --rxh docs/profiling/rxh-wrap.sh
 ```
 
 CPU per request: read fields 14 and 15 (user and system time, in clock ticks)

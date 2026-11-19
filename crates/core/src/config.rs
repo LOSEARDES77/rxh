@@ -88,6 +88,10 @@ pub struct Config {
     )]
     pub grace_period: Option<Duration>,
 
+    /// How the listeners are spread over the CPUs.
+    #[serde(default, skip_serializing_if = "Runtime::is_shared")]
+    pub runtime: Runtime,
+
     /// Files merged into this one, relative to the directory of the main
     /// file. `*` and `?` work in the last path component. Followed by the
     /// loader of the daemon, which empties this list after merging.
@@ -582,6 +586,26 @@ impl Default for Log {
             output: default::log_output(),
             access: true,
         }
+    }
+}
+
+/// Threading model of the listeners.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Runtime {
+    /// One work-stealing runtime: a connection may move between threads.
+    #[default]
+    Shared,
+
+    /// One single-threaded runtime per CPU, each with its own `SO_REUSEPORT`
+    /// listeners and upstream connections: a connection stays on the thread
+    /// that accepted it.
+    PerCore,
+}
+
+impl Runtime {
+    fn is_shared(&self) -> bool {
+        *self == Runtime::Shared
     }
 }
 
@@ -3551,6 +3575,31 @@ mod tests {
 
         assert!(IncludedConfig::from_toml("[admin]\nenabled = false\n").is_err());
         assert!(IncludedConfig::from_toml("include = [\"x\"]\n").is_err());
+    }
+
+    #[test]
+    fn runtime_is_shared_or_per_core() {
+        let default = Config::from_toml("").expect("valid");
+        assert_eq!(default.runtime, Runtime::Shared);
+        let text = toml::to_string(&default).expect("serializes");
+        assert!(!text.contains("runtime"), "{text}");
+
+        let shared = Config::from_toml("runtime = \"shared\"\n").expect("valid");
+        assert_eq!(shared.runtime, Runtime::Shared);
+
+        let per_core = Config::from_toml("runtime = \"per_core\"\n").expect("valid");
+        assert_eq!(per_core.runtime, Runtime::PerCore);
+        let text = toml::to_string(&per_core).expect("serializes");
+        assert!(text.contains("runtime = \"per_core\""), "{text}");
+
+        for rejected in ["\"per-core\"", "\"percore\"", "\"\"", "4", "true"] {
+            assert!(
+                Config::from_toml(&format!("runtime = {rejected}\n")).is_err(),
+                "{rejected}"
+            );
+        }
+        // A process wide choice: not for included files.
+        assert!(IncludedConfig::from_toml("runtime = \"per_core\"\n").is_err());
     }
 
     #[test]

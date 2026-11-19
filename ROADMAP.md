@@ -79,8 +79,11 @@ goal of this milestone is to close most of that gap and to keep it closed.
       down the findings before changing code: docs/profiling.md. A request
       costs 14 µs of CPU with one worker and 41 µs with 32, makes 84
       allocator calls, and the access log takes 13% of the CPU.
-- [ ] One runtime per core with `SO_REUSEPORT` listeners, instead of one
-      work-stealing runtime, if profiling shows contention.
+- [x] One runtime per core with `SO_REUSEPORT` listeners, instead of one
+      work-stealing runtime, if profiling shows contention: opt in with
+      `runtime = "per_core"`. 3% to 96% more requests per second in the
+      `throughput` scenario (24% more on 32 CPUs), and 25.6 µs of CPU per
+      request instead of 31.8: docs/profiling.md.
 - [x] Fewer allocations per request: reuse header maps and buffers, avoid
       cloning addresses and host names on every pick. 84 allocator calls per
       request down to 26, and 7% more requests per second in the

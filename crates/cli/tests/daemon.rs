@@ -801,3 +801,162 @@ fn start_refuses_a_busy_admin_address() {
     );
     assert!(!dir.join("rxh.pid").exists());
 }
+
+/// Number of `rxh-core-N` threads of the process, the per core runtimes.
+#[cfg(target_os = "linux")]
+fn per_core_threads(pid: u32) -> usize {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return 0;
+    };
+    tasks
+        .filter_map(Result::ok)
+        .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+        .filter(|name| name.starts_with("rxh-core-"))
+        .count()
+}
+
+/// Waits until the process has `expected` per core runtimes.
+#[cfg(target_os = "linux")]
+async fn wait_for_per_core_threads(pid: u32, expected: usize) {
+    for _ in 0..250 {
+        if per_core_threads(pid) == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "{} per core runtimes, expected {expected}",
+        per_core_threads(pid)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn per_core_runtime_serves_reloads_and_stops() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Counts the connections rxh opens to it.
+    let connections = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let counted = listener.local_addr().expect("address");
+    let counter = Arc::clone(&connections);
+    tokio::task::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::task::spawn(async move {
+                let service = service_fn(|_| async {
+                    Ok::<_, Infallible>(Response::new(Full::<Bytes>::from("counted")))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let second = backend("second").await;
+
+    let admin = free_port();
+    let web = free_port();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let config = |runtime: &str, backend: SocketAddr| {
+        format!(
+            "runtime = \"{runtime}\"\n[admin]\nlisten = \"{admin}\"\n\
+             [[server]]\nname = \"web\"\nlisten = \"{web}\"\nforward = \"{backend}\"\n"
+        )
+    };
+    std::fs::write(dir.join("rxh.toml"), config("per_core", counted)).expect("write");
+    let mut daemon = start_daemon(dir);
+    let pid = daemon.0.id();
+    wait_for_body(web, "counted").await;
+
+    let cpus = std::thread::available_parallelism().expect("known").get();
+    // One runtime per CPU; the first one answers while the rest start.
+    wait_for_per_core_threads(pid, cpus).await;
+
+    // Every runtime answers, and keeps its own upstream connections: the
+    // kernel spreads these client connections over the listeners.
+    for _ in 0..200 {
+        assert_eq!(try_get(web).await.as_deref(), Some("counted"));
+    }
+    let opened = connections.load(Ordering::SeqCst);
+    assert!(opened <= cpus, "{opened} upstream connections, {cpus} CPUs");
+    if cpus > 1 {
+        assert!(opened > 1, "the runtimes share one upstream connection");
+    }
+
+    // The listener is reported once, not once per runtime.
+    let status = assert_success(&rxh(dir, admin, &["status", "--json"]));
+    let status: serde_json::Value = serde_json::from_str(&status).expect("status is JSON");
+    assert_eq!(status["servers"].as_array().expect("servers").len(), 1);
+
+    // Reloads swap the runtimes: the old threads end once drained.
+    std::fs::write(dir.join("rxh.toml"), config("per_core", second)).expect("write");
+    assert_success(&rxh(dir, admin, &["reload"]));
+    wait_for_body(web, "second").await;
+    wait_for_per_core_threads(pid, cpus).await;
+
+    // A reload can go back to the shared runtime.
+    std::fs::write(dir.join("rxh.toml"), config("shared", counted)).expect("write");
+    assert_success(&rxh(dir, admin, &["reload"]));
+    wait_for_body(web, "counted").await;
+    wait_for_per_core_threads(pid, 0).await;
+
+    std::fs::write(dir.join("rxh.toml"), config("per_core", second)).expect("write");
+    assert_success(&rxh(dir, admin, &["reload"]));
+    wait_for_body(web, "second").await;
+
+    assert_success(&rxh(dir, admin, &["stop"]));
+    let status = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || daemon.0.wait()),
+    )
+    .await
+    .expect("the daemon exits")
+    .expect("no panic")
+    .expect("waited");
+    assert!(status.success(), "{status}");
+}
+
+#[test]
+fn per_core_runtime_fails_to_start_on_a_busy_address() {
+    // Held without `SO_REUSEPORT`, so rxh cannot share it.
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = busy.local_addr().expect("address");
+    let directory = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        directory.path().join("rxh.toml"),
+        format!(
+            "runtime = \"per_core\"\n[admin]\nenabled = false\n\
+             [[server]]\nlisten = \"{address}\"\nforward = \"127.0.0.1:1\"\n"
+        ),
+    )
+    .expect("write");
+
+    let output = Command::new(RXH)
+        .current_dir(directory.path())
+        .args(["run", "--config", "rxh.toml"])
+        .output()
+        .expect("rxh runs");
+    let stderr = assert_failure(&output);
+    assert!(stderr.contains("in use"), "{stderr}");
+
+    let output = Command::new(RXH)
+        .current_dir(directory.path())
+        .args(["validate", "--config", "rxh.toml"])
+        .output()
+        .expect("rxh runs");
+    assert_success(&output);
+    std::fs::write(
+        directory.path().join("rxh.toml"),
+        "runtime = \"per-core\"\n",
+    )
+    .expect("write");
+    let output = Command::new(RXH)
+        .current_dir(directory.path())
+        .args(["validate", "--config", "rxh.toml"])
+        .output()
+        .expect("rxh runs");
+    assert!(assert_failure(&output).contains("runtime"));
+}

@@ -14,6 +14,7 @@ use crate::dynamic;
 use crate::error::Error;
 use crate::health;
 use crate::http::transport::Transport;
+use crate::per_core;
 use crate::stream::Dialer;
 
 /// A pool plus the connections and checks attached to it.
@@ -33,7 +34,9 @@ pub struct Group {
 }
 
 impl Group {
-    fn new(pool: Pool) -> Result<Self, Error> {
+    /// `runtimes` is the number of runtimes that keep their own upstream
+    /// connections.
+    fn new(pool: Pool, runtimes: usize) -> Result<Self, Error> {
         let body = pool
             .settings()
             .health
@@ -49,7 +52,7 @@ impl Group {
         let dialer = Dialer::new(pool.settings())
             .map(Arc::new)
             .map_err(|err| invalid(format!("upstream {}: tls: {err}", pool.name())))?;
-        let transport = Transport::new(pool.settings(), Arc::clone(&dialer));
+        let transport = Transport::new(pool.settings(), Arc::clone(&dialer), runtimes);
         Ok(Self {
             pool,
             dialer,
@@ -70,6 +73,7 @@ impl Registry {
     /// names like `server[0]#1`, see [`Registry::inline_name`].
     pub fn build(config: &Config) -> Result<Self, Error> {
         let mut groups = BTreeMap::new();
+        let runtimes = per_core::count(config.runtime);
 
         // Pools that serve UDP servers cannot have unix socket members.
         let mut udp_pools = BTreeSet::new();
@@ -100,7 +104,7 @@ impl Registry {
 
         for (name, group) in &config.upstreams {
             let pool = pool_for(name, group)?;
-            groups.insert(name.clone(), Arc::new(Group::new(pool)?));
+            groups.insert(name.clone(), Arc::new(Group::new(pool, runtimes)?));
         }
 
         for (server_index, server) in config.servers.iter().enumerate() {
@@ -108,7 +112,7 @@ impl Registry {
                 if let Action::Forward(Forward::Inline(group)) = &pattern.action {
                     let name = Self::inline_name(server_index, server, pattern_index);
                     let pool = pool_for(&name, group)?;
-                    groups.insert(name, Arc::new(Group::new(pool)?));
+                    groups.insert(name, Arc::new(Group::new(pool, runtimes)?));
                 }
             }
         }

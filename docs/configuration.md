@@ -12,6 +12,7 @@ The file has six parts, and top level keys must come before the first table:
 
 ```toml
 grace_period = "30s"     # top level options
+runtime = "per_core"
 
 [admin]                  # admin API
 [log]                    # access logs
@@ -25,7 +26,52 @@ grace_period = "30s"     # top level options
 | Key | Default | Description |
 |---|---|---|
 | `grace_period` | unset (wait forever) | Time open connections get to finish on stop or reload before they are closed. Idle keep-alive HTTP connections are closed right away. |
+| `runtime` | `"shared"` | Threading model of the listeners: `"shared"` or `"per_core"`, see [Runtime](#runtime). |
 | `include` | `[]` | Files merged into this one, see [Includes](#includes). Must come before the first `[table]`. |
+
+## Runtime
+
+```toml
+runtime = "per_core"
+
+[[server]]
+listen = "0.0.0.0:80"
+forward = "@api"
+```
+
+| Value | Meaning |
+|---|---|
+| `"shared"` | One work-stealing runtime with a thread per CPU. Every address has one listener, and the tasks of a connection may run on any thread. The default. |
+| `"per_core"` | One single-threaded runtime per CPU the process may use. Each one has its own `SO_REUSEPORT` listener on every `http` and `tcp` address and its own upstream connections, so a request stays on one thread from accept to response. |
+
+`per_core` served 3% to 96% more requests per second than `shared` in the
+`throughput` benchmark, with less CPU per request: see
+[profiling.md](profiling.md#after-one-runtime-per-core). It is not the default
+because of what it gives up:
+
+- The kernel picks the listener of a new connection from a hash of the client
+  address and port. A runtime never hands work to another one, so a few busy
+  connections that land on the same runtime share one CPU while others idle.
+  `per_core` fits many connections; `shared` fits a few heavy ones.
+- It needs a kernel that spreads connections over `SO_REUSEPORT` listeners:
+  Linux. Elsewhere keep `shared`.
+
+What is counted per runtime and what stays global:
+
+- `keepalive_idle_conns_per_host` and `http2_conns_per_host` apply to each
+  runtime: with 8 CPUs and `http2_conns_per_host = 2`, a backend gets up to
+  16 HTTP/2 connections.
+- `max_connections`, `max_conns_per_host`, rate limits, the cache, health,
+  load balancing state and metrics are shared by all runtimes, as with
+  `shared`.
+- `udp` servers keep one socket, on the first runtime.
+- The admin API, health checks and certificate management run on the main
+  runtime. `rxh status` shows each listener once, with the state of the
+  first runtime.
+
+The number of runtimes is the number of CPUs the process may run on
+(`taskset` and container CPU limits count). The key is not allowed in
+included files, and a reload may change it.
 
 ## Includes
 

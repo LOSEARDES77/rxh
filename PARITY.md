@@ -158,7 +158,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 
 | Caddy | RXH | Status | Notes |
 |---|---|---|---|
-| `caddy run` | `rxh run` (or plain `rxh`) | ✅ | |
+| `caddy run` | `rxh run` (or plain `rxh`) | ✅ | `runtime = "per_core"` runs one single-threaded runtime per CPU with `SO_REUSEPORT` listeners instead of the shared work-stealing one (Caddy has the Go scheduler only). |
 | `caddy start` | `rxh start` | ✅ | Unix only, PID file and log file. The PID file is locked: a second `rxh start` with the same file fails. |
 | `caddy stop` | `rxh stop` | ✅ | Admin API, falls back to the PID file. |
 | `caddy reload` | `rxh reload`, `SIGHUP` | ✅ | Zero downtime (`SO_REUSEPORT`); an invalid file keeps the running config. |
