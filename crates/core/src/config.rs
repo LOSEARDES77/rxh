@@ -281,6 +281,14 @@ impl Config {
                          handle_response, encode and cache only apply to http servers"
                     ));
                 }
+                if server.protocol != Protocol::Http
+                    && (!pattern.ip_allow.is_empty() || !pattern.ip_deny.is_empty())
+                {
+                    return invalid(format!(
+                        "{label}: match[{pattern_index}]: ip_allow and ip_deny inside match \
+                         entries only apply to http servers, set them on the server"
+                    ));
+                }
                 pattern.validate_rewrite().map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
                 })?;
@@ -744,6 +752,15 @@ pub struct Server {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_proxies: Vec<IpNet>,
 
+    /// Client networks accepted by every route of the server, see
+    /// [`crate::net::permitted`]. Empty accepts any client not in `ip_deny`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ip_allow: Vec<IpNet>,
+
+    /// Client networks rejected by every route of the server.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ip_deny: Vec<IpNet>,
+
     /// PROXY protocol header to send upstream (tcp only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<ProxyProtocol>,
@@ -836,6 +853,10 @@ struct RawServer {
     http2: bool,
     #[serde(default)]
     trusted_proxies: Vec<String>,
+    #[serde(default)]
+    ip_allow: Vec<IpNet>,
+    #[serde(default)]
+    ip_deny: Vec<IpNet>,
     proxy_protocol: Option<ProxyProtocol>,
     #[serde(default)]
     proxy_protocol_in: bool,
@@ -945,6 +966,8 @@ impl TryFrom<RawServer> for Server {
             https_redirect: raw.https_redirect,
             http2: raw.http2,
             trusted_proxies,
+            ip_allow: raw.ip_allow,
+            ip_deny: raw.ip_deny,
             proxy_protocol: raw.proxy_protocol,
             proxy_protocol_in: raw.proxy_protocol_in,
             match_timeout: raw.match_timeout,
@@ -1001,6 +1024,15 @@ pub struct Pattern {
     /// Client networks allowed to match (the directly connected peer).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_ip: Vec<IpNet>,
+
+    /// Client networks this entry accepts, on top of the server's lists
+    /// (http only). A matching request from elsewhere gets `403`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_allow: Vec<IpNet>,
+
+    /// Client networks this entry rejects with `403` (http only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_deny: Vec<IpNet>,
 
     /// What to do when the pattern matches.
     #[serde(flatten)]
@@ -1073,6 +1105,8 @@ impl Pattern {
             header: BTreeMap::new(),
             query: BTreeMap::new(),
             remote_ip: Vec::new(),
+            ip_allow: Vec::new(),
+            ip_deny: Vec::new(),
             action,
             rewrite: None,
             request: RequestConfig::default(),
@@ -5006,6 +5040,81 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
             ),
         ] {
             let message = invalid(&text);
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    #[test]
+    fn ip_allow_and_deny() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            ip_allow = ["10.0.0.0/8", "::1"]
+            ip_deny = ["10.0.0.1"]
+            match = [
+                { uri = "/admin", ip_allow = ["127.0.0.1"], ip_deny = ["127.0.0.2/32"], forward = "127.0.0.1:8080" },
+                { forward = "127.0.0.1:8080" },
+            ]
+
+            [[server]]
+            listen = "127.0.0.1:5432"
+            protocol = "tcp"
+            ip_deny = ["192.168.0.0/16"]
+            forward = "127.0.0.1:5433"
+
+            [[server]]
+            listen = "127.0.0.1:53"
+            protocol = "udp"
+            ip_allow = ["fd00::/8"]
+            forward = "127.0.0.1:5353"
+            "#,
+        )
+        .unwrap();
+
+        let http = &config.servers[0];
+        assert_eq!(http.ip_allow.len(), 2);
+        assert_eq!(http.ip_deny, ["10.0.0.1/32".parse::<IpNet>().unwrap()]);
+        assert_eq!(http.patterns[0].ip_allow.len(), 1);
+        assert_eq!(http.patterns[0].ip_deny.len(), 1);
+        assert!(http.patterns[1].ip_allow.is_empty());
+        assert_eq!(config.servers[1].ip_deny.len(), 1);
+        assert_eq!(config.servers[2].ip_allow.len(), 1);
+
+        let invalid = |text: &str| Config::from_toml(text).unwrap_err().to_string();
+        for (text, expected) in [
+            (
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n\
+                 ip_allow = [\"10.0.0.0/33\"]",
+                "invalid IP range",
+            ),
+            (
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n\
+                 ip_deny = [\"example.com\"]",
+                "invalid IP range",
+            ),
+            (
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n\
+                 ip_deny = \"10.0.0.1\"",
+                "invalid type",
+            ),
+            (
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nmatch = [{ forward = \"127.0.0.1:2\", \
+                 ip_allow = [\"10.0.0.1/8/8\"] }]",
+                "invalid IP range",
+            ),
+            (
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n\
+                 match = [{ forward = \"127.0.0.1:2\", ip_allow = [\"10.0.0.0/8\"] }]",
+                "ip_allow and ip_deny inside match entries only apply to http servers",
+            ),
+            (
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"udp\"\n\
+                 match = [{ forward = \"127.0.0.1:2\", ip_deny = [\"10.0.0.0/8\"] }]",
+                "ip_allow and ip_deny inside match entries only apply to http servers",
+            ),
+        ] {
+            let message = invalid(text);
             assert!(message.contains(expected), "{text}: {message}");
         }
     }

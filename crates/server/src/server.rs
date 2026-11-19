@@ -18,7 +18,7 @@ use hyper::header::HeaderValue;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use rxh_core::config::{Action, Config, ConfigError, Protocol, ProxyProtocol};
-use rxh_core::net::IpNet;
+use rxh_core::net::{self, IpNet};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
@@ -104,6 +104,10 @@ struct ConnectionContext {
     /// if empty).
     proxy_protocol_in: bool,
     trusted_proxies: Vec<IpNet>,
+    /// `ip_allow` and `ip_deny` of a `tcp` server, checked on accept. HTTP
+    /// servers check theirs per request, after `X-Forwarded-For`.
+    ip_allow: Vec<IpNet>,
+    ip_deny: Vec<IpNet>,
     match_timeout: Duration,
 }
 
@@ -211,6 +215,8 @@ impl Server {
                     },
                     idle_timeout: server.udp_idle_timeout,
                     max_sessions: server.max_connections,
+                    ip_allow: server.ip_allow.clone(),
+                    ip_deny: server.ip_deny.clone(),
                     log_name: Arc::clone(&log_name),
                     server: Arc::clone(&label),
                     logger: Arc::clone(&logger),
@@ -272,6 +278,10 @@ impl Server {
                     cert_resolver = Some(resolver);
                     acceptor
                 });
+                let (ip_allow, ip_deny) = match server.protocol {
+                    Protocol::Tcp => (server.ip_allow.clone(), server.ip_deny.clone()),
+                    Protocol::Http | Protocol::Udp => (Vec::new(), Vec::new()),
+                };
                 let context = ConnectionContext {
                     tls,
                     handler,
@@ -284,6 +294,8 @@ impl Server {
                     idle_timeout: server.idle_timeout,
                     proxy_protocol_in: server.proxy_protocol_in,
                     trusted_proxies: server.trusted_proxies.clone(),
+                    ip_allow,
+                    ip_deny,
                     match_timeout: server.match_timeout,
                 };
                 (Socket::Tcp(listener), Some(Arc::new(context)))
@@ -613,6 +625,10 @@ async fn handle_connection(
                 return;
             }
         }
+    }
+    if !net::permitted(peer.ip(), &context.ip_allow, &context.ip_deny) {
+        eprintln!("{log_name} => {peer}: rejected by ip_allow or ip_deny, closing");
+        return;
     }
     let stream = Rewind::new(buffer, stream);
 

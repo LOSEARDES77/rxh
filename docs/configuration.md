@@ -579,6 +579,7 @@ socket, except that `http` servers listing the same address share one socket
 | `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
+| `ip_allow`, `ip_deny` | `[]` | CIDR ranges or addresses of the clients this server accepts and rejects, on every protocol, see [IP allow and deny lists](#ip-allow-and-deny-lists). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header with the client address on every new connection to a backend, see [PROXY protocol output](#proxy-protocol-output) (http and tcp). |
 | `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). Set `trusted_proxies` too: with it empty any directly connecting client can spoof its address. |
 | `match_timeout` | `"3s"` | Time a client has to send the PROXY header (`proxy_protocol_in`) and, on `tcp` servers with layer 4 matchers, the first bytes the matchers look at. |
@@ -835,6 +836,7 @@ match = [
 | `header` | `{ name = "value" }`: the header must have this exact value (one of its values); `"*"` only requires the header. |
 | `query` | `{ key = "value" }`: same for query parameters (not percent decoded); `"*"` only requires the key. |
 | `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
+| `ip_allow`, `ip_deny` | Client IP lists of this route, on top of the server's; a request the route matches but its lists reject gets `403`, see [IP allow and deny lists](#ip-allow-and-deny-lists). |
 | `forward` / `serve` / `redirect` | Action, exactly one. `serve` is a directory or a [file server table](#file-server), `redirect` a target or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `rewrite` | New URI of the request before it is forwarded or served, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `handle_response` | List of handlers for upstream responses: change the status, or answer with a file or a redirect instead, see [Handling upstream responses](#handling-upstream-responses) (`forward` only). |
@@ -865,6 +867,51 @@ match = [
     { method = ["GET", "HEAD"], header = { x-beta = "*" }, forward = "@beta" },
     { forward = "@web" },
 ]
+```
+
+### IP allow and deny lists
+
+`ip_allow` and `ip_deny` take CIDR ranges (`"10.0.0.0/8"`, `"fd00::/8"`) or
+single addresses (`"192.0.2.7"`). A client is accepted when it is in no
+`ip_deny` range and, if `ip_allow` is not empty, in an `ip_allow` range: a
+deny wins, so `ip_deny` can cut holes in the allowed ranges. IPv4-mapped
+IPv6 clients (`::ffff:10.0.0.1`) are checked as IPv4.
+
+| Protocol | Client IP | Rejected client |
+|---|---|---|
+| `http` | The left-most `X-Forwarded-For` entry when the peer is in `trusted_proxies`, else the peer (or the PROXY header source with `proxy_protocol_in`) | `403 Forbidden`, nothing reaches the backend |
+| `tcp` | The peer, or the PROXY header source | Connection closed before the TLS handshake, with a log line |
+| `udp` | The sender of the datagram | Datagram dropped, without a log line |
+
+On `http` servers the lists can also go on `match` entries, and a request
+must pass both the server's lists and those of the route it matches. Unlike
+the `remote_ip` matcher, which makes a request skip to the next route, a
+route whose lists reject the client answers `403`. On a shared address each
+server's lists apply to its own routes only. `tcp` and `udp` servers take the
+lists on the server, not in `match` entries.
+
+With `trusted_proxies`, the proxy in front must replace `X-Forwarded-For`
+(or append to a value it trusts): rxh takes the left-most entry, so a
+proxy that keeps what the client sent lets the client pick its address.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "example.com"
+trusted_proxies = ["10.0.0.0/8"]       # the load balancer in front
+ip_deny = ["203.0.113.0/24"]
+match = [
+    # Office and VPN only, except one VPN address.
+    { uri = "/admin", ip_allow = ["198.51.100.0/24", "10.8.0.0/16"], ip_deny = ["10.8.0.66"], forward = "@admin" },
+    { forward = "@web" },
+]
+
+[[server]]
+listen = "0.0.0.0:5432"
+protocol = "tcp"
+ip_allow = ["10.0.0.0/8"]
+forward = "10.0.0.5:5432"
 ```
 
 ### Rewrites and redirects

@@ -112,8 +112,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] TLS options: minimum version, cipher suites, curves. OCSP stapling.
 - [x] Certificate reload without restart, and `rxh cert` commands to list
       certificates and expiry dates.
-- [ ] IP allow and deny lists, rate limiting, concurrent connection limit
-      per client.
+- [x] IP allow and deny lists on servers and routes (`ip_allow`, `ip_deny`).
+- [ ] Rate limiting, concurrent connection limit per client.
 - [ ] Basic auth, forward auth (Authelia, Authentik, oauth2-proxy).
 - [ ] Security header presets and CORS.
 - [ ] Admin API over a unix socket, and optional token authentication for
