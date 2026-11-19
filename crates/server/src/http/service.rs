@@ -32,6 +32,7 @@ use crate::http::cache::Cache;
 use crate::http::cors::Cors;
 use crate::http::encode;
 use crate::http::headers::{self, Forwarding, Replacement, Via};
+use crate::http::mirror::Mirror;
 use crate::http::proxy;
 use crate::http::rate_limit::RateLimiter;
 use crate::http::response::{self, BoxResponse};
@@ -111,6 +112,8 @@ pub(crate) struct Route {
     /// `handle_response` entries; the first one matching an upstream
     /// response runs.
     pub(crate) handle_response: Vec<ResponseHandler>,
+    /// `mirror` entries, each copying its share of the proxied requests.
+    pub(crate) mirror: Vec<Mirror>,
     pub(crate) cache: Option<Cache>,
     pub(crate) encode: Vec<Encoding>,
     /// Entry `ip_allow` and `ip_deny`, on top of the site's.
@@ -291,6 +294,13 @@ impl Site {
                 .map(ResponseHandler::compile)
                 .collect::<Result<_, _>>()
                 .map_err(|err| invalid("handle_response", err))?;
+            let mut mirror = Vec::with_capacity(pattern.mirror.len());
+            for entry in &pattern.mirror {
+                let group = registry.get(&entry.pool).ok_or_else(|| {
+                    invalid("mirror", format!("unknown upstream group @{}", entry.pool))
+                })?;
+                mirror.push(Mirror::new(group, entry));
+            }
 
             routes.push(Route {
                 site: Arc::clone(&site),
@@ -309,6 +319,7 @@ impl Site {
                 request_replace,
                 response_replace,
                 handle_response,
+                mirror,
                 cache: Cache::new(&pattern.cache),
                 encode: pattern.encode.clone(),
                 ip_allow: pattern.ip_allow.clone(),

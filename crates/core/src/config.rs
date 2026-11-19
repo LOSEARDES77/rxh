@@ -361,7 +361,7 @@ impl Config {
                 if server.protocol != Protocol::Http && pattern.has_http_options() {
                     return invalid(format!(
                         "{label}: match[{pattern_index}]: rewrite, request, response, \
-                         handle_response, encode and cache only apply to http servers"
+                         handle_response, mirror, encode and cache only apply to http servers"
                     ));
                 }
                 if server.protocol != Protocol::Http
@@ -446,6 +446,26 @@ impl Config {
                     return invalid(format!(
                         "{label}: match[{pattern_index}]: handle_response only applies to forward"
                     ));
+                }
+                if !pattern.mirror.is_empty() && !matches!(pattern.action, Action::Forward(_)) {
+                    return invalid(format!(
+                        "{label}: match[{pattern_index}]: mirror only applies to forward"
+                    ));
+                }
+                for (mirror_index, mirror) in pattern.mirror.iter().enumerate() {
+                    let at = format!("{label}: match[{pattern_index}]: mirror[{mirror_index}]");
+                    if mirror.percent > 100 {
+                        return invalid(format!("{at}: percent must be between 0 and 100"));
+                    }
+                    let Some(group) = self.upstreams.get(&mirror.pool) else {
+                        return invalid(format!("{at}: unknown upstream group @{}", mirror.pool));
+                    };
+                    // Mirrors get the same PROXY header as the forward.
+                    if server.proxy_protocol.is_some() && group.h2c {
+                        return invalid(format!(
+                            "{at}: proxy_protocol cannot be used with h2c backends"
+                        ));
+                    }
                 }
                 for (handler_index, handler) in pattern.handle_response.iter().enumerate() {
                     handler.validate().map_err(|err| {
@@ -1362,6 +1382,8 @@ struct RawServer {
     response: Option<ResponseConfig>,
     #[serde(default)]
     handle_response: Vec<HandleResponse>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    mirror: Vec<Mirror>,
     cache: Option<Cache>,
     #[serde(default = "default::max_connections", alias = "connections")]
     max_connections: usize,
@@ -1432,6 +1454,7 @@ impl TryFrom<RawServer> for Server {
             || raw.request.is_some()
             || raw.response.is_some()
             || !raw.handle_response.is_empty()
+            || !raw.mirror.is_empty()
             || !raw.encode.is_empty()
             || raw.cache.is_some();
 
@@ -1444,8 +1467,8 @@ impl TryFrom<RawServer> for Server {
             (Some(_), None) if has_inline_options => {
                 return Err(String::from(
                     "'uri', 'path', 'method', 'header', 'query', 'remote_ip', 'rewrite', \
-                     'request', 'response', 'handle_response', 'encode' and 'cache' go inside \
-                     each 'match' entry",
+                     'request', 'response', 'handle_response', 'mirror', 'encode' and 'cache' \
+                     go inside each 'match' entry",
                 ));
             }
             (Some(patterns), None) if !patterns.is_empty() => patterns,
@@ -1460,6 +1483,7 @@ impl TryFrom<RawServer> for Server {
                 request: raw.request.unwrap_or_default(),
                 response: raw.response.unwrap_or_default(),
                 handle_response: raw.handle_response,
+                mirror: raw.mirror,
                 encode: raw.encode,
                 cache: raw.cache.unwrap_or_default(),
                 ..Pattern::new(action)
@@ -1612,6 +1636,15 @@ pub struct Pattern {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handle_response: Vec<HandleResponse>,
 
+    /// Pools that get a copy of the requests, their responses dropped
+    /// (`forward` only).
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub mirror: Vec<Mirror>,
+
     /// Encodings to compress responses with, in order of preference. Applies
     /// to files and proxied responses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1673,6 +1706,7 @@ impl Pattern {
             request: RequestConfig::default(),
             response: ResponseConfig::default(),
             handle_response: Vec::new(),
+            mirror: Vec::new(),
             encode: Vec::new(),
             cache: Cache::default(),
             sni: Vec::new(),
@@ -1739,9 +1773,11 @@ impl Pattern {
     }
 
     /// Returns true if the entry sets `rewrite`, `request`, `response`,
-    /// `handle_response`, `encode` or `cache`, which only HTTP servers use.
+    /// `handle_response`, `mirror`, `encode` or `cache`, which only HTTP
+    /// servers use.
     fn has_http_options(&self) -> bool {
         !self.encode.is_empty()
+            || !self.mirror.is_empty()
             || self.rewrite.is_some()
             || self.request != RequestConfig::default()
             || self.response != ResponseConfig::default()
@@ -2125,6 +2161,28 @@ pub struct WeightedPool {
     /// other pools of the split. Zero sends nothing to the pool.
     #[serde(default = "default::weight")]
     pub weight: u32,
+}
+
+/// One entry of `mirror` on a `forward` route: `{ pool = "shadow", percent =
+/// 10 }`. A copy of the request goes to a member of the pool and its
+/// response is dropped; the client only ever sees the `forward` response.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Mirror {
+    /// Name of an entry of [`Config::upstreams`], without `@`.
+    pub pool: String,
+
+    /// Share of the requests copied, from 0 to 100.
+    #[serde(default = "default::mirror_percent")]
+    pub percent: u8,
+
+    /// Largest request body copied. Requests with a bigger body, or a body
+    /// of unknown length, are forwarded without a copy.
+    #[serde(
+        default = "default::mirror_max_body_size",
+        deserialize_with = "size::deserialize"
+    )]
+    pub max_body_size: usize,
 }
 
 impl Serialize for Forward {
@@ -4434,6 +4492,14 @@ mod default {
         1
     }
 
+    pub fn mirror_percent() -> u8 {
+        100
+    }
+
+    pub fn mirror_max_body_size() -> usize {
+        1024 * 1024
+    }
+
     pub fn dynamic_refresh() -> Duration {
         Duration::from_secs(60)
     }
@@ -4751,6 +4817,92 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(message.contains("policy cookie needs HTTP"), "{message}");
+    }
+
+    #[test]
+    fn mirror_parses() {
+        let config = split_config(
+            "forward = \"@v1\"\nmirror = { pool = \"v2\", percent = 10, max_body_size = \"64KB\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.servers[0].patterns[0].mirror,
+            [Mirror {
+                pool: "v2".into(),
+                percent: 10,
+                max_body_size: 64_000,
+            }]
+        );
+
+        // Defaults, a list inside a match entry, and a round trip through TOML.
+        let config = split_config(
+            "match = [{ forward = \"@v1\", mirror = [{ pool = \"v2\" }, { pool = \"v1\", percent = 0 }] }]\n",
+        )
+        .unwrap();
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        let mirror = &again.servers[0].patterns[0].mirror;
+        assert_eq!(mirror.len(), 2);
+        assert_eq!(
+            (mirror[0].percent, mirror[0].max_body_size),
+            (100, 1024 * 1024)
+        );
+        assert_eq!(mirror[1].percent, 0);
+    }
+
+    #[test]
+    fn mirror_rejects_invalid_entries() {
+        let message = split_error("forward = \"@v1\"\nmirror = { pool = \"v3\" }\n");
+        assert!(
+            message.contains("mirror[0]: unknown upstream group @v3"),
+            "{message}"
+        );
+
+        let message = split_error("forward = \"@v1\"\nmirror = { pool = \"v2\", percent = 101 }\n");
+        assert!(
+            message.contains("percent must be between 0 and 100"),
+            "{message}"
+        );
+
+        let message = split_error("serve = \".\"\nmirror = { pool = \"v2\" }\n");
+        assert!(
+            message.contains("mirror only applies to forward"),
+            "{message}"
+        );
+
+        let message =
+            split_error("protocol = \"tcp\"\nforward = \"@v1\"\nmirror = { pool = \"v2\" }\n");
+        assert!(
+            message.contains("mirror, encode and cache only apply to http"),
+            "{message}"
+        );
+
+        let message = split_error("match = [{ forward = \"@v1\" }]\nmirror = { pool = \"v2\" }\n");
+        assert!(message.contains("'mirror'"), "{message}");
+
+        let message = Config::from_toml(&format!(
+            "{SPLIT_POOLS}[upstream.h2]\nh2c = true\nbackends = [\"127.0.0.1:84\"]\n\
+             [[server]]\nlisten = \"127.0.0.1:1\"\nproxy_protocol = \"v1\"\n\
+             forward = \"@v1\"\nmirror = {{ pool = \"h2\" }}\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("mirror[0]: proxy_protocol cannot be used with h2c"),
+            "{message}"
+        );
+
+        assert!(
+            split_config("forward = \"@v1\"\nmirror = { pool = \"v2\", share = 1 }\n").is_err()
+        );
+        assert!(
+            split_config("forward = \"@v1\"\nmirror = { pool = \"v2\", percent = -1 }\n").is_err()
+        );
+        assert!(
+            split_config(
+                "forward = \"@v1\"\nmirror = { pool = \"v2\", max_body_size = \"1 mile\" }\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

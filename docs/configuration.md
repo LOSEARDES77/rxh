@@ -1249,6 +1249,49 @@ split to a pool with an HTTP-only policy. Splits are not sticky: a client
 can land on either version from one request to the next; use a `match`
 entry on a cookie or header to pin testers to the canary.
 
+### Request mirroring
+
+`mirror` on a `forward` route sends a copy of the requests to other pools
+(shadow traffic), to try a new version with production traffic before it
+answers anyone. The client only ever gets the response of the `forward`: the
+mirror's responses are read and dropped, and a slow, failing or down mirror
+never delays or changes it. Each entry is a table, or a list of them:
+
+| Key | Default | Description |
+|---|---|---|
+| `pool` | | Name of an `[upstream.NAME]`, without `@`. |
+| `percent` | `100` | Share of the requests copied, from `0` to `100`, spread evenly: `10` copies one request out of every ten. |
+| `max_body_size` | `"1MiB"` | [Size](#sizes): largest request body copied. |
+
+```toml
+[upstream.v2]
+backends = ["10.0.1.1:8080"]
+
+[[server]]
+listen = "0.0.0.0:80"
+forward = "@v1"
+# A copy of 1 request out of 4 goes to v2 as well.
+mirror = { pool = "v2", percent = 25 }
+```
+
+The copy is the request as the `forward` sends it: same method, URI (after
+`rewrite`), `Host`, body, and headers after the `request.headers` rules,
+`X-Forwarded-*` and the PROXY protocol header of the server. It is sent at
+the same time as the forwarded request, to a member picked by the mirror
+pool's own policy; its failures are logged and fed to the pool's passive
+health checks, never retried. Notes:
+
+- A request with a body is copied only when its `Content-Length` is at
+  most `max_body_size`. The body is then read before it is forwarded;
+  bodies without a length (chunked) and larger ones are forwarded without a
+  copy.
+- WebSocket and other upgrade requests, and responses served from `cache`,
+  are not copied.
+- A copy may take 30 seconds, response included. Past 1024 copies in flight
+  per mirror, requests go without one until some finish.
+- `mirror` is only allowed on `forward` routes of `http` servers, and
+  `proxy_protocol` with an `h2c` mirror pool is rejected like on `forward`.
+
 ### Virtual hosts on a shared address
 
 Several `http` servers may list the same `listen` address. They share one
@@ -1482,6 +1525,7 @@ match = [
 | `forward` / `serve` / `redirect` | Action, exactly one. `serve` is a directory or a [file server table](#file-server), `redirect` a target or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `rewrite` | New URI of the request before it is forwarded or served, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `handle_response` | List of handlers for upstream responses: change the status, or answer with a file or a redirect instead, see [Handling upstream responses](#handling-upstream-responses) (`forward` only). |
+| `mirror` | Copies of the requests sent to other pools, their responses dropped: `{ pool, percent, max_body_size }` or a list, see [Request mirroring](#request-mirroring) (`forward` only). |
 | `request.method` | Method the request is forwarded or served with instead of its own (upper cased), for example `"POST"`. |
 | `request.max_body_size` | [Size](#sizes): largest request body accepted, for example `"10MB"`. Larger ones get `413 Content Too Large`: at once when `Content-Length` says so (nothing is sent to the backend), else when the streamed body passes the limit, which aborts the upstream request (with `request_buffers` at least as large, the backend is never contacted). Unset means no limit; `0` is rejected. Also on `serve` and `redirect` routes, by `Content-Length`. Example: `request = { max_body_size = "10MB" }`. |
 | `encode` | List of `zstd`, `br`, `gzip`: compress this route's responses (files and proxied) with the first one the client accepts in `Accept-Encoding`. Only text, JSON, JavaScript, XML, SVG and WebAssembly responses without a `Content-Encoding`, and never `206` or `304`. Removes `Content-Length`, adds `Vary: Accept-Encoding`, makes a strong `ETag` weak. |
@@ -2001,7 +2045,8 @@ handshake and `alpn` matches the negotiated protocol. Entries using only
 HTTP request matchers (`uri`, `host`, `path`, `method`, `header`, `query`,
 `remote_ip`) are rejected on `tcp` and `udp` servers, and layer 4 matchers on
 `http` and `udp` servers. `rewrite`, `request`, `response`, `handle_response`,
-`encode` and `cache` only apply to `http` servers and are rejected elsewhere.
+`mirror`, `encode` and `cache` only apply to `http` servers and are rejected
+elsewhere.
 
 ### PROXY protocol input
 
