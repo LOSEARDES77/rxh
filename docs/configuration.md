@@ -374,7 +374,7 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 their state, hosts with their routes, the live health of every backend, and
 the certificates with their expiry. It refreshes every 2 seconds, is embedded
 in the binary and loads nothing from other sites. It has no key: it is there
-whenever the admin API is.
+whenever the admin API is. `/dashboard/` redirects to `/dashboard`.
 
 ```toml
 [admin]

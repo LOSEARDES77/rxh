@@ -271,8 +271,11 @@ async fn handle(
     request: Request<Incoming>,
     state: Arc<AdminState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let is_dashboard =
-        request.method() == Method::GET && request.uri().path().trim_matches('/') == "dashboard";
+    let raw_path = request.uri().path();
+    let is_dashboard = request.method() == Method::GET && raw_path.trim_matches('/') == "dashboard";
+    // The page calls the API with relative URLs, which only resolve to the
+    // API routes from this exact path.
+    let is_dashboard_page = raw_path == "/dashboard";
     if let Some(token) = &state.token {
         // A browser cannot send the token when it opens a page.
         if !is_dashboard && !has_token(&request, token) {
@@ -316,7 +319,8 @@ async fn handle(
             );
             response
         }
-        (&Method::GET, ["dashboard"]) => dashboard(),
+        (&Method::GET, ["dashboard"]) if is_dashboard_page => dashboard(),
+        (&Method::GET, ["dashboard"]) => dashboard_redirect(),
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
         (&Method::GET, ["pools"]) => {
             let registry = registry(&state);
@@ -721,6 +725,17 @@ fn dashboard() -> Response<Full<Bytes>> {
     ] {
         headers.insert(name, header::HeaderValue::from_static(value));
     }
+    response
+}
+
+/// Sends `/dashboard/` and the like to the one path the page works from.
+fn dashboard_redirect() -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
+    response.headers_mut().insert(
+        header::LOCATION,
+        header::HeaderValue::from_static("/dashboard"),
+    );
     response
 }
 

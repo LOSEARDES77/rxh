@@ -15,6 +15,8 @@ Changed.
   with their expiry, refreshed every 2 seconds. One page embedded in the
   binary, without external resources. With `[admin] token` the page is
   served without the token and asks for it before reading any data.
+  `/dashboard/` redirects to `/dashboard`, the path its requests are
+  relative to.
 - `rxh top`: requests per second, errors per second and error share,
   mean upstream latency, requests in flight and healthy backends of every
   pool, refreshed every `--interval` (1s) from `GET /metrics` until

@@ -636,19 +636,31 @@ async fn dashboard_is_a_page_served_to_local_browsers_only() {
     fs::write(&config_path, format!("[admin]\nlisten = \"{admin}\"\n")).expect("write");
     let _daemon = start(&config_path, admin).await;
 
-    for uri in ["/dashboard", "/dashboard/"] {
+    let (status, headers, body) = util::get(admin, "/dashboard").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "text/html; charset=utf-8");
+    let policy = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+    assert!(policy.starts_with("default-src 'none';"), "{policy}");
+    assert!(policy.contains("connect-src 'self'"), "{policy}");
+    assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+    let page = String::from_utf8(body.to_vec()).expect("UTF-8 page");
+    assert!(page.starts_with("<!doctype html>"));
+    for section in ["Listeners", "Hosts", "Health", "Certificates"] {
+        assert!(page.contains(&format!("<h2>{section}</h2>")), "{section}");
+    }
+
+    // The page calls the API with relative URLs: from `/dashboard/` they
+    // would resolve to `/dashboard/status`, so that path redirects instead.
+    for uri in ["/dashboard/", "//dashboard"] {
         let (status, headers, body) = util::get(admin, uri).await;
-        assert_eq!(status, StatusCode::OK, "{uri}");
-        assert_eq!(headers[header::CONTENT_TYPE], "text/html; charset=utf-8");
-        let policy = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
-        assert!(policy.starts_with("default-src 'none';"), "{policy}");
-        assert!(policy.contains("connect-src 'self'"), "{policy}");
-        assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
-        let page = String::from_utf8(body.to_vec()).expect("UTF-8 page");
-        assert!(page.starts_with("<!doctype html>"), "{uri}");
-        for section in ["Listeners", "Hosts", "Health", "Certificates"] {
-            assert!(page.contains(&format!("<h2>{section}</h2>")), "{section}");
-        }
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT, "{uri}");
+        assert_eq!(headers[header::LOCATION], "/dashboard", "{uri}");
+        assert!(body.is_empty(), "{uri}");
+    }
+    // Every URL the page fetches answers from where the page is served.
+    for route in ["/status", "/config", "/certificates"] {
+        let (status, _, _) = util::get(admin, route).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
     }
 
     // The page is read only, and so is its route.
@@ -716,6 +728,10 @@ async fn token_is_required_on_every_route_when_set() {
             .windows(TOKEN.len())
             .any(|part| part == TOKEN.as_bytes())
     );
+    // Its trailing slash form redirects there without the token as well.
+    let (status, headers, _) = util::get(admin, "/dashboard/").await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(headers[header::LOCATION], "/dashboard");
     for (method, uri) in [(Method::POST, "/dashboard"), (Method::GET, "/dashboard/x")] {
         let (status, _, _) = call(admin, method.clone(), uri, "", &[]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
