@@ -465,13 +465,12 @@ impl Server {
             }
         };
 
-        tokio::select! {
-            result = udp::serve(socket, settings) => {
-                if let Err(err) = result {
-                    eprintln!("{log_name} => UDP socket failed: {err}");
-                }
-            }
-            () = shutdown => println!("{log_name} => Received shutdown signal"),
+        let shutdown = async {
+            shutdown.await;
+            println!("{log_name} => Received shutdown signal");
+        };
+        if let Err(err) = udp::serve(socket, settings, shutdown).await {
+            eprintln!("{log_name} => UDP socket failed: {err}");
         }
 
         state.send_replace(State::ShuttingDown(ShutdownState::Done));

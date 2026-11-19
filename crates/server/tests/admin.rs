@@ -371,12 +371,19 @@ async fn udp_listener_is_rebound_on_reload() {
     }
     util::eventually(async || exchange(listen).await == "one:hi").await;
 
-    // The same UDP port cannot be bound twice, so this reload goes through
-    // the stop-then-start path.
-    fs::write(&config_path, config(two)).expect("write");
-    let (status, json) = send(admin, Method::POST, "/reload", "").await;
-    assert_eq!(status, StatusCode::OK, "{json}");
-    util::eventually(async || exchange(listen).await == "two:hi").await;
+    // The same UDP port cannot be bound twice, so each reload goes through
+    // the stop-then-start path. The open sessions share the listening socket:
+    // the stop must close it with them, or the start finds the port in use.
+    for (backend, answer) in [(two, "two:hi"), (one, "one:hi")].repeat(4) {
+        let clients: Vec<_> = (0..16).map(|_| tokio::spawn(exchange(listen))).collect();
+        for client in clients {
+            client.await.expect("client");
+        }
+        fs::write(&config_path, config(backend)).expect("write");
+        let (status, json) = send(admin, Method::POST, "/reload", "").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        util::eventually(async || exchange(listen).await == answer).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

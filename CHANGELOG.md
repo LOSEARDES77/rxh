@@ -208,6 +208,13 @@ Changed.
   running?") instead of exiting silently in the background, and the PID file
   is written before `rxh start` returns.
 
+### Fixed
+
+- Reloading a configuration with a UDP server could fail with "Address
+  already in use" and keep the old configuration: the stopped listener
+  reported its shutdown while its sessions still held the socket. The
+  sessions now end before the listener reports that it has stopped.
+
 ## 0.2.0 (unreleased)
 
 RXH grows from an HTTP reverse proxy into a general reverse proxy and load

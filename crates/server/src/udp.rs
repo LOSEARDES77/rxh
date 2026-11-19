@@ -44,12 +44,34 @@ struct Session {
 
 type Sessions = Arc<Mutex<HashMap<SocketAddr, Session>>>;
 
-/// Serves datagrams until the future is dropped. Dropping it also ends all
-/// sessions.
-pub(crate) async fn serve(socket: Arc<UdpSocket>, settings: UdpSettings) -> io::Result<()> {
+/// Serves datagrams until `shutdown` completes or the socket fails.
+///
+/// The listening socket is closed when this returns: the sessions, which
+/// share it to answer their clients, are ended and awaited first. Dropping
+/// their tasks without waiting would leave the port bound for a moment, and a
+/// reload that binds it again right away would fail with "Address already in
+/// use".
+pub(crate) async fn serve(
+    socket: Arc<UdpSocket>,
+    settings: UdpSettings,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let mut replies = JoinSet::new();
+    let result = tokio::select! {
+        result = receive_loop(&socket, &settings, &mut replies) => result,
+        () = shutdown => Ok(()),
+    };
+    replies.shutdown().await;
+    result
+}
+
+async fn receive_loop(
+    socket: &Arc<UdpSocket>,
+    settings: &UdpSettings,
+    replies: &mut JoinSet<()>,
+) -> io::Result<()> {
     let sessions: Sessions = Arc::default();
     let epoch = Instant::now();
-    let mut replies = JoinSet::new();
     let mut buffer = vec![0; MAX_DATAGRAM];
 
     loop {
@@ -78,11 +100,11 @@ pub(crate) async fn serve(socket: Arc<UdpSocket>, settings: UdpSettings) -> io::
                 }
                 // ponytail: session setup (DNS + bind) runs inline in the
                 // receive loop; move it to a task if setup latency matters.
-                match open_session(&settings, client).await {
+                match open_session(settings, client).await {
                     Ok((session, upstream)) => {
                         let guard = upstream.start_request();
                         replies.spawn(reply_loop(
-                            Arc::clone(&socket),
+                            Arc::clone(socket),
                             session.clone(),
                             client,
                             epoch,
