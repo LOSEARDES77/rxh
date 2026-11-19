@@ -247,6 +247,70 @@ async fn sighup_and_reload_swap_configuration_without_downtime() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn placeholders_take_values_from_the_environment_and_secret_files() {
+    let first = backend("backend-1").await;
+    let second = backend("backend-2").await;
+    let admin = free_address();
+    let from_env = free_address();
+    let from_file = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\
+             [[server]]\nlisten = \"{from_env}\"\nforward = \"{{env.RXH_TEST_BACKEND}}\"\n\
+             [[server]]\nlisten = \"{from_file}\"\nforward = \"{{file.secrets/backend}}\"\n"
+        ),
+    )
+    .expect("write");
+    std::fs::create_dir(dir.join("secrets")).expect("mkdir");
+    std::fs::write(dir.join("secrets/backend"), format!("{second}\n")).expect("write");
+
+    // Without the variable the daemon refuses to start.
+    let output = Command::new(RXH)
+        .current_dir(dir)
+        .args(["validate", "-c", "rxh.toml"])
+        .env_remove("RXH_TEST_BACKEND")
+        .output()
+        .expect("rxh runs");
+    let stderr = assert_failure(&output);
+    assert!(
+        stderr.contains("environment variable RXH_TEST_BACKEND is not set"),
+        "{stderr}"
+    );
+
+    let _daemon = Daemon(
+        Command::new(RXH)
+            .current_dir(dir)
+            .args(["run", "--config", "rxh.toml"])
+            .env("RXH_TEST_BACKEND", first.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon starts"),
+    );
+    wait_for_body(from_env, "backend-1").await;
+    wait_for_body(from_file, "backend-2").await;
+
+    // A reload reads the secret file again.
+    std::fs::write(dir.join("secrets/backend"), first.to_string()).expect("write");
+    assert_success(&rxh(dir, admin, &["reload"]));
+    wait_for_body(from_file, "backend-1").await;
+
+    // A missing secret is rejected and the running configuration keeps serving.
+    std::fs::remove_file(dir.join("secrets/backend")).expect("remove");
+    let output = rxh(dir, admin, &["reload"]);
+    let (stdout, stderr) = stdout_and_stderr(&output);
+    assert!(!output.status.success());
+    assert!(
+        format!("{stdout}{stderr}").contains("{file.secrets/backend}"),
+        "{stdout}{stderr}"
+    );
+    assert_eq!(try_get(from_file).await.as_deref(), Some("backend-1"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn watch_reloads_when_the_file_or_an_include_changes() {
     let first = backend("backend-1").await;
     let second = backend("backend-2").await;

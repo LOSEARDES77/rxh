@@ -7,12 +7,14 @@
 //! drains its connections in the background. If the configuration is invalid
 //! the old generation keeps running untouched.
 
+use std::env::VarError;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use rxh_core::config::{AdminListen, Config, IncludedConfig, Runtime};
+use rxh_core::config::{AdminListen, Config, ConfigError, IncludedConfig, Runtime};
+use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -29,14 +31,39 @@ fn read_file(path: &Path) -> Result<String, Error> {
         .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", path.display())))?)
 }
 
+/// Reads a configuration file and, when `expand` is true, replaces its
+/// `{env.NAME}` and `{file.PATH}` placeholders. Relative secret file paths
+/// start at the directory of `path`.
+fn read_config(path: &Path, expand: bool) -> Result<String, Error> {
+    let text = read_file(path)?;
+    if !expand {
+        return Ok(text);
+    }
+    let base = path.parent().unwrap_or(Path::new(""));
+    let expanded = placeholder::expand(&text, |lookup| match lookup {
+        Lookup::Env(name) => std::env::var(name).map_err(|err| match err {
+            VarError::NotPresent => format!("environment variable {name} is not set"),
+            VarError::NotUnicode(_) => format!("environment variable {name} is not UTF-8"),
+        }),
+        Lookup::File(file) => {
+            let file = base.join(file);
+            // `echo secret > file` and most secret stores end the value with a newline.
+            std::fs::read_to_string(&file)
+                .map(|contents| contents.trim_end_matches(['\r', '\n']).to_owned())
+                .map_err(|err| format!("{}: {err}", file.display()))
+        }
+    })
+    .map_err(|err| ConfigError::Invalid(format!("{}: {err}", path.display())))?;
+    Ok(expanded.into_owned())
+}
+
 /// Reads the main file and every file it includes, merged but not validated.
-fn read_merged(path: &Path) -> Result<(Config, Vec<PathBuf>), Error> {
-    let mut config = Config::parse(&read_file(path)?)?;
+fn read_merged(path: &Path, expand: bool) -> Result<(Config, Vec<PathBuf>), Error> {
+    let mut config = Config::parse(&read_config(path, expand)?)?;
     let included = include::expand(path, &config.include)?;
     for file in &included {
-        let part = IncludedConfig::from_toml(&read_file(file)?).map_err(|err| {
-            rxh_core::config::ConfigError::Invalid(format!("{}: {err}", file.display()))
-        })?;
+        let part = IncludedConfig::from_toml(&read_config(file, expand)?)
+            .map_err(|err| ConfigError::Invalid(format!("{}: {err}", file.display())))?;
         config.merge(part, &file.display().to_string())?;
     }
     config.include.clear();
@@ -49,15 +76,17 @@ fn read_merged(path: &Path) -> Result<(Config, Vec<PathBuf>), Error> {
 /// Servers keep the order of the main file first, then the included files
 /// sorted by path. The returned `include` list is empty, it is merged.
 pub fn load_config(path: &Path) -> Result<Config, Error> {
-    let (config, _) = read_merged(path)?;
+    let (config, _) = read_merged(path, /* expand= */ true)?;
     config.validate()?;
     Ok(config)
 }
 
 /// The main configuration file followed by the files it includes, sorted by
-/// path. The files are parsed but the result is not validated.
+/// path. The files are parsed but the result is not validated, and
+/// placeholders are not replaced, so the CLI can edit the files without the
+/// secrets of the daemon.
 pub fn config_files(path: &Path) -> Result<Vec<PathBuf>, Error> {
-    Ok(read_merged(path)?.1)
+    Ok(read_merged(path, /* expand= */ false)?.1)
 }
 
 /// Daemon bound to a configuration file, or to a configuration without one.
@@ -618,6 +647,40 @@ forward = "@api"
         write(dir.path(), "x.toml", "");
         fs::write(&main, "include = [\"missing.toml\"]\n").expect("write");
         assert!(load_config(&main).is_err());
+    }
+
+    #[test]
+    fn secret_files_are_read_relative_to_the_file_that_names_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("rxh.toml");
+        write(dir.path(), "rxh.toml", "include = [\"conf.d/*.toml\"]\n");
+        write(
+            dir.path(),
+            "conf.d/api.toml",
+            "[upstream.api]\nbackends = [\"{file.secrets/backend}\"]\n",
+        );
+        write(dir.path(), "conf.d/secrets/backend", "127.0.0.1:9\r\n");
+        let config = load_config(&main).expect("loads");
+        assert_eq!(config.upstreams["api"].backends[0].address, "127.0.0.1:9");
+        // Listing the files for the CLI does not need the secrets.
+        fs::remove_file(dir.path().join("conf.d/secrets/backend")).expect("remove");
+        assert_eq!(config_files(&main).expect("files").len(), 2);
+        let err = load_config(&main).expect_err("missing secret").to_string();
+        assert!(
+            err.contains("api.toml") && err.contains("{file.secrets/backend}"),
+            "{err}"
+        );
+
+        write(
+            dir.path(),
+            "rxh.toml",
+            "[admin]\ntoken = \"{env.RXH_TEST_SURELY_UNSET_VARIABLE}\"\n",
+        );
+        let err = load_config(&main).expect_err("unset variable").to_string();
+        assert!(
+            err.contains("environment variable RXH_TEST_SURELY_UNSET_VARIABLE is not set"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

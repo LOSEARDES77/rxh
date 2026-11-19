@@ -75,7 +75,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `health_method` | `method` | ✅ | |
 | `health_status` | `status` (`200`, `2xx`) | ✅ | Default `2xx`. |
 | `health_body` | `body` (regex) | ✅ | |
-| `health_request_body` | `request_body` | 🟡 | No `{env.*}` placeholders. |
+| `health_request_body` | `request_body` | ✅ | `{env.NAME}` and `{file.PATH}` are replaced when the configuration loads, like in every string value. |
 | `health_headers` | `headers` | ✅ | |
 | `health_follow_redirects` | `follow_redirects` | 🟡 | Follows the path of `Location` on the same target. |
 | TCP connect checks | `health` without `uri` | ➕ | For TCP/UDP pools and non-HTTP backends. |
@@ -176,6 +176,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Remote admin (`remote_admin` with mTLS identities) | `[admin] token` | 🟡 | Bearer token on every request, required for a non-loopback `listen`. Plain HTTP: no TLS or client certificates on the admin listener, no per-identity access rules. |
 | CLI to manage pools, peers and services | `rxh upstream`, `rxh pool`, `rxh service` | ➕ | Edits the TOML keeping comments, validates, applies live. |
 | Split configuration (Nginx `include`) | `include = ["conf.d/*.toml"]` | ➕ | Included files hold `upstream` and `server` only; the CLI edits the defining file; `--file PATH` on `pool add` and `service add`. |
+| Environment variables in the config (`{$VAR}`, `{env.*}`, `{file.*}`) | `{env.NAME}`, `{file.PATH}` in any string value | 🟡 | Replaced when the file loads and on every reload, in the main and included files; secret files relative to the file that names them, trailing newlines dropped. An unset variable or unreadable file is an error: no `{$VAR:default}`. Not replaced in `POST /load` uploads, and not at request time. |
 | Effective config | `rxh config show [--json]` | ➕ | Daemon `/config` when reachable, else the merged files. |
 | Live status table | `rxh status` | ➕ | |
 | Certificate list with expiry | `rxh cert list [--json]`, `GET /certificates`; `rxh cert reload`, `POST /certificates/reload` | ➕ | Every certificate of every TLS listener (files and ACME): names, hosts, expiry, days left, source file, OCSP staple. Traefik shows certificates in its dashboard only. |

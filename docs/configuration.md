@@ -122,6 +122,57 @@ are polled rather than followed with inotify or kqueue, which works the
 same on every platform and on network file systems. Certificate files of
 `tls = { cert, key }` are watched on their own and need no `watch`.
 
+## Environment variables and secret files
+
+Any string value can take part of its text from an environment variable or
+a file, so secrets and per-host addresses stay out of the configuration:
+
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+token = "{file./run/secrets/rxh-admin-token}"
+
+[upstream.api]
+backends = ["{env.API_HOST}:8080", "{env.API_HOST}:8081"]
+
+[upstream.api.health]
+uri = "/health"
+headers = { Authorization = "Bearer {file.secrets/health-token}" }
+
+[[server]]
+listen = "0.0.0.0:{env.PORT}"
+forward = "@api"
+```
+
+| Placeholder | Replaced with |
+|---|---|
+| `{env.NAME}` | The environment variable `NAME` of the daemon (letters, digits and `_`). Set but empty is allowed. |
+| `{file.PATH}` | The contents of the file, without trailing newlines (`\n`, `\r`). A relative `PATH` starts at the directory of the file that contains the placeholder, which can be an included file. Fits Docker and Kubernetes secrets mounted as files. |
+
+- Placeholders are replaced when the configuration loads: at startup, on
+  `rxh validate`, and on every reload (`rxh reload`, `SIGHUP`, `watch`). A
+  reload reads the variables of the running daemon, which do not change, and
+  the secret files again. `watch` follows the configuration files, not the
+  secret files: run `rxh reload` after rotating a secret.
+- An unset variable, an unreadable file or a `{env.` / `{file.` without its
+  closing `}` is a configuration error, so the daemon does not start, or a
+  reload keeps the running configuration.
+- Only string values are replaced, in the main file and the included files.
+  Keys, numbers and booleans are not: write the whole value as a string
+  where the key accepts one (`listen`, durations, sizes). The value is
+  inserted as text, so quotes or newlines in it cannot change the structure
+  of the file.
+- Other braces, like `{host}` or `{uri}` in `rewrite` and `redirect`, are
+  request placeholders and stay as they are.
+- `POST /load` and `PATCH` bodies are taken as sent, without placeholders.
+- `GET /config` and `rxh config show` print the replaced values. `[admin]
+  token` and the DNS provider credentials are shown as `***`; other secrets
+  placed in the configuration this way are visible to whoever can read the
+  admin API.
+- The CLI commands that edit the files (`rxh upstream`, `rxh pool`,
+  `rxh service`) keep the placeholders in the file, and validate the result
+  with the environment and the files the CLI can read.
+
 ## Quick commands without a file
 
 `rxh file-server [--listen ADDR] [--root DIR] [--no-browse] [--encode]` serves a

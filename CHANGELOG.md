@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- `{env.NAME}` and `{file.PATH}` placeholders in any string value of the
+  configuration file and its included files: the environment variable, or
+  the contents of the file without trailing newlines (relative to the
+  directory of the file that names it), so tokens, passwords and addresses
+  stay out of the configuration. Replaced at startup and on every reload;
+  an unset variable or an unreadable file is a configuration error. Keys,
+  numbers and booleans are not replaced, and `POST /load` uploads are taken
+  as sent.
 - `POST /load` on the admin API runs the configuration sent in the body,
   TOML or JSON (what `GET /config` prints loads again), with the validation
   and rollback of a reload. `PATCH /config/upstream/{name}` and

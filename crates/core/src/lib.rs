@@ -11,6 +11,7 @@ pub mod config;
 pub mod duration;
 pub mod matcher;
 pub mod net;
+pub mod placeholder;
 pub mod pool;
 pub mod size;
 pub mod status;
