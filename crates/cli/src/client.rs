@@ -70,12 +70,37 @@ impl AdminClient {
         self.request(Method::DELETE, path, Some(body)).await
     }
 
+    /// Body of a `GET` answered with text, like `/metrics`.
+    pub(crate) async fn get_text(&self, path: &str) -> Result<String, ClientError> {
+        let (status, bytes) = self.timed(Method::GET, path, None).await?;
+        if status.is_success() {
+            String::from_utf8(bytes.to_vec())
+                .map_err(|err| ClientError::Protocol(format!("invalid UTF-8: {err}")))
+        } else {
+            Err(api_error(status, &bytes))
+        }
+    }
+
     async fn request(
         &self,
         method: Method,
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, ClientError> {
+        let (status, bytes) = self.timed(method, path, body).await?;
+        if !status.is_success() {
+            return Err(api_error(status, &bytes));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|err| ClientError::Protocol(format!("invalid JSON: {err}")))
+    }
+
+    async fn timed(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(StatusCode, Bytes), ClientError> {
         tokio::time::timeout(TIMEOUT, self.send(method, path, body))
             .await
             .map_err(|_| ClientError::Protocol(String::from("timed out")))?
@@ -86,7 +111,7 @@ impl AdminClient {
         method: Method,
         path: &str,
         body: Option<Value>,
-    ) -> Result<Value, ClientError> {
+    ) -> Result<(StatusCode, Bytes), ClientError> {
         match &self.address {
             AdminListen::Tcp(address) => {
                 let stream = TcpStream::connect(address)
@@ -117,7 +142,7 @@ impl AdminClient {
         method: Method,
         path: &str,
         body: Option<Value>,
-    ) -> Result<Value, ClientError>
+    ) -> Result<(StatusCode, Bytes), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -150,17 +175,15 @@ impl AdminClient {
             .await
             .map_err(|err| ClientError::Protocol(err.to_string()))?
             .to_bytes();
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|err| ClientError::Protocol(format!("invalid JSON: {err}")))?;
-
-        if status.is_success() {
-            Ok(value)
-        } else {
-            let message = value["error"]
-                .as_str()
-                .unwrap_or("unknown error")
-                .to_owned();
-            Err(ClientError::Api { status, message })
-        }
+        Ok((status, bytes))
     }
+}
+
+/// The error of a failed answer: the `error` field of its JSON body.
+fn api_error(status: StatusCode, body: &[u8]) -> ClientError {
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value["error"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| String::from("unknown error"));
+    ClientError::Api { status, message }
 }

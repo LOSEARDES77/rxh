@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- `rxh top`: requests per second, errors per second and error share,
+  mean upstream latency, requests in flight and healthy backends of every
+  pool, refreshed every `--interval` (1s) from `GET /metrics` until
+  interrupted or for `--count` refreshes. New metrics behind it:
+  `rxh_upstream_responses_total`, `rxh_upstream_server_errors_total` (5xx)
+  and `rxh_upstream_response_seconds_total` (time to the response headers).
 - Access log filters and sampling: `status` (codes or classes such as
   `"5xx"`) and `min_duration` in `[log]` always write the matching lines
   and drop the others; `sample_ratio` writes a random share of the lines no
@@ -364,6 +370,10 @@ Changed.
 
 ### Changed
 
+- `rxh_upstream_failures_total` counts requests and connections that failed
+  without a response only. Responses that passive health checks treat as
+  failures (`unhealthy_status`, `unhealthy_latency`) are no longer added to
+  it; 5xx responses are in `rxh_upstream_server_errors_total`.
 - `[admin] listen` on an address outside loopback is rejected unless
   `[admin] token` is set; it used to serve the admin API to the network
   without authentication.

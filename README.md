@@ -227,6 +227,7 @@ and [TCP/UDP balancing](examples/tcp-udp.toml). The full reference is in
 | `rxh run` | Run in the foreground (default command). |
 | `rxh start` / `stop` / `reload` | Daemon control through the admin API, with PID file and signal fallbacks. |
 | `rxh status [--json]` | Listeners, pools, health and request counters. |
+| `rxh top [-i 1s] [-n N]` | Live requests per second, errors, latency and health per pool, from `/metrics`. |
 | `rxh validate` | Check a configuration file. |
 | `rxh upstream list\|add\|rm` | Manage the backends (peers) of a pool, live and in the file. `--no-save` changes only the running daemon. |
 | `rxh pool list\|add\|rm` | Manage `[upstream.NAME]` pools. |

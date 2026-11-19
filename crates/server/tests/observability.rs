@@ -77,6 +77,13 @@ forward = "{echo}"
         "rxh_l4_connections_total{server=\"obs-raw\",protocol=\"tcp\"} 1".to_owned(),
         format!("rxh_upstream_requests_total{{pool=\"obs-web#1\",upstream=\"{web_backend}\"}} 2"),
         format!("rxh_upstream_failures_total{{pool=\"obs-web#1\",upstream=\"{web_backend}\"}} 0"),
+        format!("rxh_upstream_responses_total{{pool=\"obs-web#1\",upstream=\"{web_backend}\"}} 2"),
+        format!(
+            "rxh_upstream_server_errors_total{{pool=\"obs-web#1\",upstream=\"{web_backend}\"}} 0"
+        ),
+        format!(
+            "rxh_upstream_response_seconds_total{{pool=\"obs-web#1\",upstream=\"{web_backend}\"}} "
+        ),
         format!("rxh_upstream_healthy{{pool=\"obs-web#1\",upstream=\"{web_backend}\"}} 1"),
     ] {
         assert!(text.contains(&expected), "missing {expected} in\n{text}");

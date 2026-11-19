@@ -57,6 +57,7 @@ pub(crate) async fn execute(cli: &Cli, command: Command) -> Result<(), String> {
         Command::Stop => stop(cli, &client).await,
         Command::Reload => reload(cli, &client).await,
         Command::Status { json } => status(&client, json).await,
+        Command::Top { interval, count } => crate::top::run(&client, interval, count).await,
         Command::Validate => validate(&config_path(cli)),
         Command::Cert(CertCommand::List { json }) => cert_list(&client, json).await,
         Command::Cert(CertCommand::Reload) => cert_reload(&client).await,

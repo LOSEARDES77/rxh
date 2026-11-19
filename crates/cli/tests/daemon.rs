@@ -2109,3 +2109,103 @@ async fn kubernetes_ingresses_and_http_routes_are_routed_to_ready_endpoints() {
     assert_ne!(get_host(web, "shop.test").await.as_deref(), Some("b"));
     wait_for_backends(web, "route.test", &["b"], 1).await;
 }
+
+/// A backend answering every request with `500 Internal Server Error`.
+async fn failing_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::task::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::task::spawn(async move {
+                let service = service_fn(|_| async {
+                    let mut response = Response::new(Full::<Bytes>::from("broken"));
+                    *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                    Ok::<_, Infallible>(response)
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    address
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn top_shows_live_rates_per_pool() {
+    let live = backend("live").await;
+    let broken = failing_backend().await;
+    let (admin, web, bad) = (free_address(), free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\n\
+             [upstream.api]\nbackends = [\"{live}\"]\n\n\
+             [upstream.broken]\nbackends = [\"{broken}\"]\n\n\
+             [upstream.idle]\nbackends = [\"{}\"]\n\n\
+             [[server]]\nlisten = \"{web}\"\nforward = \"@api\"\n\n\
+             [[server]]\nlisten = \"{bad}\"\nforward = \"@broken\"\n",
+            free_address()
+        ),
+    )
+    .expect("write config");
+    let _daemon = start_daemon(dir);
+    wait_for_body(web, "live").await;
+
+    let load = tokio::task::spawn(async move {
+        loop {
+            try_get(web).await;
+            try_get(bad).await;
+        }
+    });
+    let output = tokio::task::spawn_blocking({
+        let dir = dir.to_owned();
+        move || rxh(&dir, admin, &["top", "--interval", "300ms", "-n", "2"])
+    })
+    .await
+    .expect("top runs");
+    load.abort();
+    let table = assert_success(&output);
+
+    // Not a terminal: two frames, no escape codes.
+    assert_eq!(table.matches("rxh top  admin ").count(), 2, "{table}");
+    assert!(!table.contains('\x1b'), "{table}");
+    let last_frame = table.rsplit("rxh top").next().expect("a frame");
+    let row = |pool: &str| -> Vec<String> {
+        last_frame
+            .lines()
+            .find(|line| line.starts_with(&format!("{pool} ")))
+            .unwrap_or_else(|| panic!("no row for {pool} in\n{table}"))
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    };
+    let rate = |cell: &str| -> f64 { cell.parse().expect("a rate") };
+
+    let api = row("api");
+    assert!(rate(&api[1]) > 0.0, "{table}");
+    assert_eq!(
+        (api[2].as_str(), api[3].as_str()),
+        ("0.0", "0.0"),
+        "{table}"
+    );
+    assert!(api[4].ends_with("ms"), "{table}");
+    assert_eq!(api[6], "1/1", "{table}");
+
+    let broken_row = row("broken");
+    assert!(rate(&broken_row[2]) > 0.0, "{table}");
+    assert_eq!(broken_row[3], "100.0", "{table}");
+
+    // An idle pool has no rates to show; its dead backend has no active
+    // health check, so it still counts as healthy.
+    assert_eq!(row("idle")[1..5], ["0.0", "0.0", "-", "-"], "{table}");
+}
+
+#[test]
+fn top_fails_without_a_daemon() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let stderr = assert_failure(&rxh(directory.path(), free_address(), &["top", "-n", "1"]));
+    assert!(stderr.contains("daemon is not reachable"), "{stderr}");
+}

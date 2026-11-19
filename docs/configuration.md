@@ -508,12 +508,37 @@ Counters survive reloads; upstream series are read from the live pools.
 | `rxh_http_request_duration_seconds` | `server` | histogram, buckets 0.005 to 10 seconds |
 | `rxh_l4_connections_total` | `server`, `protocol` | counter (`tcp` connections, `udp` sessions) |
 | `rxh_upstream_requests_total` | `pool`, `upstream` | counter |
-| `rxh_upstream_failures_total` | `pool`, `upstream` | counter |
+| `rxh_upstream_failures_total` | `pool`, `upstream` | counter, requests and connections without a response |
+| `rxh_upstream_responses_total` | `pool`, `upstream` | counter, HTTP responses |
+| `rxh_upstream_server_errors_total` | `pool`, `upstream` | counter, HTTP responses with a 5xx status |
+| `rxh_upstream_response_seconds_total` | `pool`, `upstream` | counter, time to the response headers summed over the responses |
 | `rxh_upstream_active_requests` | `pool`, `upstream` | gauge |
 | `rxh_upstream_healthy` | `pool`, `upstream` | gauge, 1 or 0 |
 
 `server` is the server name, or its listen address when unnamed (requests that
 match no route use the listener name).
+
+### `rxh top`
+
+`rxh top` reads `/metrics` every second and shows the traffic of every pool
+since the previous read:
+
+```sh
+$ rxh top --interval 2s
+rxh top  admin 127.0.0.1:2019  every 2s
+POOL                         REQ/S     ERR/S    ERR%    LATENCY  ACTIVE  HEALTHY
+api                          121.8       0.5     0.4      3.2ms       4      2/2
+db                            12.0       0.0     0.0          -       1      1/1
+```
+
+`REQ/S` counts requests and connections sent to the pool, `ERR/S`
+requests and connections that failed without a response plus 5xx responses,
+`ERR%` the share of errors among the requests that finished, `LATENCY` the
+mean time to the response headers (HTTP pools only), `ACTIVE` requests in
+flight and `HEALTHY` healthy backends out of all. On a terminal the table is
+redrawn in place until Ctrl-C; piped, one table is appended per refresh.
+`--count N` stops after `N` tables. It uses `--admin` and `--admin-token`
+like the other commands.
 
 ## `[tracing]`: OpenTelemetry
 

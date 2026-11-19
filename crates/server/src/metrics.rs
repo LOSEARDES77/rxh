@@ -177,31 +177,50 @@ impl Metrics {
             })
             .collect();
 
-        type Value = fn(&rxh_core::pool::Upstream) -> u64;
-        let families: [(&str, &str, &str, Value); 4] = [
+        // Counts print as integers: `Display` of a whole `f64` has no decimals.
+        type Value = fn(&rxh_core::pool::Upstream) -> f64;
+        let families: [(&str, &str, &str, Value); 7] = [
             (
                 "rxh_upstream_requests_total",
                 "Requests and connections sent to the upstream.",
                 "counter",
-                |upstream| upstream.total_requests(),
+                |upstream| upstream.total_requests() as f64,
             ),
             (
                 "rxh_upstream_failures_total",
-                "Failed requests and connections to the upstream.",
+                "Requests and connections to the upstream that failed without a response.",
                 "counter",
-                |upstream| upstream.total_failures(),
+                |upstream| upstream.total_failures() as f64,
+            ),
+            (
+                "rxh_upstream_responses_total",
+                "HTTP responses received from the upstream.",
+                "counter",
+                |upstream| upstream.total_responses() as f64,
+            ),
+            (
+                "rxh_upstream_server_errors_total",
+                "HTTP responses with a 5xx status received from the upstream.",
+                "counter",
+                |upstream| upstream.total_server_errors() as f64,
+            ),
+            (
+                "rxh_upstream_response_seconds_total",
+                "Time to the response headers of the upstream, summed over its responses.",
+                "counter",
+                |upstream| upstream.total_response_time().as_secs_f64(),
             ),
             (
                 "rxh_upstream_active_requests",
                 "Requests and connections in flight.",
                 "gauge",
-                |upstream| upstream.active_requests() as u64,
+                |upstream| upstream.active_requests() as f64,
             ),
             (
                 "rxh_upstream_healthy",
                 "1 if the upstream is healthy, 0 otherwise.",
                 "gauge",
-                |upstream| u64::from(upstream.is_healthy()),
+                |upstream| f64::from(u8::from(upstream.is_healthy())),
             ),
         ];
         for (name, help, kind, value) in families {
