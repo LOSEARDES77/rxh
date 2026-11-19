@@ -151,7 +151,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | TLS termination | `tls` on a `tcp` server | ✅ | |
 | PROXY protocol to upstreams | `proxy_protocol = "v1"` or `"v2"` | ✅ | Before the TLS handshake of TLS backends. |
 | Load balancing and health checks | same pools as HTTP | ✅ | Active TCP checks, passive dial failures. |
-| Matchers (SNI, HTTP, SSH, ...) and routing | `match = [{ sni, alpn, protocol, http_host, forward }]` on `tcp` servers | 🟡 | TLS passthrough by SNI/ALPN, `protocol` `tls`/`http`/`ssh`, HTTP/1 `Host`; first match wins, replayed bytes, `match_timeout`. No other caddy-l4 matchers (`remote_ip`, regexp, postgres, ...) and no subroutes. |
+| Matchers (SNI, HTTP, SSH, ...) and routing | `match = [{ sni, alpn, protocol, http_host, remote_ip, regexp, forward }]` on `tcp` servers | 🟡 | TLS passthrough by SNI/ALPN, `protocol` `tls`/`http`/`ssh`/`postgres`, HTTP/1 `Host`, `remote_ip` (CIDR list), `regexp` + `regexp_count` on the first bytes; first match wins, replayed bytes, `match_timeout`. `postgres` only recognizes the first message: no user or database matching. No `not`, `local_ip`, `remote_ip_list`, `proxy_protocol`, `socks`, `rdp`, `quic`, `xmpp`, `dns`, `openvpn`, `wireguard` or `winbox` matchers; `regexp` covers the simple ones. |
+| `subroute` handler | `subroute = [...]` in a `match` entry of a `tcp` server | ✅ | Nested entries are tried on the connections the outer entry matches; when none matches, the outer list goes on. Any depth. Shares the server's `match_timeout`, no `matching_timeout` per subroute. |
 | Receiving PROXY protocol | `proxy_protocol_in = true` (`http` and `tcp`) | ✅ | v1 and v2, gated by `trusted_proxies`; the source address is the client everywhere. |
 
 ## Operations: daemon, CLI and admin API

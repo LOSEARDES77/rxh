@@ -1,6 +1,7 @@
 //! Live load balancing groups of one configuration generation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -82,7 +83,7 @@ impl Registry {
             if server.protocol != Protocol::Udp {
                 continue;
             }
-            for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+            for (pattern_index, pattern) in &server.entries() {
                 if let Action::Forward(forward) = &pattern.action {
                     match forward {
                         Forward::Group(name) => udp_pools.insert(name.clone()),
@@ -111,7 +112,7 @@ impl Registry {
         }
 
         for (server_index, server) in config.servers.iter().enumerate() {
-            for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+            for (pattern_index, pattern) in &server.entries() {
                 if let Action::Forward(Forward::Inline(group)) = &pattern.action {
                     let name = Self::inline_name(server_index, server, pattern_index);
                     let pool = pool_for(&name, group)?;
@@ -125,7 +126,11 @@ impl Registry {
 
     /// Name given to the inline group of a pattern.
     #[must_use]
-    pub fn inline_name(server_index: usize, server: &ServerConfig, pattern_index: usize) -> String {
+    pub fn inline_name(
+        server_index: usize,
+        server: &ServerConfig,
+        pattern_index: impl Display,
+    ) -> String {
         match &server.name {
             Some(name) => format!("{name}#{pattern_index}"),
             None => format!("server[{server_index}]#{pattern_index}"),
@@ -138,7 +143,7 @@ impl Registry {
         forward: &Forward,
         server_index: usize,
         server: &ServerConfig,
-        pattern_index: usize,
+        pattern_index: impl Display,
     ) -> Result<Split, Error> {
         let lookup = |name: &str| {
             self.get(name)

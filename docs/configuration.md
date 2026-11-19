@@ -2332,33 +2332,58 @@ match = [
     { protocol = "ssh", forward = "10.0.0.9:22" },
     { forward = "@fallback" },
 ]
+
+# One port for the office: databases and a SOCKS5 proxy, nothing for others.
+[[server]]
+listen = "0.0.0.0:5432"
+protocol = "tcp"
+match = [
+    { remote_ip = ["10.0.0.0/8", "fd00::/8"], subroute = [
+        { protocol = "postgres", forward = "@postgres" },
+        { regexp = '^\x05[\x01-\xff]', regexp_count = 2, forward = "10.0.0.7:1080" },
+    ] },
+]
 ```
 
 | Key | Description |
 |---|---|
 | `sni` | Server name or list from the TLS ClientHello, same patterns as `host`: exact or leading `*.` wildcard, case insensitive. |
 | `alpn` | ALPN protocol or list; matches if the client offers any of them. |
-| `protocol` | `"tls"` (a TLS ClientHello), `"http"` (an HTTP/1 request line, or the h2c preface `PRI * HTTP/2.0`) or `"ssh"` (an `SSH-` banner). |
+| `protocol` | `"tls"` (a TLS ClientHello), `"http"` (an HTTP/1 request line, or the h2c preface `PRI * HTTP/2.0`), `"ssh"` (an `SSH-` banner) or `"postgres"` (the first message of a PostgreSQL client: a startup message of protocol 3, or an SSL, GSSAPI encryption or cancel request). |
 | `http_host` | `Host` header of an HTTP/1 request, same patterns as `host`; the port is ignored. |
-| `forward` | Required: where matching connections go. Each entry has its own pool. |
+| `remote_ip` | List of CIDR ranges the client must belong to: the connected peer, or the source of the PROXY header with `proxy_protocol_in`. Needs no bytes from the client. |
+| `regexp` | Regular expression ([syntax](https://docs.rs/regex/latest/regex/#syntax)) searched in the first `regexp_count` bytes of the connection. It is not anchored (start it with `^`) and matches bytes, not UTF-8 text: `\xff` is the byte 0xff; `(?u)` turns Unicode on. A client that sends fewer bytes does not match. |
+| `regexp_count` | Bytes `regexp` looks at: 1 to 16384, `4` by default. Needs `regexp`. |
+| `forward` | Where matching connections go. Each entry has its own pool. Required unless the entry has a `subroute`. |
+| `subroute` | Instead of `forward`: a nested `match` list, tried in order on the connections this entry matches. When none of its entries matches, the outer list goes on with the next entry. Subroutes can be nested. |
+
+`postgres` only tells that the client speaks PostgreSQL; clients that start
+with an SSL request (most do) hide the user and the database from the proxy.
+A `subroute` saves repeating the matchers of the outer entry, and RXH still
+reads the first bytes once, whatever the depth. The inline pool of a nested
+entry is named after its position: `NAME#1.0` is the first entry of the
+subroute of `match[1]`.
 
 To decide, RXH reads up to 16 KiB from the client for at most
 `match_timeout`; these bytes are not lost, they are replayed to the chosen
 backend. A client that sends nothing in time (protocols where the server
 speaks first), closes early or sends something unrecognized only matches
-entries without matchers. The ClientHello may span several TLS records.
-When the first entry has no matchers, nothing is read.
+entries without matchers (and those that only use `remote_ip`). The
+ClientHello may span several TLS records. With `regexp` entries RXH also
+waits, within `match_timeout`, until the client has sent the largest
+`regexp_count`. When the first entry has no matchers, or the entries only
+use `remote_ip`, nothing is read.
 
 When the `tcp` server terminates TLS (`tls` is set), `sni` and `alpn` come
 from the completed handshake and `protocol = "tls"` matches every
-connection; `http_host` and the other protocols look at the decrypted
-stream. The server offers the `alpn` values of its entries during the
+connection; `http_host`, `regexp` and the other protocols look at the
+decrypted stream. The server offers the `alpn` values of its entries during the
 handshake and `alpn` matches the negotiated protocol. Entries using only
 `sni`, `alpn` or `protocol = "tls"` then need no extra read.
 
-HTTP request matchers (`uri`, `host`, `path`, `method`, `header`, `query`,
-`remote_ip`) are rejected on `tcp` and `udp` servers, and layer 4 matchers on
-`http` and `udp` servers. `rewrite`, `request`, `response`, `handle_response`,
+HTTP request matchers (`uri`, `host`, `path`, `method`, `header`, `query`)
+are rejected on `tcp` and `udp` servers, `remote_ip` on `udp` servers, and
+the other layer 4 matchers and `subroute` on `http` and `udp` servers. `rewrite`, `request`, `response`, `handle_response`,
 `mirror`, `encode` and `cache` only apply to `http` servers and are rejected
 elsewhere.
 

@@ -18,7 +18,7 @@ use std::time::Duration;
 use hyper::header::HeaderValue;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use rxh_core::config::{Action, Config, ConfigError, Protocol, ProxyProtocol};
+use rxh_core::config::{Action, Config, ConfigError, Pattern, Protocol, ProxyProtocol};
 use rxh_core::net::{self, IpNet};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -83,8 +83,9 @@ enum Handler {
     },
     Tcp {
         routes: Arc<[tcp::Route]>,
-        /// True if picking a route needs the client's first bytes.
-        sniff: bool,
+        /// Set if picking a route needs the client's first bytes: how many
+        /// of them the `regexp` matchers look at.
+        sniff: Option<usize>,
         proxy_protocol: Option<ProxyProtocol>,
         limits: tcp::Limits,
     },
@@ -273,24 +274,40 @@ impl Server {
                 let handler = match server.protocol {
                     Protocol::Tcp => {
                         let mut routes = Vec::new();
-                        for (index, pattern) in server.patterns.iter().enumerate() {
+                        let entries = server.entries();
+                        for (index, (position, pattern)) in entries.iter().enumerate() {
                             let Action::Forward(forward) = &pattern.action else {
-                                unreachable!("validation guarantees tcp servers forward")
+                                continue;
                             };
-                            let matcher = L4Matcher::new(pattern).map_err(|err| {
+                            // The entries this one is nested in: `1` and `1.0`
+                            // for `1.0.2`.
+                            let mut chain: Vec<&Pattern> = Vec::new();
+                            for (outer, pattern) in entries.iter().take(index) {
+                                if position.starts_with(&format!("{outer}.")) {
+                                    chain.push(pattern);
+                                }
+                            }
+                            chain.push(pattern);
+                            let matcher = L4Matcher::new(&chain).map_err(|err| {
                                 Error::Config(ConfigError::Invalid(format!(
-                                    "match[{index}]: {err}"
+                                    "match[{position}]: {err}"
                                 )))
                             })?;
-                            let split = registry.resolve(forward, server_index, server, index)?;
+                            let split =
+                                registry.resolve(forward, server_index, server, position)?;
                             routes.push(tcp::Route { matcher, split });
                         }
                         // Entries after the first one without matchers never match.
                         let terminated = server.tls.is_some();
-                        let sniff = routes
+                        let reachable = routes
                             .iter()
-                            .take_while(|route| !route.matcher.is_default())
-                            .any(|route| route.matcher.needs_bytes(terminated));
+                            .take_while(|route| !route.matcher.is_default());
+                        let mut sniff = None;
+                        for route in reachable {
+                            if route.matcher.needs_bytes(terminated) {
+                                sniff = sniff.max(Some(route.matcher.regexp_count()));
+                            }
+                        }
                         Handler::Tcp {
                             routes: routes.into(),
                             sniff,
@@ -761,8 +778,8 @@ async fn serve<S>(
         } => {
             let log_name = &context.log.log_name;
             let mut buffer = Vec::new();
-            let mut detected = if *sniff {
-                match l4match::sniff(&mut stream, &mut buffer, context.match_timeout).await {
+            let mut detected = if let Some(want) = *sniff {
+                match l4match::sniff(&mut stream, &mut buffer, context.match_timeout, want).await {
                     Ok(detected) => detected,
                     Err(err) => {
                         eprintln!("{log_name} => {peer}: reading the first bytes failed: {err}");
@@ -777,7 +794,9 @@ async fn serve<S>(
                 detected.sni = handshake.sni;
                 detected.alpn = handshake.alpn;
             }
-            let Some(route) = routes.iter().find(|route| route.matcher.matches(&detected)) else {
+            let accepts =
+                |route: &&tcp::Route| route.matcher.matches(&detected, peer.ip(), &buffer);
+            let Some(route) = routes.iter().find(accepts) else {
                 eprintln!("{log_name} => {peer}: no match entry accepts the connection, closing");
                 return;
             };

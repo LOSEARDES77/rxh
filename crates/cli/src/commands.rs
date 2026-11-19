@@ -771,6 +771,10 @@ fn describe_target(pattern: &rxh_core::config::Pattern) -> String {
         }
         Action::Serve(files) => format!("files {}", files.root),
         Action::Redirect(redirect) => format!("redirect {}", redirect.to),
+        Action::Subroute(entries) => {
+            let targets: Vec<String> = entries.iter().map(describe_target).collect();
+            format!("[{}]", targets.join(", "))
+        }
     };
     if pattern.uri == "/" {
         target
@@ -898,6 +902,17 @@ mod tests {
             !dir.path().join("extra").exists(),
             "created directory removed"
         );
+    }
+
+    #[test]
+    fn describes_subroute_targets() {
+        let config = rxh_core::config::Config::from_toml(
+            "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\nmatch = [\n\
+             { subroute = [{ forward = \"a:1\" }, { forward = \"@b\" }] }]\n\
+             [upstream.b]\nbackends = [\"b:1\"]",
+        )
+        .expect("valid");
+        assert_eq!(describe_target(&config.servers[0].patterns[0]), "[a:1, @b]");
     }
 
     #[test]

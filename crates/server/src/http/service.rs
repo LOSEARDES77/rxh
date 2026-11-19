@@ -267,6 +267,9 @@ impl Site {
                     server,
                     pattern_index,
                 )?),
+                Action::Subroute(_) => {
+                    unreachable!("validation rejects subroute on http servers")
+                }
                 Action::Serve(root) => RouteAction::Files(Files::new(root)),
                 Action::Redirect(redirect) => RouteAction::Redirect {
                     to: redirect

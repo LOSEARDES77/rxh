@@ -654,7 +654,8 @@ pub(crate) fn acceptor(
         // order, and matches on the one negotiated.
         _ => {
             let mut protocols: Vec<Vec<u8>> = Vec::new();
-            for alpn in first.patterns.iter().flat_map(|pattern| &pattern.alpn) {
+            let entries = first.entries();
+            for alpn in entries.iter().flat_map(|(_, pattern)| &pattern.alpn) {
                 if !protocols.iter().any(|known| known == alpn.as_bytes()) {
                     protocols.push(alpn.as_bytes().to_vec());
                 }

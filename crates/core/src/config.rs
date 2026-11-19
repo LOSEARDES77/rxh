@@ -363,7 +363,7 @@ impl Config {
                 return invalid(format!("{label}: host does not apply to udp servers"));
             }
 
-            for (pattern_index, pattern) in server.patterns.iter().enumerate() {
+            for (pattern_index, pattern) in &server.entries() {
                 if server.protocol != Protocol::Http && pattern.has_http_options() {
                     return invalid(format!(
                         "{label}: match[{pattern_index}]: rewrite, request, response, \
@@ -410,7 +410,9 @@ impl Config {
                 pattern.validate_rewrite().map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
                 })?;
-                if server.protocol == Protocol::Udp && pattern.has_http_matchers() {
+                if server.protocol == Protocol::Udp
+                    && (pattern.has_http_matchers() || !pattern.remote_ip.is_empty())
+                {
                     return invalid(format!(
                         "{label}: match[{pattern_index}]: udp servers take no request matchers"
                     ));
@@ -419,7 +421,8 @@ impl Config {
                     if pattern.has_http_matchers() {
                         return invalid(format!(
                             "{label}: match[{pattern_index}]: tcp servers match with sni, \
-                             alpn, protocol and http_host, not with HTTP request matchers"
+                             alpn, protocol, http_host, regexp and remote_ip, not with HTTP \
+                             request matchers"
                         ));
                     }
                     for host in pattern.sni.iter().chain(&pattern.http_host) {
@@ -427,10 +430,13 @@ impl Config {
                             ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
                         })?;
                     }
+                    pattern.validate_regexp().map_err(|err| {
+                        ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
+                    })?;
                 } else if pattern.has_l4_matchers() {
                     return invalid(format!(
-                        "{label}: match[{pattern_index}]: sni, alpn, protocol and http_host \
-                         only apply to tcp servers"
+                        "{label}: match[{pattern_index}]: sni, alpn, protocol, http_host and \
+                         regexp only apply to tcp servers"
                     ));
                 }
                 RequestMatcher::new(pattern, &server.host).map_err(|err| {
@@ -480,6 +486,19 @@ impl Config {
                              {err}"
                         ))
                     })?;
+                }
+                if let Action::Subroute(entries) = &pattern.action {
+                    if server.protocol != Protocol::Tcp {
+                        return invalid(format!(
+                            "{label}: match[{pattern_index}]: subroute only applies to tcp servers"
+                        ));
+                    }
+                    if entries.is_empty() {
+                        return invalid(format!(
+                            "{label}: match[{pattern_index}]: subroute needs at least one entry"
+                        ));
+                    }
+                    continue;
                 }
                 if let Action::Serve(files) = &pattern.action {
                     files.validate().map_err(|err| {
@@ -571,10 +590,9 @@ impl Config {
                 return invalid(format!("{label}: udp servers take a single forward"));
             }
             if server.protocol != Protocol::Http
-                && server
-                    .patterns
-                    .iter()
-                    .any(|pattern| !matches!(pattern.action, Action::Forward(_)))
+                && server.entries().iter().any(|(_, pattern)| {
+                    !matches!(pattern.action, Action::Forward(_) | Action::Subroute(_))
+                })
             {
                 return invalid(format!(
                     "{label}: {} servers can only forward",
@@ -1352,6 +1370,25 @@ pub struct Server {
 }
 
 impl Server {
+    /// Every `match` entry with its position, depth first: `0`, `1`, and
+    /// `1.0`, `1.1` for the entries of the `subroute` of entry 1.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(String, &Pattern)> {
+        fn walk<'a>(patterns: &'a [Pattern], prefix: &str, out: &mut Vec<(String, &'a Pattern)>) {
+            for (index, pattern) in patterns.iter().enumerate() {
+                let position = format!("{prefix}{index}");
+                let inner = format!("{position}.");
+                out.push((position, pattern));
+                if let Action::Subroute(entries) = &pattern.action {
+                    walk(entries, &inner, out);
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        walk(&self.patterns, "", &mut entries);
+        entries
+    }
+
     /// Returns a label such as `server[0] (api)` for error messages.
     #[must_use]
     pub fn label(&self, index: usize) -> String {
@@ -1726,6 +1763,15 @@ pub struct Pattern {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub http_host: Vec<String>,
+
+    /// Regular expression searched in the first `regexp_count` bytes of the
+    /// connection (tcp only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regexp: Option<String>,
+
+    /// Bytes `regexp` looks at, 4 by default (tcp only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regexp_count: Option<usize>,
 }
 
 impl Pattern {
@@ -1758,6 +1804,8 @@ impl Pattern {
             alpn: Vec::new(),
             protocol: None,
             http_host: Vec::new(),
+            regexp: None,
+            regexp_count: None,
         }
     }
 
@@ -1795,17 +1843,51 @@ impl Pattern {
         Ok(())
     }
 
-    /// Returns true if the entry uses a layer 4 matcher (`sni`, `alpn`,
-    /// `protocol` or `http_host`).
+    /// Bytes the `regexp` matcher looks at.
+    #[must_use]
+    pub fn regexp_count(&self) -> usize {
+        self.regexp_count.unwrap_or(4)
+    }
+
+    /// Compiles `regexp`. It matches bytes, not UTF-8 text: `\xff` is the
+    /// byte 0xff and `.` any byte but `\n`, unless the expression turns
+    /// Unicode on with `(?u)`.
+    pub fn compile_regexp(&self) -> Result<Option<regex::bytes::Regex>, String> {
+        let Some(regexp) = &self.regexp else {
+            return Ok(None);
+        };
+        let mut builder = regex::bytes::RegexBuilder::new(regexp);
+        let compiled = builder.unicode(false).build();
+        compiled.map(Some).map_err(|err| format!("regexp: {err}"))
+    }
+
+    /// Checks `regexp` and `regexp_count`.
+    fn validate_regexp(&self) -> Result<(), String> {
+        if self.compile_regexp()?.is_none() && self.regexp_count.is_some() {
+            return Err(String::from("regexp_count needs regexp"));
+        }
+        if !(1..=MAX_REGEXP_COUNT).contains(&self.regexp_count()) {
+            return Err(format!(
+                "regexp_count must be between 1 and {MAX_REGEXP_COUNT}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns true if the entry uses a matcher only `tcp` servers have
+    /// (`sni`, `alpn`, `protocol`, `http_host` or `regexp`).
     #[must_use]
     pub fn has_l4_matchers(&self) -> bool {
         !self.sni.is_empty()
             || !self.alpn.is_empty()
             || self.protocol.is_some()
             || !self.http_host.is_empty()
+            || self.regexp.is_some()
+            || self.regexp_count.is_some()
     }
 
-    /// Returns true if the entry uses an HTTP request matcher.
+    /// Returns true if the entry uses an HTTP request matcher. `remote_ip`
+    /// is not one: `tcp` servers match on it too.
     #[must_use]
     fn has_http_matchers(&self) -> bool {
         self.uri != "/"
@@ -1814,7 +1896,6 @@ impl Pattern {
             || !self.method.is_empty()
             || !self.header.is_empty()
             || !self.query.is_empty()
-            || !self.remote_ip.is_empty()
     }
 
     /// Returns true if the entry sets `rewrite`, `request`, `response`,
@@ -1843,7 +1924,15 @@ pub enum L4Protocol {
 
     /// An SSH banner (`SSH-`).
     Ssh,
+
+    /// A PostgreSQL startup message, or an SSL, GSSAPI encryption or cancel
+    /// request.
+    Postgres,
 }
+
+/// Most bytes the `regexp` matcher of `tcp` servers can look at: what layer
+/// 4 matching reads at most.
+pub const MAX_REGEXP_COUNT: usize = 16 * 1024;
 
 /// Content encoding RXH can produce.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1976,6 +2065,11 @@ pub enum Action {
 
     /// Answer with a redirect.
     Redirect(Redirect),
+
+    /// Try a nested list of entries on connections this entry matches (tcp
+    /// only). When none of them matches, the next entry of the outer list
+    /// is tried.
+    Subroute(Vec<Pattern>),
 }
 
 /// Settings of a `redirect` action: `redirect = "target"` or a table.
@@ -5491,6 +5585,124 @@ mod tests {
                 Config::from_toml(case).is_err(),
                 "config should be rejected:\n{case}"
             );
+        }
+    }
+
+    #[test]
+    fn layer4_remote_ip_regexp_postgres_and_subroute() {
+        let tcp = |rest: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n{rest}"
+            ))
+        };
+        let text = r#"match = [
+            { remote_ip = ["10.0.0.0/8", "::1"], subroute = [
+                { protocol = "postgres", forward = "x:1" },
+                { regexp = '^\x05[\x01-\xff]', regexp_count = 2, subroute = [
+                    { sni = "a.test", forward = "x:2" },
+                ] },
+            ] },
+            { regexp = "^SSH-", forward = "x:3" },
+            { forward = "x:4" },
+        ]"#;
+        let config = tcp(text).unwrap();
+        let server = &config.servers[0];
+        assert_eq!(server.patterns.len(), 3);
+        assert_eq!(server.patterns[0].remote_ip.len(), 2);
+        assert_eq!(server.patterns[1].regexp.as_deref(), Some("^SSH-"));
+        assert_eq!(server.patterns[1].regexp_count(), 4, "the default");
+        let entries = server.entries();
+        let positions: Vec<&str> = entries.iter().map(|(at, _)| at.as_str()).collect();
+        assert_eq!(positions, ["0", "0.0", "0.1", "0.1.0", "1", "2"]);
+        assert_eq!(entries[1].1.protocol, Some(L4Protocol::Postgres));
+        assert_eq!(entries[2].1.regexp_count(), 2);
+        assert_eq!(entries[3].1.sni, ["a.test"]);
+
+        // The tree survives a round trip through TOML.
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        let positions = |config: &Config| -> Vec<String> {
+            let entries = config.servers[0].entries();
+            entries.into_iter().map(|(at, _)| at).collect()
+        };
+        assert_eq!(positions(&again), positions(&config));
+        assert_eq!(again.servers[0].entries()[2].1.regexp_count, Some(2));
+
+        // A server with a single forward takes `remote_ip` too.
+        let config = tcp("remote_ip = [\"10.0.0.0/8\"]\nforward = \"x:1\"");
+        assert_eq!(config.unwrap().servers[0].patterns[0].remote_ip.len(), 1);
+
+        let message = |result: Result<Config, ConfigError>| match result {
+            Err(err) => err.to_string(),
+            Ok(_) => String::from("accepted"),
+        };
+        let other = |protocol: &str, rest: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"{protocol}\"\n{rest}"
+            ))
+        };
+        let nested = "match = [{ subroute = [{ forward = \"x:1\" }] }]";
+        for (result, expected) in [
+            (
+                tcp("match = [{ regexp = \"(\", forward = \"x:1\" }]"),
+                "match[0]: regexp:",
+            ),
+            (
+                tcp("match = [{ regexp_count = 8, forward = \"x:1\" }]"),
+                "regexp_count needs regexp",
+            ),
+            (
+                tcp("match = [{ regexp = \"a\", regexp_count = 0, forward = \"x:1\" }]"),
+                "regexp_count must be between 1 and 16384",
+            ),
+            (
+                tcp("match = [{ regexp = \"a\", regexp_count = 16385, forward = \"x:1\" }]"),
+                "regexp_count must be between 1 and 16384",
+            ),
+            (
+                tcp("match = [{ remote_ip = [\"10.0.0.300\"], forward = \"x:1\" }]"),
+                "remote_ip",
+            ),
+            (
+                other("http", "match = [{ regexp = \"a\", forward = \"x:1\" }]"),
+                "only apply to tcp servers",
+            ),
+            (
+                other("http", nested),
+                "subroute only applies to tcp servers",
+            ),
+            (other("udp", nested), "subroute only applies to tcp servers"),
+            (
+                other("udp", "remote_ip = [\"10.0.0.0/8\"]\nforward = \"x:1\""),
+                "udp servers take no request matchers",
+            ),
+            (
+                tcp("match = [{ subroute = [] }]"),
+                "match[0]: subroute needs at least one entry",
+            ),
+            (
+                tcp("match = [{ subroute = [{ forward = \"x:1\" }], forward = \"x:1\" }]"),
+                "match",
+            ),
+            // Nested entries are validated like the others.
+            (
+                tcp("match = [{ subroute = [{ forward = \"x:1\" }, { serve = \".\" }] }]"),
+                "can only forward",
+            ),
+            (
+                tcp("match = [{ subroute = [{ path = \"/a\", forward = \"x:1\" }] }]"),
+                "match[0.0]: tcp servers match with",
+            ),
+            (
+                tcp("match = [{ subroute = [{ regexp = \"(\", forward = \"x:1\" }] }]"),
+                "match[0.0]: regexp:",
+            ),
+            (
+                tcp("match = [{ subroute = [{ forward = \"@missing\" }] }]"),
+                "unknown upstream group @missing",
+            ),
+        ] {
+            let message = message(result);
+            assert!(message.contains(expected), "{message:?} lacks {expected:?}");
         }
     }
 
