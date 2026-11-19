@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rxh_core::pool::{Pool, RequestGuard, SelectContext, Selection, Upstream};
+use rxh_core::pool::{Pool, RequestGuard, RetryPermit, SelectContext, Selection, Upstream};
 
 /// Why no upstream connection could be made.
 #[derive(Debug)]
@@ -22,9 +22,12 @@ pub(crate) enum DialError {
 /// `retries`, `try_duration` and `try_interval` settings. Connection failures
 /// are reported to passive health checks. The request counts as in flight
 /// on the backend, within `max_connections`, until the guard is dropped.
+/// A retry also needs room in the `retry_budget` of the pool; `retry_permit`
+/// then counts the request as retrying until the caller drops it.
 pub(crate) async fn connect_with_retries<T, F, Fut>(
     pool: &Pool,
     context: &SelectContext<'_>,
+    retry_permit: &mut Option<RetryPermit>,
     mut connect: F,
 ) -> Result<(Selection, RequestGuard, T), DialError>
 where
@@ -67,7 +70,7 @@ where
             Some(limit) => started.elapsed() + settings.try_interval < limit,
             None => attempts <= settings.retries,
         };
-        if !retry {
+        if !retry || !pool.allow_retry(retry_permit) {
             return Err(error);
         }
 

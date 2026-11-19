@@ -152,9 +152,12 @@ pub(crate) async fn proxy<S>(
         .unwrap_or_default();
     let preface = &preface;
 
+    // Kept until the connection ends.
+    let mut retry_permit = None;
     let dialed = upstream::connect_with_retries(
         &group.pool,
         &context,
+        &mut retry_permit,
         |upstream: Arc<Upstream>| async move {
             dialer.dial_with_preface(upstream.address(), preface).await
         },

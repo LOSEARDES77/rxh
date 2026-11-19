@@ -993,6 +993,8 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `retries` | `0` | `lb_retries` | Extra attempts after a failure. |
 | `try_duration` | unset | `lb_try_duration` | Keep retrying for this long. Wins over `retries`. Round-trip and `retry_match.status` retries wait `try_interval` first and are skipped when that wait would pass this limit, counted from the first attempt. |
 | `try_interval` | `"250ms"` | `lb_try_interval` | Wait between attempts. |
+| `retry_budget` | unset | Envoy `retry_budget` | `{ percent = 20, min_retries = 3 }`: bound on the requests of the pool that are retrying or hedged at the same time, see [Retry budgets and hedging](#retry-budgets-and-hedging). |
+| `hedge_delay` | unset | Envoy `hedge_policy` | A retryable HTTP request without response headers after this long is also sent to a second backend; the first response wins, see [Retry budgets and hedging](#retry-budgets-and-hedging). `0` is rejected. |
 | `dial_timeout` | `"3s"` | `dial_timeout` | Connect timeout. |
 | `response_header_timeout` | unset | `response_header_timeout` | Time from sending the request to receiving the response headers. On expiry the client gets `504 Gateway Timeout` and the backend counts a passive failure. |
 | `read_timeout` | unset | `read_timeout` | An upstream read that makes no progress for this long fails the connection (also idle pooled connections and upgraded tunnels). |
@@ -1310,6 +1312,59 @@ HTTP/1.1 connections of the transport and makes requests wait for that same
 backend without a limit or a timeout. A request with a `cookie` session
 whose backend is full goes to another backend. `udp` datagrams of new
 sessions over the limit are dropped, never queued.
+
+### Retry budgets and hedging
+
+`retries` and `try_duration` bound the attempts of one request. When many
+requests fail at once, each of them retrying multiplies the load on backends
+that are already in trouble. `retry_budget` bounds the retries of the whole
+pool instead (Envoy `retry_budget`):
+
+```toml
+[upstream.api]
+backends = ["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"]
+retries = 2
+retry_match = { status = ["502", "503"] }
+retry_budget = { percent = 20, min_retries = 3 }
+hedge_delay = "100ms"
+```
+
+| Key | Default | Envoy | Meaning |
+|---|---|---|---|
+| `percent` | `20` | `budget_percent` | Most requests retrying at the same time, in percent of the requests in flight on the pool. `0` to `100`, fractions allowed. |
+| `min_retries` | `3` | `min_retry_concurrency` | Requests that may always retry at the same time, so a pool with little traffic can still retry. |
+
+A request counts against the budget from its first retry (after a refused
+connection, a failed round trip or a `retry_match.status` response) or its
+hedge, until its response is fully sent. A request that wants to retry while
+the budget is used up is not retried: the client gets the answer of the
+attempt that failed (`502`, or the upstream response for `retry_match.status`).
+`retry_budget = {}` uses the defaults. On `tcp` servers a retried connection
+counts until it closes. Without `retry_budget` nothing is counted. The budget
+is counted per process.
+
+`hedge_delay` cuts the tail latency (Envoy `hedge_policy`, "hedged
+requests"): when a backend has not sent its response headers after the
+delay, the same request also goes to a second backend. The first response
+wins and the other request is cancelled. A good value is the 95th or 99th
+percentile of the latency of the backends, so that few requests are sent
+twice.
+
+- Only requests that may be retried are hedged: no body, and a method of
+  `retry_match.method` (`GET`, `HEAD` and `OPTIONS` by default). Upgrades
+  (WebSocket) are not.
+- A request is hedged once, on its first attempt, and only on a backend
+  other than the first one. `round_robin`, `least_conn` and the random
+  policies pick another; hash policies and `cookie` sessions keep picking
+  the same backend, so their requests are not hedged. A hedge does not wait
+  in the `max_connections` queue.
+- A hedge counts against `retry_budget` like a retry. Setting both is
+  recommended: without a budget, slow backends double the requests.
+- When the first attempt fails and the hedge answers, the client gets the
+  hedge's response, without `retries`. When neither answers, the error of
+  the first attempt is handled as usual (`retries` apply).
+- The cancelled request is not reported to passive health checks or the
+  circuit breaker. `response_header_timeout` applies to each of the two.
 
 ### Slow start
 
