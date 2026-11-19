@@ -22,6 +22,7 @@ use rxh_core::pool::Upstream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::http::body::Body;
+use crate::per_core;
 use crate::stream::Dialer;
 
 /// Idle connections by backend address, then by the preface they were
@@ -63,6 +64,15 @@ struct Http2Pool {
     dialing: usize,
     /// Position of the connection used last.
     next: usize,
+}
+
+/// Connections kept by one runtime. A connection is driven by a task of the
+/// runtime that opened it, so reusing it from another one would move every
+/// request between threads.
+#[derive(Debug)]
+struct Shard {
+    idle: Arc<Mutex<IdlePool>>,
+    http2: Mutex<HashMap<String, Http2Pool>>,
 }
 
 /// One of the `http2_conns_per_host` slots of `address`, held while its
@@ -120,13 +130,21 @@ pub(crate) struct Transport {
     max_conns: usize,
     /// One semaphore of `max_conns` permits per backend address.
     limits: Mutex<HashMap<String, Arc<Semaphore>>>,
-    idle: Arc<Mutex<IdlePool>>,
     http2_conns: usize,
-    http2: Mutex<HashMap<String, Http2Pool>>,
+    /// One per runtime, see [`per_core::index`].
+    shards: Box<[Shard]>,
 }
 
 impl Transport {
-    pub(crate) fn new(settings: &UpstreamGroup, dialer: Arc<Dialer>) -> Self {
+    /// Pool with separate connections for each of `runtimes` runtimes.
+    pub(crate) fn new(settings: &UpstreamGroup, dialer: Arc<Dialer>, runtimes: usize) -> Self {
+        let shards = (0..runtimes.max(1)).map(|_| Shard {
+            idle: Arc::new(Mutex::new(IdlePool {
+                lists: HashMap::new(),
+                swept: Instant::now(),
+            })),
+            http2: Mutex::default(),
+        });
         Self {
             dialer,
             keepalive: settings.keepalive,
@@ -134,13 +152,14 @@ impl Transport {
             h2c: settings.h2c,
             max_conns: settings.max_conns_per_host,
             limits: Mutex::default(),
-            idle: Arc::new(Mutex::new(IdlePool {
-                lists: HashMap::new(),
-                swept: Instant::now(),
-            })),
             http2_conns: settings.http2_conns_per_host,
-            http2: Mutex::default(),
+            shards: shards.collect(),
         }
+    }
+
+    /// Connections of the calling runtime.
+    fn shard(&self) -> &Shard {
+        &self.shards[per_core::index() % self.shards.len()]
     }
 
     /// Returns a connection to `address`, reusing an idle one if possible.
@@ -173,7 +192,11 @@ impl Transport {
             });
             // Without a slot the connection only carries this request.
             if dial.is_some() {
-                let mut pools = self.http2.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut pools = self
+                    .shard()
+                    .http2
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 if let Some(pool) = pools.get_mut(address) {
                     pool.senders.push(sender.clone());
                 }
@@ -205,7 +228,8 @@ impl Transport {
         &'a self,
         address: &'a str,
     ) -> Result<http2::SendRequest<Body>, Option<Http2Dial<'a>>> {
-        let mut pools = self.http2.lock().unwrap_or_else(PoisonError::into_inner);
+        let shard = self.shard();
+        let mut pools = shard.http2.lock().unwrap_or_else(PoisonError::into_inner);
         // The address is only copied for the first request to a backend.
         if !pools.contains_key(address) {
             pools.insert(address.to_owned(), Http2Pool::default());
@@ -216,7 +240,7 @@ impl Transport {
         if pool.senders.len() + pool.dialing < self.http2_conns {
             pool.dialing += 1;
             return Err(Some(Http2Dial {
-                pools: &self.http2,
+                pools: &shard.http2,
                 address,
             }));
         }
@@ -273,7 +297,11 @@ impl Transport {
     }
 
     fn take_idle(&self, address: &str, preface: &[u8]) -> Option<http1::SendRequest<Body>> {
-        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut idle = self
+            .shard()
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let list = idle.lists.get_mut(address)?.get_mut(preface)?;
         while let Some(entry) = list.pop() {
             if entry.since.elapsed() < self.keepalive && entry.sender.is_ready() {
@@ -298,7 +326,7 @@ impl Transport {
             return;
         }
 
-        let idle = Arc::clone(&self.idle);
+        let idle = Arc::clone(&self.shard().idle);
         let (keepalive, max_idle) = (self.keepalive, self.max_idle);
         // The task shares the backend instead of copying its address. An
         // empty preface, the usual one, is not allocated.
@@ -371,7 +399,11 @@ impl Transport {
     /// Drops the idle connections to `address` opened with `preface`, after
     /// one of them was found dead.
     pub(crate) fn forget(&self, address: &str, preface: &[u8]) {
-        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut idle = self
+            .shard()
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(prefaces) = idle.lists.get_mut(address) {
             prefaces.remove(preface);
         }

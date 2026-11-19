@@ -104,6 +104,21 @@ struct ConnectionContext {
     match_timeout: Duration,
 }
 
+/// What the listeners of the other runtimes share with the [`Server`] they
+/// replicate: its address, its routes with their state, and its limits.
+#[derive(Clone)]
+pub struct Replica {
+    address: SocketAddr,
+    protocol: Protocol,
+    name: Option<String>,
+    log_name: Arc<str>,
+    max_connections: usize,
+    grace_period: Option<Duration>,
+    context: Arc<ConnectionContext>,
+    permits: Arc<Semaphore>,
+    closing: watch::Sender<bool>,
+}
+
 /// One listener. See the module documentation.
 pub struct Server {
     state: watch::Sender<State>,
@@ -113,9 +128,14 @@ pub struct Server {
     name: Option<String>,
     log_name: Arc<str>,
     max_connections: usize,
+    /// One permit per open connection, shared with the replicas.
+    permits: Arc<Semaphore>,
     grace_period: Option<Duration>,
     context: Option<Arc<ConnectionContext>>,
     cert_resolver: Option<Arc<CertResolver>>,
+    /// False for replicas, which do not repeat the messages of the first
+    /// listener.
+    announce: bool,
     /// Raised on shutdown, for `stream_close_delay`.
     closing: watch::Sender<bool>,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -265,6 +285,7 @@ impl Server {
             }
         };
 
+        let max_connections = server.max_connections.max(1);
         Ok(Self {
             state: watch::channel(State::Starting).0,
             socket,
@@ -272,11 +293,54 @@ impl Server {
             protocol: server.protocol,
             name,
             log_name,
-            max_connections: server.max_connections.max(1),
+            max_connections,
+            permits: Arc::new(Semaphore::new(max_connections)),
             grace_period: config.grace_period,
             context,
             cert_resolver,
+            announce: true,
             closing,
+            shutdown: Box::pin(std::future::pending()),
+        })
+    }
+
+    /// What another runtime needs to listen on the same address, or `None`
+    /// for UDP, which keeps a single socket.
+    #[must_use]
+    pub fn replica(&self) -> Option<Replica> {
+        Some(Replica {
+            address: self.address,
+            protocol: self.protocol,
+            name: self.name.clone(),
+            log_name: Arc::clone(&self.log_name),
+            max_connections: self.max_connections,
+            grace_period: self.grace_period,
+            context: Arc::clone(self.context.as_ref()?),
+            permits: Arc::clone(&self.permits),
+            closing: self.closing.clone(),
+        })
+    }
+
+    /// Binds one more `SO_REUSEPORT` listener on the address of the server
+    /// `replica` comes from, in the current runtime. Both serve the same
+    /// routes and count their connections against the same
+    /// `max_connections`.
+    pub fn from_replica(replica: &Replica) -> Result<Self, Error> {
+        let replica = replica.clone();
+        Ok(Self {
+            state: watch::channel(State::Starting).0,
+            socket: Socket::Tcp(bind_tcp(replica.address)?),
+            address: replica.address,
+            protocol: replica.protocol,
+            name: replica.name,
+            log_name: replica.log_name,
+            max_connections: replica.max_connections,
+            permits: replica.permits,
+            grace_period: replica.grace_period,
+            context: Some(replica.context),
+            cert_resolver: None,
+            announce: false,
+            closing: replica.closing,
             shutdown: Box::pin(std::future::pending()),
         })
     }
@@ -330,15 +394,19 @@ impl Server {
             socket,
             log_name,
             max_connections,
+            permits,
             grace_period,
             context,
+            announce,
             closing,
             shutdown,
             ..
         } = self;
 
         state.send_replace(State::Listening);
-        println!("{log_name} => Listening ({})", self.protocol);
+        if announce {
+            println!("{log_name} => Listening ({})", self.protocol);
+        }
 
         let (socket, settings) = match socket {
             Socket::Udp(socket, settings) => (socket, settings),
@@ -346,11 +414,14 @@ impl Server {
                 let context = context.expect("TCP servers always have a connection context");
                 let mut connections = JoinSet::new();
                 let (stop, stop_receiver) = watch::channel(false);
-                let permits = Arc::new(Semaphore::new(max_connections));
 
                 tokio::select! {
                     () = accept_loop(&listener, &state, &permits, max_connections, &mut connections, &context, &stop_receiver) => {}
-                    () = shutdown => println!("{log_name} => Received shutdown signal"),
+                    () = shutdown => {
+                        if announce {
+                            println!("{log_name} => Received shutdown signal");
+                        }
+                    }
                 }
 
                 // Stop accepting: new clients get "connection refused".
@@ -386,7 +457,9 @@ impl Server {
                 }
 
                 state.send_replace(State::ShuttingDown(ShutdownState::Done));
-                println!("{log_name} => Shutdown complete");
+                if announce {
+                    println!("{log_name} => Shutdown complete");
+                }
                 return Ok(());
             }
         };
@@ -455,12 +528,15 @@ async fn accept_loop(
             state.send_replace(State::MaxConnectionsReached(max_connections));
         }
 
-        let permit = Arc::clone(permits)
-            .acquire_owned()
-            .await
-            .expect("the semaphore is never closed");
-
         if full {
+            // Wait for a free slot without keeping it: holding one while
+            // idle in `accept` would starve the replicas of this listener.
+            drop(
+                permits
+                    .acquire()
+                    .await
+                    .expect("the semaphore is never closed"),
+            );
             println!("{} => Accepting connections again", context.log.log_name);
             state.send_replace(State::Listening);
         }
@@ -474,6 +550,12 @@ async fn accept_loop(
                 continue;
             }
         };
+
+        // Immediate, unless a replica took the last slot in the meantime.
+        let permit = Arc::clone(permits)
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
 
         let _ = stream.set_nodelay(true);
         let local = stream.local_addr().unwrap_or(peer);

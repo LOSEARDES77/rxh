@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- `runtime = "per_core"` (top level, default `"shared"`): one single-threaded
+  runtime per CPU, each with its own `SO_REUSEPORT` listeners and upstream
+  connections, instead of one work-stealing runtime. In the `throughput`
+  scenario it serves 3% to 96% more requests per second (24% more on 32
+  CPUs with 32 connections) at a lower p99: docs/profiling.md.
 - `http2_conns_per_host` on a pool: number of HTTP/2 connections kept open
   to each backend with `h2c` (default `1`, as before). Requests use them in
   turn and closed ones are replaced.
