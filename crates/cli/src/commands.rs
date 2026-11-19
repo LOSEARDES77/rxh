@@ -724,6 +724,13 @@ fn describe_target(pattern: &rxh_core::config::Pattern) -> String {
             let addresses: Vec<&str> = group.backends.iter().map(|b| b.address.as_str()).collect();
             addresses.join(" ")
         }
+        Action::Forward(Forward::Split(split)) => {
+            let pools: Vec<String> = split
+                .iter()
+                .map(|target| format!("@{}={}", target.pool, target.weight))
+                .collect();
+            pools.join(" ")
+        }
         Action::Serve(files) => format!("files {}", files.root),
         Action::Redirect(redirect) => format!("redirect {}", redirect.to),
     };
@@ -758,6 +765,21 @@ mod tests {
             backends: vec![backend.to_owned()],
             ..PoolSpec::default()
         }
+    }
+
+    #[test]
+    fn split_targets_show_pools_and_weights() {
+        let config = rxh_core::config::Config::from_toml(
+            "[upstream.v1]\nbackends = [\"127.0.0.1:1\"]\n\
+             [upstream.v2]\nbackends = [\"127.0.0.1:2\"]\n\
+             [[server]]\nlisten = \"127.0.0.1:0\"\n\
+             forward = [{ pool = \"v1\", weight = 9 }, { pool = \"v2\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            describe_target(&config.servers[0].patterns[0]),
+            "@v1=9 @v2=1"
+        );
     }
 
     #[test]

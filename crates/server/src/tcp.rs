@@ -22,7 +22,7 @@ use crate::l4match::{L4Matcher, Rewind};
 use crate::log::{self, ListenerLog};
 use crate::metrics;
 use crate::proxy_protocol;
-use crate::registry::Group;
+use crate::registry::{Group, Split};
 #[cfg(target_os = "linux")]
 use crate::splice;
 use crate::stream::UpstreamStream;
@@ -46,7 +46,7 @@ pub(crate) struct Route {
     pub(crate) matcher: L4Matcher,
 
     /// Backends of the entry's `forward`.
-    pub(crate) group: Arc<Group>,
+    pub(crate) split: Split,
 }
 
 /// A client connection, which says whether its bytes can stay in the kernel.

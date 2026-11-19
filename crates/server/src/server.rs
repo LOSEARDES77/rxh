@@ -256,7 +256,8 @@ impl Server {
                         let Action::Forward(forward) = &server.patterns[0].action else {
                             unreachable!("validation guarantees udp servers forward")
                         };
-                        registry.resolve(forward, server_index, server, 0)?
+                        // Validation rejects splits on UDP servers: one group.
+                        Arc::clone(registry.resolve(forward, server_index, server, 0)?.pick())
                     },
                     idle_timeout: server.udp_idle_timeout,
                     max_sessions: server.max_connections,
@@ -281,8 +282,8 @@ impl Server {
                                     "match[{index}]: {err}"
                                 )))
                             })?;
-                            let group = registry.resolve(forward, server_index, server, index)?;
-                            routes.push(tcp::Route { matcher, group });
+                            let split = registry.resolve(forward, server_index, server, index)?;
+                            routes.push(tcp::Route { matcher, split });
                         }
                         // Entries after the first one without matchers never match.
                         let terminated = server.tls.is_some();
@@ -784,7 +785,7 @@ async fn serve<S>(
                 Rewind::new(buffer, stream),
                 peer,
                 local,
-                &route.group,
+                route.split.pick(),
                 *proxy_protocol,
                 *limits,
                 &context.log,

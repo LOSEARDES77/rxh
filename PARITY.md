@@ -230,7 +230,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 
 | Feature | Inspired by | Notes |
 |---|---|---|
-| Traffic splitting and canary releases between pools (weighted services) | Traefik weighted services, Envoy | `forward = [{ pool = "v1", weight = 90 }, { pool = "v2", weight = 10 }]`. |
+| Traffic splitting and canary releases between pools (weighted services) | Traefik weighted services, Envoy | Done: `forward = [{ pool = "v1", weight = 90 }, { pool = "v2", weight = 10 }]` on `http` (per request) and `tcp` (per connection) servers, in smooth weighted round robin order like Traefik's WRR service. A pool with no available member gives its turn to the next one, like Traefik's `healthCheck` on weighted services. Unlike Traefik: no sticky cookie, no nesting of splits, no UDP, and the targets are named pools only. |
 | Request mirroring (shadow traffic) | Traefik mirroring, Nginx `mirror`, Envoy | |
 | Circuit breaker on error ratio or latency | Traefik `CircuitBreaker`, Envoy outlier detection | |
 | Slow start for recovered or new backends | Nginx Plus `slow_start`, HAProxy `slowstart` | Ramp weight up over a duration. |

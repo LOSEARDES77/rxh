@@ -473,9 +473,9 @@ impl Config {
                     continue;
                 };
 
-                let group = match forward {
+                let groups: Vec<&UpstreamGroup> = match forward {
                     Forward::Group(name) => match self.upstreams.get(name) {
-                        Some(group) => group,
+                        Some(group) => vec![group],
                         None => return invalid(format!("{label}: unknown upstream group @{name}")),
                     },
                     Forward::Inline(group) => {
@@ -485,24 +485,59 @@ impl Config {
                         if group.backends.is_empty() && group.dynamic.is_none() {
                             return invalid(format!("{label}: forward needs at least one backend"));
                         }
-                        group
+                        vec![&**group]
+                    }
+                    Forward::Split(split) => {
+                        if server.protocol == Protocol::Udp {
+                            return invalid(format!(
+                                "{label}: udp servers cannot split traffic between pools"
+                            ));
+                        }
+                        if split.iter().all(|target| target.weight == 0) {
+                            return invalid(format!(
+                                "{label}: forward: at least one pool needs a weight above 0"
+                            ));
+                        }
+                        let mut groups = Vec::with_capacity(split.len());
+                        for (index, target) in split.iter().enumerate() {
+                            if split[..index].iter().any(|other| other.pool == target.pool) {
+                                return invalid(format!(
+                                    "{label}: forward: pool {} is listed twice",
+                                    target.pool
+                                ));
+                            }
+                            match self.upstreams.get(&target.pool) {
+                                Some(group) => groups.push(group),
+                                None => {
+                                    return invalid(format!(
+                                        "{label}: unknown upstream group @{}",
+                                        target.pool
+                                    ));
+                                }
+                            }
+                        }
+                        groups
                     }
                 };
 
-                // An h2c backend shares one connection between all clients, and a
-                // PROXY header describes a single one.
-                if server.protocol == Protocol::Http && server.proxy_protocol.is_some() && group.h2c
-                {
-                    return invalid(format!(
-                        "{label}: proxy_protocol cannot be used with h2c backends"
-                    ));
-                }
+                for group in groups {
+                    // An h2c backend shares one connection between all clients, and a
+                    // PROXY header describes a single one.
+                    if server.protocol == Protocol::Http
+                        && server.proxy_protocol.is_some()
+                        && group.h2c
+                    {
+                        return invalid(format!(
+                            "{label}: proxy_protocol cannot be used with h2c backends"
+                        ));
+                    }
 
-                if server.protocol != Protocol::Http && group.policy.requires_http() {
-                    return invalid(format!(
-                        "{label}: policy {} needs HTTP requests, it cannot be used with {}",
-                        group.policy, server.protocol
-                    ));
+                    if server.protocol != Protocol::Http && group.policy.requires_http() {
+                        return invalid(format!(
+                            "{label}: policy {} needs HTTP requests, it cannot be used with {}",
+                            group.policy, server.protocol
+                        ));
+                    }
                 }
             }
 
@@ -526,6 +561,7 @@ impl Config {
                 && let Some(group) = match forward {
                     Forward::Group(name) => self.upstreams.get(name),
                     Forward::Inline(group) => Some(&**group),
+                    Forward::Split(_) => None,
                 }
                 && group
                     .backends
@@ -2062,6 +2098,7 @@ impl HandleResponse {
 /// forward = "127.0.0.1:8080"                        # single backend
 /// forward = ["127.0.0.1:8080", "127.0.0.1:8081"]    # list of backends
 /// forward = { policy = "ip_hash", backends = ["127.0.0.1:8080"] }
+/// forward = [{ pool = "v1", weight = 90 }, { pool = "v2", weight = 10 }]
 /// ```
 #[derive(Deserialize, Debug, Clone)]
 #[serde(from = "ForwardOption")]
@@ -2071,6 +2108,23 @@ pub enum Forward {
 
     /// Anonymous group declared in place.
     Inline(Box<UpstreamGroup>),
+
+    /// Traffic split between entries of [`Config::upstreams`] by weight,
+    /// for canary releases.
+    Split(Vec<WeightedPool>),
+}
+
+/// One pool of a [`Forward::Split`]: `{ pool = "v2", weight = 10 }`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WeightedPool {
+    /// Name of an entry of [`Config::upstreams`], without `@`.
+    pub pool: String,
+
+    /// Share of the requests (HTTP) or connections (TCP), relative to the
+    /// other pools of the split. Zero sends nothing to the pool.
+    #[serde(default = "default::weight")]
+    pub weight: u32,
 }
 
 impl Serialize for Forward {
@@ -2078,6 +2132,7 @@ impl Serialize for Forward {
         match self {
             Forward::Group(name) => serializer.serialize_str(&format!("@{name}")),
             Forward::Inline(group) => group.serialize(serializer),
+            Forward::Split(split) => split.serialize(serializer),
         }
     }
 }
@@ -2087,6 +2142,7 @@ impl Serialize for Forward {
 enum ForwardOption {
     Text(String),
     List(Vec<Backend>),
+    Split(Vec<WeightedPool>),
     Group(Box<UpstreamGroup>),
 }
 
@@ -2104,6 +2160,7 @@ impl From<ForwardOption> for Forward {
             ForwardOption::List(backends) => {
                 Forward::Inline(Box::new(UpstreamGroup::with_backends(backends)))
             }
+            ForwardOption::Split(split) => Forward::Split(split),
             ForwardOption::Group(group) => Forward::Inline(group),
         }
     }
@@ -4606,6 +4663,94 @@ mod tests {
         assert!(
             matches!(&config.servers[0].patterns[0].action, Action::Forward(Forward::Group(name)) if name == "db")
         );
+    }
+
+    const SPLIT_POOLS: &str = "[upstream.v1]\nbackends = [\"127.0.0.1:81\"]\n\
+                               [upstream.v2]\nbackends = [\"127.0.0.1:82\"]\n";
+
+    fn split_config(server: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!(
+            "{SPLIT_POOLS}[[server]]\nlisten = \"127.0.0.1:1\"\n{server}"
+        ))
+    }
+
+    fn split_error(server: &str) -> String {
+        split_config(server).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn forward_split_between_pools() {
+        let config = split_config(
+            "forward = [{ pool = \"v1\", weight = 90 }, { pool = \"v2\", weight = 10 }]\n",
+        )
+        .unwrap();
+        let Action::Forward(Forward::Split(split)) = &config.servers[0].patterns[0].action else {
+            panic!("expected a split");
+        };
+        assert_eq!(
+            split,
+            &[
+                WeightedPool {
+                    pool: "v1".into(),
+                    weight: 90
+                },
+                WeightedPool {
+                    pool: "v2".into(),
+                    weight: 10
+                },
+            ]
+        );
+
+        // Default weight 1, zero turns a pool off, and the split survives a
+        // round trip through TOML.
+        let config = split_config(
+            "protocol = \"tcp\"\nforward = [{ pool = \"v1\" }, { pool = \"v2\", weight = 0 }]\n",
+        )
+        .unwrap();
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        let Action::Forward(Forward::Split(split)) = &again.servers[0].patterns[0].action else {
+            panic!("expected a split after the round trip");
+        };
+        assert_eq!(split[0].weight, 1);
+        assert_eq!(split[1].weight, 0);
+
+        // A list of backends is still a list of backends.
+        let config =
+            split_config("forward = [{ address = \"127.0.0.1:83\", weight = 2 }]\n").unwrap();
+        assert!(matches!(
+            &config.servers[0].patterns[0].action,
+            Action::Forward(Forward::Inline(_))
+        ));
+    }
+
+    #[test]
+    fn forward_split_rejects_invalid_targets() {
+        let message = split_error("forward = [{ pool = \"v3\", weight = 1 }]\n");
+        assert!(message.contains("unknown upstream group @v3"), "{message}");
+
+        let message = split_error(
+            "forward = [{ pool = \"v1\", weight = 0 }, { pool = \"v2\", weight = 0 }]\n",
+        );
+        assert!(message.contains("weight above 0"), "{message}");
+
+        let message = split_error("forward = [{ pool = \"v1\" }, { pool = \"v1\" }]\n");
+        assert!(message.contains("pool v1 is listed twice"), "{message}");
+
+        let message = split_error("protocol = \"udp\"\nforward = [{ pool = \"v1\" }]\n");
+        assert!(message.contains("udp servers cannot split"), "{message}");
+
+        assert!(split_config("forward = [{ pool = \"v1\", weight = -1 }]\n").is_err());
+        assert!(split_config("forward = [{ pool = \"v1\", share = 1 }]\n").is_err());
+
+        // Every pool of the split is checked against the server.
+        let message = Config::from_toml(&format!(
+            "{SPLIT_POOLS}[upstream.sticky]\npolicy = \"cookie\"\nbackends = [\"127.0.0.1:84\"]\n\
+             [[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n\
+             forward = [{{ pool = \"v1\" }}, {{ pool = \"sticky\" }}]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("policy cookie needs HTTP"), "{message}");
     }
 
     #[test]

@@ -373,7 +373,8 @@ struct Members {
 
 impl Members {
     fn new(upstreams: Vec<Arc<Upstream>>) -> Self {
-        let weighted_order = smooth_weighted_order(&upstreams);
+        let weights: Vec<u32> = upstreams.iter().map(|upstream| upstream.weight).collect();
+        let weighted_order = smooth_weighted_order(&weights);
         Self {
             upstreams,
             weighted_order,
@@ -441,6 +442,15 @@ impl Pool {
 
     fn members(&self) -> Arc<Members> {
         Arc::clone(&self.members.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// True when at least one member can take new requests.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.members()
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.is_available())
     }
 
     /// Pool name. Inline groups get generated names such as `server[0]/api`.
@@ -899,15 +909,16 @@ fn mix(mut value: u64) -> u64 {
 
 /// Nginx style smooth weighted round robin. Weights `[5, 1, 1]` produce
 /// `[a, a, b, a, c, a, a]` instead of `[a, a, a, a, a, b, c]`.
-fn smooth_weighted_order(upstreams: &[Arc<Upstream>]) -> Vec<usize> {
-    let divisor = upstreams
+/// Nginx style smooth weighted round robin: one cycle of picks, as indexes
+/// into `weights`, where index `i` appears `weights[i] / gcd` times and the
+/// picks of each index are spread over the cycle. Empty when every weight is
+/// zero.
+#[must_use]
+pub fn smooth_weighted_order(weights: &[u32]) -> Vec<usize> {
+    let divisor = weights.iter().copied().fold(0, gcd).max(1);
+    let weights: Vec<i64> = weights
         .iter()
-        .map(|upstream| upstream.weight)
-        .fold(0, gcd)
-        .max(1);
-    let weights: Vec<i64> = upstreams
-        .iter()
-        .map(|upstream| i64::from(upstream.weight / divisor))
+        .map(|weight| i64::from(weight / divisor))
         .collect();
     let total: i64 = weights.iter().sum();
 

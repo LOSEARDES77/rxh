@@ -1162,7 +1162,7 @@ socket, except that `http` servers listing the same address share one socket
 | `listen` | required | `"ip:port"` or a list of them. Port `0` picks a free port. |
 | `protocol` | `"http"` | `http`, `tcp` or `udp`. |
 | `name` | | Name shown in logs, in `rxh status`, and in `Forwarded: by=` and `Via`. Must be unique: inline pools, metrics labels and `rxh service` use it. |
-| `forward` | | Proxy target: `"@pool"`, `"host:port"`, a list of backends, or an inline pool table. |
+| `forward` | | Proxy target: `"@pool"`, `"host:port"`, a list of backends, an inline pool table, or a weighted split between pools, see [Traffic splitting and canary releases](#traffic-splitting-and-canary-releases). |
 | `serve` | | Serve static files: a directory, or a table, see [File server](#file-server) (http only). |
 | `redirect` | | Answer with a redirect: `"target"` or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects) (http only). |
 | `uri` | `"/"` | Path prefix for the single `forward`, `serve` or `redirect` of this server (http only). |
@@ -1211,6 +1211,43 @@ listen = "0.0.0.0:5432"
 protocol = "tcp"
 forward = "10.0.0.5:5432"
 ```
+
+### Traffic splitting and canary releases
+
+`forward` can split the traffic between named pools by weight, for canary
+releases and blue-green switches. Each entry is `{ pool, weight }`: `pool`
+names an `[upstream.NAME]` (without `@`) and `weight` (default `1`) is its
+share relative to the other entries. HTTP servers split requests, `tcp`
+servers split connections; `udp` servers cannot split.
+
+```toml
+[upstream.v1]
+backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
+
+[upstream.v2]
+backends = ["10.0.1.1:8080"]
+
+[[server]]
+listen = "0.0.0.0:80"
+# 9 requests out of 10 to v1, 1 to v2.
+forward = [{ pool = "v1", weight = 90 }, { pool = "v2", weight = 10 }]
+```
+
+The pools take turns in the smooth weighted round robin order (the one of
+`weighted_round_robin`), so the shares hold exactly over every cycle of
+`sum of weights / gcd` requests, then each pool picks a member with its own
+policy, retries and health checks. A pool whose members are all down or
+full (active or passive health checks) gives its turn to the next pool of
+the cycle, so a broken canary stops getting traffic until it recovers; when
+no pool has an available member, the pool whose turn it is answers.
+
+Weight `0` keeps a pool listed without traffic; change the weights and
+reload (`rxh reload`, or `watch = true`) to shift the traffic. At least
+one weight must be above zero, and a pool can be listed once. Every pool is
+checked against the server like a plain `forward`: a `tcp` server cannot
+split to a pool with an HTTP-only policy. Splits are not sticky: a client
+can land on either version from one request to the next; use a `match`
+entry on a cookie or header to pin testers to the canary.
 
 ### Virtual hosts on a shared address
 

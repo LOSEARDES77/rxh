@@ -143,7 +143,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 
 ## 0.7: traffic management
 
-- [ ] Weighted pools for canary releases and traffic splitting.
+- [x] Weighted pools for canary releases and traffic splitting.
 - [ ] Request mirroring.
 - [ ] Circuit breaker on error ratio or latency.
 - [ ] Slow start for new and recovered backends.
