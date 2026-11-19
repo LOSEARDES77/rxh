@@ -239,6 +239,44 @@ listen = "0.0.0.0:80"
 forward = "@app"
 ```
 
+## Running in a container
+
+Images for linux/amd64 and linux/arm64 are published on
+`ghcr.io/loseardes77/rxh` (and Docker Hub when the repository is set up for
+it) from every release tag, built from [`dist/Dockerfile`](../dist/Dockerfile):
+
+| Variant | Tags | Base |
+|---|---|---|
+| Debian | `latest`, `0.3`, `0.3.0` | `debian:bookworm-slim` |
+| Alpine | `alpine`, `0.3-alpine`, `0.3.0-alpine` | `alpine:3`, static musl binary |
+| Distroless | `distroless`, `0.3-distroless`, `0.3.0-distroless` | `gcr.io/distroless/cc-debian12`, no shell |
+
+`MAJOR.MINOR` tags follow the last patch release; pre-releases
+(`0.4.0-rc.1`) only get their own tag and never move `latest`. From 1.0 a
+`MAJOR` tag (`1`, `1-alpine`) is added.
+
+Every image runs `rxh run` as UID 65532 with `RXH_CONFIG=/etc/rxh/rxh.toml`
+and `/var/lib/rxh` as working directory. Mount the configuration there;
+arguments replace the command (`docker run ... ghcr.io/loseardes77/rxh
+validate`). Listeners must bind `0.0.0.0` (or `[::]`) to be reachable from
+outside the container; ports below 1024 work as the unprivileged user
+because Docker allows them in the container network namespace (not with
+`--network host`, where the host's `net.ipv4.ip_unprivileged_port_start`
+applies). The relative ACME storage, `rxh-data/certificates`, lands in
+`/var/lib/rxh`: keep it on a volume.
+
+```sh
+docker run -d --name rxh -p 80:80 -p 443:443 \
+  -v "$PWD/rxh.toml:/etc/rxh/rxh.toml:ro" \
+  -v rxh-data:/var/lib/rxh \
+  ghcr.io/loseardes77/rxh:0.3
+docker exec rxh rxh status   # the admin API stays on 127.0.0.1:2019 inside
+docker kill -s HUP rxh       # reload
+```
+
+The Docker provider needs the socket mounted and readable by UID 65532
+(`--group-add` the group of the socket, or a socket proxy over TCP).
+
 ## `[admin]`
 
 | Key | Default | Description |
