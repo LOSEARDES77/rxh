@@ -127,7 +127,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
       start and stop events live.
 - [ ] Official images (`rxh:latest`, `rxh:0.x`, `-alpine`, distroless) for
       amd64 and arm64, published from CI on release tags.
-- [ ] File watch: reload when the configuration file changes.
+- [x] File watch: reload when the configuration file changes.
 - [ ] `POST /load` to upload a full configuration, and `PATCH` for one
       pool or server.
 - [ ] Environment variable placeholders and secret files in the

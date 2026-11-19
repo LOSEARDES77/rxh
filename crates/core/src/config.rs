@@ -93,6 +93,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Runtime::is_shared")]
     pub runtime: Runtime,
 
+    /// Reload when the configuration file or one of its included files
+    /// changes, as `rxh reload` would.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub watch: bool,
+
     /// Files merged into this one, relative to the directory of the main
     /// file. `*` and `?` work in the last path component. Followed by the
     /// loader of the daemon, which empties this list after merging.
@@ -5188,6 +5193,29 @@ mod tests {
 
         assert!(IncludedConfig::from_toml("[admin]\nenabled = false\n").is_err());
         assert!(IncludedConfig::from_toml("include = [\"x\"]\n").is_err());
+    }
+
+    #[test]
+    fn watch_is_a_boolean_off_by_default() {
+        let default = Config::from_toml("").expect("valid");
+        assert!(!default.watch);
+        let text = toml::to_string(&default).expect("serializes");
+        assert!(!text.contains("watch"), "{text}");
+
+        let watched = Config::from_toml("watch = true\n").expect("valid");
+        assert!(watched.watch);
+        let text = toml::to_string(&watched).expect("serializes");
+        assert!(text.contains("watch = true"), "{text}");
+        assert!(!Config::from_toml("watch = false\n").expect("valid").watch);
+
+        for rejected in ["\"true\"", "\"yes\"", "1", "\"1s\""] {
+            assert!(
+                Config::from_toml(&format!("watch = {rejected}\n")).is_err(),
+                "{rejected}"
+            );
+        }
+        // Set in the main file only.
+        assert!(IncludedConfig::from_toml("watch = true\n").is_err());
     }
 
     #[test]

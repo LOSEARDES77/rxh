@@ -246,6 +246,45 @@ async fn sighup_and_reload_swap_configuration_without_downtime() {
     wait_for_body(web, "backend-1").await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_reloads_when_the_file_or_an_include_changes() {
+    let first = backend("backend-1").await;
+    let second = backend("backend-2").await;
+    let admin = free_address();
+    let web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let main = |watch: bool| {
+        format!("watch = {watch}\ninclude = [\"conf.d/*.toml\"]\n[admin]\nlisten = \"{admin}\"\n")
+    };
+    let site =
+        |backend: SocketAddr| format!("[[server]]\nlisten = \"{web}\"\nforward = \"{backend}\"\n");
+
+    std::fs::create_dir(dir.join("conf.d")).expect("mkdir");
+    std::fs::write(dir.join("conf.d/web.toml"), site(first)).expect("write");
+    std::fs::write(dir.join("rxh.toml"), main(true)).expect("write");
+    let _daemon = start_daemon(dir);
+    wait_for_body(web, "backend-1").await;
+
+    // An edited included file is picked up without `rxh reload`.
+    std::fs::write(dir.join("conf.d/web.toml"), site(second)).expect("write");
+    wait_for_body(web, "backend-2").await;
+
+    // A broken file keeps the running configuration.
+    std::fs::write(dir.join("conf.d/web.toml"), "[[server]]\nlisten = 1").expect("write");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(try_get(web).await.as_deref(), Some("backend-2"));
+    std::fs::write(dir.join("conf.d/web.toml"), site(first)).expect("write");
+    wait_for_body(web, "backend-1").await;
+
+    // Turned off by editing the main file, which is a change too.
+    std::fs::write(dir.join("rxh.toml"), main(false)).expect("write");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    std::fs::write(dir.join("conf.d/web.toml"), site(second)).expect("write");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(try_get(web).await.as_deref(), Some("backend-1"));
+}
+
 #[test]
 fn validate_reports_errors() {
     let directory = tempfile::tempdir().expect("temp dir");
