@@ -19,7 +19,14 @@ sha2.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "policies"
+harness = false
+# `cargo test` runs every benchmark once, so the checks in it run in CI.
+test = true
 
 [lints]
 workspace = true

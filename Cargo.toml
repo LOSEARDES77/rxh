@@ -17,6 +17,7 @@ rxh-server = { path = "crates/server", version = "0.3.0" }
 async-compression = { version = "0.4.52", features = ["tokio", "gzip", "zstd", "brotli"] }
 bytes = "1.12.2"
 clap = { version = "4.6.8", features = ["derive", "env"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 hickory-resolver = "0.26.3"
 hmac = "0.13.0"
 http = "1.5.0"

@@ -160,6 +160,45 @@ Numbers from different machines are not comparable: the history lists the
 CPU of every release and warns when they differ. The 0.2.0 entry is the run
 above.
 
+## Policy micro benchmarks
+
+`crates/core/benches/policies.rs` measures `Pool::select`, the backend choice
+made for every request, with [Criterion](https://docs.rs/criterion) for every
+policy, with 4 and 64 healthy backends. The request carries every key a
+policy reads (IPs, path, query, header), and `cookie` sends back the cookie
+of a first selection, so it measures the sticky path.
+
+```bash
+cargo bench -p rxh-core --bench policies
+cargo bench -p rxh-core --bench policies -- cookie   # one policy
+```
+
+`cargo test` runs each benchmark once without timing, which checks that every
+policy picks a backend and that a valid cookie keeps its backend.
+
+Median time per selection, 0.3.0 on an AMD Ryzen 9 7950X (one thread):
+
+| Policy | 4 backends | 64 backends |
+|---|---:|---:|
+| `random` | 20 ns | 138 ns |
+| `random_choose` | 31 ns | 207 ns |
+| `first` | 16 ns | 16 ns |
+| `round_robin` | 18 ns | 18 ns |
+| `weighted_round_robin` | 19 ns | 20 ns |
+| `least_conn` | 18 ns | 139 ns |
+| `ip_hash` | 93 ns | 232 ns |
+| `client_ip_hash` | 92 ns | 233 ns |
+| `uri_hash` | 42 ns | 181 ns |
+| `query` | 33 ns | 170 ns |
+| `header` | 40 ns | 178 ns |
+| `cookie` | 38 ns | 57 ns |
+
+The rotating policies and `first` cost the same at any size. The others look
+at every member, so they grow with the pool: `random` draws a random number
+per member (reservoir sampling), and `ip_hash` and `client_ip_hash` also
+format the IP as a string before hashing. Even the slowest, a hash over 64
+backends, stays far below the microseconds of a proxied request.
+
 ## Run it yourself
 
 ```bash
