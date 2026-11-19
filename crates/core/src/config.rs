@@ -1702,6 +1702,11 @@ pub struct UpstreamGroup {
     #[serde(default)]
     pub h2c: bool,
 
+    /// HTTP/2 connections kept open to each backend with `h2c`; requests
+    /// are spread over them in turn.
+    #[serde(default = "default::http2_conns_per_host")]
+    pub http2_conns_per_host: usize,
+
     /// How long idle upstream HTTP connections stay in the pool.
     #[serde(default = "default::keepalive", with = "duration")]
     pub keepalive: Duration,
@@ -1893,6 +1898,7 @@ impl UpstreamGroup {
             read_timeout: None,
             write_timeout: None,
             h2c: false,
+            http2_conns_per_host: default::http2_conns_per_host(),
             keepalive: default::keepalive(),
             keepalive_idle_conns_per_host: default::keepalive_idle_conns_per_host(),
             max_conns_per_host: 0,
@@ -1974,6 +1980,9 @@ impl UpstreamGroup {
 
         if self.choose == 0 {
             return Err(String::from("choose must be at least 1"));
+        }
+        if self.http2_conns_per_host == 0 {
+            return Err(String::from("http2_conns_per_host must be at least 1"));
         }
 
         for (name, value) in [
@@ -2873,6 +2882,10 @@ mod default {
 
     pub fn keepalive_idle_conns_per_host() -> usize {
         32
+    }
+
+    pub fn http2_conns_per_host() -> usize {
+        1
     }
 
     pub fn health_interval() -> Duration {
@@ -4072,6 +4085,17 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
     }
 
     #[test]
+    fn http2_conns_per_host_parses_and_defaults_to_one() {
+        let config = Config::from_toml(
+            "[[server]]\nlisten = \"127.0.0.1:8000\"\nforward = \"@grpc\"\n\
+             [upstream.grpc]\nbackends = [\"127.0.0.1:1\"]\nh2c = true\nhttp2_conns_per_host = 4",
+        )
+        .unwrap();
+        assert_eq!(config.upstreams["grpc"].http2_conns_per_host, 4);
+        assert_eq!(UpstreamGroup::default().http2_conns_per_host, 1);
+    }
+
+    #[test]
     fn invalid_connection_limit_buffers_and_body_size_are_rejected() {
         let forward = |options: &str| {
             format!(
@@ -4084,6 +4108,12 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
 
         for (text, expected) in [
             (forward("max_conns_per_host = -1"), "max_conns_per_host"),
+            (forward("http2_conns_per_host = 0"), "at least 1"),
+            (forward("http2_conns_per_host = -1"), "http2_conns_per_host"),
+            (
+                forward("http2_conns_per_host = \"2\""),
+                "http2_conns_per_host",
+            ),
             (forward("max_conns_per_host = \"4\""), "max_conns_per_host"),
             (forward("request_buffers = \"4XB\""), "invalid size"),
             (forward("request_buffers = -1"), "request_buffers"),

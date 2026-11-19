@@ -9,6 +9,9 @@ Changed.
 
 ### Added
 
+- `http2_conns_per_host` on a pool: number of HTTP/2 connections kept open
+  to each backend with `h2c` (default `1`, as before). Requests use them in
+  turn and closed ones are replaced.
 - `rxh-bench` scenarios `tls` (HTTPS termination), `http2` (HTTP/2 clients
   over TLS), `large-body` (1 MiB echoed bodies), `websocket`, `udp`, `idle`
   (load next to thousands of idle keep-alive connections) and `memory` (proxy
@@ -190,6 +193,9 @@ balancer with Caddy level load balancing.
 
 ### Added
 
+- `http2_conns_per_host` on a pool: number of HTTP/2 connections kept open
+  to each backend with `h2c` (default `1`, as before). Requests use them in
+  turn and closed ones are replaced.
 - Layer 4 proxying: `protocol = "tcp"` (with TLS termination and PROXY
   protocol v1/v2) and `protocol = "udp"` (per client sessions).
 - Named load balancing pools (`[upstream.NAME]`, `forward = "@NAME"`).

@@ -87,8 +87,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
       `throughput` scenario: docs/profiling.md.
 - [x] `splice` zero copy for TCP on Linux, when both sides are plain TCP;
       buffered copy otherwise and on other systems.
-- [ ] Upstream HTTP/2 connection pool with more than one connection per
-      backend.
+- [x] Upstream HTTP/2 connection pool with more than one connection per
+      backend: `http2_conns_per_host`.
 - [x] More benchmark scenarios: TLS termination, HTTP/2 clients, large
       bodies, WebSocket, UDP, thousands of idle connections, and memory use
       per connection.

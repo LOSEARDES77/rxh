@@ -215,10 +215,11 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `response_header_timeout` | unset | `response_header_timeout` | Time from sending the request to receiving the response headers. On expiry the client gets `504 Gateway Timeout` and the backend counts a passive failure. |
 | `read_timeout` | unset | `read_timeout` | An upstream read that makes no progress for this long fails the connection (also idle pooled connections and upgraded tunnels). |
 | `write_timeout` | unset | `write_timeout` | An upstream write that makes no progress for this long fails the connection. |
-| `h2c` | `false` | `h2c://` | Speak cleartext HTTP/2 to the backends (one shared connection each). |
+| `h2c` | `false` | `h2c://` | Speak cleartext HTTP/2 to the backends, over `http2_conns_per_host` shared connections each. |
+| `http2_conns_per_host` | `1` | | HTTP/2 connections kept open to each backend of an `h2c` pool. The first requests open them, later ones use them in turn, and a closed one is replaced by the next request. More than one helps when a backend limits the concurrent streams of a connection, or when one TCP connection is the bottleneck. A burst on a backend without any open connection may open more; those carry one request and are closed. `0` is rejected. Ignored without `h2c`. |
 | `keepalive` | `"2m"` | `keepalive` | How long idle upstream HTTP connections are kept. `"0s"` disables pooling. |
 | `keepalive_idle_conns_per_host` | `32` | `keepalive_idle_conns_per_host` | Idle connections kept per backend. |
-| `max_conns_per_host` | `0` | `max_conns_per_host` | Most HTTP/1.1 connections open to each backend, idle ones included. Requests over the limit wait for a free connection (they are not failed or sent elsewhere; use `passive.unhealthy_request_count` for that). Upgraded tunnels (WebSockets) count. `0` means no limit. Ignored with `h2c`, which shares one connection per backend, and on `tcp` and `udp` servers. |
+| `max_conns_per_host` | `0` | `max_conns_per_host` | Most HTTP/1.1 connections open to each backend, idle ones included. Requests over the limit wait for a free connection (they are not failed or sent elsewhere; use `passive.unhealthy_request_count` for that). Upgraded tunnels (WebSockets) count. `0` means no limit. Ignored with `h2c`, which shares `http2_conns_per_host` connections per backend, and on `tcp` and `udp` servers. |
 | `request_buffers` | `0` | `request_buffers` | [Size](#sizes): bytes of each request body read before a backend is picked and dialed. A body that fits is sent with a `Content-Length`; the rest of a larger one is streamed. `0` streams everything. Not applied to upgrades. |
 | `response_buffers` | `0` | `response_buffers` | [Size](#sizes): bytes of each response body read before the response goes to the client, which frees the backend from slow clients. Same rules as `request_buffers`; a backend failing meanwhile gives `502`. |
 | `flush_interval` | unset | `flush_interval` | Hold back response data and write it to the client in batches, at most this long after the first held byte (or as soon as 64 KiB are held, or the body ends). Only for responses with a `Content-Length` that are not `text/event-stream`; streams of unknown length and server-sent events are always written as they arrive, like in Caddy. Unset writes every chunk at once (Caddy's `-1`); `0` and negative values are rejected. |
@@ -235,6 +236,15 @@ backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
 max_conns_per_host = 8
 request_buffers = "64KiB"
 response_buffers = "1MiB"
+```
+
+Example: four HTTP/2 connections to each gRPC backend:
+
+```toml
+[upstream.grpc]
+backends = ["10.0.0.1:50051", "10.0.0.2:50051"]
+h2c = true
+http2_conns_per_host = 4
 ```
 
 Example: fewer, larger writes to clients of a backend that sends many small
@@ -773,7 +783,7 @@ On `http` servers:
   opened for. Idle ones are closed after `keepalive`; `max_conns_per_host`
   only counts connections carrying a request.
 - It applies to every `forward` of the server, and is rejected when one of
-  them uses an `h2c` pool, whose single connection is shared by all clients.
+  them uses an `h2c` pool, whose connections are shared by all clients.
 - Active health checks send no header: check a port of the backend that does
   not require it (`health.port`), or rely on passive checks.
 

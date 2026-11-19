@@ -24,7 +24,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 |---|---|---|---|
 | Static upstreams `host:port` | `backends = ["host:port"]` | ✅ | Host names are resolved on every dial. |
 | Port ranges `host:8001-8006` | same syntax | ✅ | |
-| `h2c://` upstreams | `h2c = true` | ✅ | One multiplexed HTTP/2 connection per backend. |
+| `h2c://` upstreams | `h2c = true`, `http2_conns_per_host` | ✅ ➕ | Multiplexed HTTP/2 connections shared by all clients: one per backend by default, `http2_conns_per_host` of them used in turn (Caddy keeps one). |
 | `https://` upstreams, `transport http { tls }` | `https://host[:port]`, `[upstream.NAME.tls]` | ✅ | `server_name`, `insecure_skip_verify`, `ca` (extra roots on top of webpki-roots), `client_cert`/`client_key`. `Host` is the backend host unless set. Also used by L4 and health checks. Pools cannot mix `https://` and plain backends. |
 | `unix//path` upstreams | `unix//run/app.sock` | ✅ | HTTP, TCP and health checks. Not for UDP. |
 | `dynamic srv`, `dynamic a` | `[upstream.NAME.dynamic]` with `srv`/`a`, `refresh`, `resolvers`, `versions` | ✅ | Periodic DNS refresh feeding the pool; health state and counters of unchanged members survive. `a` needs `tls.server_name` with TLS. `dynamic multi` is not implemented. |
@@ -107,7 +107,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Upstream keep-alive pool | `keepalive`, `keepalive_idle_conns_per_host` | ✅ | |
 | `dial_timeout` | `dial_timeout` | ✅ | Default 3s. |
 | `read_timeout`, `write_timeout`, `response_header_timeout` | same names | ✅ | Unset by default. `response_header_timeout` gives `504`; read and write timeouts also apply to idle pooled connections and tunnels. |
-| `max_conns_per_host` | `max_conns_per_host` | ✅ | HTTP/1.1 connections per backend, idle ones included; requests over the limit wait for a free connection, like Caddy. Upgraded tunnels count. Not applied to `h2c` (one shared connection) or to `tcp`/`udp` servers. |
+| `max_conns_per_host` | `max_conns_per_host` | ✅ | HTTP/1.1 connections per backend, idle ones included; requests over the limit wait for a free connection, like Caddy. Upgraded tunnels count. Not applied to `h2c` (see `http2_conns_per_host`) or to `tcp`/`udp` servers. |
 | `proxy_protocol v1/v2` on HTTP transport | `proxy_protocol = "v1"` or `"v2"` on the server | 🟡 | Server level option, shared with `tcp` servers. Sent before the upstream TLS handshake; like Caddy, upstream keep-alive connections are kept per client connection. Not with `h2c` pools (rejected); active health checks send no header. |
 | `flush_interval` | `flush_interval` on a pool | ✅ | Unset streams immediately (Caddy's `-1`, so `-1` itself is not accepted). Like Caddy, server-sent events and responses without `Content-Length` are never batched. |
 | `request_buffers`, `response_buffers` | same names | ✅ | Bytes or a size (`"64KiB"`). A body that fits is sent with a `Content-Length`; the rest of a larger one is streamed. No `-1` (unlimited); buffered request bodies are not replayed on retries. |
