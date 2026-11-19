@@ -105,7 +105,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 
 - [x] Automatic HTTPS with ACME HTTP-01, certificate storage and renewal.
 - [x] ACME TLS-ALPN-01.
-- [ ] ACME DNS-01 and wildcard certificates (Cloudflare, Route53,
+- [x] ACME DNS-01 and wildcard certificates (Cloudflare, Route53,
       RFC 2136).
 - [ ] mTLS on listeners with the four Traefik modes, and the client
       certificate subject passed to backends.

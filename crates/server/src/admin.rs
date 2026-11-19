@@ -282,7 +282,8 @@ fn status(state: &AdminState) -> serde_json::Value {
     })
 }
 
-/// Running configuration with live pool membership.
+/// Running configuration with live pool membership and without the secrets
+/// of the DNS provider.
 fn live_config(state: &AdminState) -> Config {
     let current = state.current.read().unwrap_or_else(PoisonError::into_inner);
     let mut config = Config::clone(&current.config);
@@ -290,6 +291,9 @@ fn live_config(state: &AdminState) -> Config {
         if let Some(live) = current.registry.get(name) {
             *group = live.pool.to_group();
         }
+    }
+    if let Some(dns) = &mut config.acme.dns {
+        dns.redact();
     }
     config
 }

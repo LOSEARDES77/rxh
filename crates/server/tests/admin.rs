@@ -99,6 +99,8 @@ async fn routes_answer_with_status_codes_and_json() {
         &config_path,
         format!(
             "[admin]\nlisten = \"{admin}\"\n\
+             [acme.dns]\nprovider = \"rfc2136\"\nserver = \"127.0.0.1\"\n\
+             tsig_key = \"rxh.\"\ntsig_secret = \"c2VjcmV0\"\n\
              [upstream.api]\nbackends = [\"{first}\"]\n\
              [[server]]\nname = \"web\"\nlisten = \"{web}\"\nforward = \"@api\"\n"
         ),
@@ -185,6 +187,9 @@ async fn routes_answer_with_status_codes_and_json() {
     assert_eq!(status, StatusCode::OK);
     let backends = config["upstream"]["api"]["backends"].to_string();
     assert!(backends.contains(&second.to_string()), "{config}");
+    // The secrets of the DNS provider never leave the process.
+    assert_eq!(config["acme"]["dns"]["tsig_key"], "rxh.");
+    assert_eq!(config["acme"]["dns"]["tsig_secret"], "***");
 
     // Removing: by query, by JSON body, unknown members and pools.
     let by_query = format!("/pools/api/upstreams?address={second}");

@@ -1,6 +1,6 @@
 //! `tls = "auto"`: stored certificates, runtime swaps through the resolver
-//! and, against a local Pebble CA, the whole ACME flow with HTTP-01 and
-//! TLS-ALPN-01.
+//! and, against a local Pebble CA, the whole ACME flow with HTTP-01,
+//! TLS-ALPN-01 and DNS-01 (a wildcard, through RFC 2136).
 
 mod util;
 
@@ -216,6 +216,68 @@ async fn daemon_serves_stored_certificates_and_fails_missing_ones() {
     daemon.abort();
 }
 
+#[tokio::test]
+async fn dns_01_serves_a_stored_wildcard_and_opens_no_challenge_listener() {
+    let backend = util::backend("wildcard").await;
+    let dns = rxh_test_util::DnsServer::spawn("127.0.0.1:0", "wild.test").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ca_dir = dir.path().join("certs/127.0.0.1_1_directory");
+    let stored = self_signed("*.wild.test");
+    std::fs::create_dir_all(ca_dir.join("wildcard_.wild.test")).unwrap();
+    std::fs::write(
+        ca_dir.join("wildcard_.wild.test/cert.pem"),
+        stored.cert.pem(),
+    )
+    .unwrap();
+    std::fs::write(
+        ca_dir.join("wildcard_.wild.test/key.pem"),
+        stored.signing_key.serialize_pem(),
+    )
+    .unwrap();
+    let address = free_address();
+    let http_port = free_address().port();
+    let config = dir.path().join("rxh.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[admin]\nenabled = false\n\
+             [acme]\nstorage = \"certs\"\nca = \"https://127.0.0.1:1/directory\"\n\
+             http_port = {http_port}\nchallenge = \"dns-01\"\n\
+             [acme.dns]\nprovider = \"rfc2136\"\nserver = \"{}\"\npropagation_wait = \"0s\"\n\
+             [[server]]\nlisten = \"{address}\"\nhost = [\"*.wild.test\", \"wild.test\"]\n\
+             tls = \"auto\"\nhttps_redirect = false\nforward = \"{backend}\"\n",
+            dns.address()
+        ),
+    )
+    .unwrap();
+    let daemon = tokio::task::spawn(Daemon::new(&config).run());
+
+    // The stored wildcard certificate covers every subdomain.
+    let root = stored.cert.der().clone();
+    let mut served = None;
+    for _ in 0..100 {
+        if let Ok(result) = https_get(address, "any.wild.test", Some(root.clone())).await {
+            served = Some(result);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (presented, body) = served.expect("any.wild.test is served from storage");
+    assert_eq!(presented, root);
+    assert_eq!(body, "wildcard");
+
+    // The bare domain is another certificate, which this unreachable CA
+    // never issues: nothing was published, and no port was opened for it.
+    assert!(https_get(address, "wild.test", None).await.is_err());
+    assert!(dns.updates().is_empty());
+    assert!(
+        std::net::TcpListener::bind(("0.0.0.0", http_port)).is_ok(),
+        "DNS-01 opens no HTTP challenge listener"
+    );
+    assert!(!daemon.is_finished());
+    daemon.abort();
+}
+
 /// Full issuance against [Pebble](https://github.com/letsencrypt/pebble).
 ///
 /// ```sh
@@ -246,15 +308,41 @@ async fn pebble_issues_a_certificate_with_tls_alpn_01() {
     pebble_issues("tls-alpn-01", "127.0.0.1:5001".parse().unwrap()).await;
 }
 
+/// A wildcard certificate with DNS-01 through RFC 2136. Pebble must look the
+/// TXT record up at the DNS server this test starts on port 8053, which takes
+/// the dynamic updates of RXH:
+///
+/// ```sh
+/// docker run --rm --network host -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
+///   ghcr.io/letsencrypt/pebble -dnsserver 127.0.0.1:8053
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Pebble ACME server, see the doc comment"]
+async fn pebble_issues_a_wildcard_certificate_with_dns_01() {
+    let dns = rxh_test_util::DnsServer::spawn("127.0.0.1:8053", "rxh.test").await;
+    pebble_issues("dns-01", free_address()).await;
+    let updates = dns.updates();
+    assert_eq!(updates.len(), 2, "the record is added, then deleted");
+    assert!(dns.txt("_acme-challenge.rxh.test").is_empty());
+}
+
 async fn pebble_issues(challenge: &str, address: SocketAddr) {
     let root = std::env::var("RXH_PEBBLE_ROOT").expect("RXH_PEBBLE_ROOT: pebble.minica.pem path");
     let directory = std::env::var("RXH_PEBBLE_DIRECTORY")
         .unwrap_or_else(|_| String::from("https://localhost:14000/dir"));
     let backend = util::backend("pebble").await;
-    let tls_alpn = challenge == "tls-alpn-01";
+    let (host, stored, dns) = match challenge {
+        "dns-01" => (
+            "*.rxh.test",
+            "wildcard_.rxh.test",
+            "[acme.dns]\nprovider = \"rfc2136\"\nserver = \"127.0.0.1:8053\"\n\
+             propagation_wait = \"0s\"\n",
+        ),
+        _ => ("acme.rxh.test", "acme.rxh.test", ""),
+    };
     // The redirect of `tls = "auto"` would listen on `http_port` too: HTTP-01
-    // is answered there, TLS-ALPN-01 must work with nothing on that port.
-    let redirect = if tls_alpn {
+    // is answered there, the others must work with nothing on that port.
+    let redirect = if challenge != "http-01" {
         "https_redirect = false\n"
     } else {
         ""
@@ -266,8 +354,8 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
         format!(
             "[admin]\nenabled = false\n\
              [acme]\nca = {directory:?}\nca_root = {root:?}\nhttp_port = 5002\n\
-             email = \"test@rxh.test\"\nchallenge = {challenge:?}\n\
-             [[server]]\nlisten = \"{address}\"\nhost = \"acme.rxh.test\"\n\
+             email = \"test@rxh.test\"\nchallenge = {challenge:?}\n{dns}\
+             [[server]]\nlisten = \"{address}\"\nhost = \"{host}\"\n\
              tls = \"auto\"\n{redirect}forward = \"{backend}\"\n"
         ),
     )
@@ -279,7 +367,7 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
         |c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'),
         "_",
     );
-    let cert = storage.join(&ca_dir).join("acme.rxh.test/cert.pem");
+    let cert = storage.join(&ca_dir).join(stored).join("cert.pem");
     for _ in 0..600 {
         if cert.exists() {
             break;
@@ -290,7 +378,7 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
         cert.exists(),
         "no certificate after 60 seconds, see the daemon log"
     );
-    assert!(storage.join(&ca_dir).join("acme.rxh.test/key.pem").exists());
+    assert!(storage.join(&ca_dir).join(stored).join("key.pem").exists());
     let accounts = std::fs::read_dir(storage.join("accounts"))
         .expect("accounts directory")
         .count();
@@ -304,7 +392,7 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
         .expect("valid PEM");
     let mut served = None;
     for _ in 0..50 {
-        if let Ok(result) = https_get(address, "acme.rxh.test", None).await {
+        if let Ok(result) = https_get(address, &host.replace('*', "any"), None).await {
             served = Some(result);
             break;
         }
@@ -313,11 +401,11 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
     let (presented, body) = served.expect("handshake with the issued certificate");
     assert_eq!(presented, leaf);
     assert_eq!(body, "pebble");
-    if tls_alpn {
+    if challenge != "http-01" {
         // Checked while the daemon still runs, after the whole issuance.
         assert!(
             std::net::TcpListener::bind("0.0.0.0:5002").is_ok(),
-            "TLS-ALPN-01 opens no HTTP challenge listener"
+            "only HTTP-01 opens an HTTP challenge listener"
         );
     }
     daemon.abort();
