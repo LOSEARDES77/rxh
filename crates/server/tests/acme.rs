@@ -239,15 +239,11 @@ async fn pebble_issues_and_installs_a_certificate() {
 
 /// Same as [`pebble_issues_and_installs_a_certificate`] with TLS-ALPN-01,
 /// which Pebble validates on port 5001: the TLS server itself listens there
-/// and nothing listens on `http_port`.
+/// and, with `https_redirect = false`, nothing listens on `http_port`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a Pebble ACME server, see the doc comment"]
 async fn pebble_issues_a_certificate_with_tls_alpn_01() {
     pebble_issues("tls-alpn-01", "127.0.0.1:5001".parse().unwrap()).await;
-    assert!(
-        std::net::TcpListener::bind("0.0.0.0:5002").is_ok(),
-        "TLS-ALPN-01 opens no HTTP challenge listener"
-    );
 }
 
 async fn pebble_issues(challenge: &str, address: SocketAddr) {
@@ -255,6 +251,14 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
     let directory = std::env::var("RXH_PEBBLE_DIRECTORY")
         .unwrap_or_else(|_| String::from("https://localhost:14000/dir"));
     let backend = util::backend("pebble").await;
+    let tls_alpn = challenge == "tls-alpn-01";
+    // The redirect of `tls = "auto"` would listen on `http_port` too: HTTP-01
+    // is answered there, TLS-ALPN-01 must work with nothing on that port.
+    let redirect = if tls_alpn {
+        "https_redirect = false\n"
+    } else {
+        ""
+    };
     let dir = tempfile::tempdir().expect("temporary directory");
     let config = dir.path().join("rxh.toml");
     std::fs::write(
@@ -264,7 +268,7 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
              [acme]\nca = {directory:?}\nca_root = {root:?}\nhttp_port = 5002\n\
              email = \"test@rxh.test\"\nchallenge = {challenge:?}\n\
              [[server]]\nlisten = \"{address}\"\nhost = \"acme.rxh.test\"\n\
-             tls = \"auto\"\nforward = \"{backend}\"\n"
+             tls = \"auto\"\n{redirect}forward = \"{backend}\"\n"
         ),
     )
     .expect("write the configuration");
@@ -309,5 +313,12 @@ async fn pebble_issues(challenge: &str, address: SocketAddr) {
     let (presented, body) = served.expect("handshake with the issued certificate");
     assert_eq!(presented, leaf);
     assert_eq!(body, "pebble");
+    if tls_alpn {
+        // Checked while the daemon still runs, after the whole issuance.
+        assert!(
+            std::net::TcpListener::bind("0.0.0.0:5002").is_ok(),
+            "TLS-ALPN-01 opens no HTTP challenge listener"
+        );
+    }
     daemon.abort();
 }
