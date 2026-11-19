@@ -243,6 +243,12 @@ impl Config {
                          either all or none of the servers on it must set proxy_protocol_in"
                     ));
                 }
+                if server.max_connections_per_ip != first.max_connections_per_ip {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         the servers on it must have the same max_connections_per_ip"
+                    ));
+                }
                 // The certificate of a host-less server is the listener's default
                 // only when it is set first; later ones would never be served.
                 if server.tls.is_some() && server.host.is_empty() {
@@ -270,6 +276,28 @@ impl Config {
                 ));
             }
 
+            if server.protocol != Protocol::Http && server.rate_limit.is_some() {
+                return invalid(format!("{label}: rate_limit only applies to http servers"));
+            }
+            if let Some(rate_limit) = &server.rate_limit {
+                rate_limit
+                    .validate()
+                    .map_err(|err| ConfigError::Invalid(format!("{label}: rate_limit: {err}")))?;
+            }
+            match server.max_connections_per_ip {
+                Some(0) => {
+                    return invalid(format!(
+                        "{label}: max_connections_per_ip must be greater than zero"
+                    ));
+                }
+                Some(_) if server.protocol == Protocol::Udp => {
+                    return invalid(format!(
+                        "{label}: max_connections_per_ip does not apply to udp servers"
+                    ));
+                }
+                _ => {}
+            }
+
             if server.protocol == Protocol::Udp && !server.host.is_empty() {
                 return invalid(format!("{label}: host does not apply to udp servers"));
             }
@@ -288,6 +316,19 @@ impl Config {
                         "{label}: match[{pattern_index}]: ip_allow and ip_deny inside match \
                          entries only apply to http servers, set them on the server"
                     ));
+                }
+                if let Some(rate_limit) = &pattern.rate_limit {
+                    if server.protocol != Protocol::Http {
+                        return invalid(format!(
+                            "{label}: match[{pattern_index}]: rate_limit only applies to http \
+                             servers"
+                        ));
+                    }
+                    rate_limit.validate().map_err(|err| {
+                        ConfigError::Invalid(format!(
+                            "{label}: match[{pattern_index}]: rate_limit: {err}"
+                        ))
+                    })?;
                 }
                 pattern.validate_rewrite().map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
@@ -761,6 +802,15 @@ pub struct Server {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ip_deny: Vec<IpNet>,
 
+    /// Request rate limit shared by every route of the server (http only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
+
+    /// Maximum number of concurrent connections of one client IP (http and
+    /// tcp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_ip: Option<usize>,
+
     /// PROXY protocol header to send upstream (tcp only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<ProxyProtocol>,
@@ -857,6 +907,8 @@ struct RawServer {
     ip_allow: Vec<IpNet>,
     #[serde(default)]
     ip_deny: Vec<IpNet>,
+    rate_limit: Option<RateLimit>,
+    max_connections_per_ip: Option<usize>,
     proxy_protocol: Option<ProxyProtocol>,
     #[serde(default)]
     proxy_protocol_in: bool,
@@ -968,6 +1020,8 @@ impl TryFrom<RawServer> for Server {
             trusted_proxies,
             ip_allow: raw.ip_allow,
             ip_deny: raw.ip_deny,
+            rate_limit: raw.rate_limit,
+            max_connections_per_ip: raw.max_connections_per_ip,
             proxy_protocol: raw.proxy_protocol,
             proxy_protocol_in: raw.proxy_protocol_in,
             match_timeout: raw.match_timeout,
@@ -1033,6 +1087,10 @@ pub struct Pattern {
     /// Client networks this entry rejects with `403` (http only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ip_deny: Vec<IpNet>,
+
+    /// Request rate limit of this entry, on top of the server's (http only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
 
     /// What to do when the pattern matches.
     #[serde(flatten)]
@@ -1107,6 +1165,7 @@ impl Pattern {
             remote_ip: Vec::new(),
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
+            rate_limit: None,
             action,
             rewrite: None,
             request: RequestConfig::default(),
@@ -3291,6 +3350,88 @@ impl Default for ServerHeader {
     }
 }
 
+/// Token bucket rate limit of requests: `rate` requests every `per`, with
+/// bursts of up to `burst` requests, counted separately for each `key`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    /// Requests allowed every `per`.
+    pub rate: u32,
+
+    /// Period of `rate`.
+    #[serde(default = "default::rate_limit_per", with = "duration")]
+    pub per: Duration,
+
+    /// Requests a client can send at once before `rate` applies. Defaults to
+    /// `rate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+
+    /// What identifies a client.
+    #[serde(default)]
+    pub key: RateLimitKey,
+}
+
+impl RateLimit {
+    /// Size of the bucket: `burst`, or `rate` when unset.
+    #[must_use]
+    pub fn burst(&self) -> u32 {
+        self.burst.unwrap_or(self.rate)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.rate == 0 {
+            return Err(String::from("rate must be greater than zero"));
+        }
+        if self.per.is_zero() {
+            return Err(String::from("per must be greater than zero"));
+        }
+        if self.burst == Some(0) {
+            return Err(String::from("burst must be greater than zero"));
+        }
+        Ok(())
+    }
+}
+
+/// What a [`RateLimit`] counts requests by.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(try_from = "String", into = "String")]
+pub enum RateLimitKey {
+    /// The client IP: `X-Forwarded-For` of `trusted_proxies`, else the peer.
+    #[default]
+    ClientIp,
+
+    /// The value of a request header, such as an API key. Requests without
+    /// the header are counted by client IP.
+    Header(String),
+}
+
+impl TryFrom<String> for RateLimitKey {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        match text.strip_prefix("header:") {
+            _ if text == "client_ip" => Ok(Self::ClientIp),
+            Some(name) if http::HeaderName::from_bytes(name.as_bytes()).is_ok() => {
+                Ok(Self::Header(name.to_owned()))
+            }
+            Some(name) => Err(format!("invalid header name {name:?} in rate limit key")),
+            None => Err(format!(
+                "invalid rate limit key {text:?}, expected \"client_ip\" or \"header:<name>\""
+            )),
+        }
+    }
+}
+
+impl From<RateLimitKey> for String {
+    fn from(key: RateLimitKey) -> Self {
+        match key {
+            RateLimitKey::ClientIp => Self::from("client_ip"),
+            RateLimitKey::Header(name) => format!("header:{name}"),
+        }
+    }
+}
+
 /// Response cache for `GET` requests.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -3450,6 +3591,10 @@ mod default {
 
     pub fn fail_duration() -> Duration {
         Duration::from_secs(30)
+    }
+
+    pub fn rate_limit_per() -> Duration {
+        Duration::from_secs(1)
     }
 
     pub fn udp_idle_timeout() -> Duration {
@@ -5115,6 +5260,126 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
             ),
         ] {
             let message = invalid(text);
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_and_max_connections_per_ip() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            rate_limit = { rate = 100 }
+            max_connections_per_ip = 20
+            match = [
+                { uri = "/login", rate_limit = { rate = 5, per = "1m", burst = 10, key = "header:X-Api-Key" }, forward = "127.0.0.1:8080" },
+                { forward = "127.0.0.1:8080" },
+            ]
+
+            [[server]]
+            listen = "127.0.0.1:5432"
+            protocol = "tcp"
+            max_connections_per_ip = 2
+            forward = "127.0.0.1:5433"
+            "#,
+        )
+        .unwrap();
+
+        let http = &config.servers[0];
+        let server_limit = http.rate_limit.as_ref().unwrap();
+        assert_eq!(server_limit.rate, 100);
+        assert_eq!(server_limit.per, Duration::from_secs(1));
+        assert_eq!(server_limit.burst(), 100, "burst defaults to rate");
+        assert_eq!(server_limit.key, RateLimitKey::ClientIp);
+        assert_eq!(http.max_connections_per_ip, Some(20));
+        let route_limit = http.patterns[0].rate_limit.as_ref().unwrap();
+        assert_eq!(route_limit.per, Duration::from_secs(60));
+        assert_eq!(route_limit.burst(), 10);
+        assert_eq!(
+            route_limit.key,
+            RateLimitKey::Header(String::from("X-Api-Key"))
+        );
+        assert!(http.patterns[1].rate_limit.is_none());
+        assert_eq!(config.servers[1].max_connections_per_ip, Some(2));
+
+        // The serialized form parses back to the same limits.
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.servers[0].rate_limit, http.rate_limit);
+        assert_eq!(
+            again.servers[0].patterns[0].rate_limit,
+            http.patterns[0].rate_limit
+        );
+
+        let invalid = |text: &str| Config::from_toml(text).unwrap_err().to_string();
+        let http = "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n";
+        for (text, expected) in [
+            (
+                format!("{http}rate_limit = {{ rate = 0 }}"),
+                "rate must be greater than zero",
+            ),
+            (
+                format!("{http}rate_limit = {{ burst = 5 }}"),
+                "missing field `rate`",
+            ),
+            (
+                format!("{http}rate_limit = {{ rate = 1, per = \"0s\" }}"),
+                "per must be greater than zero",
+            ),
+            (
+                format!("{http}rate_limit = {{ rate = 1, burst = 0 }}"),
+                "burst must be greater than zero",
+            ),
+            (
+                format!("{http}rate_limit = {{ rate = 1, key = \"cookie\" }}"),
+                "invalid rate limit key",
+            ),
+            (
+                format!("{http}rate_limit = {{ rate = 1, key = \"header:bad name\" }}"),
+                "invalid header name",
+            ),
+            (
+                format!("{http}rate_limit = {{ rate = 1, every = \"1s\" }}"),
+                "unknown field",
+            ),
+            (format!("{http}rate_limit = 5"), "invalid type"),
+            (
+                format!("{http}max_connections_per_ip = 0"),
+                "max_connections_per_ip must be greater than zero",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nmatch = [{ forward = \"127.0.0.1:2\", \
+                     rate_limit = { rate = 0 } }]",
+                ),
+                "match[0]: rate_limit: rate must be greater than zero",
+            ),
+            (
+                format!("{http}protocol = \"tcp\"\nrate_limit = {{ rate = 1 }}"),
+                "rate_limit only applies to http servers",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n\
+                     match = [{ forward = \"127.0.0.1:2\", rate_limit = { rate = 1 } }]",
+                ),
+                "match[0]: rate_limit only applies to http servers",
+            ),
+            (
+                format!("{http}protocol = \"udp\"\nmax_connections_per_ip = 5"),
+                "max_connections_per_ip does not apply to udp servers",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nhost = \"a.test\"\n\
+                     forward = \"127.0.0.1:2\"\nmax_connections_per_ip = 5\n\
+                     [[server]]\nlisten = \"127.0.0.1:1\"\nhost = \"b.test\"\n\
+                     forward = \"127.0.0.1:2\"",
+                ),
+                "must have the same max_connections_per_ip",
+            ),
+        ] {
+            let message = invalid(&text);
             assert!(message.contains(expected), "{text}: {message}");
         }
     }

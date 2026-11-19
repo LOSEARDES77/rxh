@@ -7,11 +7,12 @@
 //! connections finish (up to `grace_period`) and reports progress through
 //! [`State`].
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyper::header::HeaderValue;
@@ -108,7 +109,47 @@ struct ConnectionContext {
     /// servers check theirs per request, after `X-Forwarded-For`.
     ip_allow: Vec<IpNet>,
     ip_deny: Vec<IpNet>,
+    /// `max_connections_per_ip` and the open connections of each client.
+    per_ip: Option<(usize, Mutex<HashMap<IpAddr, usize>>)>,
     match_timeout: Duration,
+}
+
+/// One connection counted against `max_connections_per_ip`, until dropped.
+struct PerIpSlot<'a> {
+    counts: &'a Mutex<HashMap<IpAddr, usize>>,
+    ip: IpAddr,
+}
+
+impl<'a> PerIpSlot<'a> {
+    /// Counts one more connection of `ip`, or `None` if it already has `max`.
+    fn acquire(max: usize, counts: &'a Mutex<HashMap<IpAddr, usize>>, ip: IpAddr) -> Option<Self> {
+        let ip = ip.to_canonical();
+        let mut map = counts
+            .lock()
+            .expect("nothing panics while holding the connection counts");
+        let count = map.entry(ip).or_insert(0);
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(Self { counts, ip })
+    }
+}
+
+impl Drop for PerIpSlot<'_> {
+    fn drop(&mut self) {
+        // Dropped during a panic of the connection task too, where a second
+        // panic would abort: a poisoned lock is left alone.
+        let Ok(mut map) = self.counts.lock() else {
+            return;
+        };
+        if let Some(count) = map.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
 }
 
 /// What the listeners of the other runtimes share with the [`Server`] they
@@ -296,6 +337,9 @@ impl Server {
                     trusted_proxies: server.trusted_proxies.clone(),
                     ip_allow,
                     ip_deny,
+                    per_ip: server
+                        .max_connections_per_ip
+                        .map(|max| (max, Mutex::default())),
                     match_timeout: server.match_timeout,
                 };
                 (Socket::Tcp(listener), Some(Arc::new(context)))
@@ -630,6 +674,14 @@ async fn handle_connection(
         eprintln!("{log_name} => {peer}: rejected by ip_allow or ip_deny, closing");
         return;
     }
+    // Closed without a log line: a client over its limit could flood it.
+    let _slot = match &context.per_ip {
+        Some((max, counts)) => match PerIpSlot::acquire(*max, counts, peer.ip()) {
+            Some(slot) => Some(slot),
+            None => return,
+        },
+        None => None,
+    };
     let stream = Rewind::new(buffer, stream);
 
     match &context.tls {
