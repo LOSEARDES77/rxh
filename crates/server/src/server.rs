@@ -34,6 +34,7 @@ use crate::log::{ListenerLog, Logger};
 use crate::ocsp;
 use crate::proxy_protocol;
 use crate::registry::Registry;
+use crate::systemd;
 use crate::tcp;
 use crate::timeout::{Stamp, Watched};
 use crate::tls::{self, CertResolver};
@@ -217,7 +218,10 @@ impl Server {
 
         let (socket, address) = match server.protocol {
             Protocol::Udp => {
-                let socket = std::net::UdpSocket::bind(requested)?;
+                let socket = match systemd::udp_socket(requested)? {
+                    Some(socket) => socket,
+                    None => std::net::UdpSocket::bind(requested)?,
+                };
                 socket.set_nonblocking(true)?;
                 let socket = UdpSocket::from_std(socket)?;
                 let address = socket.local_addr()?;
@@ -561,6 +565,11 @@ enum SocketKind {
 }
 
 fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
+    if let Some(listener) = systemd::tcp_listener(address)? {
+        listener.set_nonblocking(true)?;
+        return TcpListener::from_std(listener);
+    }
+
     let socket = if address.is_ipv4() {
         TcpSocket::new_v4()?
     } else {

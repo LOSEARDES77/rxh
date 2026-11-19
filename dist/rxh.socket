@@ -1,0 +1,21 @@
+# Optional socket activation for rxh.service. systemd binds the ports and
+# passes them to rxh, which serves them with the listener whose `listen`
+# address is exactly the address of the socket: `ListenStream=0.0.0.0:443`
+# goes to `listen = "0.0.0.0:443"`, and a bare port such as
+# `ListenStream=443` is `[::]:443`. The sockets stay open across restarts,
+# so connections wait in the queue instead of being refused.
+# `ListenDatagram=` does the same for `udp` servers, and a unix socket for the
+# `[admin]` listen path (add `SocketMode=0600`, or anyone can use the API).
+#
+#   sudo install -Dm644 dist/rxh.socket /etc/systemd/system/rxh.socket
+#   sudo systemctl enable --now rxh.socket
+
+[Unit]
+Description=RXH reverse proxy and load balancer sockets
+
+[Socket]
+ListenStream=0.0.0.0:80
+ListenStream=0.0.0.0:443
+
+[Install]
+WantedBy=sockets.target

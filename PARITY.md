@@ -180,6 +180,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Effective config | `rxh config show [--json]` | ➕ | Daemon `/config` when reachable, else the merged files. |
 | Live status table | `rxh status` | ➕ | |
 | `caddy completion`, `caddy manpage` | `rxh completions SHELL`, `rxh man [--dir DIR]` | ✅ | Generated from the clap definition: bash, zsh, fish, elvish, PowerShell (no nushell); `rxh man` prints rxh(1), `--dir` writes it plus one page per subcommand. |
+| systemd `Type=notify`, socket activation (`fd/N`, `fdgram/N` addresses) | `NOTIFY_SOCKET`, `LISTEN_FDS`; `dist/rxh.service`, `dist/rxh.socket` | ✅ | `READY=1`, `RELOADING=1` with `MONOTONIC_USEC` and `STOPPING=1`, so the unit is `Type=notify-reload` (Caddy's is `Type=notify` with `ExecReload`); a failed reload shows in `STATUS=`. Passed sockets are matched to `listen` addresses (TCP, UDP, and a unix or TCP admin socket) instead of naming descriptors, and are kept across reloads. No watchdog, no `LISTEN_FDNAMES`. |
 | Certificate list with expiry | `rxh cert list [--json]`, `GET /certificates`; `rxh cert reload`, `POST /certificates/reload` | ➕ | Every certificate of every TLS listener (files and ACME): names, hosts, expiry, days left, source file, OCSP staple. Traefik shows certificates in its dashboard only. |
 
 ## Next steps

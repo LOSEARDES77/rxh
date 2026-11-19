@@ -196,6 +196,44 @@ rxh completions fish > /usr/share/fish/vendor_completions.d/rxh.fish
 rxh man --dir /usr/share/man/man1
 ```
 
+## Running under systemd
+
+[`dist/rxh.service`](../dist/rxh.service) runs `rxh run` as a
+`Type=notify-reload` service. When `NOTIFY_SOCKET` is set, rxh sends
+`READY=1` once every listener and the admin API are up, `RELOADING=1` and
+then `READY=1` around every reload (`SIGHUP`, `rxh reload`, `watch`), with
+`STATUS=Reload failed: ...` when the new configuration is rejected (the
+previous one keeps running), and `STOPPING=1` on shutdown. No watchdog.
+
+With socket activation ([`dist/rxh.socket`](../dist/rxh.socket)), systemd
+binds the sockets and passes them in `LISTEN_FDS`. A listener whose `listen`
+address equals the local address of a passed socket of the same kind uses
+that socket instead of binding its own: TCP sockets (`ListenStream=`) for
+`http` and `tcp` servers, UDP sockets (`ListenDatagram=`) for `udp` servers,
+and a TCP or unix socket for `[admin] listen`. Matching is exact:
+`ListenStream=443` is `[::]:443`, not `0.0.0.0:443`. Reloads reuse the same
+sockets, so nothing is ever closed; listeners without a passed socket bind
+as usual, and a passed socket no listener uses is reported on startup. The
+challenge-only ACME listener always binds its own port.
+
+```ini
+# rxh.socket
+[Socket]
+ListenStream=0.0.0.0:80
+ListenStream=/run/rxh/admin.sock
+# systemd creates the file with mode 0666 otherwise: anyone could use the API.
+SocketMode=0600
+```
+
+```toml
+[admin]
+listen = "unix//run/rxh/admin.sock"
+
+[[server]]
+listen = "0.0.0.0:80"
+forward = "@app"
+```
+
 ## `[admin]`
 
 | Key | Default | Description |

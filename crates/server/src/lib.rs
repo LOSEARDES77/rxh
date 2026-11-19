@@ -32,6 +32,7 @@ mod server;
 #[cfg(target_os = "linux")]
 mod splice;
 mod stream;
+mod systemd;
 mod tcp;
 mod timeout;
 mod tls;

@@ -4,6 +4,14 @@
 #   sudo install -Dm644 rxh.toml /etc/rxh/rxh.toml
 #   sudo systemctl enable --now rxh
 # Manage it with `rxh status`, `rxh upstream add ...` and `systemctl reload rxh`.
+#
+# rxh tells systemd when it is ready and when a reload starts and ends
+# (sd_notify), so `systemctl start` and `systemctl reload` return once the
+# configuration runs, and a failed reload shows in `systemctl status`.
+# Type=notify-reload needs systemd 253 or later; on older versions use
+# Type=notify and ExecReload=/bin/kill -HUP $MAINPID instead.
+#
+# For socket activation, also install and enable dist/rxh.socket.
 
 [Unit]
 Description=RXH reverse proxy and load balancer
@@ -12,9 +20,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+Type=notify-reload
 ExecStart=/usr/local/bin/rxh run --config /etc/rxh/rxh.toml
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 DynamicUser=yes
 ConfigurationDirectory=rxh

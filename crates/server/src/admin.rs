@@ -65,6 +65,7 @@ use crate::files;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
+use crate::systemd;
 use crate::tls::{self, CertificateInfo};
 
 const MAX_BODY: usize = 64 * 1024;
@@ -134,18 +135,25 @@ struct ServerStatus {
     state: String,
 }
 
-/// Bound admin endpoint. A unix socket file is removed on drop.
+/// Bound admin endpoint. A unix socket file is removed on drop, unless it
+/// came from systemd, which owns it.
 pub(crate) enum Listener {
     Tcp(TcpListener),
     #[cfg(unix)]
-    Unix(UnixListener, PathBuf),
+    Unix(UnixListener, Option<PathBuf>),
 }
 
 impl Listener {
     /// Binds `listen`, replacing the socket file a dead daemon left behind.
     pub(crate) async fn bind(listen: &AdminListen) -> io::Result<Self> {
         match listen {
-            AdminListen::Tcp(address) => TcpListener::bind(address).await.map(Self::Tcp),
+            AdminListen::Tcp(address) => match systemd::tcp_listener(*address)? {
+                Some(listener) => {
+                    listener.set_nonblocking(true)?;
+                    TcpListener::from_std(listener).map(Self::Tcp)
+                }
+                None => TcpListener::bind(address).await.map(Self::Tcp),
+            },
             #[cfg(unix)]
             AdminListen::Unix(path) => bind_unix(path).await,
             #[cfg(not(unix))]
@@ -160,7 +168,7 @@ impl Listener {
 #[cfg(unix)]
 impl Drop for Listener {
     fn drop(&mut self) {
-        if let Self::Unix(_, path) = self {
+        if let Self::Unix(_, Some(path)) = self {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -169,6 +177,11 @@ impl Drop for Listener {
 #[cfg(unix)]
 async fn bind_unix(path: &Path) -> io::Result<Listener> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    if let Some(listener) = systemd::unix_listener(path)? {
+        listener.set_nonblocking(true)?;
+        return Ok(Listener::Unix(UnixListener::from_std(listener)?, None));
+    }
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_socket() => {
@@ -200,7 +213,7 @@ async fn bind_unix(path: &Path) -> io::Result<Listener> {
         let _ = std::fs::remove_file(&temporary);
         return Err(err);
     }
-    Ok(Listener::Unix(listener, path.to_owned()))
+    Ok(Listener::Unix(listener, Some(path.to_owned())))
 }
 
 /// Serves the admin API until the task is dropped.
