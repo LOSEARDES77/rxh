@@ -220,6 +220,7 @@ and [TCP/UDP balancing](examples/tcp-udp.toml). The full reference is in
 | `rxh cert list [--json]` | Certificates of every TLS listener, with expiry dates. |
 | `rxh cert reload` | Read the certificate files again now (the daemon also does it within seconds of a change). |
 | `rxh policies` | List load balancing policies. |
+| `rxh hash-password` | Hash the password read from standard input, for `basic_auth` users. |
 
 Global flags: `-c/--config` (`RXH_CONFIG`), `--admin` (`RXH_ADMIN`),
 `--pid-file`.

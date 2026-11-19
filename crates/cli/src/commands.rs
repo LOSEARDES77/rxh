@@ -46,7 +46,8 @@ pub(crate) async fn execute(cli: &Cli, command: Command) -> Result<(), String> {
         Command::Run
         | Command::Start { .. }
         | Command::FileServer { .. }
-        | Command::ReverseProxy { .. } => unreachable!("handled in main"),
+        | Command::ReverseProxy { .. }
+        | Command::HashPassword => unreachable!("handled in main"),
         Command::Config(ConfigCommand::Show { json }) => config_show(cli, &client, json).await,
         Command::Stop => stop(cli, &client).await,
         Command::Reload => reload(cli, &client).await,

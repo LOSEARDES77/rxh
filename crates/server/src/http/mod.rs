@@ -1,5 +1,6 @@
 //! HTTP reverse proxy: routing, header rewriting, upstream transport and cache.
 
+pub(crate) mod auth;
 pub(crate) mod body;
 pub(crate) mod cache;
 pub(crate) mod encode;

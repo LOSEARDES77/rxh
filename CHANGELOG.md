@@ -9,6 +9,16 @@ Changed.
 
 ### Added
 
+- `basic_auth = { users, realm }` on `http` servers and on their `match`
+  entries: HTTP Basic authentication against bcrypt password hashes, `401`
+  with `WWW-Authenticate` for everybody else. `rxh hash-password` hashes a
+  password read from standard input.
+- `forward_auth = { url, copy_headers, timeout }` on `http` servers and on
+  their `match` entries: an external service (Authelia, Authentik,
+  oauth2-proxy) gets the head of each request with `X-Forwarded-Method`,
+  `-Proto`, `-Host`, `-Uri` and `-For`; a `2xx` answer lets the request
+  through with the `copy_headers` of the answer, any other answer goes to
+  the client. `502` or `504` when the service fails.
 - `rate_limit = { rate, per, burst, key }` on `http` servers and on their
   `match` entries: a token bucket of `burst` requests refilled with `rate`
   requests every `per`, for each client IP or each value of a request header
