@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- Circuit breaker: `circuit_breaker = { error_ratio = 0.3, latency =
+  "500ms" }` on a pool takes a backend out of rotation for `open_duration`
+  when its share of failed requests, or of responses slower than `latency`,
+  reaches a ratio within `window`. Afterwards one trial request decides
+  whether it comes back. The admin API reports the state of each backend as
+  `circuit`.
 - Request mirroring: `mirror = { pool = "shadow", percent = 10 }` on a
   `forward` route sends a copy of the requests (a share of them with
   `percent`) to other pools in the background and drops their responses.

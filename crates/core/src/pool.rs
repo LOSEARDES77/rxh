@@ -17,7 +17,7 @@ use http::{HeaderMap, Uri};
 use serde::Serialize;
 use sha2::Sha256;
 
-use crate::config::{Backend, Fallback, PassiveHealth, Policy, UpstreamGroup};
+use crate::config::{Backend, CircuitBreaker, Fallback, PassiveHealth, Policy, UpstreamGroup};
 use crate::random;
 
 /// Default cookie name of the `cookie` policy, same as Caddy.
@@ -120,6 +120,136 @@ pub struct UpstreamStatus {
 
     /// Failures remembered by passive health checks (Caddy `fails`).
     pub fails: u32,
+
+    /// State of the circuit breaker, for pools that have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub circuit: Option<CircuitState>,
+}
+
+/// State of the circuit breaker of a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitState {
+    /// Requests flow and are counted.
+    Closed,
+
+    /// The backend is out of rotation.
+    Open,
+
+    /// The backend gets one trial request that decides the next state.
+    HalfOpen,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    Closed,
+    Open { until: Instant },
+    HalfOpen,
+}
+
+/// Counters of the current window of a [`Breaker`].
+#[derive(Debug)]
+struct BreakerWindow {
+    phase: Phase,
+    started: Instant,
+    requests: u32,
+    errors: u32,
+    slow: u32,
+}
+
+/// Circuit breaker of one backend.
+#[derive(Debug)]
+struct Breaker {
+    settings: CircuitBreaker,
+    /// False while closed, so the request path takes no lock.
+    tripped: AtomicBool,
+    window: Mutex<BreakerWindow>,
+}
+
+impl Breaker {
+    fn new(settings: CircuitBreaker) -> Self {
+        Self {
+            settings,
+            tripped: AtomicBool::new(false),
+            window: Mutex::new(BreakerWindow {
+                phase: Phase::Closed,
+                started: Instant::now(),
+                requests: 0,
+                errors: 0,
+                slow: 0,
+            }),
+        }
+    }
+
+    /// Current state; an open breaker whose time is up becomes half open.
+    fn state(&self) -> CircuitState {
+        if !self.tripped.load(Ordering::Relaxed) {
+            return CircuitState::Closed;
+        }
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::phase(&mut window, Instant::now())
+    }
+
+    fn phase(window: &mut BreakerWindow, now: Instant) -> CircuitState {
+        if let Phase::Open { until } = window.phase
+            && now >= until
+        {
+            window.phase = Phase::HalfOpen;
+        }
+        match window.phase {
+            Phase::Closed => CircuitState::Closed,
+            Phase::Open { .. } => CircuitState::Open,
+            Phase::HalfOpen => CircuitState::HalfOpen,
+        }
+    }
+
+    /// Counts a finished request.
+    fn record(&self, error: bool, slow: bool) {
+        let settings = &self.settings;
+        let now = Instant::now();
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let open = match Self::phase(&mut window, now) {
+            // Late result of a request sent before the breaker opened.
+            CircuitState::Open => return,
+            CircuitState::HalfOpen => error || slow,
+            CircuitState::Closed => {
+                // shortcut: fixed windows, a burst split over two windows goes
+                // unseen; use sliding buckets if that matters.
+                if now.duration_since(window.started) >= settings.window {
+                    (window.requests, window.errors, window.slow) = (0, 0, 0);
+                    window.started = now;
+                }
+                window.requests += 1;
+                window.errors += u32::from(error);
+                window.slow += u32::from(slow);
+
+                let reaches =
+                    |count: u32, ratio: f64| f64::from(count) >= ratio * f64::from(window.requests);
+                let trips = window.requests >= settings.min_requests
+                    && (settings
+                        .error_ratio
+                        .is_some_and(|ratio| reaches(window.errors, ratio))
+                        || (settings.latency.is_some()
+                            && reaches(window.slow, settings.latency_ratio)));
+                if !trips {
+                    return;
+                }
+                true
+            }
+        };
+
+        (window.requests, window.errors, window.slow) = (0, 0, 0);
+        window.started = now;
+        window.phase = if open {
+            Phase::Open {
+                until: now + settings.open_duration,
+            }
+        } else {
+            Phase::Closed
+        };
+        self.tripped.store(open, Ordering::Relaxed);
+    }
 }
 
 /// Snapshot of a pool, as reported by the admin API.
@@ -152,10 +282,16 @@ pub struct Upstream {
     passive: Option<PassiveHealth>,
     fail_count: AtomicU32,
     failures: Mutex<VecDeque<Instant>>,
+    breaker: Option<Breaker>,
 }
 
 impl Upstream {
-    fn new(backend: Backend, passive: Option<PassiveHealth>, cookie_secret: Option<&str>) -> Self {
+    fn new(
+        backend: Backend,
+        passive: Option<PassiveHealth>,
+        breaker: Option<CircuitBreaker>,
+        cookie_secret: Option<&str>,
+    ) -> Self {
         let cookie = cookie_secret.map(|secret| cookie_value(secret, &backend.address));
         Self {
             address_hash: hash_bytes(backend.address.as_bytes()),
@@ -172,6 +308,7 @@ impl Upstream {
             passive,
             fail_count: AtomicU32::new(0),
             failures: Mutex::new(VecDeque::new()),
+            breaker: breaker.map(Breaker::new),
         }
     }
 
@@ -194,10 +331,13 @@ impl Upstream {
         self.active.load(Ordering::Relaxed)
     }
 
-    /// True unless active or passive health checks marked the backend down.
+    /// True unless active or passive health checks marked the backend down
+    /// or its circuit breaker is open.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        self.checked_healthy.load(Ordering::Relaxed) && self.passive_ok()
+        self.checked_healthy.load(Ordering::Relaxed)
+            && self.passive_ok()
+            && self.circuit() != Some(CircuitState::Open)
     }
 
     /// Healthy and not over the `unhealthy_request_count` limit.
@@ -206,7 +346,17 @@ impl Upstream {
         self.is_healthy() && !self.is_full()
     }
 
+    /// State of the circuit breaker, for pools that have one.
+    #[must_use]
+    pub fn circuit(&self) -> Option<CircuitState> {
+        self.breaker.as_ref().map(Breaker::state)
+    }
+
     fn is_full(&self) -> bool {
+        // A half open breaker lets one trial request through at a time.
+        if self.circuit() == Some(CircuitState::HalfOpen) && self.active_requests() > 0 {
+            return true;
+        }
         match &self.passive {
             Some(passive) if passive.unhealthy_request_count > 0 => {
                 self.active_requests() >= passive.unhealthy_request_count
@@ -264,8 +414,24 @@ impl Upstream {
         }
     }
 
-    /// Records a failed request or connection for passive health checks.
+    /// Records a failed request or connection for passive health checks and
+    /// the circuit breaker.
     pub fn record_failure(&self) {
+        self.passive_failure();
+        if let Some(breaker) = &self.breaker {
+            breaker.record(/* error= */ true, /* slow= */ false);
+        }
+    }
+
+    /// Records a connection that was established, for the circuit breaker of
+    /// pools without HTTP responses to judge.
+    pub fn record_success(&self) {
+        if let Some(breaker) = &self.breaker {
+            breaker.record(/* error= */ false, /* slow= */ false);
+        }
+    }
+
+    fn passive_failure(&self) {
         self.failure_total.fetch_add(1, Ordering::Relaxed);
         let Some(passive) = &self.passive else {
             return;
@@ -279,8 +445,19 @@ impl Upstream {
         self.prune_failures(passive);
     }
 
-    /// Feeds a completed HTTP response to passive health checks.
+    /// Feeds a completed HTTP response to passive health checks and the
+    /// circuit breaker.
     pub fn record_response(&self, status: u16, latency: Duration) {
+        if let Some(breaker) = &self.breaker {
+            let settings = &breaker.settings;
+            let error = settings
+                .error_status
+                .iter()
+                .any(|matcher| matcher.matches(status));
+            let slow = settings.latency.is_some_and(|limit| latency > limit);
+            breaker.record(error, slow);
+        }
+
         let Some(passive) = &self.passive else {
             return;
         };
@@ -294,7 +471,7 @@ impl Upstream {
             .is_some_and(|limit| latency > limit);
 
         if bad_status || too_slow {
-            self.record_failure();
+            self.passive_failure();
         }
     }
 
@@ -341,6 +518,7 @@ impl Upstream {
             num_requests: self.active_requests(),
             total_requests: self.total.load(Ordering::Relaxed),
             fails: self.fails(),
+            circuit: self.circuit(),
         }
     }
 }
@@ -436,6 +614,7 @@ impl Pool {
         Upstream::new(
             backend,
             self.settings.passive.clone(),
+            self.settings.circuit_breaker.clone(),
             self.settings.cookie_secret(),
         )
     }
@@ -605,10 +784,11 @@ impl Pool {
         if same(self).is_none() || same(self) != same(previous) {
             return;
         }
-        // Passive settings and cookie values are baked into each member: share
+        // Passive and breaker settings and cookie values are baked into each member: share
         // the old ones only when they still apply, otherwise rebuild them.
         let cookie_secret = |pool: &Pool| pool.settings.cookie_secret().map(str::to_owned);
         let reusable = self.settings.passive == previous.settings.passive
+            && self.settings.circuit_breaker == previous.settings.circuit_breaker
             && cookie_secret(self) == cookie_secret(previous);
 
         let mut guard = self.members.write().unwrap_or_else(PoisonError::into_inner);
@@ -1346,5 +1526,138 @@ mod tests {
     fn empty_pool_selects_nothing() {
         let pool = Pool::new("t", &UpstreamGroup::default()).unwrap();
         assert!(pool.select(&context()).is_none());
+    }
+
+    fn breaker_pool(settings: CircuitBreaker) -> (Pool, Arc<Upstream>) {
+        let mut group = group(Policy::First, &[("10.0.0.1:80", 1), ("10.0.0.2:80", 1)]);
+        group.circuit_breaker = Some(settings);
+        let pool = Pool::new("p", &group).unwrap();
+        let first = Arc::clone(&pool.upstreams()[0]);
+        (pool, first)
+    }
+
+    fn breaker(error_ratio: Option<f64>, latency: Option<Duration>) -> CircuitBreaker {
+        CircuitBreaker {
+            error_ratio,
+            error_status: vec![crate::status::StatusMatcher::Class(5)],
+            latency,
+            latency_ratio: 0.5,
+            window: Duration::from_secs(60),
+            min_requests: 4,
+            open_duration: Duration::from_millis(40),
+        }
+    }
+
+    fn selected(pool: &Pool) -> String {
+        let context = SelectContext::l4(IpAddr::from([127, 0, 0, 1]));
+        pool.select(&context).unwrap().upstream.address().to_owned()
+    }
+
+    #[test]
+    fn breaker_opens_on_error_ratio_and_recovers_through_half_open() {
+        let (pool, first) = breaker_pool(breaker(Some(0.5), None));
+        let fast = Duration::ZERO;
+
+        // Three errors out of three: under `min_requests`, still closed.
+        first.record_failure();
+        first.record_response(503, fast);
+        first.record_response(500, fast);
+        assert_eq!(first.circuit(), Some(CircuitState::Closed));
+        assert_eq!(selected(&pool), "10.0.0.1:80");
+
+        first.record_response(200, fast);
+        assert_eq!(first.circuit(), Some(CircuitState::Open));
+        assert!(!first.is_healthy());
+        assert_eq!(selected(&pool), "10.0.0.2:80");
+        // Results of requests already in flight do not close it.
+        first.record_response(200, fast);
+        assert_eq!(first.circuit(), Some(CircuitState::Open));
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(first.circuit(), Some(CircuitState::HalfOpen));
+        assert_eq!(selected(&pool), "10.0.0.1:80");
+        // One trial at a time.
+        let trial = first.start_request();
+        assert_eq!(selected(&pool), "10.0.0.2:80");
+
+        // A failed trial reopens the breaker at once.
+        first.record_response(502, fast);
+        drop(trial);
+        assert_eq!(first.circuit(), Some(CircuitState::Open));
+
+        std::thread::sleep(Duration::from_millis(60));
+        first.record_response(404, fast);
+        assert_eq!(first.circuit(), Some(CircuitState::Closed));
+        // The window starts again: old errors are forgotten.
+        first.record_response(500, fast);
+        first.record_response(200, fast);
+        first.record_response(200, fast);
+        first.record_response(200, fast);
+        assert_eq!(first.circuit(), Some(CircuitState::Closed));
+        assert_eq!(selected(&pool), "10.0.0.1:80");
+    }
+
+    #[test]
+    fn breaker_stays_closed_below_the_ratio_and_forgets_old_windows() {
+        let mut settings = breaker(Some(0.5), None);
+        settings.window = Duration::from_millis(40);
+        let (_pool, first) = breaker_pool(settings);
+
+        for status in [500, 200, 200, 200, 200, 200] {
+            first.record_response(status, Duration::ZERO);
+        }
+        assert_eq!(first.circuit(), Some(CircuitState::Closed));
+
+        first.record_failure();
+        first.record_failure();
+        first.record_failure();
+        std::thread::sleep(Duration::from_millis(60));
+        // The fourth error falls in a new window.
+        first.record_failure();
+        assert_eq!(first.circuit(), Some(CircuitState::Closed));
+    }
+
+    #[test]
+    fn breaker_opens_on_latency() {
+        let limit = Duration::from_millis(100);
+        let (_pool, first) = breaker_pool(breaker(None, Some(limit)));
+
+        // Errors alone do not open a latency breaker.
+        for _ in 0..4 {
+            first.record_response(500, limit);
+        }
+        assert_eq!(first.circuit(), Some(CircuitState::Closed));
+
+        let slow = Duration::from_millis(101);
+        for latency in [slow, slow, slow, slow] {
+            first.record_response(200, latency);
+        }
+        assert_eq!(first.circuit(), Some(CircuitState::Open));
+
+        // A slow trial reopens it.
+        std::thread::sleep(Duration::from_millis(60));
+        first.record_response(200, slow);
+        assert_eq!(first.circuit(), Some(CircuitState::Open));
+    }
+
+    #[test]
+    fn breaker_counts_connections_and_is_absent_without_settings() {
+        let (_pool, first) = breaker_pool(breaker(Some(0.5), None));
+        first.record_success();
+        first.record_success();
+        first.record_success();
+        first.record_failure();
+        assert_eq!(first.circuit(), Some(CircuitState::Closed));
+        first.record_failure();
+        first.record_failure();
+        assert_eq!(first.circuit(), Some(CircuitState::Open));
+
+        let pool = Pool::new("p", &group(Policy::First, &[("10.0.0.1:80", 1)])).unwrap();
+        let plain = &pool.upstreams()[0];
+        for _ in 0..20 {
+            plain.record_failure();
+        }
+        assert_eq!(plain.circuit(), None);
+        assert!(plain.is_healthy());
     }
 }
