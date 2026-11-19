@@ -580,6 +580,8 @@ socket, except that `http` servers listing the same address share one socket
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
 | `ip_allow`, `ip_deny` | `[]` | CIDR ranges or addresses of the clients this server accepts and rejects, on every protocol, see [IP allow and deny lists](#ip-allow-and-deny-lists). |
+| `rate_limit` | | `{ rate, per, burst, key }`: requests each client may send, see [Rate limits](#rate-limits) (http only). |
+| `max_connections_per_ip` | | Concurrent connections of one client IP; more are closed on accept, see [Connections per client](#connections-per-client) (http and tcp). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header with the client address on every new connection to a backend, see [PROXY protocol output](#proxy-protocol-output) (http and tcp). |
 | `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). Set `trusted_proxies` too: with it empty any directly connecting client can spoof its address. |
 | `match_timeout` | `"3s"` | Time a client has to send the PROXY header (`proxy_protocol_in`) and, on `tcp` servers with layer 4 matchers, the first bytes the matchers look at. |
@@ -617,8 +619,9 @@ socket and their routes are tried in configuration order, each route keeping
 the settings of its own server (`name`, `trusted_proxies`, `host`, headers,
 cache). Give each server a `host` so requests reach the right one; a request
 no route accepts gets `404`. `http2` and `max_connections` of the shared
-socket come from the first server, and `rxh status` shows one listener whose
-name joins the server names.
+socket come from the first server, `max_connections_per_ip` must be the same
+on all of them, and `rxh status` shows one listener whose name joins the
+server names.
 
 With TLS every server on the address needs its own `tls`, and the certificate
 is picked by the SNI name of the client against the servers' `host` patterns:
@@ -837,6 +840,7 @@ match = [
 | `query` | `{ key = "value" }`: same for query parameters (not percent decoded); `"*"` only requires the key. |
 | `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
 | `ip_allow`, `ip_deny` | Client IP lists of this route, on top of the server's; a request the route matches but its lists reject gets `403`, see [IP allow and deny lists](#ip-allow-and-deny-lists). |
+| `rate_limit` | Rate limit of this route, on top of the server's, see [Rate limits](#rate-limits). |
 | `forward` / `serve` / `redirect` | Action, exactly one. `serve` is a directory or a [file server table](#file-server), `redirect` a target or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `rewrite` | New URI of the request before it is forwarded or served, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `handle_response` | List of handlers for upstream responses: change the status, or answer with a file or a redirect instead, see [Handling upstream responses](#handling-upstream-responses) (`forward` only). |
@@ -913,6 +917,76 @@ protocol = "tcp"
 ip_allow = ["10.0.0.0/8"]
 forward = "10.0.0.5:5432"
 ```
+
+### Rate limits
+
+`rate_limit` on an `http` server, or on one of its `match` entries, caps the
+requests each client may send. Every client has a bucket of `burst` tokens
+that gains `rate` tokens every `per`; a request takes one token, and a
+request that finds the bucket empty gets `429 Too Many Requests` with a
+`Retry-After` header (seconds until the next token, rounded up) without
+reaching the backend. Requests are rejected, never delayed.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `rate` | required | Requests allowed every `per`, at least 1. |
+| `per` | `"1s"` | Period of `rate`: `{ rate = 30, per = "1m" }` is one request every 2 seconds. |
+| `burst` | `rate` | Size of the bucket: requests a client can send at once after a pause. |
+| `key` | `"client_ip"` | What identifies a client. `"client_ip"`: the left-most `X-Forwarded-For` entry when the peer is in `trusted_proxies`, else the peer (or the PROXY header source). `"header:<name>"`: the value of a request header, such as an API key; requests without the header are counted by client IP. |
+
+A server limit is shared by all the routes of the server; a route limit
+counts the requests of that route only. A request must pass both, the
+server's first, and takes a token from each one it passes. Clients rejected
+by `ip_allow` or `ip_deny` get `403` and use no tokens. On a shared address
+each server's limit applies to its own routes only.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "example.com"
+trusted_proxies = ["10.0.0.0/8"]
+# 100 requests per second for each client IP, bursts of 200.
+rate_limit = { rate = 100, burst = 200 }
+match = [
+    # 5 login attempts per minute for each client IP.
+    { uri = "/login", rate_limit = { rate = 5, per = "1m" }, forward = "@web" },
+    # 1000 requests per hour for each API key.
+    { uri = "/api", rate_limit = { rate = 1000, per = "1h", burst = 50, key = "header:X-Api-Key" }, forward = "@api" },
+    { forward = "@web" },
+]
+```
+
+The buckets live in memory: they are shared by the runtimes of one process,
+start full again after a reload or restart, and are not shared between
+several rxh instances. An IPv6 client is one address, not its `/64`. With
+`key = "header:..."` the header is whatever the client sends, so a client
+that changes it gets a new bucket: use it for values the backend checks
+(API keys), together with a server limit by client IP.
+
+### Connections per client
+
+`max_connections_per_ip` on an `http` or `tcp` server is the number of
+connections one client IP may have open at once. A connection over the limit
+is closed as soon as it is accepted (after the PROXY header with
+`proxy_protocol_in`, before the TLS handshake), without a log line.
+`max_connections` still caps the total.
+
+```toml
+[[server]]
+listen = "0.0.0.0:5432"
+protocol = "tcp"
+max_connections = 500
+max_connections_per_ip = 10
+forward = "10.0.0.5:5432"
+```
+
+The client is the peer of the connection, or the source of the PROXY header:
+`X-Forwarded-For` is not known when a connection is accepted, so behind an
+HTTP proxy that does not send a PROXY header every client shares the proxy's
+count; use `rate_limit` there. It counts connections, not requests: an
+HTTP/2 connection with many streams counts once. Connections that survive a
+reload are not counted by the new listeners. `udp` servers do not take it.
 
 ### Rewrites and redirects
 

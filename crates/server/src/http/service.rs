@@ -12,7 +12,7 @@ use std::time::Duration;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{Method, Request, StatusCode, Uri};
+use hyper::{HeaderMap, Method, Request, StatusCode, Uri};
 use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders};
 use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::{self, IpNet};
@@ -29,6 +29,7 @@ use crate::http::cache::Cache;
 use crate::http::encode;
 use crate::http::headers::{self, Replacement, Via};
 use crate::http::proxy;
+use crate::http::rate_limit::RateLimiter;
 use crate::http::response::{self, BoxResponse};
 use crate::http::response_handler::ResponseHandler;
 use crate::log::{self, Logger};
@@ -54,6 +55,9 @@ pub(crate) struct Site {
     /// Server `ip_allow` and `ip_deny`, checked against the client IP.
     pub(crate) ip_allow: Vec<IpNet>,
     pub(crate) ip_deny: Vec<IpNet>,
+
+    /// Server `rate_limit`, shared by the routes of the site.
+    pub(crate) rate_limit: Option<RateLimiter>,
 
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
@@ -98,15 +102,29 @@ pub(crate) struct Route {
     /// Entry `ip_allow` and `ip_deny`, on top of the site's.
     pub(crate) ip_allow: Vec<IpNet>,
     pub(crate) ip_deny: Vec<IpNet>,
+    /// Entry `rate_limit`, on top of the site's.
+    pub(crate) rate_limit: Option<RateLimiter>,
 }
 
 impl Route {
-    /// Returns true if the route or its site has an IP allow or deny list.
-    fn has_ip_lists(&self) -> bool {
+    /// Returns true if the route or its site has an IP list or a rate limit.
+    fn needs_client_ip(&self) -> bool {
         !(self.ip_allow.is_empty()
             && self.ip_deny.is_empty()
             && self.site.ip_allow.is_empty()
-            && self.site.ip_deny.is_empty())
+            && self.site.ip_deny.is_empty()
+            && self.rate_limit.is_none()
+            && self.site.rate_limit.is_none())
+    }
+
+    /// Takes a token from the site's bucket of `client`, then from the
+    /// route's. On an empty one, returns how long until its next token.
+    fn rate_limited(&self, client: IpAddr, headers: &HeaderMap) -> Option<Duration> {
+        let limiters = [&self.site.rate_limit, &self.rate_limit];
+        limiters
+            .into_iter()
+            .flatten()
+            .find_map(|limiter| limiter.check(client, headers).err())
     }
 
     /// Returns true if both the site and the route accept `client`.
@@ -163,6 +181,7 @@ impl Site {
             trusted_proxies: server.trusted_proxies.clone(),
             ip_allow: server.ip_allow.clone(),
             ip_deny: server.ip_deny.clone(),
+            rate_limit: server.rate_limit.as_ref().map(RateLimiter::new),
             tls: server.tls.is_some(),
             client_subject_header: server
                 .client_auth
@@ -248,6 +267,7 @@ impl Site {
                 encode: pattern.encode.clone(),
                 ip_allow: pattern.ip_allow.clone(),
                 ip_deny: pattern.ip_deny.clone(),
+                rate_limit: pattern.rate_limit.as_ref().map(RateLimiter::new),
             });
         }
 
@@ -361,10 +381,10 @@ impl Service {
             .find(|route| route.matcher.matches(&input));
 
         let server = route.map_or(&*self.log_name, |route| &*route.site.by);
-        // Only computed when an IP list or a JSON line needs it.
+        // Only computed when an IP list, a rate limit or a JSON line needs it.
         let json = self.logger.is_json();
         let client_ip = match route {
-            Some(route) if json || route.has_ip_lists() => {
+            Some(route) if json || route.needs_client_ip() => {
                 headers::client_ip(
                     self.peer.ip(),
                     request.headers(),
@@ -375,6 +395,10 @@ impl Service {
             _ => self.peer.ip(),
         };
         let forbidden = route.is_some_and(|route| !route.permits(client_ip));
+        // Rejected clients do not use up tokens.
+        let retry_after = route
+            .filter(|_| !forbidden)
+            .and_then(|route| route.rate_limited(client_ip, request.headers()));
         let version = request.version();
 
         let accept_encoding = match route {
@@ -407,6 +431,9 @@ impl Service {
         let mut response = match route {
             None => response::not_found(),
             Some(_) if forbidden => response::forbidden(),
+            Some(_) if retry_after.is_some() => {
+                response::too_many_requests(retry_after.unwrap_or_default())
+            }
             Some(_) if rewrite_failed => {
                 response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST")
             }

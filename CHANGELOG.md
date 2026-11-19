@@ -9,6 +9,13 @@ Changed.
 
 ### Added
 
+- `rate_limit = { rate, per, burst, key }` on `http` servers and on their
+  `match` entries: a token bucket of `burst` requests refilled with `rate`
+  requests every `per`, for each client IP or each value of a request header
+  (`key = "header:X-Api-Key"`). Requests over the limit get
+  `429 Too Many Requests` with `Retry-After`.
+- `max_connections_per_ip` on `http` and `tcp` servers: connections of a
+  client IP over the limit are closed on accept.
 - `ip_allow` and `ip_deny` on servers (`http`, `tcp`, `udp`) and on the
   `match` entries of `http` servers: lists of CIDR ranges or addresses of
   the clients accepted and rejected, a deny winning over an allow. HTTP uses
