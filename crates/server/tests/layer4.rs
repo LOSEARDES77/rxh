@@ -213,6 +213,83 @@ async fn tcp_routes_http_by_host() {
     }
 }
 
+#[tokio::test]
+async fn tcp_routes_by_remote_ip() {
+    let inside = util::tcp_echo("inside:").await;
+    let outside = util::tcp_echo("outside:").await;
+    // The PROXY header stands in for clients from other networks.
+    let proxy = util::spawn(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nprotocol = \"tcp\"\nproxy_protocol_in = true\n\
+         match = [\n\
+         {{ remote_ip = [\"203.0.113.0/24\", \"2001:db8::/32\"], forward = \"{inside}\" }},\n\
+         {{ forward = \"{outside}\" }},\n]"
+    ))[0];
+    for (header, reply) in [
+        (
+            "PROXY TCP4 203.0.113.7 127.0.0.1 40000 80\r\n",
+            "inside:ping",
+        ),
+        ("PROXY TCP6 2001:db8::1 ::1 40000 80\r\n", "inside:ping"),
+        (
+            "PROXY TCP4 198.51.100.7 127.0.0.1 40000 80\r\n",
+            "outside:ping",
+        ),
+    ] {
+        let message = format!("{header}ping");
+        let received = tcp_round_trip(proxy, message.as_bytes()).await;
+        assert_eq!(received, reply.as_bytes(), "{header:?}");
+    }
+
+    // The peer address itself, and no entry for anyone else: closed.
+    let proxies = util::spawn(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nprotocol = \"tcp\"\n\
+         remote_ip = [\"127.0.0.0/8\"]\nforward = \"{inside}\"\n\
+         [[server]]\nlisten = \"127.0.0.1:0\"\nprotocol = \"tcp\"\n\
+         remote_ip = [\"10.0.0.0/8\"]\nforward = \"{inside}\""
+    ));
+    assert_eq!(tcp_round_trip(proxies[0], b"ping").await, b"inside:ping");
+    let mut stream = TcpStream::connect(proxies[1]).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0; 16]))
+        .await
+        .expect("the proxy closes in time");
+    assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+}
+
+#[tokio::test]
+async fn tcp_routes_by_regexp_postgres_and_subroute() {
+    let postgres = util::tcp_echo("postgres:").await;
+    let socks = util::tcp_echo("socks:").await;
+    let never = util::tcp_echo("never:").await;
+    let other = util::tcp_echo("other:").await;
+    let proxy = util::spawn(&format!(
+        "[[server]]\nlisten = \"127.0.0.1:0\"\nprotocol = \"tcp\"\nmatch_timeout = \"300ms\"\n\
+         match = [\n\
+         {{ remote_ip = [\"10.0.0.0/8\"], subroute = [{{ forward = \"{never}\" }}] }},\n\
+         {{ remote_ip = [\"127.0.0.0/8\"], subroute = [\n\
+             {{ protocol = \"postgres\", forward = \"{postgres}\" }},\n\
+             {{ regexp = '^\\x05[\\x01-\\xff]', regexp_count = 2, forward = \"{socks}\" }},\n\
+         ] }},\n\
+         {{ forward = \"{other}\" }},\n]"
+    ))[0];
+
+    let ssl_request = b"\x00\x00\x00\x08\x04\xd2\x16\x2f";
+    let startup = b"\x00\x00\x00\x13\x00\x03\x00\x00user\0rxh\0\0";
+    for (message, prefix) in [
+        (&ssl_request[..], &b"postgres:"[..]),
+        (startup, b"postgres:"),
+        (b"\x05\x01\x00", b"socks:"),
+        // Nothing in the subroute matches: the outer list goes on.
+        (b"\x05\x00\x00", b"other:"),
+        (b"hello", b"other:"),
+        // Fewer bytes than `regexp_count`, after `match_timeout`.
+        (b"\x05", b"other:"),
+    ] {
+        let received = tcp_round_trip(proxy, message).await;
+        assert_eq!(received, [prefix, message].concat(), "{message:?}");
+    }
+}
+
 /// Opens a connection to `address` that starts with `preamble`, then sends
 /// `GET /` and returns the response status.
 async fn get_after(address: SocketAddr, preamble: &[u8]) -> Option<hyper::StatusCode> {

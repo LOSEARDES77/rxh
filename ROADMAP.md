@@ -156,6 +156,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] gRPC health checks and gRPC-Web.
 - [x] Layer 4 matchers (SNI, HTTP, SSH) and routing; receiving PROXY
       protocol; PROXY protocol on the HTTP transport.
+- [x] More layer 4 matchers (`remote_ip`, `regexp`, PostgreSQL) and
+      subroutes.
 
 ## 0.8: observability and UI
 

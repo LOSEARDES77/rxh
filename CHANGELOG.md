@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- More layer 4 matchers in the `match` entries of `tcp` servers:
+  `remote_ip` (client networks, the PROXY protocol source with
+  `proxy_protocol_in`), `regexp` with `regexp_count` (a regular expression
+  on the first bytes of the connection) and `protocol = "postgres"` (a
+  PostgreSQL startup message or SSL, GSSAPI encryption or cancel request).
+- Layer 4 subroutes: `subroute = [...]` instead of `forward` in a `match`
+  entry of a `tcp` server nests a list of entries that is only tried on the
+  connections the entry matches.
 - gRPC health checks: `health = { grpc = true, grpc_service = "NAME" }` on
   a pool checks each backend with the gRPC health checking protocol
   (`grpc.health.v1.Health/Check` over HTTP/2) and keeps it in rotation

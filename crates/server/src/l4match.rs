@@ -1,18 +1,22 @@
-//! Layer 4 matching: looks at the first bytes of a connection (TLS
-//! ClientHello, HTTP/1 request head, SSH banner) to pick a `tcp` route.
+//! Layer 4 matching: looks at the client address and the first bytes of a
+//! connection (TLS ClientHello, HTTP/1 request head, SSH banner, PostgreSQL
+//! startup message, or a regular expression) to pick a `tcp` route.
 //!
 //! The bytes read while sniffing are not lost: [`Rewind`] replays them to
 //! whoever reads the connection next. Everything here parses untrusted input,
 //! so every read is bounded and every parser fails closed instead of panicking.
 
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use regex::bytes::Regex;
 use rxh_core::config::{L4Protocol, Pattern};
 use rxh_core::matcher::HostPattern;
+use rxh_core::net::IpNet;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 /// Most bytes read from a client before matching gives up on more.
@@ -30,6 +34,9 @@ pub(crate) struct Detected {
     /// An SSH banner.
     pub(crate) ssh: bool,
 
+    /// A PostgreSQL startup message or SSL, GSSAPI or cancel request.
+    pub(crate) postgres: bool,
+
     /// TLS server name.
     pub(crate) sni: Option<String>,
 
@@ -41,84 +48,133 @@ pub(crate) struct Detected {
     pub(crate) http_host: Option<String>,
 }
 
-/// Compiled layer 4 matchers of one `match` entry. Every given matcher must
-/// hold; inside a list any item may match. No matchers match everything.
+/// Compiled layer 4 matchers of one `match` entry and of the entries whose
+/// `subroute` holds it. Every given matcher must hold; inside a list any item
+/// may match. No matchers match everything.
 #[derive(Debug)]
 pub(crate) struct L4Matcher {
+    levels: Vec<Level>,
+}
+
+/// Matchers of a single entry.
+#[derive(Debug)]
+struct Level {
+    remote_ip: Vec<IpNet>,
     sni: Vec<HostPattern>,
     alpn: Vec<Vec<u8>>,
     protocol: Option<L4Protocol>,
     http_host: Vec<HostPattern>,
+    regexp: Option<(Regex, usize)>,
 }
 
 impl L4Matcher {
-    /// Compiles the layer 4 matchers of `pattern`.
-    pub(crate) fn new(pattern: &Pattern) -> Result<Self, String> {
+    /// Compiles the layer 4 matchers of `chain`: an entry preceded by the
+    /// entries it is nested in, outermost first.
+    pub(crate) fn new(chain: &[&Pattern]) -> Result<Self, String> {
         let hosts = |hosts: &[String]| -> Result<Vec<HostPattern>, String> {
             hosts.iter().map(|host| HostPattern::new(host)).collect()
         };
-        Ok(Self {
-            sni: hosts(&pattern.sni)?,
-            alpn: pattern
-                .alpn
-                .iter()
-                .map(|alpn| alpn.as_bytes().to_vec())
-                .collect(),
-            protocol: pattern.protocol,
-            http_host: hosts(&pattern.http_host)?,
-        })
+        let mut levels = Vec::with_capacity(chain.len());
+        for pattern in chain {
+            let regexp = pattern.compile_regexp()?;
+            levels.push(Level {
+                remote_ip: pattern.remote_ip.clone(),
+                sni: hosts(&pattern.sni)?,
+                alpn: pattern
+                    .alpn
+                    .iter()
+                    .map(|alpn| alpn.as_bytes().to_vec())
+                    .collect(),
+                protocol: pattern.protocol,
+                http_host: hosts(&pattern.http_host)?,
+                regexp: regexp.map(|regexp| (regexp, pattern.regexp_count())),
+            });
+        }
+        Ok(Self { levels })
     }
 
     /// Returns true if the entry matches every connection.
     pub(crate) fn is_default(&self) -> bool {
-        self.sni.is_empty()
-            && self.alpn.is_empty()
-            && self.protocol.is_none()
-            && self.http_host.is_empty()
+        self.levels.iter().all(|level| {
+            level.remote_ip.is_empty()
+                && level.sni.is_empty()
+                && level.alpn.is_empty()
+                && level.protocol.is_none()
+                && level.http_host.is_empty()
+                && level.regexp.is_none()
+        })
     }
 
     /// Returns true if deciding needs the client's first bytes. When the
     /// server `terminated` TLS, `sni`, `alpn` and `protocol = "tls"` come from
-    /// the handshake instead.
+    /// the handshake instead; `remote_ip` never needs them.
     pub(crate) fn needs_bytes(&self, terminated: bool) -> bool {
-        let handshake_only =
-            self.http_host.is_empty() && matches!(self.protocol, None | Some(L4Protocol::Tls));
-        !self.is_default() && !(terminated && handshake_only)
+        self.levels.iter().any(|level| {
+            let stream = !level.http_host.is_empty()
+                || level.regexp.is_some()
+                || !matches!(level.protocol, None | Some(L4Protocol::Tls));
+            let hello = !level.sni.is_empty()
+                || !level.alpn.is_empty()
+                || level.protocol == Some(L4Protocol::Tls);
+            stream || (hello && !terminated)
+        })
     }
 
-    /// Returns true if `detected` satisfies every matcher.
-    pub(crate) fn matches(&self, detected: &Detected) -> bool {
+    /// Bytes the `regexp` matchers want to look at; 0 without any.
+    pub(crate) fn regexp_count(&self) -> usize {
+        let counts = self.levels.iter().filter_map(|level| level.regexp.as_ref());
+        counts.map(|(_, count)| *count).max().unwrap_or(0)
+    }
+
+    /// Returns true if a connection from `peer` that started with `bytes`,
+    /// in which `detected` was found, satisfies every matcher.
+    pub(crate) fn matches(&self, detected: &Detected, peer: IpAddr, bytes: &[u8]) -> bool {
         let host = |patterns: &[HostPattern], name: Option<&str>| {
             patterns.is_empty()
                 || name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name)))
         };
-        let protocol = match self.protocol {
-            None => true,
-            Some(L4Protocol::Tls) => detected.tls,
-            Some(L4Protocol::Http) => detected.http,
-            Some(L4Protocol::Ssh) => detected.ssh,
-        };
-        protocol
-            && host(&self.sni, detected.sni.as_deref())
-            && host(&self.http_host, detected.http_host.as_deref())
-            && (self.alpn.is_empty() || detected.alpn.iter().any(|a| self.alpn.contains(a)))
+        self.levels.iter().all(|level| {
+            let protocol = match level.protocol {
+                None => true,
+                Some(L4Protocol::Tls) => detected.tls,
+                Some(L4Protocol::Http) => detected.http,
+                Some(L4Protocol::Ssh) => detected.ssh,
+                Some(L4Protocol::Postgres) => detected.postgres,
+            };
+            // A client that sent fewer bytes than `regexp_count` does not match.
+            let regexp = level.regexp.as_ref().is_none_or(|(regexp, count)| {
+                bytes
+                    .get(..*count)
+                    .is_some_and(|head| regexp.is_match(head))
+            });
+            protocol
+                && regexp
+                && (level.remote_ip.is_empty() || level.remote_ip.iter().any(|n| n.contains(peer)))
+                && host(&level.sni, detected.sni.as_deref())
+                && host(&level.http_host, detected.http_host.as_deref())
+                && (level.alpn.is_empty() || detected.alpn.iter().any(|a| level.alpn.contains(a)))
+        })
     }
 }
 
 /// Reads the first bytes of `stream` into `buffer` (at most 16 KiB, for at
-/// most `limit`) until they identify the protocol. A client that stays
+/// most `limit`) until they identify the protocol and there are at least
+/// `want` of them (what the `regexp` matchers look at). A client that stays
 /// silent, closes early or sends something unknown gets an empty
-/// [`Detected`], which only matches entries without matchers.
+/// [`Detected`], which only matches entries without protocol matchers.
 pub(crate) async fn sniff<S>(
     stream: &mut S,
     buffer: &mut Vec<u8>,
     limit: Duration,
+    want: usize,
 ) -> io::Result<Detected>
 where
     S: AsyncRead + Unpin,
 {
-    let found = read_until(stream, buffer, MAX_SNIFF, limit, detect).await?;
-    Ok(found.unwrap_or_default())
+    let enough = |bytes: &[u8]| detect(bytes).filter(|_| bytes.len() >= want);
+    let found = read_until(stream, buffer, MAX_SNIFF, limit, enough).await?;
+    // Fewer than `want` bytes may still identify the protocol.
+    Ok(found.or_else(|| detect(buffer)).unwrap_or_default())
 }
 
 /// Reads from `stream` into `buffer` until `decide` returns a value. Gives
@@ -193,6 +249,16 @@ pub(crate) fn detect(bytes: &[u8]) -> Option<Detected> {
     }
     if b"SSH-".starts_with(bytes) {
         return None;
+    }
+    match postgres(bytes) {
+        Step::Yes(()) => {
+            return Some(Detected {
+                postgres: true,
+                ..Detected::default()
+            });
+        }
+        Step::More => return None,
+        Step::No => {}
     }
     match http_request(bytes) {
         Step::Yes(host) => Some(Detected {
@@ -331,6 +397,34 @@ fn parse_client_hello(body: &[u8]) -> Option<Hello> {
         }
     }
     Some(hello)
+}
+
+/// Recognizes the first message of a PostgreSQL client: a 32 bit length and
+/// a 32 bit code, which is protocol version 3.x of a startup message or one
+/// of the SSL, GSSAPI encryption and cancel requests.
+fn postgres(bytes: &[u8]) -> Step<()> {
+    const CANCEL: u32 = 80_877_102;
+    const SSL: u32 = 80_877_103;
+    const GSSENC: u32 = 80_877_104;
+    /// Largest startup message PostgreSQL accepts.
+    const MAX_STARTUP: u32 = 10_000;
+
+    let Some((&[a, b, c, d, e, f, g, h], _)) = bytes.split_first_chunk::<8>() else {
+        // Lengths fit in 16 bits: the message starts with two zero bytes.
+        let plausible = bytes.iter().take(2).all(|&byte| byte == 0);
+        return if plausible { Step::More } else { Step::No };
+    };
+    let length = u32::from_be_bytes([a, b, c, d]);
+    let known = match u32::from_be_bytes([e, f, g, h]) {
+        SSL | GSSENC => length == 8,
+        CANCEL => length >= 16,
+        version => version >> 16 == 3 && length >= 8,
+    };
+    if known && length <= MAX_STARTUP {
+        Step::Yes(())
+    } else {
+        Step::No
+    }
 }
 
 /// Recognizes an HTTP/1 request line, then looks for the `Host` header.
@@ -574,9 +668,43 @@ mod tests {
             b"get / HTTP/1.1\r\n",
             b"GET / SIP/2.0\r\n",
             b"GET  HTTP/1.1\r\n",
-            b"\x00\x00\x00\x08\x04\xd2\x16\x2f",
+            b"\x00\x00\x00\x08\x04\xd2\x16\x2e",
         ] {
             assert_eq!(detect(unknown), Some(Detected::default()), "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn postgres_first_messages() {
+        let postgres = Some(Detected {
+            postgres: true,
+            ..Detected::default()
+        });
+        let startup = b"\x00\x00\x00\x13\x00\x03\x00\x00user\0rxh\0\0";
+        for message in [
+            &startup[..],
+            // Protocol 3.2, only the first 8 bytes read so far.
+            b"\x00\x00\x00\x13\x00\x03\x00\x02",
+            // SSLRequest, GSSENCRequest and CancelRequest.
+            b"\x00\x00\x00\x08\x04\xd2\x16\x2f",
+            b"\x00\x00\x00\x08\x04\xd2\x16\x30",
+            b"\x00\x00\x00\x10\x04\xd2\x16\x2e\x00\x00\x00\x01\x00\x00\x00\x02",
+        ] {
+            assert_eq!(detect(message), postgres, "{message:?}");
+        }
+        for end in 0..8 {
+            assert_eq!(detect(&startup[..end]), None, "prefix of {end} bytes");
+        }
+        for other in [
+            // Protocol 2, an SSLRequest with a body, a length under 8 and
+            // one over what PostgreSQL accepts.
+            &b"\x00\x00\x00\x13\x00\x02\x00\x00"[..],
+            b"\x00\x00\x00\x09\x04\xd2\x16\x2f",
+            b"\x00\x00\x00\x04\x00\x03\x00\x00",
+            b"\x00\x00\x27\x11\x00\x03\x00\x00",
+            b"\x00\x01\x00\x00\x00\x03\x00\x00",
+        ] {
+            assert_eq!(detect(other), Some(Detected::default()), "{other:?}");
         }
     }
 
@@ -593,16 +721,67 @@ mod tests {
                 { protocol = "http", http_host = "b.test", forward = "x:1" },
                 { protocol = "tls", forward = "x:1" },
                 { forward = "x:1" },
+                { protocol = "postgres", forward = "x:1" },
+                { remote_ip = ["10.0.0.0/8", "::1"], forward = "x:1" },
+                { regexp = '^\x05[\x01-\xff]', regexp_count = 2, forward = "x:1" },
+                { regexp = "ell", forward = "x:1" },
             ]
             "#,
         )
         .unwrap();
-        let matchers: Vec<L4Matcher> = config.servers[0]
-            .patterns
+        let patterns = &config.servers[0].patterns;
+        let matchers: Vec<L4Matcher> = patterns
             .iter()
-            .map(|pattern| L4Matcher::new(pattern).unwrap())
+            .map(|pattern| L4Matcher::new(&[pattern]).unwrap())
             .collect();
-        let first = |detected: &Detected| matchers.iter().position(|m| m.matches(detected));
+        let peer = IpAddr::from([192, 0, 2, 1]);
+        let first =
+            |detected: &Detected| matchers.iter().position(|m| m.matches(detected, peer, b""));
+
+        let postgres = Detected {
+            postgres: true,
+            ..Detected::default()
+        };
+        assert!(matchers[5].matches(&postgres, peer, b""));
+        assert!(!matchers[5].matches(&Detected::default(), peer, b""));
+
+        let unknown = Detected::default();
+        let from = |ip: &str| matchers[6].matches(&unknown, ip.parse().unwrap(), b"");
+        assert!(from("10.1.2.3"));
+        assert!(from("::1"));
+        assert!(from("::ffff:10.1.2.3"), "IPv4 mapped addresses are IPv4");
+        assert!(!from("192.0.2.1"));
+        assert!(!matchers[6].is_default());
+        assert!(!matchers[6].needs_bytes(false), "the address is enough");
+
+        // Raw bytes, not UTF-8; only the first `regexp_count` bytes count.
+        let socks = |bytes: &[u8]| matchers[7].matches(&unknown, peer, bytes);
+        assert!(socks(b"\x05\x01\x00"));
+        assert!(socks(b"\x05\xff"));
+        assert!(!socks(b"\x05\x00\x05\x01"));
+        assert!(!socks(b"\x05"), "fewer bytes than regexp_count");
+        assert!(matchers[8].matches(&unknown, peer, b"hello"), "unanchored");
+        assert!(!matchers[8].matches(&unknown, peer, b"ell"), "default of 4");
+        assert!(!matchers[8].matches(&unknown, peer, b"shell"));
+        assert!(matchers[7].needs_bytes(true));
+        assert_eq!(matchers[7].regexp_count(), 2);
+        assert_eq!(matchers[8].regexp_count(), 4);
+        assert_eq!(matchers[0].regexp_count(), 0);
+
+        // Nested in a subroute: the outer and the inner matchers must hold.
+        let nested = L4Matcher::new(&[&patterns[6], &patterns[5], &patterns[8]]).unwrap();
+        let inside = IpAddr::from([10, 0, 0, 1]);
+        assert!(nested.matches(&postgres, inside, b"hello"));
+        assert!(!nested.matches(&postgres, peer, b"hello"));
+        assert!(!nested.matches(&unknown, inside, b"hello"));
+        assert!(!nested.matches(&postgres, inside, b"world"));
+        assert!(nested.needs_bytes(true));
+        assert_eq!(nested.regexp_count(), 4);
+        assert!(
+            L4Matcher::new(&[&patterns[4], &patterns[4]])
+                .unwrap()
+                .is_default()
+        );
 
         assert_eq!(first(&tls("www.a.test")), Some(0));
         assert_eq!(first(&tls("a.test")), Some(3), "wildcards need a label");
@@ -641,7 +820,7 @@ mod tests {
             .await
             .unwrap();
         let mut buffer = Vec::new();
-        let detected = sniff(&mut server, &mut buffer, Duration::from_secs(5))
+        let detected = sniff(&mut server, &mut buffer, Duration::from_secs(5), 15)
             .await
             .unwrap();
         assert!(detected.ssh);
@@ -653,9 +832,22 @@ mod tests {
         // A silent client gets nothing detected once the limit passes.
         let (_client, mut silent) = tokio::io::duplex(64);
         let mut buffer = Vec::new();
-        let detected = sniff(&mut silent, &mut buffer, Duration::from_millis(20))
+        let detected = sniff(&mut silent, &mut buffer, Duration::from_millis(20), 0)
             .await
             .unwrap();
         assert_eq!(detected, Detected::default());
+
+        // Fewer bytes than the regexp matchers want: the wait ends with the
+        // limit and the protocol is still known.
+        let (mut client, mut short) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"SSH-2.0-x\r\n")
+            .await
+            .unwrap();
+        let mut buffer = Vec::new();
+        let detected = sniff(&mut short, &mut buffer, Duration::from_millis(20), 64)
+            .await
+            .unwrap();
+        assert!(detected.ssh);
+        assert_eq!(buffer, b"SSH-2.0-x\r\n");
     }
 }
