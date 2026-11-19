@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- Official container images for linux/amd64 and linux/arm64, published on
+  GHCR (and Docker Hub when configured) by the `Images` workflow on release
+  tags: `latest`/`0.x`/`0.x.y` on Debian slim, `-alpine` with a static musl
+  binary and `-distroless`. They run `rxh run` as UID 65532 with
+  `RXH_CONFIG=/etc/rxh/rxh.toml` and `/var/lib/rxh` as working directory;
+  pre-releases never move the floating tags.
 - Docker provider: with a `[docker]` table (`endpoint`, `listen`) the daemon
   routes to the running containers labelled `rxh.enable=true`. `rxh.http.host`
   and `rxh.http.port` make an HTTP route, `rxh.tcp.listen` and `rxh.tcp.port`

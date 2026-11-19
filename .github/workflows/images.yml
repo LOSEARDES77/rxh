@@ -1,0 +1,127 @@
+name: Images
+
+# Official images on release tags: `debian` (latest), `alpine` and `distroless`
+# variants for linux/amd64 and linux/arm64, on GHCR and, when the repository
+# variable DOCKERHUB_IMAGE (`user/rxh`) is set, on Docker Hub with the
+# DOCKERHUB_USERNAME variable and the DOCKERHUB_TOKEN secret. Each platform is
+# built on a native runner and pushed by digest; the merge job then publishes
+# one multi-platform manifest per tag from dist/image-tags.sh.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.variant }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: [debian, alpine, distroless]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against the crate version
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_NAME#v}" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $crate"
+            exit 1
+          fi
+      - name: Image names
+        id: names
+        env:
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        run: |
+          images="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rxh"
+          if [ -n "$DOCKERHUB_IMAGE" ]; then images="$images,docker.io/$DOCKERHUB_IMAGE"; fi
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: vars.DOCKERHUB_IMAGE != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: dist/Dockerfile
+          target: ${{ matrix.variant }}
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=rxh
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=MIT
+          outputs: type=image,"name=${{ steps.names.outputs.images }}",push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.arch }}
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: publish ${{ matrix.variant }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [debian, alpine, distroless]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.variant }}-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: vars.DOCKERHUB_IMAGE != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create the multi-platform manifests
+        env:
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          images="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rxh"
+          if [ -n "$DOCKERHUB_IMAGE" ]; then images="$images docker.io/$DOCKERHUB_IMAGE"; fi
+          for image in $images; do
+            tags=$(sh dist/image-tags.sh "${GITHUB_REF_NAME#v}" "$VARIANT" "$image" | sed 's/^/--tag /')
+            sources=$(cd /tmp/digests && printf "$image@sha256:%s " *)
+            docker buildx imagetools create $tags $sources
+            docker buildx imagetools inspect "$image:${GITHUB_REF_NAME#v}$([ "$VARIANT" = debian ] || echo "-$VARIANT")"
+          done

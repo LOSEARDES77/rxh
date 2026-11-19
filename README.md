@@ -134,6 +134,13 @@ git clone https://github.com/LOSEARDES77/rxh && cd rxh
 cargo build --release        # binary at target/release/rxh
 ```
 
+Or run the official image (amd64 and arm64; `alpine` and `distroless`
+variants too, see [Running in a container](docs/configuration.md#running-in-a-container)):
+
+```bash
+docker run -p 80:80 -v "$PWD/rxh.toml:/etc/rxh/rxh.toml:ro" ghcr.io/loseardes77/rxh
+```
+
 Docker and systemd files are in [`dist/`](dist).
 
 ## Quick start

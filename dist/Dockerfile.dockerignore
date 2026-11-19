@@ -1,0 +1,6 @@
+target
+.git
+fuzz
+# The images build with the stable toolchain of the base image; the file
+# would make rustup download another one with clippy and rustfmt.
+rust-toolchain.toml
