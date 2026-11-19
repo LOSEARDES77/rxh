@@ -22,6 +22,7 @@ watch = true
 [consul]                 # routes to Consul catalog services from their tags
 [etcd]                   # routes to service instances written in etcd
 [nomad]                  # routes to Nomad services from their tags
+[kubernetes]             # routes the hosts of Ingresses and HTTPRoutes to their Services
 [upstream.NAME]          # named load balancing pools, any number
 [[server]]               # listeners, any number
 ```
@@ -727,6 +728,7 @@ another provider is ignored and reported.
 | `endpoint` | `"http://127.0.0.1:8500"` (Consul), `"http://127.0.0.1:2379"` (etcd), `"http://127.0.0.1:4646"` (Nomad) | HTTP API of the catalog: `http://host:port`. HTTPS and Unix sockets are not supported. |
 | `token` | unset | ACL token, sent as `X-Consul-Token` or `X-Nomad-Token`. Not accepted by `[etcd]`. Use a `{env.NAME}` or `{file.PATH}` placeholder to keep it out of the file. |
 | `prefix` | `"rxh/"` | `[etcd]` only: where the instances are written. |
+| `ingress_class` | unset | `[kubernetes]` only, see [below](#kubernetes-ingress-and-gateway-api). |
 | `listen` | `"0.0.0.0:80"` | Address of the HTTP servers made from `rxh.http.host` options. |
 | `refresh` | `"15s"` | How often the catalog is listed. |
 
@@ -775,6 +777,84 @@ etcdctl put rxh/web/1/http.host app.example.com
 etcdctl put rxh/web/2/address 10.0.0.6:8080
 etcdctl put rxh/web/2/http.host app.example.com
 ```
+
+## `[kubernetes]`: Ingress and Gateway API
+
+```toml
+[kubernetes]
+endpoint = "http://127.0.0.1:8001"   # kubectl proxy
+ingress_class = "rxh"
+listen = "0.0.0.0:80"
+refresh = "15s"
+```
+
+The daemon lists the Ingresses (`networking.k8s.io/v1`), the Gateway API
+HTTPRoutes (`gateway.networking.k8s.io/v1`, skipped when the cluster does
+not have them), the Services and the EndpointSlices of every namespace
+every `refresh`, and serves each host on `listen`. A host is routed to the
+ready endpoints of the Service port it points at, directly at the pod
+addresses, not through the cluster IP. Each Service port is one pool named
+`NAMESPACE-SERVICE-PORT` (server `kubernetes-NAMESPACE-SERVICE-PORT`),
+shared by every Ingress and HTTPRoute that points at it; pods that come and
+go only change its members. It behaves like the
+[service catalogs](#consul-etcd-nomad-routes-from-a-service-catalog)
+otherwise: while the API cannot be reached or read, the last routes stay.
+
+| Key | Default | Description |
+|---|---|---|
+| `endpoint` | `"http://127.0.0.1:8001"` | Kubernetes API over plain HTTP: `http://host:port`. The default is the address of `kubectl proxy`, which can run as a sidecar of rxh in the cluster. |
+| `token` | unset | Bearer token sent to the API (`Authorization: Bearer`). Not needed through `kubectl proxy`. |
+| `ingress_class` | unset | Only the Ingresses of this class (`spec.ingressClassName`, or the `kubernetes.io/ingress.class` annotation) are routed. Unset routes every Ingress. HTTPRoutes are not filtered. |
+| `listen` | `"0.0.0.0:80"` | Address of the HTTP servers of the hosts. |
+| `refresh` | `"15s"` | How often the API is listed. |
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+spec:
+  ingressClassName: rxh
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
+```
+
+The account that reads the API needs `list` on `ingresses`, `httproutes`,
+`services` and `endpointslices` in every namespace.
+
+This is a first cut. What is missing:
+
+- The API is only reached over plain HTTP: no TLS, no in-cluster service
+  account (token and CA files), no kubeconfig. Run `kubectl proxy` next to
+  rxh.
+- Only whole hosts are routed. Paths other than the prefix `/`, `Exact`
+  paths, rules without a host, `defaultBackend` and resource backends of an
+  Ingress, and the matches (path, headers, query, method), filters and
+  weighted `backendRefs` of an HTTPRoute are left out and reported in the
+  log (`Kubernetes => ignored object Ingress default/shop: ...`).
+- Gateways and GatewayClasses are not read: every HTTPRoute with
+  `hostnames` is served on `listen`, whatever its `parentRefs`, and a route
+  without `hostnames` is left out. `ReferenceGrant` is not checked for
+  Services of another namespace. No GRPCRoute, TLSRoute, TCPRoute or
+  UDPRoute.
+- No TLS from the cluster: `spec.tls` and its Secrets are not read, and the
+  hosts are served over plain HTTP on one address.
+- Nothing is written back: no `status.loadBalancer` on an Ingress, no
+  route or Gateway status, no IngressClass or GatewayClass controller name.
+- The API is polled, not watched, and the namespaces cannot be restricted.
+- A wildcard host `*.example.com` matches one or more labels, where
+  Kubernetes asks for exactly one. A Service without ready endpoints has no
+  route, instead of answering `503`. `ExternalName` Services, annotations
+  and the `rxh.policy` option are not supported.
 
 ## `[upstream.NAME]`: load balancing pools
 
