@@ -7,15 +7,23 @@ use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use rxh_core::config::{self, Protocol, Tls};
+use hyper::header::HeaderValue;
+use rxh_core::config::{self, ClientAuth, Protocol, Tls};
 use rxh_core::matcher::HostPattern;
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::rustls::crypto::CryptoProvider;
-use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
+use tokio_rustls::rustls::crypto::{self, CryptoProvider};
+use tokio_rustls::rustls::pki_types::{CertificateDer, UnixTime};
+use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use tokio_rustls::rustls::sign::CertifiedKey;
+use tokio_rustls::rustls::{
+    self, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig, ServerConnection,
+    SignatureScheme,
+};
 
 use crate::acme;
+use crate::stream;
 
 /// Picks a certificate by SNI. Exact host names beat wildcards; a client
 /// without SNI, or with a name that matches nothing, gets the default (first)
@@ -213,10 +221,103 @@ impl ResolvesServerCert for CertResolver {
     }
 }
 
+/// Accepts any client certificate, or none unless `mandatory`: the modes
+/// `request` and `require`. The client still has to prove that it holds the
+/// key of the certificate it sends.
+#[derive(Debug)]
+struct AnyClientCert {
+    provider: Arc<CryptoProvider>,
+    mandatory: bool,
+}
+
+impl ClientCertVerifier for AnyClientCert {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.mandatory
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.provider.signature_verification_algorithms;
+        crypto::verify_tls12_signature(message, cert, dss, algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.provider.signature_verification_algorithms;
+        crypto::verify_tls13_signature(message, cert, dss, algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Client certificate verifier of a `client_auth` table, loading its `ca`
+/// files.
+fn client_verifier(
+    client_auth: &ClientAuth,
+    provider: &Arc<CryptoProvider>,
+) -> io::Result<Arc<dyn ClientCertVerifier>> {
+    let mandatory = client_auth.mode.is_mandatory();
+    if !client_auth.mode.verifies() {
+        return Ok(Arc::new(AnyClientCert {
+            provider: Arc::clone(provider),
+            mandatory,
+        }));
+    }
+    let mut roots = RootCertStore::empty();
+    for path in &client_auth.ca {
+        for cert in stream::read_certs(path)? {
+            roots
+                .add(cert)
+                .map_err(|err| io::Error::other(format!("{path}: {err}")))?;
+        }
+    }
+    let builder = WebPkiClientVerifier::builder_with_provider(roots.into(), Arc::clone(provider));
+    let builder = if mandatory {
+        builder
+    } else {
+        builder.allow_unauthenticated()
+    };
+    builder.build().map_err(io::Error::other)
+}
+
+/// Subject of the certificate the client of `connection` presented, such as
+/// `CN=alice, O=Example`, as a header value. `None` without a certificate,
+/// or if the subject has characters a header cannot carry.
+pub(crate) fn client_subject(connection: &ServerConnection) -> Option<HeaderValue> {
+    let end_entity = connection.peer_certificates()?.first()?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(end_entity).ok()?;
+    HeaderValue::from_bytes(certificate.subject().to_string().as_bytes()).ok()
+}
+
 /// Builds the TLS acceptor of a listener shared by `servers` and the
 /// resolver it picks certificates with, or `None` if they do not use TLS
-/// (validation guarantees all or none of them do). ALPN follows the first
-/// server. `tls = "auto"` servers start without certificates, the ACME
+/// (validation guarantees all or none of them do). ALPN and `client_auth`
+/// follow the first server. `tls = "auto"` servers start without certificates, the ACME
 /// manager adds them to the resolver.
 pub(crate) fn acceptor(
     servers: &[&config::Server],
@@ -225,8 +326,15 @@ pub(crate) fn acceptor(
         return Ok(None);
     };
 
-    let builder = ServerConfig::builder().with_no_client_auth();
-    let resolver = Arc::new(CertResolver::new(Arc::clone(builder.crypto_provider())));
+    let builder = ServerConfig::builder();
+    let provider = Arc::clone(builder.crypto_provider());
+    let builder = match &first.client_auth {
+        None => builder.with_no_client_auth(),
+        Some(client_auth) => {
+            builder.with_client_cert_verifier(client_verifier(client_auth, &provider)?)
+        }
+    };
+    let resolver = Arc::new(CertResolver::new(provider));
 
     for server in servers {
         match &server.tls {

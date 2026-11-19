@@ -275,7 +275,7 @@ fn client_config(settings: &UpstreamTls, h2: bool) -> io::Result<ClientConfig> {
     Ok(config)
 }
 
-fn read_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn read_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     let pem = fs::read(path).map_err(|err| io::Error::new(err.kind(), format!("{path}: {err}")))?;
     let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()

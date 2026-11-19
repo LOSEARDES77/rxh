@@ -574,6 +574,7 @@ socket, except that `http` servers listing the same address share one socket
 | `match` | | List of patterns instead of `forward`/`serve`/`redirect`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
+| `client_auth` | | `{ mode, ca, header }`: ask clients for a certificate in the TLS handshake, see [Client certificates (mTLS)](#client-certificates-mtls) (servers with `tls` only). |
 | `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
@@ -644,9 +645,59 @@ forward = "@b"
 
 It is a validation error to share an address between an `http` server and a
 `tcp` server, between two `tcp` servers or two `udp` servers, or between `http`
-servers with and without `tls`. TCP and UDP sockets never conflict, so a `udp`
+servers with and without `tls` or with different `client_auth` tables. TCP and UDP sockets never conflict, so a `udp`
 server may use the address of a `tcp` or `http` server. Port `0` is never
 shared: every port `0` entry gets its own free port.
+
+### Client certificates (mTLS)
+
+`client_auth` on a server with `tls` (files or `"auto"`, `http` or `tcp`)
+asks the client for a certificate during the TLS handshake. A client that
+does not satisfy the mode fails the handshake and never reaches a backend.
+
+| Key | Default | Description |
+|---|---|---|
+| `mode` | `"require_and_verify"` | What is asked of the client, see the modes below. |
+| `ca` | | PEM file, or list of PEM files, with the certificate authorities that sign client certificates. Required by `verify_if_given` and `require_and_verify`, rejected by the other modes. A missing file or one without certificates fails the start. |
+| `header` | | Request header that carries the subject of the client certificate to the backends, such as `CN=alice, O=Example` (http servers, verifying modes only). A value of this header sent by the client is always removed, and `request.headers` rules cannot change it. Without a client certificate (`verify_if_given`) the backend gets no such header. A subject with control characters is not passed. |
+
+| `mode` | Client without a certificate | Certificate checked against `ca` |
+|---|---|---|
+| `"request"` | accepted | no |
+| `"require"` | refused | no |
+| `"verify_if_given"` | accepted | yes: a certificate that is not signed by `ca`, expired or not valid yet is refused |
+| `"require_and_verify"` | refused | yes |
+
+They are Traefik's `RequestClientCert`, `RequireAnyClientCert`,
+`VerifyClientCertIfGiven` and `RequireAndVerifyClientCert`. `request` and
+`require` accept any certificate, self-signed ones included, so they say
+nothing about who the client is; that is why `header` needs a verifying
+mode.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+host = "internal.example.com"
+tls = { cert = "/etc/rxh/internal.pem", key = "/etc/rxh/internal.key" }
+client_auth = { ca = "/etc/rxh/clients-ca.pem", header = "X-Client-Subject" }
+forward = "@internal"
+
+# Certificates are optional here; the backend tells users apart by the header.
+[[server]]
+listen = "0.0.0.0:8443"
+tls = { cert = "/etc/rxh/internal.pem", key = "/etc/rxh/internal.key" }
+forward = "@app"
+
+[server.client_auth]
+mode = "verify_if_given"
+ca = ["/etc/rxh/clients-ca.pem", "/etc/rxh/partners-ca.pem"]
+header = "X-Client-Subject"
+```
+
+The handshake happens before the request names a host, so `http` servers
+sharing a listen address must have the same `client_auth` table. Use
+different addresses for different policies. The `ca` files are read when the
+listener starts. There is no revocation check (CRL or OCSP).
 
 ### `match` entries (HTTP routes)
 
