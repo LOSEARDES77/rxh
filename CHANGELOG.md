@@ -18,6 +18,12 @@ Changed.
   without dropping connections only when the routes themselves change. A
   container with wrong labels is ignored and reported; an unreachable Docker
   keeps the last routes and is retried.
+- Podman and Docker Swarm providers: `[docker] provider = "podman"` follows
+  the Docker compatible API of Podman (default endpoint
+  `unix:///run/podman/podman.sock`) and reaches containers at the host port
+  they publish, which rootless containers need. `provider = "swarm"` routes
+  to the running tasks of the services labelled `rxh.enable=true`, with the
+  labels of their service, polled every `[docker] refresh` (default 15s).
 - systemd integration: `rxh run` reports readiness, reloads (with the
   failure reason in `STATUS=`) and shutdown over `NOTIFY_SOCKET`, and takes
   socket-activated listeners from `LISTEN_FDS`, matched to `listen` and

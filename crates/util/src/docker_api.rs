@@ -7,8 +7,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
-/// Serves `GET /containers/json` and `GET /events` on a local TCP address,
-/// with whatever the test publishes.
+/// Serves `GET /containers/json` and `GET /events`, and the Swarm
+/// `GET /services` and `GET /tasks`, on a local TCP address, with whatever
+/// the test publishes.
 #[derive(Debug)]
 pub struct DockerApi {
     address: SocketAddr,
@@ -18,6 +19,8 @@ pub struct DockerApi {
 #[derive(Debug)]
 struct State {
     containers: Mutex<String>,
+    /// `GET /services` and `GET /tasks`.
+    swarm: Mutex<(String, String)>,
     events: broadcast::Sender<String>,
 }
 
@@ -41,6 +44,7 @@ impl DockerApi {
         let address = listener.local_addr().expect("address");
         let state = Arc::new(State {
             containers: Mutex::new(String::from("[]")),
+            swarm: Mutex::new((String::from("[]"), String::from("[]"))),
             events: broadcast::channel(64).0,
         });
         let shared = Arc::clone(&state);
@@ -72,6 +76,18 @@ impl DockerApi {
         );
         // No event stream is open yet: the next one starts with the list.
         let _ = self.state.events.send(event);
+    }
+}
+
+impl DockerApi {
+    /// Makes `services` and `tasks`, JSON arrays as `GET /services` and
+    /// `GET /tasks` return them, the Swarm lists.
+    pub fn publish_swarm(&self, services: &str, tasks: &str) {
+        *self
+            .state
+            .swarm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = (services.to_owned(), tasks.to_owned());
     }
 }
 
@@ -110,6 +126,14 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         ("200 OK", containers.clone())
+    } else if path.starts_with("/services") || path.starts_with("/tasks") {
+        let swarm = state.swarm.lock().unwrap_or_else(PoisonError::into_inner);
+        let body = if path.starts_with("/services") {
+            &swarm.0
+        } else {
+            &swarm.1
+        };
+        ("200 OK", body.clone())
     } else {
         (
             "404 Not Found",
