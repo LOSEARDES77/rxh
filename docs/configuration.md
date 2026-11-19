@@ -355,6 +355,8 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 - Without a token, TCP requests must have a loopback `Host` and `Origin`
   (protection against DNS rebinding). With a token, or on a unix socket, any
   `Host` is accepted. A token set together with a unix socket is checked too.
+- `GET /dashboard` is the only route served without the token: a static
+  page with no data, which asks for the token and sends it on its requests.
 - The admin API speaks plain HTTP: the token is as private as the network it
   crosses. Use a private network, a VPN or an SSH tunnel
   (`ssh -L 2019:/run/rxh/admin.sock host`), not the open internet.
@@ -365,6 +367,25 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   same file.
 - `GET /config` shows the token as `***`. Keep the configuration file
   readable by the daemon's user only.
+
+### Dashboard
+
+`GET /dashboard` on the admin API is a read only web page: listeners and
+their state, hosts with their routes, the live health of every backend, and
+the certificates with their expiry. It refreshes every 2 seconds, is embedded
+in the binary and loads nothing from other sites. It has no key: it is there
+whenever the admin API is. `/dashboard/` redirects to `/dashboard`.
+
+```toml
+[admin]
+listen = "127.0.0.1:2019"   # then open http://127.0.0.1:2019/dashboard
+```
+
+On a remote host, tunnel the admin address
+(`ssh -L 2019:127.0.0.1:2019 host`) and open the same URL. With `token`
+set, the page asks for the token once per browser tab and sends it on its
+requests. A browser cannot open a unix socket: forward it to a local port
+(`ssh -L 2019:/run/rxh/admin.sock host`).
 
 ### Changing the configuration through the API
 

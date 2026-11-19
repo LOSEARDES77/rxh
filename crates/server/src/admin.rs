@@ -13,6 +13,7 @@
 //! | `DELETE` | `/pools/{name}/upstreams`     | Remove `{"address"}`                |
 //! | `GET`    | `/metrics`                    | Prometheus metrics                  |
 //! | `GET`    | `/certificates`               | Certificates served, with expiry    |
+//! | `GET`    | `/dashboard`                  | Read only web page over the routes  |
 //! | `POST`   | `/certificates/reload`        | Read certificate files again        |
 //! | `POST`   | `/reload`                     | Reload the configuration file       |
 //! | `POST`   | `/load`                       | Run the configuration in the body   |
@@ -30,6 +31,10 @@
 //! <token>`. Without it, TCP requests whose `Host` or `Origin` is not a
 //! loopback name are rejected, so web pages cannot reach the API through DNS
 //! rebinding.
+//!
+//! `/dashboard` is one static page that reads `/status`, `/config` and
+//! `/certificates` from the browser. It holds no data, so it is served
+//! without the token, which the page asks for and sends on those requests.
 
 use std::convert::Infallible;
 use std::io;
@@ -67,6 +72,14 @@ use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
 use crate::systemd;
 use crate::tls::{self, CertificateInfo};
+
+/// The whole dashboard: markup, style and script, with no other resource.
+const DASHBOARD: &str = include_str!("dashboard.html");
+
+/// Lets the dashboard run its inline script and style and call the API it
+/// came from, and nothing else: no other origin, no frames around it.
+const DASHBOARD_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; \
+     style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 const MAX_BODY: usize = 64 * 1024;
 
@@ -258,8 +271,14 @@ async fn handle(
     request: Request<Incoming>,
     state: Arc<AdminState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let raw_path = request.uri().path();
+    let is_dashboard = request.method() == Method::GET && raw_path.trim_matches('/') == "dashboard";
+    // The page calls the API with relative URLs, which only resolve to the
+    // API routes from this exact path.
+    let is_dashboard_page = raw_path == "/dashboard";
     if let Some(token) = &state.token {
-        if !has_token(&request, token) {
+        // A browser cannot send the token when it opens a page.
+        if !is_dashboard && !has_token(&request, token) {
             let mut response = error(
                 StatusCode::UNAUTHORIZED,
                 "admin API requires Authorization: Bearer <token>",
@@ -300,6 +319,8 @@ async fn handle(
             );
             response
         }
+        (&Method::GET, ["dashboard"]) if is_dashboard_page => dashboard(),
+        (&Method::GET, ["dashboard"]) => dashboard_redirect(),
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
         (&Method::GET, ["pools"]) => {
             let registry = registry(&state);
@@ -693,6 +714,31 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<B
     response
 }
 
+fn dashboard() -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from_static(DASHBOARD.as_bytes())));
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        (header::CONTENT_SECURITY_POLICY, DASHBOARD_POLICY),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::CACHE_CONTROL, "no-cache"),
+    ] {
+        headers.insert(name, header::HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// Sends `/dashboard/` and the like to the one path the page works from.
+fn dashboard_redirect() -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
+    response.headers_mut().insert(
+        header::LOCATION,
+        header::HeaderValue::from_static("/dashboard"),
+    );
+    response
+}
+
 fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     json_response(status, &json!({ "error": message }))
 }
@@ -713,6 +759,24 @@ mod tests {
     fn decodes_percent_escapes() {
         assert_eq!(files::percent_decode("server%5B0%5D%231"), "server[0]#1");
         assert_eq!(files::percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn dashboard_only_reads() {
+        for write in ["POST", "PUT", "PATCH", "DELETE", "method:", "innerHTML"] {
+            assert!(
+                !DASHBOARD.contains(write),
+                "the read only page must not hold {write}"
+            );
+        }
+        // Relative, so the page also works behind a path prefix of a proxy.
+        for route in [
+            "api(\"status\")",
+            "api(\"config\")",
+            "api(\"certificates\")",
+        ] {
+            assert!(DASHBOARD.contains(route), "{route}");
+        }
     }
 
     #[test]
