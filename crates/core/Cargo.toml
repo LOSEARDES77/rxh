@@ -11,6 +11,7 @@ keywords = ["load-balancer", "reverse-proxy", "proxy", "round-robin", "health-ch
 categories = ["network-programming", "web-programming"]
 
 [dependencies]
+bcrypt.workspace = true
 hmac.workspace = true
 http.workspace = true
 regex.workspace = true

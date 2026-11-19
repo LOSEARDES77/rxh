@@ -284,6 +284,12 @@ impl Config {
                     .validate()
                     .map_err(|err| ConfigError::Invalid(format!("{label}: rate_limit: {err}")))?;
             }
+            validate_auth(
+                server.protocol,
+                server.basic_auth.as_ref(),
+                server.forward_auth.as_ref(),
+            )
+            .map_err(|err| ConfigError::Invalid(format!("{label}: {err}")))?;
             match server.max_connections_per_ip {
                 Some(0) => {
                     return invalid(format!(
@@ -330,6 +336,14 @@ impl Config {
                         ))
                     })?;
                 }
+                validate_auth(
+                    server.protocol,
+                    pattern.basic_auth.as_ref(),
+                    pattern.forward_auth.as_ref(),
+                )
+                .map_err(|err| {
+                    ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
+                })?;
                 pattern.validate_rewrite().map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
                 })?;
@@ -806,6 +820,16 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
+    /// HTTP Basic authentication of every route that does not set its own
+    /// (http only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<BasicAuth>,
+
+    /// Authentication delegated to an external service, for every route that
+    /// does not set its own (http only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_auth: Option<ForwardAuth>,
+
     /// Maximum number of concurrent connections of one client IP (http and
     /// tcp).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -908,6 +932,8 @@ struct RawServer {
     #[serde(default)]
     ip_deny: Vec<IpNet>,
     rate_limit: Option<RateLimit>,
+    basic_auth: Option<BasicAuth>,
+    forward_auth: Option<ForwardAuth>,
     max_connections_per_ip: Option<usize>,
     proxy_protocol: Option<ProxyProtocol>,
     #[serde(default)]
@@ -1021,6 +1047,8 @@ impl TryFrom<RawServer> for Server {
             ip_allow: raw.ip_allow,
             ip_deny: raw.ip_deny,
             rate_limit: raw.rate_limit,
+            basic_auth: raw.basic_auth,
+            forward_auth: raw.forward_auth,
             max_connections_per_ip: raw.max_connections_per_ip,
             proxy_protocol: raw.proxy_protocol,
             proxy_protocol_in: raw.proxy_protocol_in,
@@ -1091,6 +1119,16 @@ pub struct Pattern {
     /// Request rate limit of this entry, on top of the server's (http only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
+
+    /// HTTP Basic authentication of this entry, replacing the server's (http
+    /// only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<BasicAuth>,
+
+    /// Authentication delegated to an external service, replacing the
+    /// server's (http only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_auth: Option<ForwardAuth>,
 
     /// What to do when the pattern matches.
     #[serde(flatten)]
@@ -1166,6 +1204,8 @@ impl Pattern {
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
             rate_limit: None,
+            basic_auth: None,
+            forward_auth: None,
             action,
             rewrite: None,
             request: RequestConfig::default(),
@@ -3432,6 +3472,155 @@ impl From<RateLimitKey> for String {
     }
 }
 
+/// Checks the `basic_auth` and `forward_auth` of a server or match entry.
+fn validate_auth(
+    protocol: Protocol,
+    basic_auth: Option<&BasicAuth>,
+    forward_auth: Option<&ForwardAuth>,
+) -> Result<(), String> {
+    if let Some(basic_auth) = basic_auth {
+        if protocol != Protocol::Http {
+            return Err(String::from("basic_auth only applies to http servers"));
+        }
+        basic_auth
+            .validate()
+            .map_err(|err| format!("basic_auth: {err}"))?;
+    }
+    if let Some(forward_auth) = forward_auth {
+        if protocol != Protocol::Http {
+            return Err(String::from("forward_auth only applies to http servers"));
+        }
+        forward_auth
+            .validate()
+            .map_err(|err| format!("forward_auth: {err}"))?;
+    }
+    Ok(())
+}
+
+/// HTTP Basic authentication (RFC 7617) against bcrypt password hashes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BasicAuth {
+    /// Realm shown in the password prompt of browsers.
+    #[serde(default = "default::realm")]
+    pub realm: String,
+
+    /// User name to bcrypt hash of the password (`htpasswd -nB`).
+    pub users: BTreeMap<String, String>,
+}
+
+impl BasicAuth {
+    fn validate(&self) -> Result<(), String> {
+        // The realm goes into a quoted string of `WWW-Authenticate`.
+        if self
+            .realm
+            .contains(|c: char| c.is_control() || c == '"' || c == '\\')
+        {
+            return Err(format!(
+                "realm {:?} must not contain quotes, backslashes or control characters",
+                self.realm
+            ));
+        }
+        if self.users.is_empty() {
+            return Err(String::from("users must not be empty"));
+        }
+        for (name, hash) in &self.users {
+            if name.is_empty() || name.contains(|c: char| c == ':' || c.is_control()) {
+                return Err(format!(
+                    "user {name:?}: a name must not be empty or contain a colon or control \
+                     characters"
+                ));
+            }
+            if hash.parse::<bcrypt::HashParts>().is_err() {
+                return Err(format!(
+                    "user {name:?}: the password must be a bcrypt hash (\"$2y$...\", from \
+                     `htpasswd -nB`)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Hashes `password` for the `users` table, like `htpasswd -nB`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when bcrypt cannot hash the password.
+    pub fn hash_password(password: &str) -> Result<String, String> {
+        bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|err| err.to_string())
+    }
+
+    /// Returns true if `password` is the password of `user`. Slow on purpose
+    /// (bcrypt): not to be called on an async runtime thread.
+    #[must_use]
+    pub fn verify(&self, user: &str, password: &[u8]) -> bool {
+        match self.users.get(user) {
+            Some(hash) => bcrypt::verify(password, hash).unwrap_or(false),
+            None => {
+                // The same work as for a known user, so the response time
+                // does not tell which names exist.
+                if let Some(hash) = self.users.values().next() {
+                    let _ = bcrypt::verify(password, hash);
+                }
+                false
+            }
+        }
+    }
+
+    /// Splits the credentials of an `Authorization: Basic` header (the base64
+    /// of `user:password`) into user and password.
+    #[must_use]
+    pub fn decode_credentials(credentials: &str) -> Option<(String, Vec<u8>)> {
+        let decoded = decode_base64(credentials.trim())?;
+        let colon = decoded.iter().position(|byte| *byte == b':')?;
+        let user = String::from_utf8(decoded[..colon].to_vec()).ok()?;
+        Some((user, decoded[colon + 1..].to_vec()))
+    }
+}
+
+/// Authentication delegated to an external service (Authelia, Authentik,
+/// oauth2-proxy): it gets the head of each request and decides with the
+/// status of its answer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardAuth {
+    /// `http://` or `https://` URL of the verification endpoint.
+    pub url: String,
+
+    /// Headers of a `2xx` answer copied to the request sent to the backend,
+    /// such as `Remote-User`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy_headers: Vec<String>,
+
+    /// Time the service has to answer.
+    #[serde(default = "default::forward_auth_timeout", with = "duration")]
+    pub timeout: Duration,
+}
+
+impl ForwardAuth {
+    fn validate(&self) -> Result<(), String> {
+        let uri: http::Uri = self
+            .url
+            .parse()
+            .map_err(|err| format!("invalid url {:?}: {err}", self.url))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
+            return Err(format!(
+                "invalid url {:?}, expected http://host[:port][/path] or https://",
+                self.url
+            ));
+        }
+        for name in &self.copy_headers {
+            if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(format!("invalid header name {name:?} in copy_headers"));
+            }
+        }
+        if self.timeout.is_zero() {
+            return Err(String::from("timeout must be greater than zero"));
+        }
+        Ok(())
+    }
+}
+
 /// Response cache for `GET` requests.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -3595,6 +3784,14 @@ mod default {
 
     pub fn rate_limit_per() -> Duration {
         Duration::from_secs(1)
+    }
+
+    pub fn realm() -> String {
+        String::from("Restricted")
+    }
+
+    pub fn forward_auth_timeout() -> Duration {
+        Duration::from_secs(10)
     }
 
     pub fn udp_idle_timeout() -> Duration {
@@ -5382,5 +5579,170 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
             let message = invalid(&text);
             assert!(message.contains(expected), "{text}: {message}");
         }
+    }
+
+    #[test]
+    fn basic_auth_and_forward_auth() {
+        let hash = bcrypt::hash("secret", 4).unwrap();
+        // What `htpasswd -nB` writes.
+        let htpasswd = hash.replacen("$2b$", "$2y$", 1);
+        let config = Config::from_toml(&format!(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            basic_auth = {{ users = {{ alice = "{hash}" }} }}
+            forward_auth = {{ url = "http://127.0.0.1:9091/api/authz/forward-auth" }}
+            match = [
+                {{ uri = "/admin", basic_auth = {{ realm = "Admin", users = {{ root = "{htpasswd}" }} }}, forward = "127.0.0.1:8080" }},
+                {{ uri = "/app", forward_auth = {{ url = "https://auth.example.com/verify?rd=1", copy_headers = ["Remote-User", "Remote-Groups"], timeout = "2s" }}, forward = "127.0.0.1:8080" }},
+                {{ forward = "127.0.0.1:8080" }},
+            ]
+            "#
+        ))
+        .unwrap();
+
+        let server = &config.servers[0];
+        let basic = server.basic_auth.as_ref().unwrap();
+        assert_eq!(basic.realm, "Restricted");
+        assert!(basic.verify("alice", b"secret"));
+        assert!(!basic.verify("alice", b"Secret"));
+        assert!(!basic.verify("alice", b""));
+        assert!(!basic.verify("bob", b"secret"), "unknown user");
+        let forward = server.forward_auth.as_ref().unwrap();
+        assert_eq!(forward.timeout, Duration::from_secs(10));
+        assert!(forward.copy_headers.is_empty());
+
+        let admin = server.patterns[0].basic_auth.as_ref().unwrap();
+        assert_eq!(admin.realm, "Admin");
+        assert!(admin.verify("root", b"secret"), "$2y$ hashes verify");
+        assert!(!admin.verify("alice", b"secret"));
+        assert!(server.patterns[0].forward_auth.is_none());
+        let app = server.patterns[1].forward_auth.as_ref().unwrap();
+        assert_eq!(app.url, "https://auth.example.com/verify?rd=1");
+        assert_eq!(app.copy_headers, ["Remote-User", "Remote-Groups"]);
+        assert_eq!(app.timeout, Duration::from_secs(2));
+        assert!(server.patterns[2].basic_auth.is_none());
+
+        // The serialized form parses back to the same settings.
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.servers[0].basic_auth, server.basic_auth);
+        assert_eq!(again.servers[0].forward_auth, server.forward_auth);
+        assert_eq!(
+            again.servers[0].patterns[0].basic_auth,
+            server.patterns[0].basic_auth
+        );
+        assert_eq!(
+            again.servers[0].patterns[1].forward_auth,
+            server.patterns[1].forward_auth
+        );
+
+        let invalid = |text: &str| Config::from_toml(text).unwrap_err().to_string();
+        let http = "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n";
+        let users = format!("users = {{ alice = \"{hash}\" }}");
+        for (text, expected) in [
+            (
+                format!("{http}basic_auth = {{ users = {{}} }}"),
+                "basic_auth: users must not be empty",
+            ),
+            (
+                format!("{http}basic_auth = {{ realm = \"x\" }}"),
+                "missing field `users`",
+            ),
+            (
+                format!("{http}basic_auth = {{ users = {{ alice = \"secret\" }} }}"),
+                "user \"alice\": the password must be a bcrypt hash",
+            ),
+            (
+                format!("{http}basic_auth = {{ users = {{ \"a:b\" = \"{hash}\" }} }}"),
+                "must not be empty or contain a colon",
+            ),
+            (
+                format!("{http}basic_auth = {{ users = {{ \"\" = \"{hash}\" }} }}"),
+                "must not be empty or contain a colon",
+            ),
+            (
+                format!("{http}basic_auth = {{ realm = 'a\"b', {users} }}"),
+                "realm",
+            ),
+            (
+                format!("{http}basic_auth = {{ {users}, file = \"x\" }}"),
+                "unknown field",
+            ),
+            (
+                format!("{http}protocol = \"tcp\"\nbasic_auth = {{ {users} }}"),
+                "basic_auth only applies to http servers",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nmatch = [{ forward = \
+                     \"127.0.0.1:2\", basic_auth = { users = {} } }]",
+                ),
+                "match[0]: basic_auth: users must not be empty",
+            ),
+            (
+                format!("{http}forward_auth = {{ timeout = \"1s\" }}"),
+                "missing field `url`",
+            ),
+            (
+                format!("{http}forward_auth = {{ url = \"127.0.0.1:9091\" }}"),
+                "forward_auth: invalid url",
+            ),
+            (
+                format!("{http}forward_auth = {{ url = \"ftp://auth/verify\" }}"),
+                "forward_auth: invalid url",
+            ),
+            (
+                format!("{http}forward_auth = {{ url = \"/verify\" }}"),
+                "forward_auth: invalid url",
+            ),
+            (
+                format!(
+                    "{http}forward_auth = {{ url = \"http://auth\", copy_headers = [\"bad name\"] }}"
+                ),
+                "invalid header name \"bad name\" in copy_headers",
+            ),
+            (
+                format!("{http}forward_auth = {{ url = \"http://auth\", timeout = \"0s\" }}"),
+                "forward_auth: timeout must be greater than zero",
+            ),
+            (
+                format!("{http}forward_auth = {{ url = \"http://auth\", address = \"x\" }}"),
+                "unknown field",
+            ),
+            (
+                format!("{http}protocol = \"tcp\"\nforward_auth = {{ url = \"http://auth\" }}"),
+                "forward_auth only applies to http servers",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nmatch = [{ forward = \
+                     \"127.0.0.1:2\", forward_auth = { url = \"nope\" } }]",
+                ),
+                "match[0]: forward_auth: invalid url",
+            ),
+        ] {
+            let message = invalid(&text);
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    #[test]
+    fn basic_auth_credentials_decoding() {
+        // "alice:secret", "alice:a:b" (the password may contain colons), "alice:".
+        assert_eq!(
+            BasicAuth::decode_credentials("YWxpY2U6c2VjcmV0"),
+            Some((String::from("alice"), b"secret".to_vec()))
+        );
+        assert_eq!(
+            BasicAuth::decode_credentials("YWxpY2U6YTpi"),
+            Some((String::from("alice"), b"a:b".to_vec()))
+        );
+        assert_eq!(
+            BasicAuth::decode_credentials("YWxpY2U6"),
+            Some((String::from("alice"), Vec::new()))
+        );
+        // "alice" without a colon, and something that is not base64.
+        assert_eq!(BasicAuth::decode_credentials("YWxpY2U="), None);
+        assert_eq!(BasicAuth::decode_credentials("alice:secret"), None);
     }
 }

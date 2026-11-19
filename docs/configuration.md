@@ -581,6 +581,8 @@ socket, except that `http` servers listing the same address share one socket
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
 | `ip_allow`, `ip_deny` | `[]` | CIDR ranges or addresses of the clients this server accepts and rejects, on every protocol, see [IP allow and deny lists](#ip-allow-and-deny-lists). |
 | `rate_limit` | | `{ rate, per, burst, key }`: requests each client may send, see [Rate limits](#rate-limits) (http only). |
+| `basic_auth` | | `{ users, realm }`: ask for a user name and password, see [Basic auth](#basic-auth) (http only). |
+| `forward_auth` | | `{ url, copy_headers, timeout }`: let an external service (Authelia, Authentik, oauth2-proxy) decide, see [Forward auth](#forward-auth) (http only). |
 | `max_connections_per_ip` | | Concurrent connections of one client IP; more are closed on accept, see [Connections per client](#connections-per-client) (http and tcp). |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header with the client address on every new connection to a backend, see [PROXY protocol output](#proxy-protocol-output) (http and tcp). |
 | `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). Set `trusted_proxies` too: with it empty any directly connecting client can spoof its address. |
@@ -841,6 +843,7 @@ match = [
 | `remote_ip` | List of CIDR ranges the directly connected peer must belong to. |
 | `ip_allow`, `ip_deny` | Client IP lists of this route, on top of the server's; a request the route matches but its lists reject gets `403`, see [IP allow and deny lists](#ip-allow-and-deny-lists). |
 | `rate_limit` | Rate limit of this route, on top of the server's, see [Rate limits](#rate-limits). |
+| `basic_auth`, `forward_auth` | Authentication of this route, each replacing the server's, see [Authentication](#authentication). |
 | `forward` / `serve` / `redirect` | Action, exactly one. `serve` is a directory or a [file server table](#file-server), `redirect` a target or `{ to, status }`, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `rewrite` | New URI of the request before it is forwarded or served, see [Rewrites and redirects](#rewrites-and-redirects). |
 | `handle_response` | List of handlers for upstream responses: change the status, or answer with a file or a redirect instead, see [Handling upstream responses](#handling-upstream-responses) (`forward` only). |
@@ -987,6 +990,125 @@ HTTP proxy that does not send a PROXY header every client shares the proxy's
 count; use `rate_limit` there. It counts connections, not requests: an
 HTTP/2 connection with many streams counts once. Connections that survive a
 reload are not counted by the new listeners. `udp` servers do not take it.
+
+### Authentication
+
+`basic_auth` and `forward_auth` on an `http` server protect every route of
+the server; on a `match` entry they protect that route, and each one
+replaces the server's setting of the same name there. A route with both
+checks the password first. Both run after `ip_allow`/`ip_deny` and
+`rate_limit`, so a rate limit also bounds password guessing.
+
+#### Basic auth
+
+`basic_auth` asks for a user name and password (RFC 7617). Requests without
+valid credentials get `401 Unauthorized` with `WWW-Authenticate` and never
+reach the backend.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `users` | required | `{ name = "hash" }`: user names and the bcrypt hash of their passwords (`$2a$`, `$2b$` or `$2y$`), never the passwords themselves. |
+| `realm` | `"Restricted"` | Name shown in the password prompt of browsers. |
+
+`rxh hash-password` hashes the password it reads from standard input;
+`htpasswd -nB` and `caddy hash-password` produce the same format:
+
+```console
+$ echo 'correct horse' | rxh hash-password
+$2b$12$kPuqTnXRi3Y7cvkLWm8wAeYpyHmdD9oIczdT8rhRWgBWjBVy7B5.G
+```
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "example.com"
+match = [
+    { uri = "/admin", rate_limit = { rate = 10, per = "1m" }, basic_auth = { realm = "Admin", users = { root = "$2b$12$kPuqTnXRi3Y7cvkLWm8wAeYpyHmdD9oIczdT8rhRWgBWjBVy7B5.G" } }, forward = "@admin" },
+    { forward = "@web" },
+]
+```
+
+Use it over TLS only: the browser sends the password with every request. A
+bcrypt check takes tens of milliseconds on purpose, so rxh runs it off the
+request threads and remembers (as a SHA-256, in memory, until a reload) the
+credentials that passed; wrong passwords pay the full cost each time. The
+`Authorization` header is forwarded to the backend unchanged. bcrypt only
+looks at the first 72 bytes of a password.
+
+#### Forward auth
+
+`forward_auth` asks an external service whether a request may pass, the way
+Traefik's `ForwardAuth` and Caddy's `forward_auth` do. For each request rxh
+sends a `GET` without a body to `url` with the headers of the request
+(cookies and `Authorization` included) plus:
+
+| Header | Value |
+|---|---|
+| `X-Forwarded-Method` | Method of the request. |
+| `X-Forwarded-Proto` | `https` or `http`. |
+| `X-Forwarded-Host` | Host the client asked for. |
+| `X-Forwarded-Uri` | Path and query of the request, before `rewrite`. |
+| `X-Forwarded-For` | Client IP. |
+
+`X-Forwarded-For`, `-Proto` and `-Host` sent by the client are only kept
+when the peer is in `trusted_proxies`, as for the backends; the method and
+URI are always those of the request. A `2xx` answer lets the request
+through. Any other answer goes to the client as it is, with its status,
+headers and body: the redirect to the login page, or a `401`. When the
+service cannot be reached the client gets `502`, when it does not answer
+within `timeout`, `504`: without an answer there is no access.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `url` | required | `http://` or `https://` URL of the verification endpoint of the service. |
+| `copy_headers` | `[]` | Headers of the `2xx` answer set on the request sent to the backend, such as the user name. The same headers sent by the client are removed, so the backend can trust them. |
+| `timeout` | `"10s"` | Time the service has to answer. |
+
+Authelia:
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "app.example.com"
+forward_auth = { url = "http://authelia:9091/api/authz/forward-auth", copy_headers = ["Remote-User", "Remote-Groups", "Remote-Email", "Remote-Name"] }
+forward = "@app"
+```
+
+Authentik (proxy provider in "forward auth" mode): the outpost path must
+reach the outpost without the check, so the check goes on the application
+route instead of the server.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "app.example.com"
+match = [
+    { uri = "/outpost.goauthentik.io", forward = "authentik:9000" },
+    { forward_auth = { url = "http://authentik:9000/outpost.goauthentik.io/auth/traefik", copy_headers = ["X-Authentik-Username", "X-Authentik-Groups", "X-Authentik-Email", "X-Authentik-Name", "X-Authentik-Uid"] }, forward = "@app" },
+]
+```
+
+oauth2-proxy (started with `--reverse-proxy --upstream=static://202`, and
+`--set-xauthrequest` for the headers): its root answers `202` to signed in
+users and redirects the others to the provider.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "app.example.com"
+match = [
+    { uri = "/oauth2", forward = "oauth2-proxy:4180" },
+    { forward_auth = { url = "http://oauth2-proxy:4180/", copy_headers = ["X-Auth-Request-User", "X-Auth-Request-Email"] }, forward = "@app" },
+]
+```
+
+Every check opens a new connection to the service. An `https://` service is
+verified against the public certificate authorities. `Set-Cookie` headers of
+a `2xx` answer are not passed on to the client.
 
 ### Rewrites and redirects
 

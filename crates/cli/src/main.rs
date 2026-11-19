@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use rxh_core::config::Config;
+use rxh_core::config::{BasicAuth, Config};
 
 use crate::cli::{Cli, Command};
 
@@ -40,6 +40,7 @@ fn main() -> ExitCode {
                 run_config(config)
             })
         }
+        Some(Command::HashPassword) => hash_password(),
         Some(command) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -80,6 +81,21 @@ fn file_server(listen: SocketAddr, root: &Path, browse: bool, encode: bool) -> R
     TcpListener::bind(listen).map_err(|err| format!("cannot listen on {listen}: {err}"))?;
     println!("Serving {} on http://{listen}", root.display());
     run_config(config)
+}
+
+/// `rxh hash-password`: prints the bcrypt hash of the first line of standard
+/// input.
+fn hash_password() -> Result<(), String> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| format!("cannot read the password: {err}"))?;
+    let password = line.trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        return Err(String::from("no password on standard input"));
+    }
+    println!("{}", BasicAuth::hash_password(password)?);
+    Ok(())
 }
 
 /// Runs a configuration that has no file in the foreground.

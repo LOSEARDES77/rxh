@@ -80,6 +80,9 @@ pub(crate) enum Command {
     /// List load balancing policies.
     Policies,
 
+    /// Hash the password read from standard input, for `basic_auth` users.
+    HashPassword,
+
     /// Show the effective configuration, with includes merged.
     #[command(subcommand)]
     Config(ConfigCommand),

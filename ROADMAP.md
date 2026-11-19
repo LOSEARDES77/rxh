@@ -115,7 +115,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] IP allow and deny lists on servers and routes (`ip_allow`, `ip_deny`).
 - [x] Rate limiting (`rate_limit`), concurrent connection limit per client
       (`max_connections_per_ip`).
-- [ ] Basic auth, forward auth (Authelia, Authentik, oauth2-proxy).
+- [x] Basic auth (`basic_auth`), forward auth (`forward_auth`: Authelia,
+      Authentik, oauth2-proxy).
 - [ ] Security header presets and CORS.
 - [ ] Admin API over a unix socket, and optional token authentication for
       remote admin.

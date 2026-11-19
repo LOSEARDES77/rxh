@@ -12,6 +12,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 use hyper::HeaderMap;
+use hyper::Method;
 use hyper::Response;
 use hyper::StatusCode;
 use hyper::Uri;
@@ -26,6 +27,8 @@ use crate::http::response;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+const X_FORWARDED_METHOD: HeaderName = HeaderName::from_static("x-forwarded-method");
+const X_FORWARDED_URI: HeaderName = HeaderName::from_static("x-forwarded-uri");
 
 const HOP_BY_HOP: [HeaderName; 9] = [
     header::CONNECTION,
@@ -238,20 +241,7 @@ pub(crate) fn prepare_request(
         headers.insert(header::UPGRADE, upgrade);
     }
 
-    // HTTP/2 clients send `:authority` instead of `Host`.
-    if !headers.contains_key(header::HOST)
-        && let Some(authority) = uri.authority()
-        && let Ok(value) = HeaderValue::from_str(authority.as_str())
-    {
-        headers.insert(header::HOST, value);
-    }
-
-    // A clone shares the bytes of the request head: the host name is not copied.
-    let host: HeaderValue = match headers.get(header::HOST) {
-        Some(value) if value.to_str().is_ok() => value.clone(),
-        _ => HeaderValue::from_str(&forwarding.local.to_string())
-            .expect("a socket address is visible ASCII"),
-    };
+    let host = ensure_host(headers, uri, forwarding.local);
     let proto = if forwarding.tls { "https" } else { "http" };
 
     set_x_forwarded(headers, client_ip, forwarding, &host, proto);
@@ -266,6 +256,56 @@ pub(crate) fn prepare_request(
         &rules.set,
         &rules.add,
     );
+}
+
+/// Sets `Host` from the URI when the request has none, and returns the host
+/// the client asked for (`local` when it named none).
+fn ensure_host(headers: &mut HeaderMap, uri: &Uri, local: SocketAddr) -> HeaderValue {
+    // HTTP/2 clients send `:authority` instead of `Host`.
+    if !headers.contains_key(header::HOST)
+        && let Some(authority) = uri.authority()
+        && let Ok(value) = HeaderValue::from_str(authority.as_str())
+    {
+        headers.insert(header::HOST, value);
+    }
+
+    // A clone shares the bytes of the request head: the host name is not copied.
+    match headers.get(header::HOST) {
+        Some(value) if value.to_str().is_ok() => value.clone(),
+        _ => HeaderValue::from_str(&local.to_string()).expect("a socket address is visible ASCII"),
+    }
+}
+
+/// Turns the headers of a client request into those of its `forward_auth`
+/// check: without the hop-by-hop ones, with `X-Forwarded-For`, `-Proto` and
+/// `-Host` as the backend would get them, and with the method and URI of the
+/// request in `X-Forwarded-Method` and `X-Forwarded-Uri`.
+pub(crate) fn prepare_auth_request(
+    headers: &mut HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    client_ip: IpAddr,
+    forwarding: &Forwarding<'_>,
+) {
+    remove_hop_by_hop(headers);
+    // The check has no body.
+    headers.remove(header::CONTENT_LENGTH);
+
+    let host = ensure_host(headers, uri, forwarding.local);
+    let proto = if forwarding.tls { "https" } else { "http" };
+    set_x_forwarded(headers, client_ip, forwarding, &host, proto);
+
+    let target = uri.path_and_query().map_or("/", |target| target.as_str());
+    // Never the client's own values: they decide what gets authorized.
+    headers.remove(&X_FORWARDED_METHOD);
+    headers.remove(&X_FORWARDED_URI);
+    if let (Ok(method), Ok(target)) = (
+        HeaderValue::from_str(method.as_str()),
+        HeaderValue::from_str(target),
+    ) {
+        headers.insert(X_FORWARDED_METHOD, method);
+        headers.insert(X_FORWARDED_URI, target);
+    }
 }
 
 fn set_x_forwarded(

@@ -24,10 +24,11 @@ use tokio::time::Instant;
 use crate::acme;
 use crate::error::Error;
 use crate::files::Files;
+use crate::http::auth::{BasicAuth, ForwardAuth};
 use crate::http::body::Guarded;
 use crate::http::cache::Cache;
 use crate::http::encode;
-use crate::http::headers::{self, Replacement, Via};
+use crate::http::headers::{self, Forwarding, Replacement, Via};
 use crate::http::proxy;
 use crate::http::rate_limit::RateLimiter;
 use crate::http::response::{self, BoxResponse};
@@ -58,6 +59,11 @@ pub(crate) struct Site {
 
     /// Server `rate_limit`, shared by the routes of the site.
     pub(crate) rate_limit: Option<RateLimiter>,
+
+    /// Server `basic_auth` and `forward_auth`, for the routes without their
+    /// own.
+    pub(crate) basic_auth: Option<BasicAuth>,
+    pub(crate) forward_auth: Option<ForwardAuth>,
 
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
@@ -104,6 +110,9 @@ pub(crate) struct Route {
     pub(crate) ip_deny: Vec<IpNet>,
     /// Entry `rate_limit`, on top of the site's.
     pub(crate) rate_limit: Option<RateLimiter>,
+    /// Entry `basic_auth` and `forward_auth`, each replacing the site's.
+    pub(crate) basic_auth: Option<BasicAuth>,
+    pub(crate) forward_auth: Option<ForwardAuth>,
 }
 
 impl Route {
@@ -174,6 +183,12 @@ impl Site {
         routes: &mut Vec<Route>,
     ) -> Result<(), Error> {
         let by = server.name.clone().unwrap_or_else(|| local.to_string());
+        let forward_auth = |settings: &Option<config::ForwardAuth>, label: &str| {
+            let built = settings.as_ref().map(ForwardAuth::new).transpose();
+            built.map_err(|err| {
+                Error::Config(ConfigError::Invalid(format!("{label}forward_auth: {err}")))
+            })
+        };
         let site = Arc::new(Self {
             log_name,
             via: Via::new(&by),
@@ -182,6 +197,8 @@ impl Site {
             ip_allow: server.ip_allow.clone(),
             ip_deny: server.ip_deny.clone(),
             rate_limit: server.rate_limit.as_ref().map(RateLimiter::new),
+            basic_auth: server.basic_auth.as_ref().map(BasicAuth::new),
+            forward_auth: forward_auth(&server.forward_auth, "")?,
             tls: server.tls.is_some(),
             client_subject_header: server
                 .client_auth
@@ -268,6 +285,11 @@ impl Site {
                 ip_allow: pattern.ip_allow.clone(),
                 ip_deny: pattern.ip_deny.clone(),
                 rate_limit: pattern.rate_limit.as_ref().map(RateLimiter::new),
+                basic_auth: pattern.basic_auth.as_ref().map(BasicAuth::new),
+                forward_auth: forward_auth(
+                    &pattern.forward_auth,
+                    &format!("match[{pattern_index}]: "),
+                )?,
             });
         }
 
@@ -360,6 +382,42 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 }
 
 impl Service {
+    /// Checks a request against the `basic_auth` and the `forward_auth` of
+    /// `route`, or of its site for the one the route does not set. Returns
+    /// the answer for a request that may not go on.
+    async fn authenticate(
+        &self,
+        route: &Route,
+        method: &Method,
+        uri: &Uri,
+        request_headers: &mut HeaderMap,
+    ) -> Option<BoxResponse> {
+        let site = &route.site;
+        if let Some(basic_auth) = route.basic_auth.as_ref().or(site.basic_auth.as_ref())
+            && !basic_auth.permits(request_headers).await
+        {
+            return Some(basic_auth.challenge());
+        }
+
+        let forward_auth = route.forward_auth.as_ref().or(site.forward_auth.as_ref())?;
+        let (client_ip, trusted) =
+            headers::client_ip(self.peer.ip(), request_headers, &site.trusted_proxies);
+        let forwarding = Forwarding {
+            peer: self.peer,
+            peer_ip: &self.peer_ip,
+            local: self.local,
+            trusted,
+            tls: site.tls,
+            by: &site.by,
+            via: &site.via,
+            rules: &route.request,
+            replace: &route.request_replace,
+        };
+        let mut headers = request_headers.clone();
+        headers::prepare_auth_request(&mut headers, method, uri, client_ip, &forwarding);
+        forward_auth.check(headers, request_headers).await
+    }
+
     async fn handle(self, mut request: Request<Incoming>) -> BoxResponse {
         if let Some(response) = acme::challenge_response(request.method(), request.uri().path()) {
             return response;
@@ -422,6 +480,15 @@ impl Service {
             *request.method_mut() = method.clone();
         }
 
+        // The auth service gets the method and URI the client sent.
+        let mut denied = match route {
+            Some(route) if !forbidden && retry_after.is_none() => {
+                self.authenticate(route, &method, &uri, request.headers_mut())
+                    .await
+            }
+            _ => None,
+        };
+
         // Declared length; bodies without one are counted as they stream.
         let declared = hyper::body::Body::size_hint(request.body()).lower();
         let too_large = route
@@ -434,6 +501,7 @@ impl Service {
             Some(_) if retry_after.is_some() => {
                 response::too_many_requests(retry_after.unwrap_or_default())
             }
+            Some(_) if denied.is_some() => denied.take().unwrap_or_else(response::forbidden),
             Some(_) if rewrite_failed => {
                 response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST")
             }
