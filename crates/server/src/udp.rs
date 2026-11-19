@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use rxh_core::address::BackendAddress;
 use rxh_core::net::{self, IpNet};
-use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
+use rxh_core::pool::{RequestGuard, SelectContext};
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 
@@ -108,8 +108,7 @@ async fn receive_loop(
                 // ponytail: session setup (DNS + bind) runs inline in the
                 // receive loop; move it to a task if setup latency matters.
                 match open_session(settings, client).await {
-                    Ok((session, upstream)) => {
-                        let guard = upstream.start_request();
+                    Ok((session, guard)) => {
                         replies.spawn(reply_loop(
                             Arc::clone(socket),
                             session.clone(),
@@ -151,13 +150,13 @@ async fn receive_loop(
 async fn open_session(
     settings: &UdpSettings,
     client: SocketAddr,
-) -> io::Result<(Session, Arc<Upstream>)> {
-    let selection = settings
+) -> io::Result<(Session, RequestGuard)> {
+    let (selection, guard) = settings
         .group
         .pool
-        .select(&SelectContext::l4(client.ip()))
+        .try_acquire(&SelectContext::l4(client.ip()))
         .ok_or_else(|| io::Error::other("no upstreams available"))?;
-    let upstream = selection.upstream;
+    let upstream = &selection.upstream;
 
     let address = BackendAddress::parse(upstream.address())
         .ok()
@@ -194,7 +193,7 @@ async fn open_session(
         bytes_sent: Arc::default(),
         bytes_received: Arc::default(),
     };
-    Ok((session, upstream))
+    Ok((session, guard))
 }
 
 async fn reply_loop(

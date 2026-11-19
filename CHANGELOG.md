@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- Per backend connection limits with a queue: `max_connections` on a pool
+  caps the requests in flight on each backend, and `queue_size` lets the
+  requests over it wait up to `queue_timeout` (default 5s) for a free
+  backend instead of getting `503` at once. `GET /pools` reports the
+  requests waiting as `queued`.
 - Consistent hashing with bounded loads and Maglev: on a pool with a hash
   policy, `hash_balance_factor = 125` keeps every backend at or below 125%
   of the average load by passing the keys of a busy backend on to the next

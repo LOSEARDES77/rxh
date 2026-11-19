@@ -111,13 +111,12 @@ async fn copy(group: &Group, mut request: Request<Body>, client: &Client) -> Res
         group.transport.connect(upstream.address(), preface).await
     })
     .await;
-    let (selection, connection) = match dialed {
+    let (selection, _guard, connection) = match dialed {
         Ok(dialed) => dialed,
         Err(DialError::NoUpstream) => return Err(String::from("no available upstream")),
         Err(DialError::Connect(err)) => return Err(format!("connect failed: {err}")),
     };
 
-    let _guard = selection.upstream.start_request();
     let started = Instant::now();
     let address = selection.upstream.address();
     if group.dialer.is_tls() && !client.sets_host {

@@ -1896,6 +1896,7 @@ dependencies = [
  "regex",
  "serde",
  "sha2",
+ "tokio",
  "toml",
  "toml_edit",
 ]
