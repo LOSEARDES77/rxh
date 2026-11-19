@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rxh_core::config::{Action, Admin, Forward, Policy};
+use rxh_core::pool::BackendState;
 use serde_json::{Value, json};
 
 use crate::cli::{
-    CertCommand, Cli, Command, ConfigCommand, PoolCommand, ServiceCommand, ServiceProtocol,
+    CertCommand, Cli, Command, ConfigCommand, Member, PoolCommand, ServiceCommand, ServiceProtocol,
     UpstreamCommand,
 };
 use crate::client::{AdminClient, ClientError};
@@ -259,16 +260,19 @@ fn print_pool(pool: &Value) {
     }
     println!(
         "  {:<28} {:>6} {:>8} {:>7} {:>9} {:>5}",
-        "ADDRESS", "WEIGHT", "HEALTHY", "ACTIVE", "REQUESTS", "FAILS"
+        "ADDRESS", "WEIGHT", "STATE", "ACTIVE", "REQUESTS", "FAILS"
     );
     for upstream in upstreams {
         let health = match (
+            upstream["state"].as_str(),
             upstream["healthy"].as_bool(),
             upstream["available"].as_bool(),
         ) {
-            (Some(true), Some(true)) => "yes",
-            (Some(true), _) => "full",
-            (Some(false), _) => "NO",
+            (Some("drain"), ..) => "drain",
+            (Some("maintenance"), ..) => "maint",
+            (_, Some(true), Some(true)) => "yes",
+            (_, Some(true), _) => "full",
+            (_, Some(false), _) => "NO",
             _ => "?",
         };
         println!(
@@ -562,7 +566,41 @@ async fn upstream(cli: &Cli, client: &AdminClient, command: UpstreamCommand) -> 
             }
             Ok(())
         }
+        UpstreamCommand::Drain(member) => set_state(client, &member, BackendState::Drain).await,
+        UpstreamCommand::Maintenance(member) => {
+            set_state(client, &member, BackendState::Maintenance).await
+        }
+        UpstreamCommand::Ready(member) => set_state(client, &member, BackendState::Ready).await,
     }
+}
+
+async fn set_state(
+    client: &AdminClient,
+    member: &Member,
+    state: BackendState,
+) -> Result<(), String> {
+    let Member { pool, address } = member;
+    let body = json!({ "address": address, "state": state });
+    let status = client
+        .post(
+            &format!("/pools/{}/upstreams/state", encode(pool)),
+            Some(body),
+        )
+        .await
+        .map_err(|err| match err {
+            ClientError::Unreachable(_) => {
+                format!("{err}; backend states only exist in a running daemon")
+            }
+            err => err.to_string(),
+        })?;
+    let in_flight = status["upstreams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|upstream| upstream["address"] == address.as_str())
+        .map_or(0, |upstream| upstream["num_requests"].as_u64().unwrap_or(0));
+    println!("{address} of pool {pool} is now {state} ({in_flight} requests in flight)");
+    Ok(())
 }
 
 fn list_pools_from_file(path: &Path, only: Option<&str>) -> Result<(), String> {

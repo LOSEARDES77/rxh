@@ -26,7 +26,7 @@ Saved 10.0.0.12:8080 to pool web in /etc/rxh/rxh.toml
 Added 10.0.0.12:8080 to pool web on the running daemon
 $ rxh status
 pool web (least_conn)
-  ADDRESS                      WEIGHT  HEALTHY  ACTIVE  REQUESTS FAILS
+  ADDRESS                      WEIGHT    STATE  ACTIVE  REQUESTS FAILS
   10.0.0.11:8080                    1      yes      12     48210     0
   10.0.0.12:8080                    1      yes       9        97     0
 ```

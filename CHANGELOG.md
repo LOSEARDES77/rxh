@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- Drain and maintenance states: `rxh upstream drain web 10.0.0.1:80`,
+  `rxh upstream maintenance` and `rxh upstream ready` (admin API
+  `PUT /pools/{name}/upstreams/state`) take a backend out of rotation while
+  requests in flight finish. A draining backend keeps its `cookie` sticky
+  sessions; one in maintenance gets nothing. Kept across reloads, shown as
+  `state` in `GET /pools` and in `rxh upstream list`.
 - Slow start: `slow_start = "30s"` on a pool ramps the share of traffic of
   a backend up from nothing to full when it joins at runtime (admin API,
   DNS or service discovery) or comes back from active or passive health

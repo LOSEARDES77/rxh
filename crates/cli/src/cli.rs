@@ -222,6 +222,29 @@ pub(crate) enum UpstreamCommand {
         #[command(flatten)]
         persistence: Persistence,
     },
+
+    /// Send no new requests to a backend. Requests in flight and `cookie`
+    /// sticky sessions finish. Runtime only, kept across reloads.
+    Drain(Member),
+
+    /// Send no requests at all to a backend, sticky sessions included.
+    /// Requests in flight finish. Runtime only, kept across reloads.
+    #[command(visible_alias = "maint")]
+    Maintenance(Member),
+
+    /// Put a drained or maintenance backend back into rotation.
+    #[command(visible_alias = "enable")]
+    Ready(Member),
+}
+
+/// One backend of a pool.
+#[derive(Debug, Args)]
+pub(crate) struct Member {
+    /// Pool name.
+    pub(crate) pool: String,
+
+    /// Backend address, as listed by `rxh upstream list`.
+    pub(crate) address: String,
 }
 
 #[derive(Debug, Clone, Copy, Args)]
@@ -365,6 +388,29 @@ mod tests {
         };
         assert_eq!(pool, "api");
         assert_eq!(weight, 3);
+    }
+
+    #[test]
+    fn parses_upstream_states() {
+        let cli = Cli::parse_from(["rxh", "upstream", "drain", "web", "10.0.0.1:80"]);
+        let Some(Command::Upstream(UpstreamCommand::Drain(member))) = cli.command else {
+            panic!("unexpected parse: {cli:?}");
+        };
+        assert_eq!(
+            (member.pool.as_str(), member.address.as_str()),
+            ("web", "10.0.0.1:80")
+        );
+        let cli = Cli::parse_from(["rxh", "upstream", "maint", "web", "10.0.0.1:80"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Upstream(UpstreamCommand::Maintenance(_)))
+        ));
+        let cli = Cli::parse_from(["rxh", "upstream", "enable", "web", "10.0.0.1:80"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Upstream(UpstreamCommand::Ready(_)))
+        ));
+        assert!(Cli::try_parse_from(["rxh", "upstream", "drain", "web"]).is_err());
     }
 
     #[test]

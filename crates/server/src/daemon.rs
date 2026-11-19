@@ -139,10 +139,11 @@ impl Generation {
         // configuration as written.
         let (effective, plan) = docker::plan(&config.with_https_redirects(), &containers);
         let registry = Arc::new(Registry::build(&effective)?);
-        if let Some(previous) = previous {
-            registry.inherit_dynamic(previous);
-        }
+        // Docker members first, so they keep their drain state too.
         plan.sync(&registry);
+        if let Some(previous) = previous {
+            registry.inherit(previous);
+        }
         let (stop, stopped) = oneshot::channel::<()>();
         let (servers, acme, task) = match effective.runtime {
             Runtime::Shared => {

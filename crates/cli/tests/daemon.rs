@@ -637,6 +637,49 @@ async fn status_and_listings_render_tables() {
         "{one}"
     );
 
+    // Drain, maintenance and back: shown in the listings, traffic follows,
+    // and the configuration file is left alone.
+    let before = std::fs::read_to_string(dir.join("rxh.toml")).expect("read");
+    let drained = assert_success(&rxh(
+        dir,
+        admin,
+        &["upstream", "drain", "api", &live.to_string()],
+    ));
+    assert_eq!(
+        drained.trim(),
+        format!("{live} of pool api is now drain (0 requests in flight)")
+    );
+    let one = assert_success(&rxh(dir, admin, &["upstream", "list", "api"]));
+    assert_eq!(health_of(&one, live), "drain", "{one}");
+    assert_ne!(
+        try_get(web).await.as_deref(),
+        Some("live"),
+        "the only healthy backend is draining"
+    );
+    assert_success(&rxh(
+        dir,
+        admin,
+        &["upstream", "maint", "api", &live.to_string()],
+    ));
+    let one = assert_success(&rxh(dir, admin, &["upstream", "list", "api"]));
+    assert_eq!(health_of(&one, live), "maint", "{one}");
+    assert_success(&rxh(
+        dir,
+        admin,
+        &["upstream", "ready", "api", &live.to_string()],
+    ));
+    let one = assert_success(&rxh(dir, admin, &["upstream", "list", "api"]));
+    assert_eq!(health_of(&one, live), "yes", "{one}");
+    wait_for_body(web, "live").await;
+    let after = std::fs::read_to_string(dir.join("rxh.toml")).expect("read");
+    assert_eq!(before, after);
+    let stderr = assert_failure(&rxh(
+        dir,
+        admin,
+        &["upstream", "drain", "api", "127.0.0.1:1"],
+    ));
+    assert!(stderr.contains("is not in pool api"), "{stderr}");
+
     // Admin API errors are reported with a failing exit code.
     let stderr = assert_failure(&rxh(dir, admin, &["upstream", "list", "nope"]));
     assert!(stderr.contains("no pool named nope"), "{stderr}");

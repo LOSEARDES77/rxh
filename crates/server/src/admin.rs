@@ -51,7 +51,7 @@ use hyper::header;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use rxh_core::config::{AdminListen, Backend, Config};
-use rxh_core::pool::PoolError;
+use rxh_core::pool::{BackendState, PoolError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -121,6 +121,12 @@ struct UpstreamBody {
     address: String,
     #[serde(default = "one")]
     weight: u32,
+}
+
+#[derive(Deserialize)]
+struct StateBody {
+    address: String,
+    state: BackendState,
 }
 
 fn one() -> u32 {
@@ -322,6 +328,13 @@ async fn handle(
                 Err(response) => *response,
             }
         }
+        (&Method::POST | &Method::PUT, ["pools", name, "upstreams", "state"]) => {
+            let name = (*name).to_owned();
+            match read_json::<StateBody>(request).await {
+                Ok(body) => set_state(&state, &name, &body),
+                Err(response) => *response,
+            }
+        }
         (&Method::DELETE, ["pools", name, "upstreams"]) => {
             let name = (*name).to_owned();
             let query_address = request.uri().query().and_then(|query| {
@@ -503,6 +516,21 @@ fn add_upstream(state: &AdminState, name: &str, body: UpstreamBody) -> Response<
         }
         Err(err @ PoolError::InvalidAddress(_)) => error(StatusCode::BAD_REQUEST, &err.to_string()),
         Err(err) => error(StatusCode::CONFLICT, &err.to_string()),
+    }
+}
+
+fn set_state(state: &AdminState, name: &str, body: &StateBody) -> Response<Full<Bytes>> {
+    let Some(group) = registry(state).get(name) else {
+        return error(StatusCode::NOT_FOUND, &format!("no pool named {name}"));
+    };
+    if group.pool.set_state(&body.address, body.state) {
+        println!("Admin => {} of {name} is now {}", body.address, body.state);
+        json_response(StatusCode::OK, &group.pool.status())
+    } else {
+        error(
+            StatusCode::NOT_FOUND,
+            &format!("{} is not in pool {name}", body.address),
+        )
     }
 }
 
