@@ -2475,6 +2475,21 @@ pub struct UpstreamGroup {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_conns_per_host: usize,
 
+    /// Maximum requests in flight (connections, for `tcp` and `udp` servers)
+    /// per backend. `0` means no limit (HAProxy `maxconn`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_connections: usize,
+
+    /// Requests that may wait for a backend when all of them are at
+    /// `max_connections`; the ones over it are refused. `0` refuses at once
+    /// (HAProxy `maxqueue`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub queue_size: usize,
+
+    /// Longest wait in the queue (HAProxy `timeout queue`).
+    #[serde(default = "default::queue_timeout", with = "duration")]
+    pub queue_timeout: Duration,
+
     /// Bytes of each request body read before the request is sent upstream.
     /// `0` streams it (Caddy `request_buffers`).
     #[serde(
@@ -2680,6 +2695,9 @@ impl UpstreamGroup {
             keepalive: default::keepalive(),
             keepalive_idle_conns_per_host: default::keepalive_idle_conns_per_host(),
             max_conns_per_host: 0,
+            max_connections: 0,
+            queue_size: 0,
+            queue_timeout: default::queue_timeout(),
             request_buffers: 0,
             response_buffers: 0,
             flush_interval: None,
@@ -2800,6 +2818,13 @@ impl UpstreamGroup {
 
         if let Some(breaker) = &self.circuit_breaker {
             breaker.validate()?;
+        }
+
+        if self.queue_size > 0 && self.max_connections == 0 {
+            return Err(String::from("queue_size needs max_connections"));
+        }
+        if self.queue_timeout.is_zero() {
+            return Err(String::from("queue_timeout must be above 0"));
         }
 
         if self.slow_start.is_some_and(|duration| duration.is_zero()) {
@@ -4646,6 +4671,10 @@ mod default {
         Duration::from_secs(3)
     }
 
+    pub fn queue_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
     pub fn keepalive() -> Duration {
         Duration::from_secs(120)
     }
@@ -4906,6 +4935,36 @@ mod tests {
         );
         assert!(!invalid("hash_balance_factor = 1.5").is_empty());
         assert!(!invalid("hash_type = \"ketama\"").is_empty());
+    }
+
+    #[test]
+    fn connection_limit_keys() {
+        let parse = |keys: &str| {
+            Config::from_toml(&format!(
+                "[upstream.api]\nbackends = [\"127.0.0.1:81\"]\n{keys}\n"
+            ))
+        };
+        let group = &parse("").unwrap().upstreams["api"];
+        assert_eq!(
+            (group.max_connections, group.queue_size, group.queue_timeout),
+            (0, 0, Duration::from_secs(5))
+        );
+        let group = &parse("max_connections = 2\nqueue_size = 8\nqueue_timeout = \"250ms\"")
+            .unwrap()
+            .upstreams["api"];
+        assert_eq!(
+            (group.max_connections, group.queue_size, group.queue_timeout),
+            (2, 8, Duration::from_millis(250))
+        );
+
+        let invalid = |keys: &str| parse(keys).unwrap_err().to_string();
+        assert!(invalid("queue_size = 1").contains("queue_size needs max_connections"));
+        assert!(
+            invalid("max_connections = 1\nqueue_timeout = \"0s\"")
+                .contains("queue_timeout must be above 0")
+        );
+        assert!(invalid("max_connections = -1").contains("max_connections"));
+        assert!(invalid("max_connections = 1\nqueue_size = \"many\"").contains("queue_size"));
     }
 
     #[test]

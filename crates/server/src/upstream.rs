@@ -5,12 +5,13 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rxh_core::pool::{Pool, SelectContext, Selection, Upstream};
+use rxh_core::pool::{Pool, RequestGuard, SelectContext, Selection, Upstream};
 
 /// Why no upstream connection could be made.
 #[derive(Debug)]
 pub(crate) enum DialError {
-    /// The pool has no available member (all down, full or empty).
+    /// The pool has no available member (all down, full or empty), or the
+    /// request waited `queue_timeout` for one below `max_connections`.
     NoUpstream,
 
     /// The last attempt failed to connect.
@@ -19,12 +20,13 @@ pub(crate) enum DialError {
 
 /// Selects an upstream and connects to it, retrying according to the pool's
 /// `retries`, `try_duration` and `try_interval` settings. Connection failures
-/// are reported to passive health checks.
+/// are reported to passive health checks. The request counts as in flight
+/// on the backend, within `max_connections`, until the guard is dropped.
 pub(crate) async fn connect_with_retries<T, F, Fut>(
     pool: &Pool,
     context: &SelectContext<'_>,
     mut connect: F,
-) -> Result<(Selection, T), DialError>
+) -> Result<(Selection, RequestGuard, T), DialError>
 where
     F: FnMut(Arc<Upstream>) -> Fut,
     Fut: Future<Output = io::Result<T>>,
@@ -34,9 +36,19 @@ where
     let mut attempts = 0;
 
     loop {
-        let error = match pool.select(context) {
-            Some(selection) => match connect(Arc::clone(&selection.upstream)).await {
-                Ok(connection) => return Ok((selection, connection)),
+        let Ok(acquired) =
+            tokio::time::timeout(settings.queue_timeout, pool.acquire(context)).await
+        else {
+            eprintln!(
+                "{} => no backend below max_connections within {:?}",
+                pool.name(),
+                settings.queue_timeout
+            );
+            return Err(DialError::NoUpstream);
+        };
+        let error = match acquired {
+            Some((selection, guard)) => match connect(Arc::clone(&selection.upstream)).await {
+                Ok(connection) => return Ok((selection, guard, connection)),
                 Err(err) => {
                     selection.upstream.record_failure();
                     eprintln!(

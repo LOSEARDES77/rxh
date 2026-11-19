@@ -1012,6 +1012,9 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `hash_type` | `"rendezvous"` | HAProxy `hash-type`, Envoy `MAGLEV` | How the hash policies map a key to a backend: `"rendezvous"` or `"maglev"`, see [Consistent hashing](#consistent-hashing). |
 | `hash_balance_factor` | unset | HAProxy `hash-balance-factor` | Bounded loads for the hash policies: the most a backend may carry, in percent of the average load, see [Consistent hashing](#consistent-hashing). At least `100`. |
 | `slow_start` | unset | Nginx Plus `slow_start` | Duration over which a backend that joins the pool at runtime or comes back healthy ramps up to its full share of the traffic, see [Slow start](#slow-start). `0` is rejected. |
+| `max_connections` | `0` | HAProxy `maxconn` | Most requests in flight (connections on `tcp` servers, sessions on `udp`) on each backend, see [Connection limits](#connection-limits). `0` means no limit. |
+| `queue_size` | `0` | HAProxy `maxqueue` | Requests that may wait for a backend when all are at `max_connections`. `0` answers `503` at once. Needs `max_connections`. |
+| `queue_timeout` | `"5s"` | HAProxy `timeout queue` | Longest wait in the queue before `503`. |
 
 Example: at most 8 connections per backend, uploads up to 64 KiB buffered
 before they are sent, responses up to 1 MiB buffered:
@@ -1278,6 +1281,35 @@ backend.
 
 With both hash types, the keys of a backend that is unavailable or at the
 bound go to the next backend in rendezvous order.
+
+
+### Connection limits
+
+`max_connections` caps the requests in flight on each backend of a pool
+(HAProxy `maxconn`): connections on `tcp` servers, sessions on `udp`. A
+backend at its limit is skipped by every policy. When all the usable backends
+are at their limit, a request gets `503` (a `tcp` connection is closed),
+unless the pool has a queue:
+
+```toml
+[upstream.api]
+backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
+max_connections = 50     # per backend
+queue_size = 200         # requests waiting, for the whole pool
+queue_timeout = "2s"     # default "5s"
+```
+
+Up to `queue_size` requests then wait for a backend to finish a request, and
+get `503` after `queue_timeout`. Requests over `queue_size` are refused at
+once, and nothing waits for backends that are down, draining or in
+maintenance. `GET /pools` shows the requests waiting as `queued`.
+
+The limit is one value for all the backends of the pool and is counted per
+process. It is different from `max_conns_per_host`, which bounds the
+HTTP/1.1 connections of the transport and makes requests wait for that same
+backend without a limit or a timeout. A request with a `cookie` session
+whose backend is full goes to another backend. `udp` datagrams of new
+sessions over the limit are dropped, never queued.
 
 ### Slow start
 

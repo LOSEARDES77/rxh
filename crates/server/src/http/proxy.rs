@@ -243,13 +243,12 @@ pub(crate) async fn forward(
         )
         .await;
 
-        let (selection, upstream_connection) = match dialed {
+        let (selection, guard, upstream_connection) = match dialed {
             Ok(dialed) => dialed,
             Err(DialError::NoUpstream) => return response::service_unavailable(),
             Err(DialError::Connect(_)) => return response::bad_gateway(),
         };
 
-        let guard = selection.upstream.start_request();
         let address = selection.upstream.address();
         if rewrite_host {
             set_backend_host(&mut outgoing, address);

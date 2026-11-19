@@ -179,7 +179,7 @@ pub(crate) async fn proxy<S>(
     };
     let text = log.logger.is_text();
 
-    let (selection, mut backend) = match dialed {
+    let (selection, _guard, mut backend) = match dialed {
         Ok(dialed) => dialed,
         Err(DialError::NoUpstream) => {
             json(None, 0, 0);
@@ -198,7 +198,6 @@ pub(crate) async fn proxy<S>(
     };
 
     selection.upstream.record_success();
-    let _guard = selection.upstream.start_request();
     let address = selection.upstream.address();
 
     // Traffic from the client is a read of `client`, traffic from the backend

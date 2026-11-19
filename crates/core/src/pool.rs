@@ -16,6 +16,7 @@ use http::header;
 use http::{HeaderMap, Uri};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::sync::Notify;
 
 use crate::config::{
     Backend, CircuitBreaker, Fallback, HashType, PassiveHealth, Policy, UpstreamGroup,
@@ -348,6 +349,9 @@ pub struct PoolStatus {
     /// Selection policy.
     pub policy: Policy,
 
+    /// Requests waiting for a backend below `max_connections`.
+    pub queued: usize,
+
     /// Members.
     pub upstreams: Vec<UpstreamStatus>,
 }
@@ -371,6 +375,10 @@ pub struct Upstream {
     failures: Mutex<VecDeque<Instant>>,
     breaker: Option<Breaker>,
     ramp: Option<Ramp>,
+    /// Requests in flight allowed at once, `0` for no limit.
+    max_connections: usize,
+    /// Wakes the queue of the pool when this backend can take a request.
+    released: Arc<Notify>,
     /// [`BackendState`] as its discriminant.
     state: AtomicU8,
 }
@@ -382,6 +390,8 @@ impl Upstream {
         breaker: Option<CircuitBreaker>,
         slow_start: Option<Duration>,
         cookie_secret: Option<&str>,
+        max_connections: usize,
+        released: Arc<Notify>,
     ) -> Self {
         let cookie = cookie_secret.map(|secret| cookie_value(secret, &backend.address));
         Self {
@@ -401,6 +411,8 @@ impl Upstream {
             failures: Mutex::new(VecDeque::new()),
             breaker: breaker.map(Breaker::new),
             ramp: slow_start.map(Ramp::new),
+            max_connections,
+            released,
             state: AtomicU8::new(BackendState::Ready as u8),
         }
     }
@@ -457,6 +469,7 @@ impl Upstream {
         let before = BackendState::from_u8(self.state.swap(state as u8, Ordering::Relaxed));
         if state == BackendState::Ready && before != BackendState::Ready {
             self.start_ramp();
+            self.released.notify_waiters();
         }
     }
 
@@ -478,7 +491,14 @@ impl Upstream {
         self.ramp.as_ref().is_none_or(Ramp::admits)
     }
 
+    fn at_max_connections(&self) -> bool {
+        self.max_connections > 0 && self.active_requests() >= self.max_connections
+    }
+
     fn is_full(&self) -> bool {
+        if self.at_max_connections() {
+            return true;
+        }
         // A half open breaker lets one trial request through at a time.
         if self.circuit() == Some(CircuitState::HalfOpen) && self.active_requests() > 0 {
             return true;
@@ -619,6 +639,7 @@ impl Upstream {
             if !healthy && streak >= passes {
                 self.checked_healthy.store(true, Ordering::Relaxed);
                 self.start_ramp();
+                self.released.notify_waiters();
                 return Some(true);
             }
         } else {
@@ -633,12 +654,29 @@ impl Upstream {
         None
     }
 
-    /// Counts a request in flight until the returned guard is dropped.
+    /// Counts a request in flight until the returned guard is dropped, even
+    /// over `max_connections`.
     #[must_use]
     pub fn start_request(self: &Arc<Self>) -> RequestGuard {
         self.active.fetch_add(1, Ordering::Relaxed);
         self.total.fetch_add(1, Ordering::Relaxed);
         RequestGuard(Arc::clone(self))
+    }
+
+    /// Like [`Upstream::start_request`], but `None` when the backend is at
+    /// `max_connections`. Concurrent callers never exceed the limit.
+    #[must_use]
+    pub fn try_start_request(self: &Arc<Self>) -> Option<RequestGuard> {
+        if self.max_connections == 0 {
+            return Some(self.start_request());
+        }
+        self.active
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                (active < self.max_connections).then_some(active + 1)
+            })
+            .ok()?;
+        self.total.fetch_add(1, Ordering::Relaxed);
+        Some(RequestGuard(Arc::clone(self)))
     }
 
     /// Snapshot for the admin API.
@@ -673,6 +711,9 @@ impl RequestGuard {
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::Relaxed);
+        if self.0.max_connections > 0 {
+            self.0.released.notify_one();
+        }
     }
 }
 
@@ -714,6 +755,9 @@ pub struct Pool {
     members: RwLock<Arc<Members>>,
     cursor: AtomicUsize,
     allow_unix: bool,
+    /// Requests waiting in [`Pool::acquire`].
+    queued: AtomicUsize,
+    released: Arc<Notify>,
 }
 
 impl Pool {
@@ -731,6 +775,8 @@ impl Pool {
             members: RwLock::new(Arc::default()),
             cursor: AtomicUsize::new(0),
             allow_unix: true,
+            queued: AtomicUsize::new(0),
+            released: Arc::default(),
         };
 
         let mut upstreams: Vec<Arc<Upstream>> = Vec::with_capacity(backends.len());
@@ -763,6 +809,8 @@ impl Pool {
             self.settings.circuit_breaker.clone(),
             self.settings.slow_start,
             self.settings.cookie_secret(),
+            self.settings.max_connections,
+            Arc::clone(&self.released),
         )
     }
 
@@ -821,6 +869,7 @@ impl Pool {
         PoolStatus {
             name: self.name.clone(),
             policy: self.settings.policy,
+            queued: self.queued.load(Ordering::Relaxed),
             upstreams: self
                 .members()
                 .upstreams
@@ -1017,6 +1066,60 @@ impl Pool {
         self.choose(node, &members, context)
     }
 
+    /// Selects a backend and counts a request in flight on it, within its
+    /// `max_connections`. `None` if no backend is available.
+    #[must_use]
+    pub fn try_acquire(&self, context: &SelectContext<'_>) -> Option<(Selection, RequestGuard)> {
+        loop {
+            let selection = self.select(context)?;
+            // Lost only to a concurrent request that took the last slot.
+            if let Some(guard) = selection.upstream.try_start_request() {
+                return Some((selection, guard));
+            }
+        }
+    }
+
+    /// Like [`Pool::try_acquire`], but when the usable backends are all at
+    /// `max_connections` the request waits in the queue of the pool until
+    /// one of them is free. `None` if no backend is available for another
+    /// reason, or if `queue_size` requests are waiting already. The caller
+    /// bounds the wait (`queue_timeout`) by dropping the future.
+    pub async fn acquire(&self, context: &SelectContext<'_>) -> Option<(Selection, RequestGuard)> {
+        if let Some(acquired) = self.try_acquire(context) {
+            return Some(acquired);
+        }
+        if self.queued.fetch_add(1, Ordering::Relaxed) >= self.settings.queue_size {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        let _queued = Queued(self);
+
+        loop {
+            let mut released = std::pin::pin!(self.released.notified());
+            // Registered before looking, so a release in between is not lost.
+            released.as_mut().enable();
+            if let Some(acquired) = self.try_acquire(context) {
+                return Some(acquired);
+            }
+            if !self.is_saturated() {
+                // Nothing to wait for; the other waiters must see that too.
+                self.released.notify_one();
+                return None;
+            }
+            released.await;
+        }
+    }
+
+    /// True when a member would take requests if it were not at
+    /// `max_connections`.
+    fn is_saturated(&self) -> bool {
+        self.members().upstreams.iter().any(|upstream| {
+            upstream.state() == BackendState::Ready
+                && upstream.is_healthy()
+                && upstream.at_max_connections()
+        })
+    }
+
     /// Selects with `node`; when its policy cannot decide, with its fallback.
     fn choose(
         &self,
@@ -1117,6 +1220,15 @@ impl Pool {
             upstream,
             set_cookie,
         })
+    }
+}
+
+/// A request counted in the queue of a pool.
+struct Queued<'a>(&'a Pool);
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1613,6 +1725,92 @@ mod tests {
         assert_eq!(pick(&pool, &context()), "b:1");
         drop(guard);
         assert_eq!(pick(&pool, &context()), "a:1");
+    }
+
+    fn limited(max_connections: usize, queue_size: usize) -> Pool {
+        let mut config = group(Policy::First, &[("a:1", 1), ("b:1", 1)]);
+        config.max_connections = max_connections;
+        config.queue_size = queue_size;
+        Pool::new("t", &config).unwrap()
+    }
+
+    /// Polls a future once: the queue needs no runtime.
+    fn poll<F: Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[test]
+    fn max_connections_spills_over_then_refuses() {
+        let pool = limited(1, 0);
+        let context = context();
+        let (first, _a) = pool.try_acquire(&context).unwrap();
+        let (second, b) = pool.try_acquire(&context).unwrap();
+        assert_eq!(
+            (first.upstream.address(), second.upstream.address()),
+            ("a:1", "b:1")
+        );
+        assert!(pool.try_acquire(&context).is_none());
+        assert!(second.upstream.try_start_request().is_none());
+        // Without a queue, `acquire` refuses at once too.
+        let mut refused = std::pin::pin!(pool.acquire(&context));
+        assert!(matches!(
+            poll(refused.as_mut()),
+            std::task::Poll::Ready(None)
+        ));
+
+        drop(b);
+        assert_eq!(
+            pool.try_acquire(&context).unwrap().0.upstream.address(),
+            "b:1"
+        );
+    }
+
+    #[test]
+    fn queue_waits_for_a_release_and_is_bounded() {
+        let pool = limited(1, 1);
+        let context = context();
+        let (_, a) = pool.try_acquire(&context).unwrap();
+        let (_, _b) = pool.try_acquire(&context).unwrap();
+
+        let mut waiting = std::pin::pin!(pool.acquire(&context));
+        assert!(poll(waiting.as_mut()).is_pending());
+        assert_eq!(pool.status().queued, 1);
+        // The queue holds one request: the next is refused.
+        let mut over = std::pin::pin!(pool.acquire(&context));
+        assert!(matches!(poll(over.as_mut()), std::task::Poll::Ready(None)));
+
+        drop(a);
+        let std::task::Poll::Ready(Some((selection, _guard))) = poll(waiting.as_mut()) else {
+            panic!("the released slot goes to the queued request");
+        };
+        assert_eq!(selection.upstream.address(), "a:1");
+        assert_eq!(pool.status().queued, 0);
+    }
+
+    #[test]
+    fn queue_does_not_wait_for_down_backends() {
+        let pool = limited(1, 4);
+        let context = context();
+        for upstream in pool.upstreams() {
+            upstream.set_state(BackendState::Maintenance);
+        }
+        let mut refused = std::pin::pin!(pool.acquire(&context));
+        assert!(matches!(
+            poll(refused.as_mut()),
+            std::task::Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn leaving_the_queue_frees_its_place() {
+        let pool = limited(1, 1);
+        let context = context();
+        let _guards = [pool.try_acquire(&context), pool.try_acquire(&context)];
+        {
+            let mut waiting = std::pin::pin!(pool.acquire(&context));
+            assert!(poll(waiting.as_mut()).is_pending());
+        }
+        assert_eq!(pool.status().queued, 0);
     }
 
     #[test]
