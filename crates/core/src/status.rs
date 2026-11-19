@@ -3,10 +3,11 @@
 use std::fmt;
 use std::str::FromStr;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Matches one status code or a whole class (`2xx`, `5xx`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "StatusOption", into = "String")]
 pub enum StatusMatcher {
     /// A single code, like `404`.
@@ -74,7 +75,7 @@ impl From<StatusMatcher> for String {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum StatusOption {
     Number(u16),

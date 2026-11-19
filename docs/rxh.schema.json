@@ -1,0 +1,3195 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RXH configuration",
+  "description": "Entire configuration file.",
+  "type": "object",
+  "properties": {
+    "acme": {
+      "description": "Certificate authority settings for `tls = \"auto\"` servers.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Acme"
+        }
+      ],
+      "default": {
+        "ca": "https://acme-v02.api.letsencrypt.org/directory",
+        "challenge": "http-01",
+        "http_port": 80,
+        "renew_before": "30d",
+        "storage": "rxh-data/certificates"
+      }
+    },
+    "admin": {
+      "description": "Admin API settings.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Admin"
+        }
+      ],
+      "default": {
+        "enabled": true,
+        "listen": "127.0.0.1:2019"
+      }
+    },
+    "consul": {
+      "description": "Routes to the healthy instances of the Consul catalog services tagged\n`rxh.enable=true`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Catalog"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "docker": {
+      "description": "Routes to Docker containers, taken from their `rxh.*` labels.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Docker"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "etcd": {
+      "description": "Routes to the service instances written under a prefix of etcd.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Catalog"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "grace_period": {
+      "description": "Maximum time to wait for open connections during shutdown or reload.\n`None` waits forever, like Caddy's default.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Duration"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "include": {
+      "description": "Files merged into this one, relative to the directory of the main\nfile. `*` and `?` work in the last path component. Followed by the\nloader of the daemon, which empties this list after merging.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "kubernetes": {
+      "description": "Routes the hosts of the Kubernetes Ingresses and Gateway API\nHTTPRoutes to the ready endpoints of their Services.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Catalog"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "log": {
+      "description": "Access log settings.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Log"
+        }
+      ],
+      "default": {
+        "access": true,
+        "format": "text",
+        "output": "stdout"
+      }
+    },
+    "nomad": {
+      "description": "Routes to the Nomad services tagged `rxh.enable=true`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Catalog"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "runtime": {
+      "description": "How the listeners are spread over the CPUs.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Runtime"
+        }
+      ]
+    },
+    "server": {
+      "description": "Listeners.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/Server"
+      }
+    },
+    "tracing": {
+      "description": "OpenTelemetry tracing of HTTP requests. Off when absent.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Tracing"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "upstream": {
+      "description": "Named load balancing groups, referenced from servers as `\"@name\"`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/UpstreamGroup"
+      }
+    },
+    "watch": {
+      "description": "Reload when the configuration file or one of its included files\nchanges, as `rxh reload` would.",
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Acme": {
+      "description": "The `[acme]` table: where `tls = \"auto\"` certificates come from and where\nthey are kept.",
+      "type": "object",
+      "properties": {
+        "ca": {
+          "description": "Directory URL of the certificate authority.",
+          "type": "string",
+          "default": "https://acme-v02.api.letsencrypt.org/directory"
+        },
+        "ca_root": {
+          "description": "PEM file with the root certificate trusted for the CA's own HTTPS\nendpoint instead of the system roots, for test CAs like Pebble.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "challenge": {
+          "description": "How the CA validates the names.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AcmeChallenge"
+            }
+          ],
+          "default": "http-01"
+        },
+        "dns": {
+          "description": "The `[acme.dns]` table: the DNS provider of `challenge = \"dns-01\"`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AcmeDns"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "email": {
+          "description": "Contact address registered with the account, for expiry notices.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "http_port": {
+          "description": "Port the CA connects to for HTTP-01 challenges.",
+          "type": "integer",
+          "format": "uint16",
+          "default": 80,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "renew_before": {
+          "description": "Certificates expiring within this time are renewed.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "30d"
+        },
+        "storage": {
+          "description": "Directory of the account and the certificates. A relative path is\nrelative to the directory of the main configuration file.",
+          "type": "string",
+          "default": "rxh-data/certificates"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AcmeChallenge": {
+      "description": "The `challenge` key of `[acme]`.",
+      "oneOf": [
+        {
+          "description": "The CA fetches a token over plain HTTP on port 80 (`http_port` here).",
+          "type": "string",
+          "const": "http-01"
+        },
+        {
+          "description": "The CA makes a TLS handshake with ALPN `acme-tls/1` on port 443, which\nmust reach the listener of the `tls = \"auto\"` server. Needs no plain\nHTTP port.",
+          "type": "string",
+          "const": "tls-alpn-01"
+        },
+        {
+          "description": "The CA looks up a TXT record at `_acme-challenge.NAME`, which rxh\ncreates through the API of the DNS provider in [`AcmeDns`]. The only\nchallenge that certifies wildcards; needs no open port.",
+          "type": "string",
+          "const": "dns-01"
+        }
+      ]
+    },
+    "AcmeDns": {
+      "description": "The `[acme.dns]` table: where DNS-01 challenge records are created.",
+      "type": "object",
+      "properties": {
+        "access_key_id": {
+          "description": "Route 53: access key of an IAM user allowed to list hosted zones and\nchange record sets.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_token": {
+          "description": "Cloudflare API token with the `Zone:Read` and `DNS:Edit` permissions.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_url": {
+          "description": "Cloudflare and Route 53: base URL of the API instead of the public\none, for tests and compatible services.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "propagation_wait": {
+          "description": "Time between creating the record and asking the CA to validate, for\nthe record to reach every name server of the zone.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "1m"
+        },
+        "provider": {
+          "description": "Who hosts the zones of the certified names.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DnsProvider"
+            }
+          ]
+        },
+        "secret_access_key": {
+          "description": "Route 53: secret of `access_key_id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server": {
+          "description": "RFC 2136: primary name server of the zone, `host` or `host:port`\n(port 53 by default).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tsig_key": {
+          "description": "RFC 2136: name of the TSIG key (HMAC-SHA256) that signs the updates.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tsig_secret": {
+          "description": "RFC 2136: base64 secret of `tsig_key`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "zone_id": {
+          "description": "Cloudflare and Route 53: identifier of the zone, instead of looking\nit up by name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider"
+      ]
+    },
+    "ActiveHealth": {
+      "description": "Active health checks. With `uri` set the check is an HTTP request,\notherwise it is a plain TCP connect.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "description": "Regular expression that the response body must match.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fails": {
+          "description": "Consecutive failures needed to mark a backend unhealthy.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "follow_redirects": {
+          "description": "Follow redirects instead of counting them as failures.",
+          "type": "boolean",
+          "default": false
+        },
+        "grpc": {
+          "description": "Check with the gRPC health checking protocol\n(`grpc.health.v1.Health/Check` over HTTP/2) instead of HTTP or TCP.",
+          "type": "boolean"
+        },
+        "grpc_service": {
+          "description": "Service name sent in gRPC checks; the server as a whole when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers": {
+          "description": "Extra request headers.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "hooks": {
+          "description": "Command and webhook run when a backend turns healthy or unhealthy.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HealthHooks"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "interval": {
+          "description": "Time between checks.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "30s"
+        },
+        "method": {
+          "description": "HTTP method of the check.",
+          "type": "string",
+          "default": "GET"
+        },
+        "passes": {
+          "description": "Consecutive passes needed to mark a backend healthy.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "port": {
+          "description": "Port to check instead of the backend port (Caddy `health_port`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "request_body": {
+          "description": "Request body sent with the check.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Expected status, `2xx` by default.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StatusMatcher"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeout": {
+          "description": "Time limit for one check.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "5s"
+        },
+        "upstream": {
+          "description": "Fixed `host:port` to check for every backend (Caddy `health_upstream`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "description": "Path and query requested by HTTP checks (Caddy `health_uri`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Admin": {
+      "description": "Admin API settings. The admin API is how the CLI talks to a running daemon.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Disables the admin API when false.",
+          "type": "boolean",
+          "default": true
+        },
+        "listen": {
+          "description": "Address of the admin API: a TCP address, on loopback unless `token`\nis set, or a unix socket only its owner can open.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AdminListen"
+            }
+          ],
+          "default": "127.0.0.1:2019"
+        },
+        "token": {
+          "description": "Secret every request must carry as `Authorization: Bearer <token>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdminListen": {
+      "description": "Where the admin API listens: `ip:port` or `unix//absolute/path.sock`\n(Caddy syntax, like backend addresses).",
+      "type": "string"
+    },
+    "Backend": {
+      "description": "One backend of an [`UpstreamGroup`].\n\nWritten as `\"host:port\"` or `{ address = \"host:port\", weight = 3 }`.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "address": {
+              "type": "string"
+            },
+            "weight": {
+              "type": "integer",
+              "format": "uint32",
+              "default": 1,
+              "minimum": 0
+            }
+          },
+          "required": [
+            "address"
+          ]
+        }
+      ]
+    },
+    "BasicAuth": {
+      "description": "HTTP Basic authentication (RFC 7617) against bcrypt password hashes.",
+      "type": "object",
+      "properties": {
+        "realm": {
+          "description": "Realm shown in the password prompt of browsers.",
+          "type": "string",
+          "default": "Restricted"
+        },
+        "users": {
+          "description": "User name to bcrypt hash of the password (`htpasswd -nB`).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "users"
+      ]
+    },
+    "Cache": {
+      "description": "Response cache for `GET` requests.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Turns the cache on.",
+          "type": "boolean",
+          "default": false
+        },
+        "max_body_bytes": {
+          "description": "Largest body stored, in bytes. Bigger responses stream uncached.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1048576,
+          "minimum": 0
+        },
+        "max_entries": {
+          "description": "Maximum number of cached responses.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1024,
+          "minimum": 0
+        },
+        "ttl_seconds": {
+          "description": "Lifetime of a cached response, in seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Catalog": {
+      "description": "Service catalog provider: `[consul]`, `[etcd]`, `[nomad]` or\n`[kubernetes]`. Each service instance becomes a member of a pool, with\nthe `rxh.*` options of its tags (Consul, Nomad) or keys (etcd), like the\nlabels of `[docker]`; in Kubernetes the hosts come from the Ingresses and\nHTTPRoutes and the instances are the ready endpoints of their Services.\nThe catalog is listed every `refresh`.",
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "description": "HTTP API: `http://host:port`. Defaults to the local agent, see\n[`Catalog::endpoint`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ingress_class": {
+          "description": "Only the Ingresses of this class (`spec.ingressClassName` or the\n`kubernetes.io/ingress.class` annotation) are routed. Only accepted\nby `[kubernetes]`, where every Ingress is routed without it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "listen": {
+          "description": "Address of the HTTP servers made from `rxh.http.host` options.",
+          "type": "string",
+          "default": "0.0.0.0:80"
+        },
+        "prefix": {
+          "description": "Keys of the service instances in etcd. Only accepted by `[etcd]`,\nwhere it defaults to `rxh/`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refresh": {
+          "description": "How often the catalog is listed.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "15s"
+        },
+        "token": {
+          "description": "ACL token sent to Consul (`X-Consul-Token`) or Nomad\n(`X-Nomad-Token`), or bearer token sent to the Kubernetes API. Not\naccepted by `[etcd]`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CircuitBreaker": {
+      "description": "Circuit breaker of each backend of a pool. A backend whose share of\nfailed or slow requests in a `window` reaches a ratio is taken out of\nrotation (open) for `open_duration`, then gets one trial request (half\nopen) that closes the breaker again or reopens it.",
+      "type": "object",
+      "properties": {
+        "error_ratio": {
+          "description": "Share of failed requests, `0.5` for half of them, that opens the\nbreaker. Failed dials, broken responses and `error_status` count.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "error_status": {
+          "description": "Response statuses counted as errors.",
+          "type": "array",
+          "default": [
+            "5xx"
+          ],
+          "items": {
+            "$ref": "#/definitions/StatusMatcher"
+          }
+        },
+        "latency": {
+          "description": "Responses slower than this (time to headers) count as slow.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "latency_ratio": {
+          "description": "Share of slow responses that opens the breaker. `0.5` trips on the\nmedian latency, `0.05` on the 95th percentile.",
+          "type": "number",
+          "format": "double",
+          "default": 0.5
+        },
+        "min_requests": {
+          "description": "Requests in a window below which the breaker never opens.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 10,
+          "minimum": 0
+        },
+        "open_duration": {
+          "description": "How long an open breaker keeps its backend out of rotation.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "10s"
+        },
+        "window": {
+          "description": "Period over which requests are counted.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "10s"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClientAuth": {
+      "description": "The `client_auth` table of a TLS server: mutual TLS.\n\n```toml\nclient_auth = { ca = \"clients-ca.pem\", header = \"X-Client-Subject\" }\n```",
+      "type": "object",
+      "properties": {
+        "ca": {
+          "description": "Paths to PEM files with the certificate authorities that sign client\ncertificates. Needed by the verifying modes, rejected by the others.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "header": {
+          "description": "Request header that carries the subject of the verified client\ncertificate to the backends (`http` servers, verifying modes).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "What is asked of the client.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClientAuthMode"
+            }
+          ],
+          "default": "require_and_verify"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClientAuthMode": {
+      "description": "What a TLS server asks of client certificates, named after Traefik's\n`clientAuthType` values.",
+      "oneOf": [
+        {
+          "description": "Asks for a certificate; accepts clients without one and does not\nverify the one given.",
+          "type": "string",
+          "const": "request"
+        },
+        {
+          "description": "Requires a certificate, without verifying it against `ca`.",
+          "type": "string",
+          "const": "require"
+        },
+        {
+          "description": "Accepts clients without a certificate; a certificate that is given\nmust be signed by one of `ca`.",
+          "type": "string",
+          "const": "verify_if_given"
+        },
+        {
+          "description": "Requires a certificate signed by one of `ca`.",
+          "type": "string",
+          "const": "require_and_verify"
+        }
+      ]
+    },
+    "ContainerProvider": {
+      "description": "Engine behind `[docker]`.",
+      "oneOf": [
+        {
+          "description": "Docker Engine: containers reached at their address on their network.",
+          "type": "string",
+          "const": "docker"
+        },
+        {
+          "description": "Podman, through its Docker compatible API: containers reached at the\nhost port they publish, which rootless containers need, else at\ntheir address on their network.",
+          "type": "string",
+          "const": "podman"
+        },
+        {
+          "description": "Docker Swarm mode: the running tasks of the services, reached at\ntheir address on their first network other than `ingress`.",
+          "type": "string",
+          "const": "swarm"
+        }
+      ]
+    },
+    "CopyResponse": {
+      "description": "Value of `copy_response`: `true` or the status to send.",
+      "anyOf": [
+        {
+          "description": "`true` keeps the upstream status; `false` is rejected.",
+          "type": "boolean"
+        },
+        {
+          "description": "Status sent instead of the upstream one.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      ]
+    },
+    "Cors": {
+      "description": "Cross-origin resource sharing: preflight answers and `Access-Control-*`\nresponse headers for the allowed origins.",
+      "type": "object",
+      "properties": {
+        "credentials": {
+          "description": "Allows cookies and `Authorization` on cross-origin requests.",
+          "type": "boolean",
+          "default": false
+        },
+        "expose_headers": {
+          "description": "Response headers scripts may read besides the safelisted ones.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "headers": {
+          "description": "Request headers allowed in preflight answers. Empty allows the ones\nthe preflight asks for.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "max_age": {
+          "description": "Time browsers may cache a preflight answer.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "methods": {
+          "description": "Methods allowed in preflight answers.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ],
+          "default": [
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ]
+        },
+        "origins": {
+          "description": "Allowed origins: `https://app.example.com`, `https://*.example.com`\nfor any subdomain, or `*` for any origin.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "origins"
+      ]
+    },
+    "DnsProvider": {
+      "description": "The `provider` key of `[acme.dns]`.",
+      "oneOf": [
+        {
+          "description": "Cloudflare API, with `api_token`.",
+          "type": "string",
+          "const": "cloudflare"
+        },
+        {
+          "description": "Amazon Route 53, with `access_key_id` and `secret_access_key`.",
+          "type": "string",
+          "const": "route53"
+        },
+        {
+          "description": "DNS UPDATE (RFC 2136) sent to `server`, signed with TSIG if `tsig_key`\nand `tsig_secret` are set.",
+          "type": "string",
+          "const": "rfc2136"
+        }
+      ]
+    },
+    "Docker": {
+      "description": "Docker provider (`[docker]`): running containers labelled `rxh.enable=true`\nbecome pools and servers, followed live through the Docker events, or the\ntasks of the Swarm services labelled `rxh.enable=true`, polled.",
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "description": "Engine API: `unix:///path/to/docker.sock` or `tcp://host:port`.\nDefaults to the system socket of the provider, see [`Docker::endpoint`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "listen": {
+          "description": "Address of the HTTP servers made from `rxh.http.host` labels.",
+          "type": "string",
+          "default": "0.0.0.0:80"
+        },
+        "provider": {
+          "description": "Engine that runs the containers.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContainerProvider"
+            }
+          ],
+          "default": "docker"
+        },
+        "refresh": {
+          "description": "How often the Swarm services and tasks are listed. Docker and Podman\ncontainers are followed through events instead.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "15s"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Duration": {
+      "description": "A duration such as `250ms`, `5s` or `1m30s` (units ns, us, ms, s, m, h, d), or a number of seconds.",
+      "type": [
+        "string",
+        "integer"
+      ],
+      "minimum": 0,
+      "pattern": "^\\s*([0-9]+|([0-9]*\\.?[0-9]+(ns|us|µs|ms|s|m|h|d))+)\\s*$"
+    },
+    "DynamicUpstreams": {
+      "description": "DNS driven members of an [`UpstreamGroup`] (Caddy `dynamic a` and `dynamic srv`).\n\n`a` resolves to plain `ip:port` backends. When the group uses TLS the SNI\nand certificate name cannot come from an IP, so `tls.server_name` is\nrequired. `srv` produces `target:port` backends that keep the host name.",
+      "type": "object",
+      "properties": {
+        "a": {
+          "description": "`name:port`, resolved to its `A` and `AAAA` records.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refresh": {
+          "description": "Time between lookups.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "1m"
+        },
+        "resolvers": {
+          "description": "DNS servers to ask, default the system configuration.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "srv": {
+          "description": "`_service._proto.name`, resolved to its `SRV` records.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "versions": {
+          "description": "Record types used with `a`, both by default. Not allowed with `srv`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/IpVersion"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Encoding": {
+      "description": "Content encoding RXH can produce.",
+      "oneOf": [
+        {
+          "description": "Zstandard (`zstd`).",
+          "type": "string",
+          "const": "zstd"
+        },
+        {
+          "description": "Brotli (`br`).",
+          "type": "string",
+          "const": "br"
+        },
+        {
+          "description": "Gzip (`gzip`).",
+          "type": "string",
+          "const": "gzip"
+        }
+      ]
+    },
+    "Fallback": {
+      "description": "Selection policy used when a policy cannot decide, with its own settings.\n\n```toml\nfallback = \"random\"\nfallback = { policy = \"header\", key = \"x-user\", fallback = \"round_robin\" }\n```",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Policy"
+        },
+        {
+          "$ref": "#/definitions/FallbackTable"
+        }
+      ]
+    },
+    "FallbackTable": {
+      "type": "object",
+      "properties": {
+        "choose": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2,
+          "minimum": 0
+        },
+        "fallback": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Fallback"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy": {
+          "$ref": "#/definitions/Policy"
+        },
+        "secret": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "policy"
+      ]
+    },
+    "FileServer": {
+      "description": "Settings of a `serve` action: `serve = \"dir\"` or a table.\n\n```toml\nserve = \"/var/www\"\nserve = { root = \".\", browse = false, hide = [\".git\", \"*.pem\"], precompressed = [\"br\", \"gzip\"] }\n```",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/definitions/FileServerTable"
+        }
+      ]
+    },
+    "FileServerTable": {
+      "type": "object",
+      "properties": {
+        "browse": {
+          "type": "boolean",
+          "default": true
+        },
+        "hide": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ],
+          "default": []
+        },
+        "index": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ],
+          "default": []
+        },
+        "precompressed": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/Encoding"
+          }
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "root"
+      ]
+    },
+    "Forward": {
+      "description": "Target of a `forward` action: a named group (`\"@api\"`) or an inline one.\n\n```toml\nforward = \"@api\"                                  # named group\nforward = \"127.0.0.1:8080\"                        # single backend\nforward = [\"127.0.0.1:8080\", \"127.0.0.1:8081\"]    # list of backends\nforward = { policy = \"ip_hash\", backends = [\"127.0.0.1:8080\"] }\nforward = [{ pool = \"v1\", weight = 90 }, { pool = \"v2\", weight = 10 }]\n```",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Backend"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WeightedPool"
+          }
+        },
+        {
+          "$ref": "#/definitions/UpstreamGroup"
+        }
+      ]
+    },
+    "ForwardAuth": {
+      "description": "Authentication delegated to an external service (Authelia, Authentik,\noauth2-proxy): it gets the head of each request and decides with the\nstatus of its answer.",
+      "type": "object",
+      "properties": {
+        "copy_headers": {
+          "description": "Headers of a `2xx` answer copied to the request sent to the backend,\nsuch as `Remote-User`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeout": {
+          "description": "Time the service has to answer.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "10s"
+        },
+        "url": {
+          "description": "`http://` or `https://` URL of the verification endpoint.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ]
+    },
+    "ForwardedHeader": {
+      "description": "`Forwarded` header settings.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "Value of the `by=` parameter. Defaults to the server name or address.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extend": {
+          "description": "Appends to client provided values instead of replacing them.",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "HandleResponse": {
+      "description": "One entry of `handle_response` on a `forward` route: what to do with the\nupstream responses that match `status` and `header`.\n\n```toml\nhandle_response = [\n    { status = 404, replace_status = 200 },\n    { header = { x-accel-redirect = \"*\" }, serve = \"/srv/private\", rewrite = \"{header.x-accel-redirect}\" },\n    { status = [502, 503], serve = \"/srv/errors\", rewrite = \"/{status}.html\" },\n    { status = 401, redirect = \"/login?next={path}\" },\n    { status = \"5xx\", copy_response = 500 },\n]\n```",
+      "type": "object",
+      "properties": {
+        "copy_response": {
+          "description": "Send the upstream response as it is (`true`) or with a status.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CopyResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "header": {
+          "description": "Required response headers. The value `*` only requires presence.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "redirect": {
+          "description": "Drop the upstream response and answer with a redirect. The target\nmay use the response placeholders of [`Template::for_response`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Redirect"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replace_status": {
+          "description": "Send the upstream response with this status.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "rewrite": {
+          "description": "Path of the file `serve` looks up instead of the request path, a\n[`Template::for_response`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "serve": {
+          "description": "Drop the upstream response and answer with a file.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FileServer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Statuses to handle: codes or classes (`\"5xx\"`), any may match. Empty\nmeans every status.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_StatusMatcher"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HashType": {
+      "description": "Algorithm mapping the key of a hash policy to a backend.",
+      "oneOf": [
+        {
+          "description": "Highest random weight hashing, computed over the members on each pick.",
+          "type": "string",
+          "const": "rendezvous"
+        },
+        {
+          "description": "Maglev lookup table, rebuilt when the members change.",
+          "type": "string",
+          "const": "maglev"
+        }
+      ]
+    },
+    "HeaderReplace": {
+      "description": "Regex rewrite of every value of a header.",
+      "type": "object",
+      "properties": {
+        "replace": {
+          "description": "Replacement, `$1` and `${name}` refer to capture groups.",
+          "type": "string"
+        },
+        "search": {
+          "description": "Regular expression to look for.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "search",
+        "replace"
+      ]
+    },
+    "HealthHooks": {
+      "description": "Actions run on `healthy` and `unhealthy` events of active health checks,\nbesides the log line. Each event runs the command, then calls the webhook.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Program and arguments, run without a shell. The event is passed in\n`RXH_EVENT`, `RXH_POOL`, `RXH_UPSTREAM` and `RXH_REASON`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "webhook": {
+          "description": "`http://` or `https://` URL that receives each event as a JSON `POST`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "IpNet": {
+      "description": "An IP network such as `10.0.0.0/8` or `::1/128`.",
+      "type": "string"
+    },
+    "IpVersion": {
+      "description": "IP versions used by [`DynamicUpstreams::a`].",
+      "oneOf": [
+        {
+          "description": "`A` records.",
+          "type": "string",
+          "const": "ipv4"
+        },
+        {
+          "description": "`AAAA` records.",
+          "type": "string",
+          "const": "ipv6"
+        }
+      ]
+    },
+    "L4Protocol": {
+      "description": "Protocol recognized by the `protocol` matcher of `tcp` servers.",
+      "oneOf": [
+        {
+          "description": "A TLS ClientHello, or any connection to a `tcp` server that terminates TLS.",
+          "type": "string",
+          "const": "tls"
+        },
+        {
+          "description": "An HTTP/1 request line, or the HTTP/2 connection preface.",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "An SSH banner (`SSH-`).",
+          "type": "string",
+          "const": "ssh"
+        },
+        {
+          "description": "A PostgreSQL startup message, or an SSL, GSSAPI encryption or cancel\nrequest.",
+          "type": "string",
+          "const": "postgres"
+        }
+      ]
+    },
+    "Log": {
+      "description": "Access log settings, the `[log]` table.",
+      "type": "object",
+      "properties": {
+        "access": {
+          "description": "Writes one line per request or connection when true.",
+          "type": "boolean",
+          "default": true
+        },
+        "format": {
+          "description": "Format of access lines.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/LogFormat"
+            }
+          ],
+          "default": "text"
+        },
+        "min_duration": {
+          "description": "Requests and connections lasting at least this long are always\nwritten.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output": {
+          "description": "`\"stdout\"`, `\"stderr\"` or the path of a file that is appended to.",
+          "type": "string",
+          "default": "stdout"
+        },
+        "sample_ratio": {
+          "description": "Share of the lines no filter keeps that are written, from 0 to 1.\nDefaults to 1 without filters and to 0 with `status` or\n`min_duration`, so that only the matching lines are written.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "status": {
+          "description": "HTTP statuses whose lines are always written, like `[\"5xx\", 429]`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StatusMatcher"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "LogFormat": {
+      "description": "Line format of access logs.",
+      "oneOf": [
+        {
+          "description": "Human readable one line per request.",
+          "type": "string",
+          "const": "text"
+        },
+        {
+          "description": "One JSON object per line.",
+          "type": "string",
+          "const": "json"
+        }
+      ]
+    },
+    "Mirror": {
+      "description": "One entry of `mirror` on a `forward` route: `{ pool = \"shadow\", percent =\n10 }`. A copy of the request goes to a member of the pool and its\nresponse is dropped; the client only ever sees the `forward` response.",
+      "type": "object",
+      "properties": {
+        "max_body_size": {
+          "description": "Largest request body copied. Requests with a bigger body, or a body\nof unknown length, are forwarded without a copy.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Size"
+            }
+          ],
+          "default": 1048576
+        },
+        "percent": {
+          "description": "Share of the requests copied, from 0 to 100.",
+          "type": "integer",
+          "format": "uint8",
+          "default": 100,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "pool": {
+          "description": "Name of an entry of [`Config::upstreams`], without `@`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pool"
+      ]
+    },
+    "OneOrMany_Mirror": {
+      "description": "A single value or a list of values; the schema of `one_or_many` fields.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Mirror"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Mirror"
+          }
+        }
+      ]
+    },
+    "OneOrMany_StatusMatcher": {
+      "description": "A single value or a list of values; the schema of `one_or_many` fields.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/StatusMatcher"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StatusMatcher"
+          }
+        }
+      ]
+    },
+    "OneOrMany_string": {
+      "description": "A single value or a list of values; the schema of `one_or_many` fields.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "PassiveHealth": {
+      "description": "Passive health checks: backends that fail real traffic are taken out of\nrotation for `fail_duration`.",
+      "type": "object",
+      "properties": {
+        "fail_duration": {
+          "description": "How long a failure is remembered.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "30s"
+        },
+        "max_fails": {
+          "description": "Failures within `fail_duration` that mark a backend down.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "unhealthy_latency": {
+          "description": "Responses slower than this count as failures.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unhealthy_request_count": {
+          "description": "Concurrent requests above which a backend is considered full. Zero\nmeans no limit.",
+          "type": "integer",
+          "format": "uint",
+          "default": 0,
+          "minimum": 0
+        },
+        "unhealthy_status": {
+          "description": "Response statuses counted as failures, like `5xx` or `503`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StatusMatcher"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Pattern": {
+      "description": "One entry of a server's `match` list.",
+      "type": "object",
+      "properties": {
+        "alpn": {
+          "description": "ALPN protocols; any may match (tcp only).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "basic_auth": {
+          "description": "HTTP Basic authentication of this entry, replacing the server's (http\nonly).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BasicAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache": {
+          "description": "Response cache for this pattern.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Cache"
+            }
+          ],
+          "default": {
+            "enabled": false,
+            "max_body_bytes": 1048576,
+            "max_entries": 1024,
+            "ttl_seconds": 30
+          }
+        },
+        "cors": {
+          "description": "Cross-origin resource sharing, replacing the server's (http only).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Cors"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "encode": {
+          "description": "Encodings to compress responses with, in order of preference. Applies\nto files and proxied responses.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Encoding"
+          }
+        },
+        "forward": true,
+        "forward_auth": {
+          "description": "Authentication delegated to an external service, replacing the\nserver's (http only).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ForwardAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "handle_response": {
+          "description": "Handlers of upstream responses, the first matching one runs\n(`forward` only).",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HandleResponse"
+          }
+        },
+        "header": {
+          "description": "Required request headers. The value `*` only requires presence.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "host": {
+          "description": "Host names, exact or `*.example.com`. Empty means any host (or the\nserver's `host`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "http_host": {
+          "description": "`Host` header of an HTTP/1 request, exact or `*.example.com` (tcp only).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "ip_allow": {
+          "description": "Client networks this entry accepts, on top of the server's lists\n(http only). A matching request from elsewhere gets `403`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/IpNet"
+          }
+        },
+        "ip_deny": {
+          "description": "Client networks this entry rejects with `403` (http only).",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/IpNet"
+          }
+        },
+        "method": {
+          "description": "HTTP methods, case insensitive.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "mirror": {
+          "description": "Pools that get a copy of the requests, their responses dropped\n(`forward` only).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_Mirror"
+            }
+          ]
+        },
+        "path": {
+          "description": "Path patterns: `/exact`, `/prefix/*`, `*.suffix`, `/a/*/b`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "protocol": {
+          "description": "Protocol detected from the first bytes of the connection (tcp only).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/L4Protocol"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "query": {
+          "description": "Required query parameters. The value `*` only requires presence.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "rate_limit": {
+          "description": "Request rate limit of this entry, on top of the server's (http only).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RateLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "redirect": true,
+        "regexp": {
+          "description": "Regular expression searched in the first `regexp_count` bytes of the\nconnection (tcp only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regexp_count": {
+          "description": "Bytes `regexp` looks at, 4 by default (tcp only).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "remote_ip": {
+          "description": "Client networks allowed to match (the directly connected peer).",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/IpNet"
+          }
+        },
+        "request": {
+          "description": "Request customization: method and headers.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RequestConfig"
+            }
+          ],
+          "default": {
+            "headers": {
+              "add": {},
+              "forwarded": {
+                "by": null,
+                "extend": true
+              },
+              "remove": [],
+              "replace": {},
+              "set": {}
+            }
+          }
+        },
+        "response": {
+          "description": "Response header customization.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResponseConfig"
+            }
+          ],
+          "default": {
+            "headers": {
+              "add": {},
+              "remove": [],
+              "replace": {},
+              "server": {
+                "override": true,
+                "version": true
+              },
+              "set": {},
+              "via": {
+                "extend": false
+              }
+            }
+          }
+        },
+        "rewrite": {
+          "description": "New URI of the request before it is forwarded or served, a\n[`Template`] starting with `/`. Without a `?` the query is kept.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "security_headers": {
+          "description": "Preset of security response headers, replacing the server's; `off`\nturns the server's off for this entry (http only).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecurityHeaders"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "serve": true,
+        "sni": {
+          "description": "TLS server names (SNI), exact or `*.example.com` (tcp only).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ]
+        },
+        "subroute": true,
+        "uri": {
+          "description": "Path prefix to match against.",
+          "type": "string",
+          "default": "/"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "description": "Proxy to a load balancing group.",
+          "type": "object",
+          "properties": {
+            "forward": {
+              "$ref": "#/definitions/Forward"
+            }
+          },
+          "required": [
+            "forward"
+          ]
+        },
+        {
+          "description": "Serve static files from a root directory.",
+          "type": "object",
+          "properties": {
+            "serve": {
+              "$ref": "#/definitions/FileServer"
+            }
+          },
+          "required": [
+            "serve"
+          ]
+        },
+        {
+          "description": "Answer with a redirect.",
+          "type": "object",
+          "properties": {
+            "redirect": {
+              "$ref": "#/definitions/Redirect"
+            }
+          },
+          "required": [
+            "redirect"
+          ]
+        },
+        {
+          "description": "Try a nested list of entries on connections this entry matches (tcp\nonly). When none of them matches, the next entry of the outer list\nis tried.",
+          "type": "object",
+          "properties": {
+            "subroute": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Pattern"
+              }
+            }
+          },
+          "required": [
+            "subroute"
+          ]
+        }
+      ]
+    },
+    "Policy": {
+      "description": "Load balancing policy. Names match Caddy's `lb_policy` values.",
+      "oneOf": [
+        {
+          "description": "Uniformly random available backend.",
+          "type": "string",
+          "const": "random"
+        },
+        {
+          "description": "Samples `choose` random backends and takes the least loaded one.",
+          "type": "string",
+          "const": "random_choose"
+        },
+        {
+          "description": "First available backend in declaration order (active/passive failover).",
+          "type": "string",
+          "const": "first"
+        },
+        {
+          "description": "Rotates through backends, ignoring weights.",
+          "type": "string",
+          "const": "round_robin"
+        },
+        {
+          "description": "Smooth weighted round robin. The default policy.",
+          "type": "string",
+          "const": "weighted_round_robin"
+        },
+        {
+          "description": "Backend with the fewest active connections, ties broken randomly.",
+          "type": "string",
+          "const": "least_conn"
+        },
+        {
+          "description": "Rendezvous hash of the remote peer IP.",
+          "type": "string",
+          "const": "ip_hash"
+        },
+        {
+          "description": "Rendezvous hash of the real client IP (honours `trusted_proxies`).",
+          "type": "string",
+          "const": "client_ip_hash"
+        },
+        {
+          "description": "Rendezvous hash of the request path and query.",
+          "type": "string",
+          "const": "uri_hash"
+        },
+        {
+          "description": "Rendezvous hash of the query parameter named by `key`.",
+          "type": "string",
+          "const": "query"
+        },
+        {
+          "description": "Rendezvous hash of the header named by `key`.",
+          "type": "string",
+          "const": "header"
+        },
+        {
+          "description": "Sticky sessions through an HMAC signed cookie.",
+          "type": "string",
+          "const": "cookie"
+        }
+      ]
+    },
+    "Protocol": {
+      "description": "Protocol spoken by a listener.",
+      "oneOf": [
+        {
+          "description": "HTTP/1.1 and HTTP/2 reverse proxy, file server and cache.",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "Raw TCP (layer 4) proxy. Optional TLS termination.",
+          "type": "string",
+          "const": "tcp"
+        },
+        {
+          "description": "Raw UDP (layer 4) proxy with per-client sessions.",
+          "type": "string",
+          "const": "udp"
+        }
+      ]
+    },
+    "ProxyProtocol": {
+      "description": "PROXY protocol header sent to upstreams on new connections of `http` and\n`tcp` servers.",
+      "oneOf": [
+        {
+          "description": "Human readable version 1 header.",
+          "type": "string",
+          "const": "v1"
+        },
+        {
+          "description": "Binary version 2 header.",
+          "type": "string",
+          "const": "v2"
+        }
+      ]
+    },
+    "RateLimit": {
+      "description": "Token bucket rate limit of requests: `rate` requests every `per`, with\nbursts of up to `burst` requests, counted separately for each `key`.",
+      "type": "object",
+      "properties": {
+        "burst": {
+          "description": "Requests a client can send at once before `rate` applies. Defaults to\n`rate`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "key": {
+          "description": "What identifies a client.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RateLimitKey"
+            }
+          ],
+          "default": "client_ip"
+        },
+        "per": {
+          "description": "Period of `rate`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "1s"
+        },
+        "rate": {
+          "description": "Requests allowed every `per`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rate"
+      ]
+    },
+    "RateLimitKey": {
+      "description": "What a [`RateLimit`] counts requests by.",
+      "type": "string"
+    },
+    "Redirect": {
+      "description": "Settings of a `redirect` action: `redirect = \"target\"` or a table.\n\n```toml\nredirect = \"https://example.com{uri}\"\nredirect = { to = \"/new{path}\", status = 301 }\n```",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/definitions/RedirectTable"
+        }
+      ]
+    },
+    "RedirectTable": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "integer",
+          "format": "uint16",
+          "default": 302,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "to"
+      ]
+    },
+    "RequestConfig": {
+      "description": "Per-pattern request customization.",
+      "type": "object",
+      "properties": {
+        "headers": {
+          "description": "Header rules.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RequestHeaders"
+            }
+          ],
+          "default": {
+            "add": {},
+            "forwarded": {
+              "by": null,
+              "extend": true
+            },
+            "remove": [],
+            "replace": {},
+            "set": {}
+          }
+        },
+        "max_body_size": {
+          "description": "Largest request body accepted; bigger ones get `413`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "method": {
+          "description": "Method the request is forwarded or served with instead of its own,\nupper cased.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RequestHeaders": {
+      "description": "Request header rules, applied before the request goes upstream.",
+      "type": "object",
+      "properties": {
+        "add": {
+          "description": "Headers to append a value to, keeping existing values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "forwarded": {
+          "description": "`Forwarded` header (RFC 7239) behavior.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ForwardedHeader"
+            }
+          ],
+          "default": {
+            "by": null,
+            "extend": true
+          }
+        },
+        "remove": {
+          "description": "Headers to remove. A trailing `*` removes every header with that prefix.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "replace": {
+          "description": "Regex rewrites of header values.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/HeaderReplace"
+          },
+          "default": {}
+        },
+        "set": {
+          "description": "Headers to set, replacing existing values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResponseConfig": {
+      "description": "Per-pattern response customization.",
+      "type": "object",
+      "properties": {
+        "headers": {
+          "description": "Header rules.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResponseHeaders"
+            }
+          ],
+          "default": {
+            "add": {},
+            "remove": [],
+            "replace": {},
+            "server": {
+              "override": true,
+              "version": true
+            },
+            "set": {},
+            "via": {
+              "extend": false
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResponseHeaders": {
+      "description": "Response header rules, applied before the response goes to the client.",
+      "type": "object",
+      "properties": {
+        "add": {
+          "description": "Headers to append a value to, keeping existing values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "remove": {
+          "description": "Headers to remove. A trailing `*` removes every header with that prefix.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "replace": {
+          "description": "Regex rewrites of header values.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/HeaderReplace"
+          },
+          "default": {}
+        },
+        "server": {
+          "description": "`Server` header behavior.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServerHeader"
+            }
+          ],
+          "default": {
+            "override": true,
+            "version": true
+          }
+        },
+        "set": {
+          "description": "Headers to set, replacing existing values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "via": {
+          "description": "`Via` header behavior.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ViaHeader"
+            }
+          ],
+          "default": {
+            "extend": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetryBudget": {
+      "description": "Bound on the retries and hedges of a pool in flight at the same time\n(Envoy `retry_budget`), so that retries cannot multiply the load of\nbackends that are already failing.\n\n```toml\nretry_budget = { percent = 20, min_retries = 3 }\n```",
+      "type": "object",
+      "properties": {
+        "min_retries": {
+          "description": "Requests that may always retry at once, whatever `percent` allows\n(Envoy `min_retry_concurrency`).",
+          "type": "integer",
+          "format": "uint",
+          "default": 3,
+          "minimum": 0
+        },
+        "percent": {
+          "description": "Most requests retrying at once, in percent of the requests in flight\non the pool (Envoy `budget_percent`).",
+          "type": "number",
+          "format": "double",
+          "default": 20.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetryMatch": {
+      "description": "Which requests are retried on another backend.\n\n```toml\nretry_match = { method = [\"GET\", \"POST\"], status = [\"502\", \"5xx\"] }\n```",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "Methods whose bodyless requests are retried after a failed round trip.\nDefaults to `GET`, `HEAD` and `OPTIONS`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "description": "Response statuses that make the proxy discard the response and try\nanother backend, for retryable requests only.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StatusMatcher"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Runtime": {
+      "description": "Threading model of the listeners.",
+      "oneOf": [
+        {
+          "description": "One work-stealing runtime: a connection may move between threads.",
+          "type": "string",
+          "const": "shared"
+        },
+        {
+          "description": "One single-threaded runtime per CPU, each with its own `SO_REUSEPORT`\nlisteners and upstream connections: a connection stays on the thread\nthat accepted it.",
+          "type": "string",
+          "const": "per_core"
+        }
+      ]
+    },
+    "SecurityHeaders": {
+      "description": "Preset of security response headers. Each header is only added when the\nresponse does not already have it.",
+      "oneOf": [
+        {
+          "description": "No headers; in a match entry, turns the server's preset off.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "Headers that break no site: `nosniff`, `SAMEORIGIN` framing,\n`strict-origin-when-cross-origin` referrers and one year of HSTS.",
+          "type": "string",
+          "const": "basic"
+        },
+        {
+          "description": "`basic` hardened: no framing, no referrers, two years of HSTS with\nsubdomains, a same-origin CSP, COOP and a restrictive\n`Permissions-Policy`.",
+          "type": "string",
+          "const": "strict"
+        }
+      ]
+    },
+    "Server": {
+      "description": "A single `[[server]]` entry. Each listen address becomes its own listener.\n\nA server can describe one pattern inline (`forward`, `serve`, `uri`,\n`request`, `response`, `cache`) or many patterns under `match`, not both.",
+      "type": "object",
+      "properties": {
+        "basic_auth": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BasicAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Cache"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_auth": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClientAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cors": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Cors"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "encode": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/Encoding"
+          }
+        },
+        "error_pages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "forward": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Forward"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "forward_auth": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ForwardAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "handle_response": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/HandleResponse"
+          }
+        },
+        "header": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "host": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ],
+          "default": []
+        },
+        "http2": {
+          "type": "boolean",
+          "default": true
+        },
+        "https_redirect": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "idle_timeout": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "ip_allow": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/IpNet"
+          }
+        },
+        "ip_deny": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/IpNet"
+          }
+        },
+        "listen": {
+          "$ref": "#/definitions/OneOrMany_string"
+        },
+        "match": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "$ref": "#/definitions/Pattern"
+          }
+        },
+        "match_timeout": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "3s"
+        },
+        "max_connections": {
+          "type": "integer",
+          "format": "uint",
+          "default": 1024,
+          "minimum": 0
+        },
+        "max_connections_per_ip": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "method": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ],
+          "default": []
+        },
+        "mirror": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_Mirror"
+            }
+          ],
+          "default": []
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OneOrMany_string"
+            }
+          ],
+          "default": []
+        },
+        "protocol": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Protocol"
+            }
+          ],
+          "default": "http"
+        },
+        "proxy_protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProxyProtocol"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "proxy_protocol_in": {
+          "type": "boolean",
+          "default": false
+        },
+        "query": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "rate_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RateLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "read_header_timeout": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "redirect": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Redirect"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_ip": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/IpNet"
+          }
+        },
+        "request": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RequestConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "response": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ResponseConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rewrite": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "security_headers": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecurityHeaders"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "serve": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FileServer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stream_close_delay": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "stream_timeout": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tls": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tls_options": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TlsOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trusted_proxies": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "udp_idle_timeout": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "1m"
+        },
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "listen"
+      ]
+    },
+    "ServerHeader": {
+      "description": "`Server` response header settings.",
+      "type": "object",
+      "properties": {
+        "override": {
+          "description": "Replaces the upstream `Server` header with `rxh`.",
+          "type": "boolean",
+          "default": true
+        },
+        "version": {
+          "description": "Includes the RXH version in the `Server` header.",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "Size": {
+      "description": "A number of bytes, or a size such as `64KiB` or `10MB` (units B, KB, MB, GB, KiB, MiB, GiB, case insensitive).",
+      "type": [
+        "string",
+        "integer"
+      ],
+      "minimum": 0,
+      "pattern": "^\\s*[0-9]+\\s*([kKmMgG][iI]?[bB]|[bB])?\\s*$"
+    },
+    "StatusMatcher": {
+      "description": "Matches one status code or a whole class (`2xx`, `5xx`).",
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "Tls": {
+      "anyOf": [
+        {
+          "description": "Certificates from ACME for every name in `host`.",
+          "const": "auto"
+        },
+        {
+          "$ref": "#/definitions/TlsFiles"
+        }
+      ]
+    },
+    "TlsFiles": {
+      "type": "object",
+      "properties": {
+        "cert": {
+          "description": "PEM certificate chain file.",
+          "type": "string"
+        },
+        "key": {
+          "description": "PEM private key file.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cert",
+        "key"
+      ]
+    },
+    "TlsOptions": {
+      "description": "The `tls_options` table of a TLS server: what its handshakes accept.\n\n```toml\ntls_options = { min_version = \"1.3\", curves = [\"X25519\", \"secp384r1\"] }\n```",
+      "type": "object",
+      "properties": {
+        "cipher_suites": {
+          "description": "Cipher suites offered, from [`TlsOptions::CIPHER_SUITES`]. Empty\nmeans all of them.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "curves": {
+          "description": "Key exchange groups offered, from [`TlsOptions::CURVES`] in any\ncase. Empty means all of them.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "min_version": {
+          "description": "Lowest protocol version accepted.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TlsVersion"
+            }
+          ],
+          "default": "1.2"
+        },
+        "ocsp_stapling": {
+          "description": "Fetches OCSP responses for the certificates and staples them to the\nhandshakes.",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "TlsVersion": {
+      "description": "Lowest TLS version a server accepts.",
+      "oneOf": [
+        {
+          "description": "TLS 1.2 and 1.3.",
+          "type": "string",
+          "const": "1.2"
+        },
+        {
+          "description": "TLS 1.3 only.",
+          "type": "string",
+          "const": "1.3"
+        }
+      ]
+    },
+    "Tracing": {
+      "description": "OpenTelemetry tracing, the `[tracing]` table: one span per HTTP request,\nsent to a collector over OTLP/HTTP in JSON, and W3C `traceparent`\npropagation to the backends.",
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "description": "`http://` or `https://` URL of the OTLP traces endpoint, like\n`http://127.0.0.1:4318/v1/traces`.",
+          "type": "string"
+        },
+        "sample_ratio": {
+          "description": "Share of the traces started here that are sampled, from 0 to 1.\nRequests that arrive with a `traceparent` keep its sampling decision.",
+          "type": "number",
+          "format": "double",
+          "default": 1.0
+        },
+        "service_name": {
+          "description": "`service.name` of the spans.",
+          "type": "string",
+          "default": "rxh"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "endpoint"
+      ]
+    },
+    "UpstreamGroup": {
+      "description": "Load balancing group: backends plus selection, retry and health settings.\nField names follow Caddy's `reverse_proxy` subdirectives.",
+      "type": "object",
+      "properties": {
+        "backends": {
+          "description": "Backends. Port ranges such as `10.0.0.1:8001-8004` expand to many.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/Backend"
+          }
+        },
+        "choose": {
+          "description": "Candidates sampled by `random_choose`.",
+          "type": "integer",
+          "format": "uint",
+          "default": 2,
+          "minimum": 0
+        },
+        "circuit_breaker": {
+          "description": "Circuit breaker on the error ratio or the latency of each backend.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CircuitBreaker"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dial_timeout": {
+          "description": "Upstream connect timeout.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "3s"
+        },
+        "dynamic": {
+          "description": "Members discovered through DNS, on top of `backends`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DynamicUpstreams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fallback": {
+          "description": "Policy used when the key of a hash policy is missing. Defaults to random.\nA policy name, or a table that can nest another fallback.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Fallback"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "flush_interval": {
+          "description": "Responses with a `Content-Length` are written to the client in\nbatches collected for this long. Unset writes every chunk at once\n(Caddy `flush_interval -1`).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "grpc_web": {
+          "description": "Translate gRPC-Web requests (`application/grpc-web`, binary and\n`-text`) to gRPC for the backends, and their responses back (Envoy\n`grpc_web` filter). Needs `h2c`.",
+          "type": "boolean"
+        },
+        "h2c": {
+          "description": "Speak cleartext HTTP/2 to the backends instead of HTTP/1.1.",
+          "type": "boolean",
+          "default": false
+        },
+        "hash_balance_factor": {
+          "description": "Bounded loads for the hash policies, in percent of the average load\nof the available backends (HAProxy `hash-balance-factor`): a backend\nat the bound passes its keys on to the next backend of the key.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "hash_type": {
+          "description": "How the hash policies map a key to a backend.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HashType"
+            }
+          ],
+          "default": "rendezvous"
+        },
+        "health": {
+          "description": "Active health checks.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ActiveHealth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hedge_delay": {
+          "description": "A retryable HTTP request without response headers after this long\nis also sent to a second backend, and the first response wins\n(Envoy `hedge_policy`).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "http2_conns_per_host": {
+          "description": "HTTP/2 connections kept open to each backend with `h2c`; requests\nare spread over them in turn.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1,
+          "minimum": 0
+        },
+        "keepalive": {
+          "description": "How long idle upstream HTTP connections stay in the pool.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "2m"
+        },
+        "keepalive_idle_conns_per_host": {
+          "description": "Maximum idle upstream HTTP connections kept per backend.",
+          "type": "integer",
+          "format": "uint",
+          "default": 32,
+          "minimum": 0
+        },
+        "key": {
+          "description": "Query parameter, header or cookie name for `query`, `header` and `cookie`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_connections": {
+          "description": "Maximum requests in flight (connections, for `tcp` and `udp` servers)\nper backend. `0` means no limit (HAProxy `maxconn`).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_conns_per_host": {
+          "description": "Maximum upstream HTTP/1.1 connections per backend; requests over it\nwait for a free one. `0` means no limit (Caddy `max_conns_per_host`).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "passive": {
+          "description": "Passive health checks.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PassiveHealth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "description": "Selection policy (Caddy `lb_policy`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Policy"
+            }
+          ],
+          "default": "weighted_round_robin"
+        },
+        "queue_size": {
+          "description": "Requests that may wait for a backend when all of them are at\n`max_connections`; the ones over it are refused. `0` refuses at once\n(HAProxy `maxqueue`).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "queue_timeout": {
+          "description": "Longest wait in the queue (HAProxy `timeout queue`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "5s"
+        },
+        "read_timeout": {
+          "description": "An upstream read without progress for this long fails the connection.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_buffers": {
+          "description": "Bytes of each request body read before the request is sent upstream.\n`0` streams it (Caddy `request_buffers`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Size"
+            }
+          ]
+        },
+        "response_buffers": {
+          "description": "Bytes of each response body read before the response is sent to the\nclient. `0` streams it (Caddy `response_buffers`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Size"
+            }
+          ]
+        },
+        "response_header_timeout": {
+          "description": "Time from sending a request to receiving the response headers\nbefore the client gets `504` (Caddy `response_header_timeout`).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retries": {
+          "description": "Extra attempts after a failed connection (Caddy `lb_retries`).",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "retry_budget": {
+          "description": "Bound on the retries and hedges in flight at once (Envoy\n`retry_budget`). Unset leaves them bounded per request only.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RetryBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retry_match": {
+          "description": "Which requests and responses are retried on another backend\n(Caddy `lb_retry_match`).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RetryMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "secret": {
+          "description": "HMAC secret for the `cookie` policy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slow_start": {
+          "description": "Time over which a backend added at runtime or back from being\nunhealthy ramps up from no share of the traffic to its full share.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tls": {
+          "description": "TLS settings for connections to the backends. Setting this table\nenables TLS even without `https://` backends.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UpstreamTls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "try_duration": {
+          "description": "Keep retrying for this long (Caddy `lb_try_duration`).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "try_interval": {
+          "description": "Wait between attempts (Caddy `lb_try_interval`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            }
+          ],
+          "default": "250ms"
+        },
+        "write_timeout": {
+          "description": "An upstream write without progress for this long fails the connection.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "UpstreamTls": {
+      "description": "TLS client settings of an [`UpstreamGroup`] (Caddy `transport http { tls }`).",
+      "type": "object",
+      "properties": {
+        "ca": {
+          "description": "Path to a PEM file with extra trusted root certificates.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert": {
+          "description": "Path to the PEM client certificate chain (mutual TLS).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key": {
+          "description": "Path to the PEM client private key (mutual TLS).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "insecure_skip_verify": {
+          "description": "Accept any certificate. Insecure, for tests only.",
+          "type": "boolean",
+          "default": false
+        },
+        "server_name": {
+          "description": "Server name sent as SNI and checked against the certificate. Defaults\nto the backend host.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ViaHeader": {
+      "description": "`Via` response header settings.",
+      "type": "object",
+      "properties": {
+        "extend": {
+          "description": "Appends this proxy to the `Via` header of responses.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "WeightedPool": {
+      "description": "One pool of a [`Forward::Split`]: `{ pool = \"v2\", weight = 10 }`.",
+      "type": "object",
+      "properties": {
+        "pool": {
+          "description": "Name of an entry of [`Config::upstreams`], without `@`.",
+          "type": "string"
+        },
+        "weight": {
+          "description": "Share of the requests (HTTP) or connections (TCP), relative to the\nother pools of the split. Zero sends nothing to the pool.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pool"
+      ]
+    }
+  }
+}

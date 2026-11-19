@@ -23,6 +23,8 @@ allow = [
     "MIT",
     "MIT-0",
     "Unicode-3.0",
+    # foldhash, through the jsonschema dev-dependency of the schema tests.
+    "Zlib",
 ]
 confidence-threshold = 0.9
 

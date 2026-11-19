@@ -5,10 +5,11 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// An IP network such as `10.0.0.0/8` or `::1/128`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "String", into = "String")]
 pub struct IpNet {
     address: IpAddr,

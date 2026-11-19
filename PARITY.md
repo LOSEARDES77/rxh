@@ -164,7 +164,9 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `caddy stop` | `rxh stop` | ✅ | Admin API, falls back to the PID file. |
 | `caddy reload` | `rxh reload`, `SIGHUP` | ✅ | Zero downtime (`SO_REUSEPORT`); an invalid file keeps the running config. |
 | `caddy validate` | `rxh validate` | ✅ | |
-| `caddy fmt`, `caddy adapt` | | ❌ | |
+| `caddy fmt` | `rxh fmt [--check] [FILE...]` | ✅ | Rewrites in place by default (Caddy prints unless `--overwrite`); `--check` lists unformatted files and fails, like `caddy fmt --diff` in CI but without the diff. Whitespace only, comments kept; arrays and inline tables kept as written. |
+| `caddy adapt` | | ❌ | |
+| JSON schema of the configuration for editors (Caddy's JSON config has community schemas only) | `rxh schema`, `docs/rxh.schema.json` | ➕ | Draft 07, generated from the parser's types with their doc comments: keys, enums, durations, sizes and one-or-many lists; unknown keys rejected. Cross-key rules stay in `rxh validate`. |
 | `caddy reverse-proxy` | `rxh reverse-proxy --from --to... [--policy] [--protocol] [--host]` | ✅ | Foreground, no file, admin disabled. `rxh service add --to` persists instead. |
 | `caddy file-server` | `rxh file-server [--listen] [--root] [--no-browse] [--encode]` | ✅ | Foreground, no file, admin disabled. `rxh service add --serve` persists instead. |
 | Admin API on `localhost:2019` | `[admin] listen` (same default) | ✅ | |

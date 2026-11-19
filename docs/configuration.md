@@ -202,6 +202,53 @@ rxh completions fish > /usr/share/fish/vendor_completions.d/rxh.fish
 rxh man --dir /usr/share/man/man1
 ```
 
+## Formatting and editor completion
+
+`rxh fmt [FILE...]` rewrites configuration files (the configuration file
+when no FILE is given) in one layout: no indentation, one space around
+`=`, no spaces inside `[table]` headers, a blank line before each table,
+at most one blank line in a row and one newline at the end. Only
+whitespace changes: keys, values, their order and every comment stay. The
+spaces before a trailing comment and the inside of arrays and inline
+tables are kept as written, so aligned comments and lists stay aligned.
+`--check` changes nothing, prints the files that are not formatted and
+fails if there is any, for CI. A file that is not valid TOML is reported
+and left alone; `fmt` checks the syntax only, `rxh validate` the meaning.
+
+```sh
+rxh fmt                            # rxh.toml, or -c FILE
+rxh fmt --check conf.d/*.toml      # CI: fails when a file needs formatting
+```
+
+`rxh schema` prints the JSON schema (draft 07) of the configuration file,
+generated from the same definitions the parser uses, with the
+documentation of every key. The schema of this version is also in
+[`docs/rxh.schema.json`](rxh.schema.json). Editors with a TOML language
+server that reads JSON schemas ([Taplo](https://taplo.tamasfe.dev/), the
+Even Better TOML extension of VS Code, [Tombi](https://tombi-toml.github.io/tombi/))
+then complete keys, show their documentation on hover and flag unknown
+keys and wrong values as you type. Point the file at the schema with a
+directive on its first line:
+
+```toml
+#:schema ./rxh.schema.json
+# or the published copy:
+#:schema https://raw.githubusercontent.com/LOSEARDES77/rxh/main/docs/rxh.schema.json
+
+[[server]]
+listen = "127.0.0.1:8080"
+forward = "127.0.0.1:3000"
+```
+
+```sh
+rxh schema > rxh.schema.json
+```
+
+The directive is a comment, so RXH ignores it. The schema describes the
+main file; files pulled in with `include` hold only `upstream` and `server`
+and match it too. Checks that need more than one key (`forward` and
+`match` together, a pool that does not exist) are left to `rxh validate`.
+
 ## Installing a release package
 
 Every `v*` tag publishes a GitHub release with these files (the `Release`

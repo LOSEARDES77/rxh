@@ -4,9 +4,11 @@
 //! a sequence of decimal numbers, each one followed by a unit (`ns`, `us`,
 //! `ms`, `s`, `m`, `h`, `d`). A bare integer is read as seconds.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::time::Duration;
 
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de;
 use serde::{Deserialize, Deserializer, Serializer};
 
@@ -112,6 +114,24 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duratio
     match Raw::deserialize(deserializer)? {
         Raw::Seconds(seconds) => Ok(Duration::from_secs(seconds)),
         Raw::Text(text) => parse(&text).map_err(de::Error::custom),
+    }
+}
+
+/// Stands in for duration fields in the JSON schema of the configuration.
+pub(crate) struct DurationSchema;
+
+impl JsonSchema for DurationSchema {
+    fn schema_name() -> Cow<'static, str> {
+        "Duration".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "A duration such as `250ms`, `5s` or `1m30s` (units ns, us, ms, s, m, h, d), or a number of seconds.",
+            "type": ["string", "integer"],
+            "minimum": 0,
+            "pattern": "^\\s*([0-9]+|([0-9]*\\.?[0-9]+(ns|us|µs|ms|s|m|h|d))+)\\s*$"
+        })
     }
 }
 
