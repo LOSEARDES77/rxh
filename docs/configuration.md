@@ -181,6 +181,21 @@ directory in the foreground (default `127.0.0.1:8080` and `.`).
 [--host NAME]` proxies in the foreground. Both disable the admin API, and
 reload requests answer "no configuration file to reload".
 
+## Shell completions and man pages
+
+`rxh completions SHELL` prints the completion script for `bash`, `zsh`,
+`fish`, `elvish` or `powershell`; `rxh man` prints the rxh(1) man page, and
+`rxh man --dir DIR` writes `rxh.1` plus one page per command
+(`rxh-upstream-add.1`, ...) into `DIR`, creating it. Both come from the
+command line definition, so they always match the binary.
+
+```sh
+rxh completions bash > /usr/share/bash-completion/completions/rxh
+rxh completions zsh > /usr/share/zsh/site-functions/_rxh
+rxh completions fish > /usr/share/fish/vendor_completions.d/rxh.fish
+rxh man --dir /usr/share/man/man1
+```
+
 ## `[admin]`
 
 | Key | Default | Description |

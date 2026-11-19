@@ -96,6 +96,22 @@ pub(crate) enum Command {
     /// Hash the password read from standard input, for `basic_auth` users.
     HashPassword,
 
+    /// Print the shell completion script for SHELL to standard output.
+    Completions {
+        /// Shell to complete for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the rxh(1) man page, or write one page per command to a
+    /// directory.
+    Man {
+        /// Write `rxh.1` and `rxh-COMMAND.1` pages into this directory
+        /// instead of printing `rxh.1` to standard output.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+
     /// Show the effective configuration, with includes merged.
     #[command(subcommand)]
     Config(ConfigCommand),
