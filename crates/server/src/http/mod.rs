@@ -3,6 +3,7 @@
 pub(crate) mod auth;
 pub(crate) mod body;
 pub(crate) mod cache;
+pub(crate) mod cors;
 pub(crate) mod encode;
 pub(crate) mod headers;
 pub(crate) mod proxy;

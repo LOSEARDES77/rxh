@@ -13,7 +13,9 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method, Request, StatusCode, Uri};
-use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders};
+use rxh_core::config::{
+    self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders, SecurityHeaders,
+};
 use rxh_core::matcher::{MatchInput, RequestMatcher};
 use rxh_core::net::{self, IpNet};
 use rxh_core::pool::Upstream;
@@ -27,6 +29,7 @@ use crate::files::Files;
 use crate::http::auth::{BasicAuth, ForwardAuth};
 use crate::http::body::Guarded;
 use crate::http::cache::Cache;
+use crate::http::cors::Cors;
 use crate::http::encode;
 use crate::http::headers::{self, Forwarding, Replacement, Via};
 use crate::http::proxy;
@@ -64,6 +67,11 @@ pub(crate) struct Site {
     /// own.
     pub(crate) basic_auth: Option<BasicAuth>,
     pub(crate) forward_auth: Option<ForwardAuth>,
+
+    /// Server `security_headers` and `cors`, for the routes without their
+    /// own.
+    pub(crate) security_headers: Option<SecurityHeaders>,
+    pub(crate) cors: Option<Cors>,
 
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
@@ -113,9 +121,28 @@ pub(crate) struct Route {
     /// Entry `basic_auth` and `forward_auth`, each replacing the site's.
     pub(crate) basic_auth: Option<BasicAuth>,
     pub(crate) forward_auth: Option<ForwardAuth>,
+    /// Entry `security_headers` and `cors`, each replacing the site's.
+    pub(crate) security_headers: Option<SecurityHeaders>,
+    pub(crate) cors: Option<Cors>,
 }
 
 impl Route {
+    fn cors(&self) -> Option<&Cors> {
+        self.cors.as_ref().or(self.site.cors.as_ref())
+    }
+
+    /// Adds the headers of the `security_headers` preset the response lacks.
+    fn add_security_headers(&self, response: &mut HeaderMap) {
+        let Some(preset) = self.security_headers.or(self.site.security_headers) else {
+            return;
+        };
+        for (name, value) in preset.headers(self.site.tls) {
+            response
+                .entry(name)
+                .or_insert(HeaderValue::from_static(value));
+        }
+    }
+
     /// Returns true if the route or its site has an IP list or a rate limit.
     fn needs_client_ip(&self) -> bool {
         !(self.ip_allow.is_empty()
@@ -199,6 +226,8 @@ impl Site {
             rate_limit: server.rate_limit.as_ref().map(RateLimiter::new),
             basic_auth: server.basic_auth.as_ref().map(BasicAuth::new),
             forward_auth: forward_auth(&server.forward_auth, "")?,
+            security_headers: server.security_headers,
+            cors: server.cors.as_ref().map(Cors::new),
             tls: server.tls.is_some(),
             client_subject_header: server
                 .client_auth
@@ -290,6 +319,8 @@ impl Site {
                     &pattern.forward_auth,
                     &format!("match[{pattern_index}]: "),
                 )?,
+                security_headers: pattern.security_headers,
+                cors: pattern.cors.as_ref().map(Cors::new),
             });
         }
 
@@ -480,9 +511,15 @@ impl Service {
             *request.method_mut() = method.clone();
         }
 
+        let origin = request.headers().get(hyper::header::ORIGIN).cloned();
+        // Preflights carry no credentials, so they are answered before auth.
+        let preflight = route
+            .and_then(Route::cors)
+            .filter(|_| Cors::is_preflight(&method, request.headers()));
+
         // The auth service gets the method and URI the client sent.
         let mut denied = match route {
-            Some(route) if !forbidden && retry_after.is_none() => {
+            Some(route) if !forbidden && retry_after.is_none() && preflight.is_none() => {
                 self.authenticate(route, &method, &uri, request.headers_mut())
                     .await
             }
@@ -501,6 +538,7 @@ impl Service {
             Some(_) if retry_after.is_some() => {
                 response::too_many_requests(retry_after.unwrap_or_default())
             }
+            Some(_) if let Some(cors) = preflight => cors.preflight(request.headers()),
             Some(_) if denied.is_some() => denied.take().unwrap_or_else(response::forbidden),
             Some(_) if rewrite_failed => {
                 response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST")
@@ -525,6 +563,12 @@ impl Service {
             && !route.encode.is_empty()
         {
             response = encode::apply(response, &route.encode, &accept_encoding);
+        }
+        if let Some(route) = route {
+            if let Some(cors) = route.cors().filter(|_| preflight.is_none()) {
+                cors.apply(origin.as_ref(), response.headers_mut());
+            }
+            route.add_security_headers(response.headers_mut());
         }
 
         let elapsed = started.elapsed();

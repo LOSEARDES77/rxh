@@ -1110,6 +1110,90 @@ Every check opens a new connection to the service. An `https://` service is
 verified against the public certificate authorities. `Set-Cookie` headers of
 a `2xx` answer are not passed on to the client.
 
+### Security headers
+
+`security_headers` adds a preset of security response headers to every
+response of an `http` server or of a `match` entry, the ones RXH makes
+itself (redirects, `401`, `403`, `404` of a route...) included. A header the
+response already has, from the backend or from `response.headers.set`, is
+kept as it is: the preset only fills the gaps.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "app.example.com"
+security_headers = "basic"
+match = [
+    { uri = "/admin", security_headers = "strict", forward = "@admin" },
+    # The backend manages its own headers.
+    { uri = "/embed", security_headers = "off", forward = "@widgets" },
+    { forward = "@app" },
+]
+```
+
+| Header | `basic` | `strict` |
+|---|---|---|
+| `X-Content-Type-Options` | `nosniff` | `nosniff` |
+| `X-Frame-Options` | `SAMEORIGIN` | `DENY` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | `no-referrer` |
+| `Strict-Transport-Security` (TLS servers only) | `max-age=31536000` | `max-age=63072000; includeSubDomains` |
+| `Content-Security-Policy` | | `default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'` |
+| `Cross-Origin-Opener-Policy` | | `same-origin` |
+| `Permissions-Policy` | | `camera=(), microphone=(), geolocation=(), payment=(), usb=()` |
+
+- An entry's `security_headers` replaces the server's; `"off"` turns the
+  server's off for that entry.
+- `basic` breaks no ordinary site. `strict` forbids scripts, styles and
+  images from other origins and inline scripts: set your own
+  `Content-Security-Policy` with `response.headers.set` (or in the backend)
+  when a site needs more, the rest of the preset stays.
+- HSTS is only sent by servers with `tls`: browsers ignore it over plain
+  HTTP. `preload` is never added, submit the domain to the preload list
+  yourself and set the header with `response.headers.set`.
+
+### CORS
+
+`cors` makes RXH handle cross-origin resource sharing for an `http` server
+or a `match` entry, whatever the backend does.
+
+```toml
+[[server]]
+listen = "0.0.0.0:443"
+tls = "auto"
+host = "api.example.com"
+cors = { origins = ["https://app.example.com", "https://*.example.com"], credentials = true, max_age = "1h" }
+match = [
+    # Anybody may read the public data.
+    { uri = "/public", cors = { origins = "*", methods = ["GET", "HEAD"] }, forward = "@api" },
+    { forward = "@api" },
+]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `origins` | required | Allowed origins: `"https://app.example.com"` (scheme, host and port must match), `"https://*.example.com"` for any subdomain (not `example.com` itself), or `"*"` for any origin. Lowercase, without a path. A string or a list. |
+| `methods` | `["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]` | `Access-Control-Allow-Methods` of preflight answers. |
+| `headers` | the requested ones | `Access-Control-Allow-Headers` of preflight answers. Unset, a preflight is allowed the headers it asks for in `Access-Control-Request-Headers`. |
+| `expose_headers` | none | `Access-Control-Expose-Headers`: response headers scripts may read besides the safelisted ones. |
+| `credentials` | `false` | Allows cookies and `Authorization` (`Access-Control-Allow-Credentials: true`). Cannot be combined with `"*"`. |
+| `max_age` | unset | `Access-Control-Max-Age`: how long browsers may cache a preflight answer, as a duration (`"10m"`). |
+
+- Preflights (`OPTIONS` with `Origin` and `Access-Control-Request-Method`)
+  are answered by RXH with `204` and never reach the backend. They skip
+  `basic_auth` and `forward_auth`, since browsers send them without
+  credentials, but not `ip_allow`, `ip_deny` or `rate_limit`. A preflight
+  from an origin that is not allowed gets a `204` without the
+  `Access-Control-Allow-*` headers, which makes the browser block the
+  request.
+- Other responses of an allowed origin get `Access-Control-Allow-Origin`
+  (the request's origin, or `*` when `origins` has `"*"`),
+  `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers`.
+  The `Access-Control-Allow-Origin`, `-Allow-Credentials` and
+  `-Expose-Headers` of the backend are always removed, and `Vary: Origin`
+  is added unless the answer is `*`.
+- An entry's `cors` replaces the server's.
+
 ### Rewrites and redirects
 
 ```toml

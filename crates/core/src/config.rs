@@ -290,6 +290,12 @@ impl Config {
                 server.forward_auth.as_ref(),
             )
             .map_err(|err| ConfigError::Invalid(format!("{label}: {err}")))?;
+            validate_response_policy(
+                server.protocol,
+                server.security_headers,
+                server.cors.as_ref(),
+            )
+            .map_err(|err| ConfigError::Invalid(format!("{label}: {err}")))?;
             match server.max_connections_per_ip {
                 Some(0) => {
                     return invalid(format!(
@@ -340,6 +346,14 @@ impl Config {
                     server.protocol,
                     pattern.basic_auth.as_ref(),
                     pattern.forward_auth.as_ref(),
+                )
+                .map_err(|err| {
+                    ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
+                })?;
+                validate_response_policy(
+                    server.protocol,
+                    pattern.security_headers,
+                    pattern.cors.as_ref(),
                 )
                 .map_err(|err| {
                     ConfigError::Invalid(format!("{label}: match[{pattern_index}]: {err}"))
@@ -830,6 +844,16 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forward_auth: Option<ForwardAuth>,
 
+    /// Preset of security response headers of every route that does not set
+    /// its own (http only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_headers: Option<SecurityHeaders>,
+
+    /// Cross-origin resource sharing of every route that does not set its
+    /// own (http only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cors: Option<Cors>,
+
     /// Maximum number of concurrent connections of one client IP (http and
     /// tcp).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -934,6 +958,8 @@ struct RawServer {
     rate_limit: Option<RateLimit>,
     basic_auth: Option<BasicAuth>,
     forward_auth: Option<ForwardAuth>,
+    security_headers: Option<SecurityHeaders>,
+    cors: Option<Cors>,
     max_connections_per_ip: Option<usize>,
     proxy_protocol: Option<ProxyProtocol>,
     #[serde(default)]
@@ -1049,6 +1075,8 @@ impl TryFrom<RawServer> for Server {
             rate_limit: raw.rate_limit,
             basic_auth: raw.basic_auth,
             forward_auth: raw.forward_auth,
+            security_headers: raw.security_headers,
+            cors: raw.cors,
             max_connections_per_ip: raw.max_connections_per_ip,
             proxy_protocol: raw.proxy_protocol,
             proxy_protocol_in: raw.proxy_protocol_in,
@@ -1130,6 +1158,15 @@ pub struct Pattern {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_auth: Option<ForwardAuth>,
 
+    /// Preset of security response headers, replacing the server's; `off`
+    /// turns the server's off for this entry (http only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_headers: Option<SecurityHeaders>,
+
+    /// Cross-origin resource sharing, replacing the server's (http only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<Cors>,
+
     /// What to do when the pattern matches.
     #[serde(flatten)]
     pub action: Action,
@@ -1206,6 +1243,8 @@ impl Pattern {
             rate_limit: None,
             basic_auth: None,
             forward_auth: None,
+            security_headers: None,
+            cors: None,
             action,
             rewrite: None,
             request: RequestConfig::default(),
@@ -3497,6 +3536,196 @@ fn validate_auth(
     Ok(())
 }
 
+/// Checks the `security_headers` and `cors` of a server or match entry.
+fn validate_response_policy(
+    protocol: Protocol,
+    security_headers: Option<SecurityHeaders>,
+    cors: Option<&Cors>,
+) -> Result<(), String> {
+    if security_headers.is_some() && protocol != Protocol::Http {
+        return Err(String::from(
+            "security_headers only applies to http servers",
+        ));
+    }
+    if let Some(cors) = cors {
+        if protocol != Protocol::Http {
+            return Err(String::from("cors only applies to http servers"));
+        }
+        cors.validate().map_err(|err| format!("cors: {err}"))?;
+    }
+    Ok(())
+}
+
+/// Preset of security response headers. Each header is only added when the
+/// response does not already have it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecurityHeaders {
+    /// No headers; in a match entry, turns the server's preset off.
+    Off,
+
+    /// Headers that break no site: `nosniff`, `SAMEORIGIN` framing,
+    /// `strict-origin-when-cross-origin` referrers and one year of HSTS.
+    Basic,
+
+    /// `basic` hardened: no framing, no referrers, two years of HSTS with
+    /// subdomains, a same-origin CSP, COOP and a restrictive
+    /// `Permissions-Policy`.
+    Strict,
+}
+
+impl SecurityHeaders {
+    /// Headers of the preset, as `(name, value)` pairs. HSTS is left out
+    /// when `tls` is false, browsers ignore it over plain HTTP.
+    #[must_use]
+    pub fn headers(self, tls: bool) -> Vec<(&'static str, &'static str)> {
+        let mut headers = match self {
+            Self::Off => return Vec::new(),
+            Self::Basic => vec![
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "SAMEORIGIN"),
+                ("referrer-policy", "strict-origin-when-cross-origin"),
+            ],
+            Self::Strict => vec![
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "DENY"),
+                ("referrer-policy", "no-referrer"),
+                (
+                    "content-security-policy",
+                    "default-src 'self'; base-uri 'self'; form-action 'self'; \
+                     frame-ancestors 'none'; object-src 'none'",
+                ),
+                ("cross-origin-opener-policy", "same-origin"),
+                (
+                    "permissions-policy",
+                    "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+                ),
+            ],
+        };
+        if tls {
+            headers.push((
+                "strict-transport-security",
+                match self {
+                    Self::Strict => "max-age=63072000; includeSubDomains",
+                    _ => "max-age=31536000",
+                },
+            ));
+        }
+        headers
+    }
+}
+
+/// Cross-origin resource sharing: preflight answers and `Access-Control-*`
+/// response headers for the allowed origins.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Cors {
+    /// Allowed origins: `https://app.example.com`, `https://*.example.com`
+    /// for any subdomain, or `*` for any origin.
+    #[serde(deserialize_with = "one_or_many")]
+    pub origins: Vec<String>,
+
+    /// Methods allowed in preflight answers.
+    #[serde(default = "default::cors_methods", deserialize_with = "one_or_many")]
+    pub methods: Vec<String>,
+
+    /// Request headers allowed in preflight answers. Empty allows the ones
+    /// the preflight asks for.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub headers: Vec<String>,
+
+    /// Response headers scripts may read besides the safelisted ones.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub expose_headers: Vec<String>,
+
+    /// Allows cookies and `Authorization` on cross-origin requests.
+    #[serde(default)]
+    pub credentials: bool,
+
+    /// Time browsers may cache a preflight answer.
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_age: Option<Duration>,
+}
+
+impl Cors {
+    fn validate(&self) -> Result<(), String> {
+        if self.origins.is_empty() {
+            return Err(String::from("origins must not be empty"));
+        }
+        for origin in &self.origins {
+            if origin == "*" {
+                if self.credentials {
+                    return Err(String::from(
+                        "origin \"*\" cannot be combined with credentials = true, list the \
+                         origins",
+                    ));
+                }
+                continue;
+            }
+            let valid = origin.split_once("://").is_some_and(|(scheme, host)| {
+                matches!(scheme, "http" | "https")
+                    && !host.is_empty()
+                    && host == host.to_ascii_lowercase()
+                    && !host.contains(['/', '?', '#', ' '])
+                    && !host.strip_prefix("*.").unwrap_or(host).contains('*')
+            });
+            if !valid {
+                return Err(format!(
+                    "invalid origin {origin:?}, expected \"*\" or a lowercase \
+                     scheme://host[:port] such as \"https://*.example.com\""
+                ));
+            }
+        }
+        if self.methods.is_empty() {
+            return Err(String::from("methods must not be empty"));
+        }
+        for method in &self.methods {
+            if http::Method::from_bytes(method.as_bytes()).is_err() {
+                return Err(format!("invalid method {method:?}"));
+            }
+        }
+        for name in self.headers.iter().chain(&self.expose_headers) {
+            if name != "*" && http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(format!("invalid header name {name:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true if requests from `origin` are allowed.
+    #[must_use]
+    pub fn allows(&self, origin: &str) -> bool {
+        self.origins.iter().any(|allowed| {
+            if allowed == "*" || allowed.eq_ignore_ascii_case(origin) {
+                return true;
+            }
+            let Some((scheme, host)) = allowed.split_once("://*.") else {
+                return false;
+            };
+            // `https://*.example.com` matches `https://a.example.com`, not
+            // `https://example.com` nor `https://evilexample.com`.
+            let origin = origin.to_ascii_lowercase();
+            let subdomain = origin
+                .strip_prefix(&format!("{scheme}://"))
+                .and_then(|rest| rest.strip_suffix(&format!(".{host}")));
+            subdomain
+                .is_some_and(|subdomain| !subdomain.is_empty() && !subdomain.contains(['/', ':']))
+        })
+    }
+}
+
 /// HTTP Basic authentication (RFC 7617) against bcrypt password hashes.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -3792,6 +4021,12 @@ mod default {
 
     pub fn forward_auth_timeout() -> Duration {
         Duration::from_secs(10)
+    }
+
+    pub fn cors_methods() -> Vec<String> {
+        ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+            .map(String::from)
+            .to_vec()
     }
 
     pub fn udp_idle_timeout() -> Duration {
@@ -5723,6 +5958,204 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
         ] {
             let message = invalid(&text);
             assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    #[test]
+    fn security_headers_and_cors() {
+        let config = Config::from_toml(
+            r#"
+            [[server]]
+            listen = "127.0.0.1:8000"
+            security_headers = "strict"
+            cors = { origins = "https://app.example.com" }
+            match = [
+                { uri = "/api", security_headers = "off", cors = { origins = ["https://*.example.com", "http://localhost:3000"], methods = ["GET", "PURGE"], headers = ["X-Token"], expose_headers = "X-Total", credentials = true, max_age = "10m" }, forward = "127.0.0.1:8080" },
+                { uri = "/docs", security_headers = "basic", forward = "127.0.0.1:8080" },
+                { forward = "127.0.0.1:8080" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let server = &config.servers[0];
+        assert_eq!(server.security_headers, Some(SecurityHeaders::Strict));
+        let cors = server.cors.as_ref().unwrap();
+        assert_eq!(cors.origins, ["https://app.example.com"]);
+        assert_eq!(cors.methods, default::cors_methods());
+        assert!(cors.headers.is_empty() && !cors.credentials && cors.max_age.is_none());
+
+        let api = &server.patterns[0];
+        assert_eq!(api.security_headers, Some(SecurityHeaders::Off));
+        let api_cors = api.cors.as_ref().unwrap();
+        assert_eq!(api_cors.methods, ["GET", "PURGE"]);
+        assert_eq!(api_cors.headers, ["X-Token"]);
+        assert_eq!(api_cors.expose_headers, ["X-Total"]);
+        assert!(api_cors.credentials);
+        assert_eq!(api_cors.max_age, Some(Duration::from_secs(600)));
+        assert_eq!(
+            server.patterns[1].security_headers,
+            Some(SecurityHeaders::Basic)
+        );
+        assert!(server.patterns[2].security_headers.is_none());
+        assert!(server.patterns[2].cors.is_none());
+
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.servers[0].security_headers, server.security_headers);
+        assert_eq!(again.servers[0].cors, server.cors);
+        assert_eq!(again.servers[0].patterns[0].cors, api.cors);
+        assert_eq!(
+            again.servers[0].patterns[0].security_headers,
+            api.security_headers
+        );
+
+        let invalid = |text: &str| Config::from_toml(text).unwrap_err().to_string();
+        let http = "[[server]]\nlisten = \"127.0.0.1:1\"\nforward = \"127.0.0.1:2\"\n";
+        for (text, expected) in [
+            (
+                format!("{http}security_headers = \"paranoid\""),
+                "unknown variant `paranoid`",
+            ),
+            (
+                format!("{http}cors = {{ origins = [] }}"),
+                "cors: origins must not be empty",
+            ),
+            (
+                format!("{http}cors = {{ methods = [\"GET\"] }}"),
+                "missing field `origins`",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"*\", methods = [] }}"),
+                "cors: methods must not be empty",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"*\", credentials = true }}"),
+                "cannot be combined with credentials",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"app.example.com\" }}"),
+                "invalid origin \"app.example.com\"",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"https://app.example.com/\" }}"),
+                "invalid origin",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"ftp://example.com\" }}"),
+                "invalid origin",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"https://a.*.example.com\" }}"),
+                "invalid origin",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"https://App.example.com\" }}"),
+                "invalid origin",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"*\", methods = [\"GE T\"] }}"),
+                "cors: invalid method \"GE T\"",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"*\", headers = [\"X Token\"] }}"),
+                "cors: invalid header name \"X Token\"",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"*\", expose_headers = [\"\"] }}"),
+                "cors: invalid header name",
+            ),
+            (
+                format!("{http}cors = {{ origins = \"*\", max_age = \"soon\" }}"),
+                "max_age",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n\
+                     forward = \"127.0.0.1:2\"\nsecurity_headers = \"basic\"",
+                ),
+                "security_headers only applies to http servers",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"tcp\"\n\
+                     forward = \"127.0.0.1:2\"\ncors = { origins = \"*\" }",
+                ),
+                "cors only applies to http servers",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nprotocol = \"udp\"\n\
+                     match = [{ forward = \"127.0.0.1:2\", cors = { origins = \"*\" } }]",
+                ),
+                "match[0]: cors only applies to http servers",
+            ),
+            (
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\n\
+                     match = [{ forward = \"127.0.0.1:2\", cors = { origins = [] } }]",
+                ),
+                "match[0]: cors: origins must not be empty",
+            ),
+        ] {
+            let err = invalid(&text);
+            assert!(err.contains(expected), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn cors_origin_matching() {
+        let cors = |origins: &[&str]| Cors {
+            origins: origins.iter().map(|origin| String::from(*origin)).collect(),
+            methods: default::cors_methods(),
+            headers: Vec::new(),
+            expose_headers: Vec::new(),
+            credentials: false,
+            max_age: None,
+        };
+        let any = cors(&["*"]);
+        assert!(any.allows("https://anything.test"));
+        assert!(any.allows("null"));
+
+        let listed = cors(&["https://app.example.com", "https://*.example.org"]);
+        assert!(listed.allows("https://app.example.com"));
+        assert!(listed.allows("https://APP.example.com"));
+        assert!(!listed.allows("http://app.example.com"), "scheme differs");
+        assert!(
+            !listed.allows("https://app.example.com:8443"),
+            "port differs"
+        );
+        assert!(!listed.allows("https://app.example.com.evil.test"));
+        assert!(listed.allows("https://a.example.org"));
+        assert!(listed.allows("https://a.b.example.org"));
+        assert!(!listed.allows("https://example.org"), "no subdomain");
+        assert!(!listed.allows("https://evilexample.org"));
+        assert!(
+            !listed.allows("https://a.example.org:8443"),
+            "port not in pattern"
+        );
+        assert!(!listed.allows("http://a.example.org"));
+        assert!(!listed.allows("null"));
+    }
+
+    #[test]
+    fn security_header_presets() {
+        let names = |preset: SecurityHeaders, tls: bool| -> Vec<&str> {
+            preset
+                .headers(tls)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+        assert!(SecurityHeaders::Off.headers(true).is_empty());
+        assert!(!names(SecurityHeaders::Basic, false).contains(&"strict-transport-security"));
+        assert!(names(SecurityHeaders::Basic, true).contains(&"strict-transport-security"));
+        assert!(names(SecurityHeaders::Strict, false).contains(&"content-security-policy"));
+        assert!(!names(SecurityHeaders::Basic, false).contains(&"content-security-policy"));
+        for preset in [SecurityHeaders::Basic, SecurityHeaders::Strict] {
+            for (name, value) in preset.headers(true) {
+                http::HeaderName::from_static(name);
+                http::HeaderValue::from_static(value);
+            }
         }
     }
 
