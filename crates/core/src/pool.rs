@@ -367,6 +367,10 @@ pub struct Upstream {
     active: AtomicUsize,
     total: AtomicU64,
     failure_total: AtomicU64,
+    /// HTTP responses received, with their summed latency and how many were 5xx.
+    responses: AtomicU64,
+    response_micros: AtomicU64,
+    server_errors: AtomicU64,
     checked_healthy: AtomicBool,
     check_passes: AtomicU32,
     check_fails: AtomicU32,
@@ -403,6 +407,9 @@ impl Upstream {
             active: AtomicUsize::new(0),
             total: AtomicU64::new(0),
             failure_total: AtomicU64::new(0),
+            responses: AtomicU64::new(0),
+            response_micros: AtomicU64::new(0),
+            server_errors: AtomicU64::new(0),
             checked_healthy: AtomicBool::new(true),
             check_passes: AtomicU32::new(0),
             check_fails: AtomicU32::new(0),
@@ -547,11 +554,30 @@ impl Upstream {
         self.total.load(Ordering::Relaxed)
     }
 
-    /// Failures recorded since start, whether or not passive health checks
-    /// are enabled.
+    /// Requests and connections that failed without a response since start,
+    /// whether or not passive health checks are enabled. Responses that
+    /// passive health checks count as failures are not included.
     #[must_use]
     pub fn total_failures(&self) -> u64 {
         self.failure_total.load(Ordering::Relaxed)
+    }
+
+    /// HTTP responses received since start.
+    #[must_use]
+    pub fn total_responses(&self) -> u64 {
+        self.responses.load(Ordering::Relaxed)
+    }
+
+    /// Time to the response headers, summed over [`Self::total_responses`].
+    #[must_use]
+    pub fn total_response_time(&self) -> Duration {
+        Duration::from_micros(self.response_micros.load(Ordering::Relaxed))
+    }
+
+    /// HTTP responses with a 5xx status received since start.
+    #[must_use]
+    pub fn total_server_errors(&self) -> u64 {
+        self.server_errors.load(Ordering::Relaxed)
     }
 
     /// Failures currently remembered by passive health checks.
@@ -566,6 +592,7 @@ impl Upstream {
     /// Records a failed request or connection for passive health checks and
     /// the circuit breaker.
     pub fn record_failure(&self) {
+        self.failure_total.fetch_add(1, Ordering::Relaxed);
         self.passive_failure();
         self.breaker_record(/* error= */ true, /* slow= */ false);
     }
@@ -585,7 +612,6 @@ impl Upstream {
     }
 
     fn passive_failure(&self) {
-        self.failure_total.fetch_add(1, Ordering::Relaxed);
         let Some(passive) = &self.passive else {
             return;
         };
@@ -601,6 +627,13 @@ impl Upstream {
     /// Feeds a completed HTTP response to passive health checks and the
     /// circuit breaker.
     pub fn record_response(&self, status: u16, latency: Duration) {
+        self.responses.fetch_add(1, Ordering::Relaxed);
+        let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+        self.response_micros.fetch_add(micros, Ordering::Relaxed);
+        if status >= 500 {
+            self.server_errors.fetch_add(1, Ordering::Relaxed);
+        }
+
         if let Some(breaker) = &self.breaker {
             let settings = &breaker.settings;
             let error = settings
@@ -1567,6 +1600,20 @@ mod tests {
     }
 
     #[test]
+    fn record_response_counts_latency_and_server_errors() {
+        let pool = Pool::new("p", &group(Policy::RoundRobin, &[("10.0.0.1:80", 1)])).unwrap();
+        let upstream = &pool.upstreams()[0];
+        upstream.record_response(200, Duration::from_millis(10));
+        upstream.record_response(499, Duration::from_millis(20));
+        upstream.record_response(503, Duration::from_millis(30));
+        assert_eq!(upstream.total_responses(), 3);
+        assert_eq!(upstream.total_response_time(), Duration::from_millis(60));
+        assert_eq!(upstream.total_server_errors(), 1);
+        // Responses, even 5xx ones, are not connection failures.
+        assert_eq!(upstream.total_failures(), 0);
+    }
+
+    #[test]
     fn sync_dynamic_adds_removes_and_keeps_state() {
         let pool = Pool::new("p", &group(Policy::RoundRobin, &[("10.0.0.1:80", 1)])).unwrap();
         let dns = |addresses: &[&str]| addresses.iter().map(|a| Backend::new(*a)).collect();
@@ -1725,6 +1772,12 @@ mod tests {
         first.record_failure();
         assert_eq!(pick(&pool, &context()), "b:1");
         assert_eq!(first.status().fails, 2);
+        // The 503 is a server error, not a failure without a response, so the
+        // metrics do not count it twice.
+        assert_eq!(
+            (first.total_failures(), first.total_server_errors()),
+            (1, 1)
+        );
     }
 
     #[test]

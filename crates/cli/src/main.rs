@@ -6,6 +6,7 @@ mod commands;
 mod edit;
 mod process;
 mod quick;
+mod top;
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};

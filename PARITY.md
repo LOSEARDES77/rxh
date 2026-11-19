@@ -139,7 +139,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `grace_period` | `grace_period` | ✅ | Default waits forever, like Caddy. Idle keep-alive connections close at once. |
 | Connection limit | `max_connections` | ➕ | |
 | Structured access logs | `[log]` `format = "json"`, `output`, `access`, `status`, `min_duration`, `sample_ratio` | ✅ | Text or JSON lines on stdout, stderr or a file; no field selection or rotation. |
-| Prometheus metrics | `GET /metrics` on the admin API | ✅ | Requests, latency histogram, L4 connections, per upstream requests, failures, in flight and health. |
+| Prometheus metrics | `GET /metrics` on the admin API | ✅ | Requests, latency histogram, L4 connections, per upstream requests, failures, responses, 5xx responses, summed time to headers, in flight and health. `rxh top` shows them live per pool. |
 
 ## Layer 4 (Caddy needs the caddy-l4 plugin)
 
@@ -175,6 +175,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `POST /stop` | same | ✅ | |
 | Admin over a unix socket (`admin unix//path`) | `[admin] listen = "unix//run/rxh/admin.sock"` | ✅ | Mode `0600`, stale sockets replaced, removed on shutdown; no `|0660` permission suffix. The CLI takes `--admin unix//path`. |
 | Remote admin (`remote_admin` with mTLS identities) | `[admin] token` | 🟡 | Bearer token on every request, required for a non-loopback `listen`. Plain HTTP: no TLS or client certificates on the admin listener, no per-identity access rules. |
+| Live per pool traffic in the terminal (like `nginxtop`, `ctop`) | `rxh top [--interval 1s] [--count N]` | ➕ | Requests per second, errors per second and share (failed connections plus 5xx), mean time to headers, requests in flight and healthy backends of every pool, computed from two scrapes of `GET /metrics`. Plain text redrawn in place on a terminal, appended frames when piped; no sorting or keys, Ctrl-C quits. Counters reset by a reload are taken from zero. |
 | CLI to manage pools, peers and services | `rxh upstream`, `rxh pool`, `rxh service` | ➕ | Edits the TOML keeping comments, validates, applies live. |
 | Split configuration (Nginx `include`) | `include = ["conf.d/*.toml"]` | ➕ | Included files hold `upstream` and `server` only; the CLI edits the defining file; `--file PATH` on `pool add` and `service add`. |
 | Environment variables in the config (`{$VAR}`, `{env.*}`, `{file.*}`) | `{env.NAME}`, `{file.PATH}` in any string value | 🟡 | Replaced when the file loads and on every reload, in the main and included files; secret files relative to the file that names them, trailing newlines dropped. An unset variable or unreadable file is an error: no `{$VAR:default}`. Not replaced in `POST /load` uploads, and not at request time. |

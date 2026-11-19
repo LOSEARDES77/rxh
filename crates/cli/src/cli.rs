@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rxh_core::config::AdminListen;
@@ -69,6 +70,21 @@ pub(crate) enum Command {
         /// Print the raw JSON from the admin API.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Live requests per second, error rate, latency, requests in flight
+    /// and healthy backends of every pool, refreshed from `GET /metrics`.
+    /// Errors are failed connections plus 5xx responses; latency is the
+    /// mean time to the response headers.
+    Top {
+        /// Time between refreshes, like `1s` or `500ms`.
+        #[arg(short, long, default_value = "1s", value_parser = positive_duration)]
+        interval: Duration,
+
+        /// Stop after this many refreshes instead of running until
+        /// interrupted.
+        #[arg(short = 'n', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        count: Option<u32>,
     },
 
     /// Check the configuration file and exit.
@@ -369,6 +385,15 @@ pub(crate) enum ServiceCommand {
     },
 }
 
+/// A duration like `500ms`, rejecting zero.
+fn positive_duration(input: &str) -> Result<Duration, String> {
+    match rxh_core::duration::parse(input) {
+        Ok(Duration::ZERO) => Err(String::from("must be more than zero")),
+        Ok(duration) => Ok(duration),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -456,6 +481,26 @@ mod tests {
             cli.command,
             Some(Command::Cert(CertCommand::Reload))
         ));
+    }
+
+    #[test]
+    fn parses_top() {
+        let cli = Cli::parse_from(["rxh", "top"]);
+        let Some(Command::Top { interval, count }) = cli.command else {
+            panic!("unexpected parse: {cli:?}");
+        };
+        assert_eq!((interval, count), (Duration::from_secs(1), None));
+        let cli = Cli::parse_from(["rxh", "top", "-i", "250ms", "-n", "3"]);
+        let Some(Command::Top { interval, count }) = cli.command else {
+            panic!("unexpected parse: {cli:?}");
+        };
+        assert_eq!((interval, count), (Duration::from_millis(250), Some(3)));
+        for bad in [["-i", "0s"], ["-i", "soon"], ["-n", "0"]] {
+            assert!(
+                Cli::try_parse_from(["rxh", "top", bad[0], bad[1]]).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

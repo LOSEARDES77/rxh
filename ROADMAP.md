@@ -164,7 +164,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] OpenTelemetry tracing with W3C trace context.
 - [x] Access log filters and sampling.
 - [x] Health events to webhooks.
-- [ ] `rxh top`: live requests per second, latency and errors per pool in
+- [x] `rxh top`: live requests per second, latency and errors per pool in
       the terminal, built on the metrics endpoint.
 - [ ] Web dashboard on top of the admin API: hosts, certificates, access
       lists, live health. Read only first, then management like Nginx
