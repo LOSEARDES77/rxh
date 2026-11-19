@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode, Uri};
 use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders};
 use rxh_core::matcher::{MatchInput, RequestMatcher};
@@ -53,6 +53,10 @@ pub(crate) struct Site {
 
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
+
+    /// Request header that carries the client certificate subject to the
+    /// backends (`client_auth.header`).
+    pub(crate) client_subject_header: Option<HeaderName>,
 
     /// PROXY protocol header sent on new connections to backends.
     pub(crate) proxy_protocol: Option<config::ProxyProtocol>,
@@ -135,6 +139,14 @@ impl Site {
             by,
             trusted_proxies: server.trusted_proxies.clone(),
             tls: server.tls.is_some(),
+            client_subject_header: server
+                .client_auth
+                .as_ref()
+                .and_then(|client_auth| client_auth.header.as_deref())
+                .map(|name| {
+                    HeaderName::from_bytes(name.as_bytes())
+                        .expect("validation checked client_auth.header")
+                }),
             proxy_protocol: server.proxy_protocol,
             stream_timeout: server.stream_timeout,
             stream_close: server
@@ -268,6 +280,8 @@ pub(crate) struct Service {
     pub(crate) peer: SocketAddr,
     /// `X-Forwarded-For` entry of `peer`.
     pub(crate) peer_ip: HeaderValue,
+    /// Subject of the certificate the client presented in the TLS handshake.
+    pub(crate) client_subject: Option<HeaderValue>,
     pub(crate) local: SocketAddr,
     pub(crate) activity: Arc<Activity>,
     pub(crate) logger: Arc<Logger>,

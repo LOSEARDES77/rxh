@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- `client_auth = { mode, ca, header }` on servers with `tls`: mutual TLS with
+  the four Traefik modes, `"request"`, `"require"`, `"verify_if_given"` and
+  `"require_and_verify"` (default). `ca` lists the PEM files of the
+  authorities that sign client certificates. On `http` servers `header`
+  names a request header that carries the subject of the verified client
+  certificate to the backends; a value sent by the client is dropped.
 - `[acme] challenge = "dns-01"` with the `[acme.dns]` table (`provider`
   `"cloudflare"`, `"route53"` or `"rfc2136"`, their credentials, `zone_id`,
   `api_url`, `propagation_wait`): `tls = "auto"` certificates validated with

@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyper::header::HeaderValue;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use rxh_core::config::{Action, Config, ConfigError, Protocol, ProxyProtocol};
@@ -612,6 +613,7 @@ async fn handle_connection(
                 if connection.alpn_protocol() == Some(acme::TLS_ALPN_PROTOCOL) {
                     return;
                 }
+                let client_subject = tls::client_subject(connection);
                 let handshake = Detected {
                     tls: true,
                     sni: connection.server_name().map(str::to_owned),
@@ -622,16 +624,26 @@ async fn handle_connection(
                         .collect(),
                     ..Detected::default()
                 };
-                serve(stream, peer, local, &context, stop, Some(handshake)).await;
+                serve(
+                    stream,
+                    peer,
+                    local,
+                    &context,
+                    stop,
+                    Some(handshake),
+                    client_subject,
+                )
+                .await;
             }
             Ok(Err(err)) => eprintln!("{log_name} => TLS handshake with {peer} failed: {err}"),
         },
-        None => serve(stream, peer, local, &context, stop, None).await,
+        None => serve(stream, peer, local, &context, stop, None, None).await,
     }
 }
 
 /// Runs the handler of `context` on an accepted (and maybe decrypted)
-/// connection. `handshake` holds what the TLS handshake revealed.
+/// connection. `handshake` holds what the TLS handshake revealed, and
+/// `client_subject` the subject of the client certificate.
 async fn serve<S>(
     mut stream: S,
     peer: SocketAddr,
@@ -639,6 +651,7 @@ async fn serve<S>(
     context: &ConnectionContext,
     stop: watch::Receiver<bool>,
     handshake: Option<Detected>,
+    client_subject: Option<HeaderValue>,
 ) where
     S: tcp::Client + Send + 'static,
 {
@@ -689,6 +702,7 @@ async fn serve<S>(
                 log_name: Arc::clone(&context.log.log_name),
                 peer,
                 peer_ip: headers::peer_ip_value(peer),
+                client_subject,
                 local,
                 activity: Arc::clone(&activity),
                 logger: Arc::clone(&context.log.logger),

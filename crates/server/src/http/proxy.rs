@@ -91,6 +91,13 @@ pub(crate) async fn forward(
         client_ip,
         &forwarding,
     );
+    // Last, so neither the client nor a header rule can forge the subject.
+    if let Some(name) = &site.client_subject_header {
+        parts.headers.remove(name);
+        if let Some(subject) = &connection.client_subject {
+            parts.headers.insert(name.clone(), subject.clone());
+        }
+    }
 
     if h2c {
         parts.headers.remove(header::CONNECTION);

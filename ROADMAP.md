@@ -107,7 +107,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] ACME TLS-ALPN-01.
 - [x] ACME DNS-01 and wildcard certificates (Cloudflare, Route53,
       RFC 2136).
-- [ ] mTLS on listeners with the four Traefik modes, and the client
+- [x] mTLS on listeners with the four Traefik modes, and the client
       certificate subject passed to backends.
 - [ ] TLS options: minimum version, cipher suites, curves. OCSP stapling.
 - [ ] Certificate reload without restart, and `rxh cert` commands to list

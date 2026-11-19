@@ -223,6 +223,14 @@ impl Config {
                          either all or none of the servers on it must use TLS"
                     ));
                 }
+                // One handshake configuration per listener: a policy picked by
+                // SNI could be dodged with a `Host` header naming another server.
+                if server.client_auth != first.client_auth {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         the servers on it must have the same client_auth"
+                    ));
+                }
                 if server.proxy_protocol_in != first.proxy_protocol_in {
                     return invalid(format!(
                         "{label}: listen address {address} is shared with {first_label}, \
@@ -407,6 +415,20 @@ impl Config {
                 return invalid(format!("{label}: TLS is not supported for UDP"));
             }
 
+            if let Some(client_auth) = &server.client_auth {
+                if server.tls.is_none() {
+                    return invalid(format!("{label}: client_auth needs tls"));
+                }
+                if client_auth.header.is_some() && server.protocol != Protocol::Http {
+                    return invalid(format!(
+                        "{label}: client_auth.header only applies to http servers"
+                    ));
+                }
+                client_auth
+                    .validate()
+                    .map_err(|err| ConfigError::Invalid(format!("{label}: client_auth: {err}")))?;
+            }
+
             if server.tls == Some(Tls::Auto) {
                 if server.protocol != Protocol::Http {
                     return invalid(format!(
@@ -525,6 +547,7 @@ impl Config {
                 patterns: vec![Pattern::new(Action::Redirect(Redirect { to, status: 308 }))],
                 name: None,
                 tls: None,
+                client_auth: None,
                 https_redirect: None,
                 ..server.clone()
             });
@@ -683,6 +706,10 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<Tls>,
 
+    /// Client certificates asked for in the TLS handshake (mutual TLS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<ClientAuth>,
+
     /// Redirects plain HTTP requests for this TLS server to HTTPS, see
     /// [`Config::with_https_redirects`]. Unset means on with `tls = "auto"`
     /// and off otherwise.
@@ -781,6 +808,7 @@ struct RawServer {
     max_connections: usize,
     name: Option<String>,
     tls: Option<Tls>,
+    client_auth: Option<ClientAuth>,
     https_redirect: Option<bool>,
     #[serde(default = "default::true_value")]
     http2: bool,
@@ -890,6 +918,7 @@ impl TryFrom<RawServer> for Server {
             max_connections: raw.max_connections,
             name: raw.name,
             tls: raw.tls,
+            client_auth: raw.client_auth,
             https_redirect: raw.https_redirect,
             http2: raw.http2,
             trusted_proxies,
@@ -2478,6 +2507,95 @@ impl<'de> Deserialize<'de> for Tls {
     }
 }
 
+/// What a TLS server asks of client certificates, named after Traefik's
+/// `clientAuthType` values.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    /// Asks for a certificate; accepts clients without one and does not
+    /// verify the one given.
+    Request,
+
+    /// Requires a certificate, without verifying it against `ca`.
+    Require,
+
+    /// Accepts clients without a certificate; a certificate that is given
+    /// must be signed by one of `ca`.
+    VerifyIfGiven,
+
+    /// Requires a certificate signed by one of `ca`.
+    #[default]
+    RequireAndVerify,
+}
+
+impl ClientAuthMode {
+    /// True when certificates are verified against `ca`.
+    #[must_use]
+    pub fn verifies(self) -> bool {
+        matches!(self, Self::VerifyIfGiven | Self::RequireAndVerify)
+    }
+
+    /// True when clients without a certificate are refused.
+    #[must_use]
+    pub fn is_mandatory(self) -> bool {
+        matches!(self, Self::Require | Self::RequireAndVerify)
+    }
+}
+
+/// The `client_auth` table of a TLS server: mutual TLS.
+///
+/// ```toml
+/// client_auth = { ca = "clients-ca.pem", header = "X-Client-Subject" }
+/// ```
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAuth {
+    /// What is asked of the client.
+    #[serde(default)]
+    pub mode: ClientAuthMode,
+
+    /// Paths to PEM files with the certificate authorities that sign client
+    /// certificates. Needed by the verifying modes, rejected by the others.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub ca: Vec<String>,
+
+    /// Request header that carries the subject of the verified client
+    /// certificate to the backends (`http` servers, verifying modes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+}
+
+impl ClientAuth {
+    fn validate(&self) -> Result<(), String> {
+        const VERIFYING: &str = "\"verify_if_given\" or \"require_and_verify\"";
+        if self.mode.verifies() {
+            if self.ca.is_empty() {
+                return Err(String::from("this mode needs ca"));
+            }
+        } else if !self.ca.is_empty() {
+            return Err(format!(
+                "this mode does not verify certificates, remove ca or use {VERIFYING}"
+            ));
+        } else if self.header.is_some() {
+            // The subject of a certificate nobody verified is whatever the
+            // client wants it to be.
+            return Err(format!(
+                "header needs a mode that verifies certificates: {VERIFYING}"
+            ));
+        }
+        if let Some(header) = &self.header
+            && http::HeaderName::from_bytes(header.as_bytes()).is_err()
+        {
+            return Err(format!("invalid header name {header:?}"));
+        }
+        Ok(())
+    }
+}
+
 /// The `[acme]` table: where `tls = "auto"` certificates come from and where
 /// they are kept.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -3699,6 +3817,110 @@ mod tests {
         assert_eq!(decode_base64("+/8=").unwrap(), [0xfb, 0xff]);
         assert_eq!(decode_base64("Z"), None);
         assert_eq!(decode_base64("Zm9v-mFy"), None);
+    }
+
+    #[test]
+    fn client_auth_modes_and_rejections() {
+        let server = |extra: &str| {
+            format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{extra}\n"
+            )
+        };
+        let parse = |extra: &str| Config::from_toml(&server(extra));
+        let error = |extra: &str| match parse(extra) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected an error for {extra}"),
+        };
+
+        assert_eq!(parse("").unwrap().servers[0].client_auth, None);
+
+        let config = parse("client_auth = { ca = \"ca.pem\", header = \"X-Client-Subject\" }");
+        let config = config.unwrap();
+        let expected = ClientAuth {
+            mode: ClientAuthMode::RequireAndVerify,
+            ca: vec![String::from("ca.pem")],
+            header: Some(String::from("X-Client-Subject")),
+        };
+        assert_eq!(config.servers[0].client_auth, Some(expected.clone()));
+        // Round trip through serialization, as `rxh config show` does.
+        let again = Config::from_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.servers[0].client_auth, Some(expected));
+
+        for (mode, ca, expected) in [
+            ("request", "", ClientAuthMode::Request),
+            ("require", "", ClientAuthMode::Require),
+            (
+                "verify_if_given",
+                ", ca = [\"a.pem\", \"b.pem\"]",
+                ClientAuthMode::VerifyIfGiven,
+            ),
+            (
+                "require_and_verify",
+                ", ca = \"a.pem\"",
+                ClientAuthMode::RequireAndVerify,
+            ),
+        ] {
+            let config = parse(&format!("client_auth = {{ mode = \"{mode}\"{ca} }}")).unwrap();
+            let client_auth = config.servers[0].client_auth.as_ref().unwrap();
+            assert_eq!(client_auth.mode, expected);
+            assert_eq!(client_auth.ca.len(), ca.matches(".pem").count());
+            assert_eq!(expected.verifies(), !ca.is_empty());
+        }
+        assert!(ClientAuthMode::Require.is_mandatory());
+        assert!(!ClientAuthMode::VerifyIfGiven.is_mandatory());
+
+        assert!(error("client_auth = { mode = \"none\" }").contains("unknown variant"));
+        assert!(error("client_auth = { ca = \"a.pem\", nope = 1 }").contains("unknown field"));
+        assert!(error("client_auth = {}").contains("client_auth: this mode needs ca"));
+        assert!(
+            error("client_auth = { mode = \"verify_if_given\" }").contains("this mode needs ca")
+        );
+        assert!(
+            error("client_auth = { mode = \"require\", ca = \"a.pem\" }")
+                .contains("does not verify certificates")
+        );
+        assert!(
+            error("client_auth = { mode = \"request\", header = \"X-Subject\" }")
+                .contains("header needs a mode that verifies")
+        );
+        assert!(
+            error("client_auth = { ca = \"a.pem\", header = \"bad name\" }")
+                .contains("invalid header name")
+        );
+        assert!(
+            error("protocol = \"tcp\"\nclient_auth = { ca = \"a.pem\", header = \"X-Subject\" }")
+                .contains("client_auth.header only applies to http servers")
+        );
+        // On a tcp server the handshake policy alone is fine.
+        parse("protocol = \"tcp\"\nclient_auth = { ca = \"a.pem\" }").unwrap();
+
+        let plain = "[[server]]\nlisten = \"127.0.0.1:80\"\nforward = \"a:1\"\n\
+                     client_auth = { ca = \"a.pem\" }\n";
+        let err = Config::from_toml(plain).unwrap_err().to_string();
+        assert!(err.contains("client_auth needs tls"), "{err}");
+
+        // Servers sharing an address share the handshake, so the policy too.
+        let shared = |first: &str, second: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nhost = \"a.test\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{first}\n\
+                 [[server]]\nlisten = \"127.0.0.1:443\"\nhost = \"b.test\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{second}\n"
+            ))
+        };
+        let same = "client_auth = { ca = \"a.pem\" }";
+        shared(same, same).unwrap();
+        let err = shared(same, "").unwrap_err().to_string();
+        assert!(err.contains("must have the same client_auth"), "{err}");
+
+        // The plain HTTP redirect companion of a TLS server asks for nothing.
+        let redirect = parse(&format!("https_redirect = true\n{same}"))
+            .unwrap()
+            .with_https_redirects();
+        assert_eq!(redirect.servers.len(), 2);
+        assert_eq!(redirect.servers[1].client_auth, None);
+        redirect.validate().unwrap();
     }
 
     #[test]
