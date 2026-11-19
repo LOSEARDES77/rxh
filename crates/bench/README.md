@@ -37,6 +37,7 @@ cargo build --release -p rxh-cli -p rxh-bench
 | `-c, --concurrency N` | Number of keep-alive client connections. The default is 32, or 16 with `--quick`. |
 | `--idle-connections N` | Idle keep-alive connections held open by `idle` and `memory`. The default is 5000, or 1000 with `--quick`. Each one takes a file descriptor in `rxh-bench` and in the proxy: raise `ulimit -n` if it is low. |
 | `--json FILE` | Also write the results as JSON. |
+| `--history DIR` | Print rxh's requests per second and p99 latency across releases from the `<version>.json` files in `DIR`, mark changes of more than 10% for the worse, and exit. See [benchmark history](../../docs/benchmarks.md#history-across-releases). |
 
 The exit code is 1 when rxh fails a scenario or cannot run it (`n/a`,
 for example when its binary is missing), so the tool works as a

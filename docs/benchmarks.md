@@ -131,6 +131,35 @@ which is why it starts high; its per connection cost is the lowest by far.
   `keepalive_requests 1000000` on NGINX, and rxh's `max_connections`
   raised above the 5000 idle connections.
 
+## History across releases
+
+Every release is measured with `rxh-bench --docker` on the same machine, and
+the raw JSON is kept in [bench/history](bench/history/README.md), one
+`<version>.json` per release next to a `<version>.md` with the machine, the
+commit and the full report. The history page shows rxh's requests per second
+and p99 latency for every scenario and release, and marks in bold every
+change of more than 10% for the worse against the previous release (single
+runs differ by up to 10%).
+
+To add a release, check out its tag on the benchmark machine and run:
+
+```bash
+crates/bench/release.sh            # version from Cargo.toml, or pass it: release.sh 0.3.0
+```
+
+The script builds the release binaries, runs `rxh-bench --docker`, writes
+`docs/bench/history/<version>.json` and `<version>.md`, regenerates
+`docs/bench/history/README.md` with `rxh-bench --history docs/bench/history`
+and prints the regressions. It refuses to replace an existing version unless
+`FORCE=1`, warns when `HEAD` is not tagged `v<version>` or the tree has
+uncommitted changes, and exits with 1 when rxh fails a scenario (the results
+are kept). Extra arguments go to `rxh-bench`, for example `-s throughput`.
+Commit the three files.
+
+Numbers from different machines are not comparable: the history lists the
+CPU of every release and warns when they differ. The 0.2.0 entry is the run
+above.
+
 ## Run it yourself
 
 ```bash

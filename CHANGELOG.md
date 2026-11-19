@@ -9,6 +9,10 @@ Changed.
 
 ### Added
 
+- Benchmark history: `crates/bench/release.sh` runs `rxh-bench --docker` for
+  a release and keeps the JSON in `docs/bench/history`, and
+  `rxh-bench --history DIR` renders rxh's numbers across releases with
+  regressions of more than 10% marked. Seeded with the 0.2.0 run.
 - `runtime = "per_core"` (top level, default `"shared"`): one single-threaded
   runtime per CPU, each with its own `SO_REUSEPORT` listeners and upstream
   connections, instead of one work-stealing runtime. In the `throughput`
