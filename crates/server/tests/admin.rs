@@ -28,13 +28,28 @@ async fn call(
     headers: &[(header::HeaderName, &str)],
 ) -> (StatusCode, HeaderMap, Value) {
     let stream = TcpStream::connect(admin).await.expect("admin accepts");
+    call_on(stream, &admin.to_string(), method, uri, body, headers).await
+}
+
+/// [`call`] on an open connection, TCP or unix socket.
+async fn call_on<S>(
+    stream: S,
+    host: &str,
+    method: Method,
+    uri: &str,
+    body: &str,
+    headers: &[(header::HeaderName, &str)],
+) -> (StatusCode, HeaderMap, Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .expect("handshake");
     tokio::task::spawn(connection);
     let mut request = Request::builder().method(method).uri(uri);
     if !headers.iter().any(|(name, _)| name == header::HOST) {
-        request = request.header(header::HOST, admin.to_string());
+        request = request.header(header::HOST, host);
     }
     for (name, value) in headers {
         request = request.header(name, *value);
@@ -423,4 +438,191 @@ async fn busy_admin_address_fails_startup_with_a_hint() {
         .to_string();
     assert!(err.contains(&format!("admin API on {admin}")), "{err}");
     assert!(err.contains("is another rxh running?"), "{err}");
+}
+
+const TOKEN: &str = "s3cret-admin-token-0123";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_is_required_on_every_route_when_set() {
+    let admin = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config_path = directory.path().join("rxh.toml");
+    fs::write(
+        &config_path,
+        format!("[admin]\nlisten = \"{admin}\"\ntoken = \"{TOKEN}\"\n"),
+    )
+    .expect("write");
+    let daemon = start(&config_path, admin).await;
+
+    let wrong = format!("Bearer {TOKEN}x");
+    let basic = format!("Basic {TOKEN}");
+    for (method, uri) in [
+        (Method::GET, "/status"),
+        (Method::GET, "/metrics"),
+        (Method::GET, "/config"),
+        (Method::POST, "/reload"),
+        (Method::POST, "/stop"),
+    ] {
+        for headers in [
+            [].as_slice(),
+            &[(header::AUTHORIZATION, wrong.as_str())],
+            &[(header::AUTHORIZATION, basic.as_str())],
+            &[(header::AUTHORIZATION, "Bearer")],
+        ] {
+            let (status, response, json) = call(admin, method.clone(), uri, "", headers).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} {headers:?}"
+            );
+            assert_eq!(response[header::WWW_AUTHENTICATE], "Bearer");
+            assert_eq!(
+                error_text(&json),
+                "admin API requires Authorization: Bearer <token>"
+            );
+        }
+    }
+
+    // The token replaces the loopback `Host` check: remote names are fine.
+    let bearer = format!("Bearer {TOKEN}");
+    let remote = [
+        (header::AUTHORIZATION, bearer.as_str()),
+        (header::HOST, "proxy.example.com:2019"),
+    ];
+    let (status, _, _) = call(admin, Method::GET, "/status", "", &remote).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The token never leaves the process.
+    let authorized = [(header::AUTHORIZATION, bearer.as_str())];
+    let (status, _, config) = call(admin, Method::GET, "/config", "", &authorized).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["admin"]["token"], "***");
+
+    // A reload cannot swap the token of the running listener.
+    fs::write(&config_path, format!("[admin]\nlisten = \"{admin}\"\n")).expect("write");
+    let (status, _, _) = call(admin, Method::POST, "/reload", "", &authorized).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call(admin, Method::GET, "/status", "", &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "token still required");
+
+    let (status, _, _) = call(admin, Method::POST, "/stop", "", &authorized).await;
+    assert_eq!(status, StatusCode::OK);
+    daemon.await.expect("no panic").expect("clean stop");
+}
+
+#[cfg(unix)]
+mod unix_socket {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
+
+    use tokio::net::UnixStream;
+
+    use super::*;
+
+    async fn call_unix(
+        socket: &Path,
+        method: Method,
+        uri: &str,
+        headers: &[(header::HeaderName, &str)],
+    ) -> (StatusCode, Value) {
+        let stream = UnixStream::connect(socket).await.expect("socket accepts");
+        let (status, _, json) = call_on(stream, "localhost", method, uri, "", headers).await;
+        (status, json)
+    }
+
+    fn config(socket: &Path, rest: &str) -> Config {
+        Config::from_toml(&format!(
+            "[admin]\nlisten = \"unix/{}\"\n{rest}",
+            socket.display()
+        ))
+        .expect("valid")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_api_is_served_on_a_private_socket_and_removed_on_stop() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let socket = directory.path().join("admin.sock");
+        // A dead daemon left its socket behind: it is replaced.
+        drop(UnixListener::bind(&socket).expect("stale socket"));
+        assert!(socket.exists());
+
+        let daemon = tokio::task::spawn(Daemon::from_config(config(&socket, "")).run());
+        util::eventually(async || UnixStream::connect(&socket).await.is_ok()).await;
+
+        let metadata = fs::metadata(&socket).expect("socket file");
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let leftovers: Vec<_> = fs::read_dir(directory.path())
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(leftovers, ["admin.sock"], "no temporary socket left");
+
+        let (status, json) = call_unix(&socket, Method::GET, "/status", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["admin"], format!("unix/{}", socket.display()));
+        // No `Host` check: web pages cannot open unix sockets.
+        let foreign = [(header::HOST, "proxy.example.com")];
+        let (status, _) = call_unix(&socket, Method::GET, "/pools", &foreign).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A second daemon does not steal the socket of a live one.
+        let err = Daemon::from_config(config(&socket, ""))
+            .run()
+            .await
+            .expect_err("socket is taken")
+            .to_string();
+        assert!(
+            err.contains("a process is listening on the socket"),
+            "{err}"
+        );
+        assert!(err.contains("is another rxh running?"), "{err}");
+        let (status, _) = call_unix(&socket, Method::GET, "/status", &[]).await;
+        assert_eq!(status, StatusCode::OK, "the first daemon keeps its socket");
+
+        let (status, json) = call_unix(&socket, Method::POST, "/stop", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["stopping"], true);
+        daemon.await.expect("no panic").expect("clean stop");
+        util::eventually(async || !socket.exists()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_is_checked_on_the_socket_too() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let socket = directory.path().join("admin.sock");
+        let rest = format!("token = \"{TOKEN}\"\n");
+        let _daemon = tokio::task::spawn(Daemon::from_config(config(&socket, &rest)).run());
+        util::eventually(async || UnixStream::connect(&socket).await.is_ok()).await;
+
+        let (status, _) = call_unix(&socket, Method::GET, "/status", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let bearer = format!("Bearer {TOKEN}");
+        let authorized = [(header::AUTHORIZATION, bearer.as_str())];
+        let (status, _) = call_unix(&socket, Method::GET, "/status", &authorized).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_that_are_not_sockets_are_never_replaced() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("precious.txt");
+        fs::write(&path, "keep me").expect("write");
+
+        let err = Daemon::from_config(config(&path, ""))
+            .run()
+            .await
+            .expect_err("not a socket")
+            .to_string();
+        assert!(err.contains("the path exists and is not a socket"), "{err}");
+        assert_eq!(fs::read_to_string(&path).expect("still there"), "keep me");
+
+        let missing = directory.path().join("missing/admin.sock");
+        let err = Daemon::from_config(config(&missing, ""))
+            .run()
+            .await
+            .expect_err("no such directory")
+            .to_string();
+        assert!(err.contains("admin API on unix/"), "{err}");
+    }
 }

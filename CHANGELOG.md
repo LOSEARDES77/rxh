@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- `[admin] listen = "unix//run/rxh/admin.sock"`: the admin API on a unix
+  socket only the daemon's user can open (mode `0600`, stale sockets
+  replaced, removed on shutdown). `rxh --admin unix//path` and `RXH_ADMIN`
+  accept the same form.
+- `[admin] token`: every admin request must carry `Authorization: Bearer
+  <token>` (`401` otherwise), which allows a non-loopback `listen` for
+  remote administration. The CLI sends `--admin-token` / `RXH_ADMIN_TOKEN`,
+  or the token of its configuration file; `GET /config` shows it as `***`.
 - `security_headers = "basic" | "strict" | "off"` on `http` servers and on
   their `match` entries: presets of `X-Content-Type-Options`,
   `X-Frame-Options`, `Referrer-Policy`, HSTS (TLS servers only) and, with
@@ -206,6 +214,10 @@ Changed.
   connections and other systems keep the buffered copy. No configuration.
 
 ### Changed
+
+- `[admin] listen` on an address outside loopback is rejected unless
+  `[admin] token` is set; it used to serve the admin API to the network
+  without authentication.
 
 - A proxied HTTP request makes 26 allocator calls instead of 84. The
   forwarding headers and the text access line are written into buffers kept

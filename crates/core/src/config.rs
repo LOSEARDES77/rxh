@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -178,6 +179,9 @@ impl Config {
         if self.log.output.trim().is_empty() {
             return invalid(String::from("log.output must not be empty"));
         }
+        self.admin
+            .validate()
+            .map_err(|err| ConfigError::Invalid(format!("admin: {err}")))?;
         self.acme
             .validate()
             .map_err(|err| ConfigError::Invalid(format!("acme: {err}")))?;
@@ -649,6 +653,64 @@ impl Config {
     }
 }
 
+/// Where the admin API listens: `ip:port` or `unix//absolute/path.sock`
+/// (Caddy syntax, like backend addresses).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
+pub enum AdminListen {
+    /// TCP address.
+    Tcp(SocketAddr),
+
+    /// Unix domain socket at this absolute path.
+    Unix(PathBuf),
+}
+
+impl FromStr for AdminListen {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if let Some(path) = text.strip_prefix("unix/") {
+            return if path.len() > 1 && path.starts_with('/') {
+                Ok(Self::Unix(PathBuf::from(path)))
+            } else {
+                Err(format!(
+                    "invalid admin address {text:?}, the socket path must be absolute: \
+                     unix//run/rxh/admin.sock"
+                ))
+            };
+        }
+        text.parse().map(Self::Tcp).map_err(|_| {
+            format!("invalid admin address {text:?}, expected ip:port or unix//absolute/path")
+        })
+    }
+}
+
+impl TryFrom<String> for AdminListen {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        text.parse()
+    }
+}
+
+impl fmt::Display for AdminListen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(address) => write!(f, "{address}"),
+            Self::Unix(path) => write!(f, "unix/{}", path.display()),
+        }
+    }
+}
+
+impl From<AdminListen> for String {
+    fn from(listen: AdminListen) -> Self {
+        listen.to_string()
+    }
+}
+
+/// Shortest accepted `[admin] token`.
+const MIN_ADMIN_TOKEN_LENGTH: usize = 16;
+
 /// Admin API settings. The admin API is how the CLI talks to a running daemon.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -657,9 +719,14 @@ pub struct Admin {
     #[serde(default = "default::true_value")]
     pub enabled: bool,
 
-    /// Address of the admin API. Keep it on loopback, it has no authentication.
+    /// Address of the admin API: a TCP address, on loopback unless `token`
+    /// is set, or a unix socket only its owner can open.
     #[serde(default = "default::admin_listen")]
-    pub listen: SocketAddr,
+    pub listen: AdminListen,
+
+    /// Secret every request must carry as `Authorization: Bearer <token>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 impl Default for Admin {
@@ -667,7 +734,42 @@ impl Default for Admin {
         Self {
             enabled: true,
             listen: default::admin_listen(),
+            token: None,
         }
+    }
+}
+
+impl Admin {
+    /// Replaces the token with `***`, for output that leaves the process.
+    pub fn redact(&mut self) {
+        if let Some(token) = &mut self.token {
+            *token = String::from("***");
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let Some(token) = &self.token {
+            if token.len() < MIN_ADMIN_TOKEN_LENGTH {
+                return Err(format!(
+                    "token must have at least {MIN_ADMIN_TOKEN_LENGTH} characters"
+                ));
+            }
+            // It travels in an `Authorization` header.
+            if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+                return Err(String::from("token must be printable ASCII without spaces"));
+            }
+        }
+        if let AdminListen::Tcp(address) = &self.listen
+            && self.enabled
+            && self.token.is_none()
+            && !address.ip().is_loopback()
+        {
+            return Err(format!(
+                "listen = \"{address}\" is reachable from other machines, set token or use a \
+                 loopback address or a unix socket"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -3943,8 +4045,8 @@ mod default {
         302
     }
 
-    pub fn admin_listen() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 2019))
+    pub fn admin_listen() -> super::AdminListen {
+        super::AdminListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 2019)))
     }
 
     pub fn max_connections() -> usize {
@@ -4084,6 +4186,82 @@ mod tests {
         assert_eq!(config.servers[1].listen.len(), 2);
         assert_eq!(config.servers[1].patterns[0].uri, "/static");
         assert!(config.admin.enabled);
+    }
+
+    #[test]
+    fn admin_listens_on_tcp_or_a_unix_socket() {
+        let config = Config::from_toml("").unwrap();
+        assert_eq!(
+            config.admin.listen,
+            AdminListen::Tcp("127.0.0.1:2019".parse().unwrap())
+        );
+        assert_eq!(config.admin.token, None);
+
+        let config = Config::from_toml("[admin]\nlisten = \"unix//run/rxh/admin.sock\"\n").unwrap();
+        assert_eq!(
+            config.admin.listen,
+            AdminListen::Unix(PathBuf::from("/run/rxh/admin.sock"))
+        );
+        // The serialized form (`GET /config`, `rxh config show`) parses back.
+        let written = toml::to_string(&config.admin).unwrap();
+        assert_eq!(
+            written,
+            "enabled = true\nlisten = \"unix//run/rxh/admin.sock\"\n"
+        );
+
+        for listen in [
+            "unix/relative.sock",
+            "unix/",
+            "unix//",
+            "localhost",
+            "example.com:2019",
+        ] {
+            let err = Config::from_toml(&format!("[admin]\nlisten = \"{listen}\"\n"))
+                .expect_err(listen)
+                .to_string();
+            assert!(err.contains("invalid admin address"), "{err}");
+        }
+    }
+
+    #[test]
+    fn admin_token_is_validated_and_required_off_loopback() {
+        let token = "0123456789abcdef";
+        let config = Config::from_toml(&format!(
+            "[admin]\nlisten = \"0.0.0.0:2019\"\ntoken = \"{token}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(config.admin.token.as_deref(), Some(token));
+        // Optional on loopback and on unix sockets, accepted on both.
+        Config::from_toml(&format!("[admin]\ntoken = \"{token}\"\n")).unwrap();
+        Config::from_toml(&format!(
+            "[admin]\nlisten = \"unix//tmp/admin.sock\"\ntoken = \"{token}\"\n"
+        ))
+        .unwrap();
+        Config::from_toml("[admin]\nlisten = \"[::1]:2019\"\n").unwrap();
+        // A disabled admin API exposes nothing.
+        Config::from_toml("[admin]\nenabled = false\nlisten = \"0.0.0.0:2019\"\n").unwrap();
+
+        let rejected = [
+            ("listen = \"0.0.0.0:2019\"", "reachable from other machines"),
+            (
+                "listen = \"192.0.2.1:2019\"",
+                "reachable from other machines",
+            ),
+            ("token = \"short\"", "at least 16 characters"),
+            ("token = \"\"", "at least 16 characters"),
+            ("token = \"0123456789 abcdef\"", "printable ASCII"),
+            ("token = \"0123456789abcdef\\n\"", "printable ASCII"),
+        ];
+        for (line, expected) in rejected {
+            let err = Config::from_toml(&format!("[admin]\n{line}\n"))
+                .expect_err(line)
+                .to_string();
+            assert!(err.contains("admin: ") && err.contains(expected), "{err}");
+        }
+
+        let mut admin = config.admin;
+        admin.redact();
+        assert_eq!(admin.token.as_deref(), Some("***"));
     }
 
     #[test]

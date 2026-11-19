@@ -2,7 +2,6 @@
 
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,7 +11,9 @@ use hyper::Request;
 use hyper::StatusCode;
 use hyper::header;
 use hyper_util::rt::TokioIo;
+use rxh_core::config::AdminListen;
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,18 +42,20 @@ impl fmt::Display for ClientError {
 }
 
 /// Admin API client.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct AdminClient {
-    address: SocketAddr,
+    address: AdminListen,
+    token: Option<String>,
 }
 
 impl AdminClient {
-    pub(crate) fn new(address: SocketAddr) -> Self {
-        Self { address }
+    /// Client of the daemon on `address`, sending `token` as a bearer token.
+    pub(crate) fn new(address: AdminListen, token: Option<String>) -> Self {
+        Self { address, token }
     }
 
-    pub(crate) fn address(&self) -> SocketAddr {
-        self.address
+    pub(crate) fn address(&self) -> &AdminListen {
+        &self.address
     }
 
     pub(crate) async fn get(&self, path: &str) -> Result<Value, ClientError> {
@@ -84,20 +87,55 @@ impl AdminClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, ClientError> {
-        let stream = TcpStream::connect(self.address)
-            .await
-            .map_err(ClientError::Unreachable)?;
+        match &self.address {
+            AdminListen::Tcp(address) => {
+                let stream = TcpStream::connect(address)
+                    .await
+                    .map_err(ClientError::Unreachable)?;
+                let host = format!("localhost:{}", address.port());
+                self.exchange(stream, &host, method, path, body).await
+            }
+            #[cfg(unix)]
+            AdminListen::Unix(socket) => {
+                let stream = tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map_err(ClientError::Unreachable)?;
+                self.exchange(stream, "localhost", method, path, body).await
+            }
+            #[cfg(not(unix))]
+            AdminListen::Unix(_) => Err(ClientError::Unreachable(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unix sockets are not available on this system",
+            ))),
+        }
+    }
+
+    async fn exchange<S>(
+        &self,
+        stream: S,
+        host: &str,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|err| ClientError::Protocol(err.to_string()))?;
         tokio::task::spawn(connection);
 
         let body = body.map(|value| value.to_string()).unwrap_or_default();
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(method)
             .uri(path)
-            .header(header::HOST, format!("localhost:{}", self.address.port()))
-            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::HOST, host)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = &self.token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = request
             .body(Full::new(Bytes::from(body)))
             .map_err(|err| ClientError::Protocol(err.to_string()))?;
 

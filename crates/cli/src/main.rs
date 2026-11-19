@@ -7,12 +7,13 @@ mod edit;
 mod process;
 mod quick;
 
+use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use rxh_core::config::{BasicAuth, Config};
+use rxh_core::config::{AdminListen, BasicAuth, Config};
 
 use crate::cli::{Cli, Command};
 
@@ -117,12 +118,21 @@ fn start(cli: &Cli, log_file: Option<PathBuf>) -> Result<(), String> {
     // Fail in the foreground, where the user can see it, if another daemon
     // already owns the admin address.
     if config.admin.enabled {
-        TcpListener::bind(config.admin.listen).map_err(|err| {
-            format!(
+        let busy = match &config.admin.listen {
+            AdminListen::Tcp(address) => TcpListener::bind(address).err(),
+            #[cfg(unix)]
+            AdminListen::Unix(path) => std::os::unix::net::UnixStream::connect(path)
+                .ok()
+                .map(|_| io::Error::from(io::ErrorKind::AddrInUse)),
+            #[cfg(not(unix))]
+            AdminListen::Unix(_) => None,
+        };
+        if let Some(err) = busy {
+            return Err(format!(
                 "admin address {} is busy ({err}), is rxh already running?",
                 config.admin.listen
-            )
-        })?;
+            ));
+        }
     }
 
     let log_file = log_file.unwrap_or_else(|| cli.pid_file.with_extension("log"));

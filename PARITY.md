@@ -172,7 +172,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `POST /load`, `PATCH /config/...` | `POST /reload` | 🟡 | Reloads the file; no config upload yet. |
 | `GET /reverse_proxy/upstreams` | same path and fields | ✅ | Plus `GET /pools` with health details. |
 | `POST /stop` | same | ✅ | |
-| Admin over a unix socket | | ❌ | |
+| Admin over a unix socket (`admin unix//path`) | `[admin] listen = "unix//run/rxh/admin.sock"` | ✅ | Mode `0600`, stale sockets replaced, removed on shutdown; no `|0660` permission suffix. The CLI takes `--admin unix//path`. |
+| Remote admin (`remote_admin` with mTLS identities) | `[admin] token` | 🟡 | Bearer token on every request, required for a non-loopback `listen`. Plain HTTP: no TLS or client certificates on the admin listener, no per-identity access rules. |
 | CLI to manage pools, peers and services | `rxh upstream`, `rxh pool`, `rxh service` | ➕ | Edits the TOML keeping comments, validates, applies live. |
 | Split configuration (Nginx `include`) | `include = ["conf.d/*.toml"]` | ➕ | Included files hold `upstream` and `server` only; the CLI edits the defining file; `--file PATH` on `pool add` and `service add`. |
 | Effective config | `rxh config show [--json]` | ➕ | Daemon `/config` when reachable, else the merged files. |

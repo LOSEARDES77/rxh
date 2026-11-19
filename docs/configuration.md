@@ -110,7 +110,45 @@ reload requests answer "no configuration file to reload".
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
-| `listen` | `"127.0.0.1:2019"` | Address of the admin API. It has no authentication, keep it on loopback. Changes need a restart. |
+| `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token`. Changes need a restart. |
+| `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
+
+On a unix socket the API is reachable only by the user running the daemon
+(and root): the file is created with mode `0600`, a socket left behind by a
+dead daemon is replaced, and the file is removed on shutdown.
+
+```toml
+[admin]
+listen = "unix//run/rxh/admin.sock"
+```
+
+For remote administration, listen on a reachable address and set a token.
+RXH refuses to start with a non-loopback `listen` and no token.
+
+```toml
+[admin]
+listen = "10.0.0.5:2019"
+token = "kq3Zp0uX7mV9cR2tLw8yHs4d"   # for instance: openssl rand -base64 24
+```
+
+```sh
+curl -H "Authorization: Bearer kq3Zp0uX7mV9cR2tLw8yHs4d" http://10.0.0.5:2019/status
+rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
+```
+
+- Without a token, TCP requests must have a loopback `Host` and `Origin`
+  (protection against DNS rebinding). With a token, or on a unix socket, any
+  `Host` is accepted. A token set together with a unix socket is checked too.
+- The admin API speaks plain HTTP: the token is as private as the network it
+  crosses. Use a private network, a VPN or an SSH tunnel
+  (`ssh -L 2019:/run/rxh/admin.sock host`), not the open internet.
+- The CLI finds the address in `--admin` / `RXH_ADMIN` (`ip:port` or
+  `unix//path`), else in `[admin] listen` of its configuration file. The
+  token comes from `--admin-token` / `RXH_ADMIN_TOKEN`, else from `[admin]
+  token` of that file, which is only sent to the `listen` address of the
+  same file.
+- `GET /config` shows the token as `***`. Keep the configuration file
+  readable by the daemon's user only.
 
 ## `[log]`
 

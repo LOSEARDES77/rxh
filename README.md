@@ -227,8 +227,11 @@ Global flags: `-c/--config` (`RXH_CONFIG`), `--admin` (`RXH_ADMIN`),
 
 ## Admin API
 
-JSON over HTTP on `[admin] listen` (default `127.0.0.1:2019`). Requests with
-a non-loopback `Host` or `Origin` are rejected.
+JSON over HTTP on `[admin] listen`: a TCP address (default `127.0.0.1:2019`)
+or a unix socket (`unix//run/rxh/admin.sock`). Requests with a non-loopback
+`Host` or `Origin` are rejected, unless `[admin] token` is set: then every
+request needs `Authorization: Bearer <token>` and the API may listen on a
+reachable address.
 
 | Method | Path | Action |
 |---|---|---|

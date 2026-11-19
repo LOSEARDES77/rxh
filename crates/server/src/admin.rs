@@ -1,5 +1,6 @@
 //! Admin API: JSON over HTTP on a loopback address (`127.0.0.1:2019` by
-//! default, like Caddy). The CLI uses it to inspect and change a running
+//! default, like Caddy), on a unix socket only its owner can open, or on any
+//! address with a token. The CLI uses it to inspect and change a running
 //! daemon.
 //!
 //! | Method   | Path                          | Action                              |
@@ -16,11 +17,16 @@
 //! | `POST`   | `/reload`                     | Reload the configuration file       |
 //! | `POST`   | `/stop`                       | Graceful shutdown                   |
 //!
-//! Requests whose `Host` or `Origin` is not a loopback name are rejected, so
-//! web pages cannot reach the API through DNS rebinding.
+//! With `[admin] token` every request must carry `Authorization: Bearer
+//! <token>`. Without it, TCP requests whose `Host` or `Origin` is not a
+//! loopback name are rejected, so web pages cannot reach the API through DNS
+//! rebinding.
 
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
@@ -35,11 +41,14 @@ use hyper::body::Incoming;
 use hyper::header;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use rxh_core::config::{Backend, Config};
+use rxh_core::config::{AdminListen, Backend, Config};
 use rxh_core::pool::PoolError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::files;
@@ -71,7 +80,8 @@ pub(crate) struct Current {
 pub(crate) struct AdminState {
     pub(crate) started: Instant,
     pub(crate) config_path: Option<PathBuf>,
-    pub(crate) listen: SocketAddr,
+    pub(crate) listen: AdminListen,
+    pub(crate) token: Option<String>,
     pub(crate) current: RwLock<Current>,
     pub(crate) control: mpsc::Sender<Control>,
 }
@@ -95,27 +105,126 @@ struct ServerStatus {
     state: String,
 }
 
-/// Serves the admin API until the task is dropped.
-pub(crate) async fn serve(listener: TcpListener, state: Arc<AdminState>) {
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
-        };
-        let state = Arc::clone(&state);
-        tokio::task::spawn(async move {
-            let service = service_fn(move |request| handle(request, Arc::clone(&state)));
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
-        });
+/// Bound admin endpoint. A unix socket file is removed on drop.
+pub(crate) enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener, PathBuf),
+}
+
+impl Listener {
+    /// Binds `listen`, replacing the socket file a dead daemon left behind.
+    pub(crate) async fn bind(listen: &AdminListen) -> io::Result<Self> {
+        match listen {
+            AdminListen::Tcp(address) => TcpListener::bind(address).await.map(Self::Tcp),
+            #[cfg(unix)]
+            AdminListen::Unix(path) => bind_unix(path).await,
+            #[cfg(not(unix))]
+            AdminListen::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unix sockets are not available on this system",
+            )),
+        }
     }
+}
+
+#[cfg(unix)]
+impl Drop for Listener {
+    fn drop(&mut self) {
+        if let Self::Unix(_, path) = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn bind_unix(path: &Path) -> io::Result<Listener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_socket() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the path exists and is not a socket",
+            ));
+        }
+        Ok(_) if tokio::net::UnixStream::connect(path).await.is_ok() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a process is listening on the socket",
+            ));
+        }
+        Ok(_) | Err(_) => {}
+    }
+
+    // Bound under another name and renamed once it is private, so the socket
+    // never accepts a connection from another user, not even between `bind`
+    // and `chmod`. The rename also replaces a stale socket.
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{}", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let _ = std::fs::remove_file(&temporary);
+    let listener = UnixListener::bind(&temporary)?;
+    let private = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(err) = private {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(err);
+    }
+    Ok(Listener::Unix(listener, path.to_owned()))
+}
+
+/// Serves the admin API until the task is dropped.
+pub(crate) async fn serve(listener: Listener, state: Arc<AdminState>) {
+    loop {
+        match &listener {
+            Listener::Tcp(listener) => {
+                if let Ok((stream, _)) = listener.accept().await {
+                    serve_connection(stream, &state);
+                }
+            }
+            #[cfg(unix)]
+            Listener::Unix(listener, _) => {
+                if let Ok((stream, _)) = listener.accept().await {
+                    serve_connection(stream, &state);
+                }
+            }
+        }
+    }
+}
+
+fn serve_connection<S>(stream: S, state: &Arc<AdminState>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::task::spawn(async move {
+        let service = service_fn(move |request| handle(request, Arc::clone(&state)));
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
 }
 
 async fn handle(
     request: Request<Incoming>,
     state: Arc<AdminState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    if !is_local_request(&request, state.listen) {
+    if let Some(token) = &state.token {
+        if !has_token(&request, token) {
+            let mut response = error(
+                StatusCode::UNAUTHORIZED,
+                "admin API requires Authorization: Bearer <token>",
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+            return Ok(response);
+        }
+    } else if let AdminListen::Tcp(listen) = state.listen
+        && !is_local_request(&request, listen)
+    {
         return Ok(error(
             StatusCode::FORBIDDEN,
             "admin API only accepts loopback Host and Origin",
@@ -337,7 +446,7 @@ fn status(state: &AdminState) -> serde_json::Value {
         "pid": std::process::id(),
         "uptime_seconds": state.started.elapsed().as_secs(),
         "config_path": state.config_path,
-        "admin": state.listen,
+        "admin": state.listen.to_string(),
         "servers": servers,
         "pools": pools,
     })
@@ -356,6 +465,7 @@ fn live_config(state: &AdminState) -> Config {
     if let Some(dns) = &mut config.acme.dns {
         dns.redact();
     }
+    config.admin.redact();
     config
 }
 
@@ -369,6 +479,24 @@ fn state_name(state: State) -> String {
         }
         State::ShuttingDown(ShutdownState::Done) => String::from("stopped"),
     }
+}
+
+/// True if the request carries `Authorization: Bearer <token>`. The
+/// comparison takes the same time wherever the first difference is.
+fn has_token<B>(request: &Request<B>, token: &str) -> bool {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .is_some_and(|(scheme, given)| {
+            scheme.eq_ignore_ascii_case("bearer")
+                && aws_lc_rs::constant_time::verify_slices_are_equal(
+                    given.trim().as_bytes(),
+                    token.as_bytes(),
+                )
+                .is_ok()
+        })
 }
 
 /// True if both `Host` and `Origin` (when present) name a loopback host or
@@ -454,6 +582,26 @@ mod tests {
     fn decodes_percent_escapes() {
         assert_eq!(files::percent_decode("server%5B0%5D%231"), "server[0]#1");
         assert_eq!(files::percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn bearer_token_must_match_exactly() {
+        let with = |value: &str| {
+            Request::builder()
+                .header(header::AUTHORIZATION, value)
+                .body(())
+                .unwrap()
+        };
+        let token = "0123456789abcdef";
+        assert!(has_token(&with("Bearer 0123456789abcdef"), token));
+        assert!(has_token(&with("bearer 0123456789abcdef"), token));
+        assert!(!has_token(&with("Bearer 0123456789abcdeX"), token));
+        assert!(!has_token(&with("Bearer 0123456789abcde"), token));
+        assert!(!has_token(&with("Bearer 0123456789abcdef0"), token));
+        assert!(!has_token(&with("Bearer"), token));
+        assert!(!has_token(&with("Basic 0123456789abcdef"), token));
+        assert!(!has_token(&with("0123456789abcdef"), token));
+        assert!(!has_token(&request("localhost", None), token));
     }
 
     #[test]
