@@ -250,7 +250,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 | Feature | Inspired by | Notes |
 |---|---|---|
 | OpenTelemetry tracing (W3C trace context propagation) | Traefik, Envoy | Done: `[tracing]` sends one server span per HTTP request over OTLP/HTTP JSON and continues or starts the `traceparent` sent to backends, with parent-based ratio sampling (`sample_ratio`). No OTLP/gRPC, no collector headers, no per-attempt client spans, no layer 4 spans. |
-| Dashboard web UI and management UI | Traefik dashboard, Nginx Proxy Manager | Future plan: an NPM-like UI on top of the admin API (hosts, certificates, access lists, live health). |
+| Dashboard web UI and management UI | Traefik dashboard, Nginx Proxy Manager | Read only part done: `GET /dashboard` on the admin API is one self-contained page (no build step, no external resource) listing listeners, hosts with their routes, pools with the live health of every backend, and certificates with expiry, refreshed every 2 seconds from `/status`, `/config` and `/certificates`. With `[admin] token` the page asks for the token and keeps it for the browser tab. Future plan: management like NPM (editing hosts and certificates, access lists); no request or latency charts like the Traefik dashboard (`rxh top` shows rates). |
 | Access log filters and sampling | Traefik access logs | Done: `[log]` `status` and `min_duration` always write the matching lines (any filter matching is enough, like Traefik), `sample_ratio` writes a random share of the others. No `retryAttempts` filter, no per-server filters, no field selection. |
 | Health check events to webhooks | Caddy events, HAProxy agent checks | |
 | Plugin or WASM middleware | Traefik plugins, Envoy WASM | |

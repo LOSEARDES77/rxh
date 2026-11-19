@@ -166,9 +166,10 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] Health events to webhooks.
 - [x] `rxh top`: live requests per second, latency and errors per pool in
       the terminal, built on the metrics endpoint.
-- [ ] Web dashboard on top of the admin API: hosts, certificates, access
-      lists, live health. Read only first, then management like Nginx
-      Proxy Manager.
+- [x] Read only web dashboard on top of the admin API: hosts,
+      certificates, live health.
+- [ ] Management in the dashboard, like Nginx Proxy Manager: edit hosts and
+      certificates, access lists.
 
 ## 1.0: stable
 

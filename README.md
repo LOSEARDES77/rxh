@@ -258,6 +258,7 @@ reachable address.
 | `DELETE` | `/pools/{name}/upstreams` | Remove `{"address": "host:port"}` |
 | `GET` | `/metrics` | Prometheus metrics (text format 0.0.4) |
 | `GET` | `/certificates` | Certificates served, with expiry dates |
+| `GET` | `/dashboard` | Read only web page: listeners, hosts, live health, certificates |
 | `POST` | `/certificates/reload` | Read the certificate files again |
 | `POST` | `/reload` | Reload the configuration file |
 | `POST` | `/load` | Run the configuration in the body (TOML or JSON), without writing the file |

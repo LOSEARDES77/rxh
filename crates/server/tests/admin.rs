@@ -628,6 +628,39 @@ async fn patch_changes_one_pool_or_one_server() {
     assert_eq!(pool["policy"], "weighted_round_robin");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_is_a_page_served_to_local_browsers_only() {
+    let admin = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config_path = directory.path().join("rxh.toml");
+    fs::write(&config_path, format!("[admin]\nlisten = \"{admin}\"\n")).expect("write");
+    let _daemon = start(&config_path, admin).await;
+
+    for uri in ["/dashboard", "/dashboard/"] {
+        let (status, headers, body) = util::get(admin, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(headers[header::CONTENT_TYPE], "text/html; charset=utf-8");
+        let policy = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(policy.starts_with("default-src 'none';"), "{policy}");
+        assert!(policy.contains("connect-src 'self'"), "{policy}");
+        assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+        let page = String::from_utf8(body.to_vec()).expect("UTF-8 page");
+        assert!(page.starts_with("<!doctype html>"), "{uri}");
+        for section in ["Listeners", "Hosts", "Health", "Certificates"] {
+            assert!(page.contains(&format!("<h2>{section}</h2>")), "{section}");
+        }
+    }
+
+    // The page is read only, and so is its route.
+    let (status, _) = send(admin, Method::POST, "/dashboard", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A page of another site cannot load it through DNS rebinding.
+    let foreign = [(header::HOST, "evil.example")];
+    let (status, _, _) = call(admin, Method::GET, "/dashboard", "", &foreign).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 const TOKEN: &str = "s3cret-admin-token-0123";
 
 #[tokio::test(flavor = "multi_thread")]
@@ -671,6 +704,21 @@ async fn token_is_required_on_every_route_when_set() {
                 "admin API requires Authorization: Bearer <token>"
             );
         }
+    }
+
+    // The dashboard page holds no data and a browser cannot send the token
+    // when it opens it, so only that page is served without one.
+    let (status, _, page) = util::get(admin, "/dashboard").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.starts_with(b"<!doctype html>"));
+    assert!(
+        !page
+            .windows(TOKEN.len())
+            .any(|part| part == TOKEN.as_bytes())
+    );
+    for (method, uri) in [(Method::POST, "/dashboard"), (Method::GET, "/dashboard/x")] {
+        let (status, _, _) = call(admin, method.clone(), uri, "", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
     }
 
     // The token replaces the loopback `Host` check: remote names are fine.
