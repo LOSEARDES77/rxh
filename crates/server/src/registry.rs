@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use regex::Regex;
 use rxh_core::config::{
     Action, Config, ConfigError, Forward, Protocol, Server as ServerConfig, UpstreamGroup,
 };
-use rxh_core::pool::Pool;
+use rxh_core::pool::{self, Pool};
 use tokio::task::JoinSet;
 
 use crate::dynamic;
@@ -83,12 +84,14 @@ impl Registry {
             }
             for (pattern_index, pattern) in server.patterns.iter().enumerate() {
                 if let Action::Forward(forward) = &pattern.action {
-                    udp_pools.insert(match forward {
-                        Forward::Group(name) => name.clone(),
+                    match forward {
+                        Forward::Group(name) => udp_pools.insert(name.clone()),
                         Forward::Inline(_) => {
-                            Self::inline_name(server_index, server, pattern_index)
+                            udp_pools.insert(Self::inline_name(server_index, server, pattern_index))
                         }
-                    });
+                        // Validation rejects splits on UDP servers.
+                        Forward::Split(_) => false,
+                    };
                 }
             }
         }
@@ -129,20 +132,38 @@ impl Registry {
         }
     }
 
-    /// Group referenced by a pattern's `forward`.
+    /// Groups referenced by a pattern's `forward`.
     pub(crate) fn resolve(
         &self,
         forward: &Forward,
         server_index: usize,
         server: &ServerConfig,
         pattern_index: usize,
-    ) -> Result<Arc<Group>, Error> {
-        let name = match forward {
-            Forward::Group(name) => name.clone(),
-            Forward::Inline(_) => Self::inline_name(server_index, server, pattern_index),
+    ) -> Result<Split, Error> {
+        let lookup = |name: &str| {
+            self.get(name)
+                .ok_or_else(|| invalid(format!("unknown upstream group @{name}")))
         };
-        self.get(&name)
-            .ok_or_else(|| invalid(format!("unknown upstream group @{name}")))
+        match forward {
+            Forward::Group(name) => Ok(Split::single(lookup(name)?)),
+            Forward::Inline(_) => Ok(Split::single(lookup(&Self::inline_name(
+                server_index,
+                server,
+                pattern_index,
+            ))?)),
+            Forward::Split(targets) => {
+                let mut groups = Vec::with_capacity(targets.len());
+                for target in targets {
+                    groups.push(lookup(&target.pool)?);
+                }
+                let weights: Vec<u32> = targets.iter().map(|target| target.weight).collect();
+                Ok(Split {
+                    groups,
+                    order: pool::smooth_weighted_order(&weights),
+                    cursor: AtomicUsize::new(0),
+                })
+            }
+        }
     }
 
     /// Looks up a group by name.
@@ -180,6 +201,41 @@ impl Registry {
             }
         }
         tasks
+    }
+}
+
+/// The groups of one `forward` and how traffic is split between them.
+#[derive(Debug)]
+pub(crate) struct Split {
+    groups: Vec<Arc<Group>>,
+    /// Smooth weighted round robin cycle, as indexes into `groups`.
+    order: Vec<usize>,
+    cursor: AtomicUsize,
+}
+
+impl Split {
+    fn single(group: Arc<Group>) -> Self {
+        Self {
+            groups: vec![group],
+            order: vec![0],
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    /// Group for the next request or connection. The weighted turn goes to
+    /// the next group of the cycle with an available member, so a canary
+    /// whose members are all down sends its share to the other pools; when
+    /// none has one, the turn's group answers (with its usual error).
+    pub(crate) fn pick(&self) -> &Arc<Group> {
+        if let [group] = self.groups.as_slice() {
+            return group;
+        }
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let turn = |offset: usize| &self.groups[self.order[(start + offset) % self.order.len()]];
+        (0..self.order.len())
+            .map(turn)
+            .find(|group| group.pool.is_available())
+            .unwrap_or_else(|| turn(0))
     }
 }
 

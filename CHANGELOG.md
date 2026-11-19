@@ -9,6 +9,10 @@ Changed.
 
 ### Added
 
+- Traffic splitting for canary releases: `forward = [{ pool = "v1", weight
+  = 90 }, { pool = "v2", weight = 10 }]` splits the requests of an `http`
+  server, or the connections of a `tcp` server, between named pools by
+  weight. A pool whose members are all down gives its share to the others.
 - Release packages built by the `Release` workflow on `v*` tags and attached
   to the GitHub release: static musl archives for x86_64 and aarch64 Linux,
   macOS archives, `.deb` and `.rpm` packages (nfpm), the `rxh-bin` AUR

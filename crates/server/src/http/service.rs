@@ -38,7 +38,7 @@ use crate::http::response::{self, BoxResponse};
 use crate::http::response_handler::ResponseHandler;
 use crate::log::{self, Logger};
 use crate::metrics;
-use crate::registry::{Group, Registry};
+use crate::registry::{Registry, Split};
 
 /// Settings of one `[[server]]`, shared by its routes. Several sites can
 /// share one listener, each route keeps its own site.
@@ -173,8 +173,8 @@ impl Route {
 /// What a route does.
 #[derive(Debug)]
 pub(crate) enum RouteAction {
-    /// Reverse proxy to a group.
-    Proxy(Arc<Group>),
+    /// Reverse proxy to a group, picked from the split of the `forward`.
+    Proxy(Split),
 
     /// Static files from a directory.
     Files(Files),
@@ -545,7 +545,9 @@ impl Service {
             }
             Some(_) if too_large => response::payload_too_large(),
             Some(route) => match &route.action {
-                RouteAction::Proxy(group) => proxy::forward(request, route, group, &self).await,
+                RouteAction::Proxy(split) => {
+                    proxy::forward(request, route, split.pick(), &self).await
+                }
                 RouteAction::Files(files) => {
                     files
                         .transfer(
