@@ -175,16 +175,19 @@ async fn open_session(
     let backend = UdpSocket::bind(bind).await?;
     backend.connect(target).await?;
     metrics::global().record_l4(&settings.server, "udp");
-    settings.logger.access_text(|line| {
-        log::push(
-            line,
-            format_args!(
-                "{client} -> {} UDP session to {}",
-                settings.log_name,
-                upstream.address()
-            ),
-        );
-    });
+    // The session has not lasted yet: only the sampling applies.
+    if settings.logger.keeps(None, Duration::ZERO) {
+        settings.logger.access_text(|line| {
+            log::push(
+                line,
+                format_args!(
+                    "{client} -> {} UDP session to {}",
+                    settings.log_name,
+                    upstream.address()
+                ),
+            );
+        });
+    }
 
     let session = Session {
         backend: Arc::new(backend),
@@ -243,18 +246,20 @@ async fn reply_loop(
         }
     }
 
-    settings.logger.access_json(|| {
-        serde_json::json!({
-            "ts": log::now(),
-            "server": &*settings.server,
-            "protocol": "udp",
-            "remote": client.to_string(),
-            "upstream": guard.upstream().address(),
-            "bytes_sent": session.bytes_sent.load(Ordering::Relaxed),
-            "bytes_received": session.bytes_received.load(Ordering::Relaxed),
-            "duration_ms": log::millis(session.started.elapsed()),
-        })
-    });
+    if settings.logger.keeps(None, session.started.elapsed()) {
+        settings.logger.access_json(|| {
+            serde_json::json!({
+                "ts": log::now(),
+                "server": &*settings.server,
+                "protocol": "udp",
+                "remote": client.to_string(),
+                "upstream": guard.upstream().address(),
+                "bytes_sent": session.bytes_sent.load(Ordering::Relaxed),
+                "bytes_received": session.bytes_received.load(Ordering::Relaxed),
+                "duration_ms": log::millis(session.started.elapsed()),
+            })
+        });
+    }
 
     sessions
         .lock()

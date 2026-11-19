@@ -207,9 +207,9 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |message: String| Err(ConfigError::Invalid(message));
 
-        if self.log.output.trim().is_empty() {
-            return invalid(String::from("log.output must not be empty"));
-        }
+        self.log
+            .validate()
+            .map_err(|err| ConfigError::Invalid(format!("log: {err}")))?;
         self.admin
             .validate()
             .map_err(|err| ConfigError::Invalid(format!("admin: {err}")))?;
@@ -940,6 +940,47 @@ pub struct Log {
     /// Writes one line per request or connection when true.
     #[serde(default = "default::true_value")]
     pub access: bool,
+
+    /// HTTP statuses whose lines are always written, like `["5xx", 429]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status: Vec<StatusMatcher>,
+
+    /// Requests and connections lasting at least this long are always
+    /// written.
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_duration: Option<Duration>,
+
+    /// Share of the lines no filter keeps that are written, from 0 to 1.
+    /// Defaults to 1 without filters and to 0 with `status` or
+    /// `min_duration`, so that only the matching lines are written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_ratio: Option<f64>,
+}
+
+impl Log {
+    fn validate(&self) -> Result<(), String> {
+        if self.output.trim().is_empty() {
+            return Err(String::from("output must not be empty"));
+        }
+        if let Some(ratio) = self.sample_ratio
+            && !(0.0..=1.0).contains(&ratio)
+        {
+            return Err(format!("sample_ratio must be between 0 and 1, got {ratio}"));
+        }
+        Ok(())
+    }
+
+    /// Share of the lines no filter keeps that are written.
+    #[must_use]
+    pub fn sample_ratio(&self) -> f64 {
+        let filtered = !self.status.is_empty() || self.min_duration.is_some();
+        self.sample_ratio
+            .unwrap_or(if filtered { 0.0 } else { 1.0 })
+    }
 }
 
 impl Default for Log {
@@ -948,6 +989,9 @@ impl Default for Log {
             format: LogFormat::Text,
             output: default::log_output(),
             access: true,
+            status: Vec::new(),
+            min_duration: None,
+            sample_ratio: None,
         }
     }
 }
@@ -7037,6 +7081,43 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
         assert_eq!(Config::default().log.output, "stdout");
         assert!(Config::from_toml("[log]\nfile = \"x\"").is_err());
         assert!(Config::from_toml("[log]\noutput = \"\"").is_err());
+    }
+
+    #[test]
+    fn log_filters_parse_and_default_the_sample_ratio() {
+        let log = Config::default().log;
+        assert!(log.status.is_empty());
+        assert_eq!(log.min_duration, None);
+        assert_eq!(log.sample_ratio(), 1.0);
+
+        let config = Config::from_toml(
+            "[log]\nstatus = [\"5xx\", 429]\nmin_duration = \"250ms\"\nsample_ratio = 0.1",
+        )
+        .expect("valid");
+        assert_eq!(
+            config.log.status,
+            [StatusMatcher::Class(5), StatusMatcher::Code(429)]
+        );
+        assert_eq!(config.log.min_duration, Some(Duration::from_millis(250)));
+        assert_eq!(config.log.sample_ratio(), 0.1);
+
+        // Filters alone keep only the matching lines.
+        let config = Config::from_toml("[log]\nstatus = [\"4xx\"]").expect("valid");
+        assert_eq!(config.log.sample_ratio(), 0.0);
+        let config = Config::from_toml("[log]\nmin_duration = \"1s\"").expect("valid");
+        assert_eq!(config.log.sample_ratio(), 0.0);
+        let config = Config::from_toml("[log]\nsample_ratio = 0").expect("valid");
+        assert_eq!(config.log.sample_ratio(), 0.0);
+    }
+
+    #[test]
+    fn log_filters_reject_invalid_values() {
+        assert!(invalid("[log]\nsample_ratio = 1.5").contains("sample_ratio"));
+        assert!(invalid("[log]\nsample_ratio = -0.1").contains("sample_ratio"));
+        assert!(Config::from_toml("[log]\nstatus = [\"6xx\"]").is_err());
+        assert!(Config::from_toml("[log]\nstatus = [600]").is_err());
+        assert!(Config::from_toml("[log]\nstatus = \"5xx\"").is_err());
+        assert!(Config::from_toml("[log]\nmin_duration = \"soon\"").is_err());
     }
 
     fn invalid(text: &str) -> String {

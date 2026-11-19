@@ -162,7 +162,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 ## 0.8: observability and UI
 
 - [x] OpenTelemetry tracing with W3C trace context.
-- [ ] Access log filters and sampling.
+- [x] Access log filters and sampling.
 - [x] Health events to webhooks.
 - [ ] `rxh top`: live requests per second, latency and errors per pool in
       the terminal, built on the metrics endpoint.

@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rxh_core::config::{Log, LogFormat};
+use rxh_core::status::StatusMatcher;
 use serde_json::Value;
+
+use crate::tracer;
 
 /// Capacity the line buffer of a thread may keep between lines.
 const MAX_KEPT_LINE: usize = 4096;
@@ -35,6 +38,9 @@ enum Sink {
 pub(crate) struct Logger {
     format: LogFormat,
     access: bool,
+    status: Vec<StatusMatcher>,
+    min_duration: Option<Duration>,
+    sample_ratio: f64,
     sink: Sink,
     write_failed: AtomicBool,
 }
@@ -66,6 +72,9 @@ impl Logger {
         Ok(Self {
             format: config.format,
             access: config.access,
+            status: config.status.clone(),
+            min_duration: config.min_duration,
+            sample_ratio: config.sample_ratio(),
             sink,
             write_failed: AtomicBool::new(false),
         })
@@ -112,6 +121,19 @@ impl Logger {
     /// True when access lines are written in text format.
     pub(crate) fn is_text(&self) -> bool {
         self.format == LogFormat::Text
+    }
+
+    /// Whether the line of a request or connection with this `status` (none
+    /// for layer 4) that took `elapsed` is written: always when it matches a
+    /// filter, with probability `sample_ratio` otherwise.
+    pub(crate) fn keeps(&self, status: Option<u16>, elapsed: Duration) -> bool {
+        let matched = status
+            .is_some_and(|status| self.status.iter().any(|matcher| matcher.matches(status)))
+            || self.min_duration.is_some_and(|min| elapsed >= min);
+        matched
+            || self.sample_ratio >= 1.0
+            || (self.sample_ratio > 0.0
+                && (tracer::random() as f64) < self.sample_ratio * 2_f64.powi(64))
     }
 
     /// Writes `line`, which ends with its newline.
@@ -194,6 +216,38 @@ mod tests {
 
     fn at(seconds: u64, millis: u64) -> String {
         rfc3339(UNIX_EPOCH + Duration::from_millis(seconds * 1_000 + millis))
+    }
+
+    fn logger(toml: &str) -> Logger {
+        let config = rxh_core::config::Config::from_toml(toml).expect("valid");
+        Logger::new(&config.log).expect("stdout opens")
+    }
+
+    #[test]
+    fn keeps_lines_matching_a_filter() {
+        let logger = logger("[log]\nstatus = [\"5xx\", 404]\nmin_duration = \"1s\"");
+        let short = Duration::from_millis(10);
+        assert!(logger.keeps(Some(503), short));
+        assert!(logger.keeps(Some(404), short));
+        assert!(logger.keeps(Some(200), Duration::from_secs(1)));
+        assert!(logger.keeps(None, Duration::from_secs(2)));
+        assert!(!logger.keeps(Some(200), short));
+        assert!(!logger.keeps(Some(400), short));
+        assert!(!logger.keeps(None, short));
+    }
+
+    #[test]
+    fn samples_the_other_lines() {
+        let all = logger("");
+        assert!(all.keeps(Some(200), Duration::ZERO));
+        let none = logger("[log]\nsample_ratio = 0");
+        assert!(!none.keeps(Some(200), Duration::ZERO));
+
+        let half = logger("[log]\nsample_ratio = 0.5");
+        let kept = (0..10_000)
+            .filter(|_| half.keeps(Some(200), Duration::ZERO))
+            .count();
+        assert!((4_000..6_000).contains(&kept), "kept {kept} of 10000");
     }
 
     #[test]

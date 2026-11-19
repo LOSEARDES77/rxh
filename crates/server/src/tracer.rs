@@ -192,8 +192,9 @@ impl Tracer {
     }
 }
 
-/// A random number. Trace and span IDs need no cryptographic strength.
-fn random() -> u64 {
+/// A random number. Trace and span IDs and log sampling need no
+/// cryptographic strength.
+pub(crate) fn random() -> u64 {
     RandomState::new().hash_one(0_u64)
 }
 

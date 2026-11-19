@@ -455,6 +455,31 @@ curl -X PUT localhost:2019/pools/web/upstreams/state \
 | `format` | `"text"` | `"text"` keeps one human readable line per request. `"json"` writes one JSON object per line. |
 | `output` | `"stdout"` | `"stdout"`, `"stderr"` or a file path (created if missing, always appended to). Only access lines go here; startup and error messages stay on stdout and stderr. |
 | `access` | `true` | `false` disables access lines. |
+| `status` | `[]` | HTTP statuses whose lines are always written: codes (`404`) or classes (`"5xx"`). |
+| `min_duration` | none | Requests and layer 4 connections lasting at least this long are always written, like `"500ms"`. |
+| `sample_ratio` | `1`, or `0` with `status` or `min_duration` | Share of the other lines that are written, from 0 to 1, drawn at random per line. |
+
+### Filters and sampling
+
+A line is written when it matches a filter (`status` or `min_duration`),
+otherwise with the probability `sample_ratio`. Setting a filter alone keeps
+only the matching lines, like Traefik's access log filters; adding
+`sample_ratio` keeps a share of the rest. Without filters, `sample_ratio`
+samples every line. Errors and slow requests in full, 1 % of the rest:
+
+```toml
+[log]
+format = "json"
+status = ["5xx", 429]
+min_duration = "1s"
+sample_ratio = 0.01
+```
+
+`status` only applies to HTTP requests; TCP connections and UDP sessions
+are kept by `min_duration` or sampled. The text line written when a UDP
+session opens is only sampled, as the session has not lasted yet.
+Operational messages (failed dials, timeouts) are never filtered. Metrics
+count every request whatever the log keeps.
 
 JSON lines for HTTP requests have `ts` (RFC 3339 UTC with milliseconds),
 `server` (server name, or its listen address), `remote`, `client_ip` (after
