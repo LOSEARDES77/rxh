@@ -2,6 +2,7 @@
 //! NGINX and Traefik and reports correctness (PASS/FAIL) and performance side by side.
 
 mod backend;
+mod history;
 mod load;
 mod scenario;
 mod target;
@@ -104,6 +105,11 @@ struct Cli {
     /// List scenarios and exit.
     #[arg(long)]
     list: bool,
+
+    /// Print rxh's numbers across releases from the `<version>.json` files
+    /// in DIR, with regressions marked, and exit.
+    #[arg(long, value_name = "DIR")]
+    history: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -130,6 +136,18 @@ async fn run(cli: Cli) -> ExitCode {
             println!("{:<14} {help}", scenario.name());
         }
         return ExitCode::SUCCESS;
+    }
+    if let Some(dir) = &cli.history {
+        return match history::render_dir(dir) {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let options = Options {

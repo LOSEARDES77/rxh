@@ -95,8 +95,9 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] More benchmark scenarios: TLS termination, HTTP/2 clients, large
       bodies, WebSocket, UDP, thousands of idle connections, and memory use
       per connection.
-- [ ] Benchmark history: run `rxh-bench --docker` on a fixed machine for
-      every release and keep the JSON, so regressions are visible.
+- [x] Benchmark history: run `rxh-bench --docker` on a fixed machine for
+      every release and keep the JSON, so regressions are visible:
+      `crates/bench/release.sh`, docs/bench/history.
 - [ ] Criterion micro benchmarks for the policies in `rxh-core`.
 
 ## 0.5: TLS and security
