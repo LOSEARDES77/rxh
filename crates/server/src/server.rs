@@ -417,8 +417,11 @@ impl Server {
 
         // Dropped, and so aborted, when the listener stops.
         let mut background = JoinSet::new();
-        if ocsp_stapling && let Some(resolver) = cert_resolver {
-            background.spawn(ocsp::run(resolver));
+        if let Some(resolver) = cert_resolver {
+            background.spawn(tls::watch_files(Arc::clone(&resolver)));
+            if ocsp_stapling {
+                background.spawn(ocsp::run(resolver));
+            }
         }
 
         state.send_replace(State::Listening);

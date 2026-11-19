@@ -650,6 +650,40 @@ servers with and without `tls` or with different `client_auth` or `tls_options` 
 server may use the address of a `tcp` or `http` server. Port `0` is never
 shared: every port `0` entry gets its own free port.
 
+### Certificate reload and expiry
+
+Certificate files are read again without a restart: every listener checks
+the contents of its `cert` and `key` files every 5 seconds and serves the new
+certificate to the next handshakes when they change. Open connections keep
+the certificate they started with. A pair that fails to load (a half-written
+file, a key that does not match the certificate) is logged and the previous
+certificate stays until the files change again, so write the key and the
+certificate in either order. Symbolic links are followed, as certbot's
+`live/` directory uses them. A new certificate gets its OCSP staple on the
+next stapling round, within the hour.
+
+`rxh cert reload` (`POST /certificates/reload`) reads every file now, changed
+or not, and fails listing the pairs that did not load, for a deploy hook:
+
+```sh
+certbot renew --deploy-hook "rxh cert reload"
+```
+
+`rxh cert list` (`GET /certificates`) shows what each TLS listener serves,
+soonest expiry first, `tls = "auto"` certificates included:
+
+```text
+$ rxh cert list
+LISTEN                 HOSTS                          EXPIRES               DAYS OCSP   SOURCE
+0.0.0.0:443            a.example.com (default)        2027-01-02T10:00:00     44 yes    /etc/rxh/a.pem
+0.0.0.0:443            *.b.example.com                2027-02-11T08:30:00     84 no     acme
+```
+
+`--json` prints the admin API answer: `subject`, `issuer`, `names` (the DNS
+names of the certificate), `not_before`, `not_after`, `days_left` (negative
+once expired), `hosts`, `default`, `source` (`"file"` or `"acme"`),
+`cert_file`, `key_file` and `ocsp_stapled`.
+
 ### Client certificates (mTLS)
 
 `client_auth` on a server with `tls` (files or `"auto"`, `http` or `tcp`)

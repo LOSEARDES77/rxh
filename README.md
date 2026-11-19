@@ -217,6 +217,8 @@ and [TCP/UDP balancing](examples/tcp-udp.toml). The full reference is in
 | `rxh upstream list\|add\|rm` | Manage the backends (peers) of a pool, live and in the file. `--no-save` changes only the running daemon. |
 | `rxh pool list\|add\|rm` | Manage `[upstream.NAME]` pools. |
 | `rxh service list\|add\|rm` | Manage `[[server]]` listeners (HTTP, TCP, UDP, files). |
+| `rxh cert list [--json]` | Certificates of every TLS listener, with expiry dates. |
+| `rxh cert reload` | Read the certificate files again now (the daemon also does it within seconds of a change). |
 | `rxh policies` | List load balancing policies. |
 
 Global flags: `-c/--config` (`RXH_CONFIG`), `--admin` (`RXH_ADMIN`),
@@ -236,6 +238,8 @@ a non-loopback `Host` or `Origin` are rejected.
 | `POST` | `/pools/{name}/upstreams` | Add `{"address": "host:port", "weight": 1}` |
 | `DELETE` | `/pools/{name}/upstreams` | Remove `{"address": "host:port"}` |
 | `GET` | `/metrics` | Prometheus metrics (text format 0.0.4) |
+| `GET` | `/certificates` | Certificates served, with expiry dates |
+| `POST` | `/certificates/reload` | Read the certificate files again |
 | `POST` | `/reload` | Reload the configuration file |
 | `POST` | `/stop` | Graceful shutdown |
 
