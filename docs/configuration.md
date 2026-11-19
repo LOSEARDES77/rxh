@@ -157,7 +157,8 @@ match no route use the listener name).
 
 `tls = "auto"` on an `http` server obtains a certificate for every name of
 its `host` list from an ACME certificate authority (Let's Encrypt by default)
-with the HTTP-01 challenge, like Caddy's automatic HTTPS:
+with the HTTP-01 challenge (default) or the TLS-ALPN-01 challenge, like
+Caddy's automatic HTTPS:
 
 ```toml
 [acme]
@@ -178,6 +179,7 @@ forward = "@app"
 | `storage` | `"rxh-data/certificates"` | Directory of the account and the certificates, relative to the directory of the main configuration file (to the current directory for `rxh reverse-proxy` and other runs without a file). |
 | `renew_before` | `"30d"` | Certificates expiring within this time are renewed. |
 | `http_port` | `80` | Plain HTTP port: the CA connects to it for HTTP-01 challenges, and [`https_redirect`](#http-to-https-redirect) listens on it. Change it only behind a port forward or for a test CA. |
+| `challenge` | `"http-01"` | How the CA validates the names: `"http-01"` (a request to port 80) or `"tls-alpn-01"` (a TLS handshake on port 443, no plain HTTP port needed). |
 
 - Every name in `host` must be an exact, fully qualified domain name (no
   wildcard, IP address or `localhost`); a `tls = "auto"` server without
@@ -202,6 +204,32 @@ forward = "@app"
     usually needs root or `CAP_NET_BIND_SERVICE`.
   - If only TLS or `tcp` servers use `http_port`, challenges cannot be
     answered: rxh logs it and obtains nothing.
+- With `challenge = "tls-alpn-01"` the CA connects to port 443 of each name
+  with ALPN `acme-tls/1`, so port 443 must reach the listener of the
+  `tls = "auto"` server (listen on it, or forward it there). That listener
+  answers the handshake with a temporary self-signed certificate that proves
+  control of the name, then closes the connection; ordinary clients never
+  see it, and a handshake with `acme-tls/1` for a name without a pending
+  challenge fails. Nothing has to listen on `http_port`, and no
+  challenge-only listener is opened; the HTTP to HTTPS redirect stays on
+  unless `https_redirect = false`:
+
+  ```toml
+  [acme]
+  email = "ops@example.com"
+  challenge = "tls-alpn-01"
+
+  [[server]]
+  listen = "0.0.0.0:443"
+  host = "example.com"
+  tls = "auto"
+  https_redirect = false    # nothing on port 80
+  forward = "@app"
+  ```
+
+  A TLS terminating balancer or CDN in front of rxh breaks TLS-ALPN-01 (the
+  CA's handshake must arrive untouched); use HTTP-01 there. Only one
+  challenge type is used, there is no fallback to the other.
 - On start and reload, stored certificates are served right away. Missing
   ones and ones expiring within `renew_before` are obtained in the
   background and swapped in without a restart; a daily check renews them.

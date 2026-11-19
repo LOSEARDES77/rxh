@@ -2406,8 +2406,8 @@ pub struct PassiveHealth {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tls {
-    /// Certificates obtained and renewed with ACME (HTTP-01) for every name
-    /// of the server's `host` list, see [`Acme`].
+    /// Certificates obtained and renewed with ACME (HTTP-01 or TLS-ALPN-01)
+    /// for every name of the server's `host` list, see [`Acme`].
     Auto,
 
     /// A PEM certificate chain and its PEM private key, read from files.
@@ -2503,6 +2503,25 @@ pub struct Acme {
     /// Port the CA connects to for HTTP-01 challenges.
     #[serde(default = "default::acme_http_port")]
     pub http_port: u16,
+
+    /// How the CA validates the names.
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
+}
+
+/// The `challenge` key of `[acme]`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AcmeChallenge {
+    /// The CA fetches a token over plain HTTP on port 80 (`http_port` here).
+    #[default]
+    #[serde(rename = "http-01")]
+    Http01,
+
+    /// The CA makes a TLS handshake with ALPN `acme-tls/1` on port 443, which
+    /// must reach the listener of the `tls = "auto"` server. Needs no plain
+    /// HTTP port.
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01,
 }
 
 impl Default for Acme {
@@ -2514,6 +2533,7 @@ impl Default for Acme {
             storage: default::acme_storage(),
             renew_before: default::acme_renew_before(),
             http_port: default::acme_http_port(),
+            challenge: AcmeChallenge::default(),
         }
     }
 }
@@ -2551,7 +2571,7 @@ impl Acme {
 pub fn validate_domain(name: &str) -> Result<(), String> {
     let invalid = |why: &str| Err(format!("{name:?} {why}"));
     if name.starts_with("*.") {
-        return invalid("is a wildcard, ACME HTTP-01 cannot certify wildcards");
+        return invalid("is a wildcard, ACME HTTP-01 and TLS-ALPN-01 cannot certify wildcards");
     }
     if name.is_empty() || name.len() > 253 {
         return invalid("is not a domain name (1 to 253 characters)");
@@ -3362,6 +3382,7 @@ mod tests {
         assert_eq!(config.acme.storage, "rxh-data/certificates");
         assert_eq!(config.acme.renew_before, Duration::from_secs(30 * 86_400));
         assert_eq!(config.acme.http_port, 80);
+        assert_eq!(config.acme.challenge, AcmeChallenge::Http01);
 
         // Round trip through serialization, as `rxh config show` does.
         let text = toml::to_string(&config).unwrap();
@@ -3408,6 +3429,24 @@ mod tests {
         assert!(error(with_acme("http_port = 0")).contains("http_port"));
         assert!(error(with_acme("storage = \" \"")).contains("storage"));
         assert!(Config::from_toml(&with_acme("typo = 1")).is_err());
+
+        let challenge = |value: &str| {
+            Config::from_toml(&with_acme(&format!("challenge = {value}")))
+                .map(|config| config.acme.challenge)
+        };
+        assert_eq!(challenge("\"http-01\"").unwrap(), AcmeChallenge::Http01);
+        assert_eq!(
+            challenge("\"tls-alpn-01\"").unwrap(),
+            AcmeChallenge::TlsAlpn01
+        );
+        for rejected in ["\"dns-01\"", "\"TLS-ALPN-01\"", "\"\"", "1"] {
+            assert!(challenge(rejected).is_err(), "{rejected}");
+        }
+        let mut config = Config::from_toml(&with_acme("challenge = \"tls-alpn-01\"")).unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("challenge = \"tls-alpn-01\""), "{text}");
+        config = Config::from_toml(&text).unwrap();
+        assert_eq!(config.acme.challenge, AcmeChallenge::TlsAlpn01);
 
         // Only "auto" or a table, and the table still rejects unknown keys.
         let tls = |value: &str| {

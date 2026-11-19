@@ -1,5 +1,6 @@
 //! Automatic HTTPS: obtains and renews the certificates of `tls = "auto"`
-//! servers with ACME HTTP-01 and swaps them into the TLS listeners.
+//! servers with ACME HTTP-01 or TLS-ALPN-01 (`[acme] challenge`) and swaps
+//! them into the TLS listeners.
 //!
 //! Files under `[acme] storage`, all written with mode 0600 in 0700
 //! directories on unix:
@@ -27,6 +28,10 @@
 //! backoff. The generation that did not order a certificate picks it up from
 //! the storage. The challenge-only listener is process wide too; a reload
 //! that puts a server on its port closes it first.
+//!
+//! TLS-ALPN-01 needs no port of its own: the TLS listeners of the
+//! `tls = "auto"` servers answer a handshake with ALPN `acme-tls/1` with the
+//! pending challenge certificate of the name and close the connection.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -47,9 +52,11 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
     NewOrder, OrderStatus, RetryPolicy,
 };
-use rxh_core::config::{self, Config, Protocol, Tls};
+use rxh_core::config::{self, AcmeChallenge, Config, Protocol, Tls};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+use tokio_rustls::rustls::sign::CertifiedKey;
 
 use crate::http::body;
 use crate::http::response::{self, BoxResponse};
@@ -79,6 +86,14 @@ const ISSUE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// every listener of every generation answers them; tokens are unique.
 static CHALLENGES: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new(RwLock::default);
 
+/// ALPN protocol of a TLS-ALPN-01 validation handshake (RFC 8737).
+pub(crate) const TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
+
+/// Pending TLS-ALPN-01 challenge certificates by lowercase name. Process
+/// wide, like [`CHALLENGES`].
+static TLS_CHALLENGES: LazyLock<RwLock<HashMap<String, Arc<CertifiedKey>>>> =
+    LazyLock::new(RwLock::default);
+
 /// Orders in flight and recent failures, by name, for every generation.
 static ISSUANCE: LazyLock<Mutex<Issuance>> = LazyLock::new(Mutex::default);
 
@@ -105,9 +120,43 @@ pub(crate) fn challenge_response(method: &Method, path: &str) -> Option<BoxRespo
     Some(response)
 }
 
-/// Tokens published while an order runs, withdrawn when dropped.
+/// The certificate a TLS-ALPN-01 validation handshake for `name` gets, if a
+/// challenge is pending for it.
+pub(crate) fn challenge_certificate(name: &str) -> Option<Arc<CertifiedKey>> {
+    TLS_CHALLENGES
+        .read()
+        .expect("nothing panics while holding the challenge lock")
+        .get(&name.to_ascii_lowercase())
+        .cloned()
+}
+
+/// Self-signed TLS-ALPN-01 certificate for `name`: the name as its only
+/// SAN and the critical `acmeIdentifier` extension holding `digest`, the
+/// SHA-256 of the key authorization (RFC 8737, section 3).
+fn challenge_certified_key(
+    domain: &Domain,
+    digest: &[u8],
+) -> Result<Arc<CertifiedKey>, Box<dyn std::error::Error>> {
+    let mut params = rcgen::CertificateParams::new(vec![domain.name.clone()])?;
+    params.custom_extensions = vec![rcgen::CustomExtension::new_acme_identifier(digest)];
+    let key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key)?;
+    let resolver = domain.resolvers.first().ok_or("the name has no listener")?;
+    // Not `CertResolver::certified_key`: its check that key and certificate
+    // match rejects the critical extension.
+    let key = PrivateKeyDer::try_from(key.serialize_der())?;
+    let key = resolver.provider().key_provider.load_private_key(key)?;
+    Ok(Arc::new(CertifiedKey::new(vec![cert.der().clone()], key)))
+}
+
+/// Challenge answers published while an order runs, withdrawn when dropped.
 #[derive(Default)]
-struct Published(Vec<String>);
+struct Published {
+    /// HTTP-01 tokens.
+    tokens: Vec<String>,
+    /// Names with a TLS-ALPN-01 certificate.
+    names: Vec<String>,
+}
 
 impl Published {
     fn add(&mut self, token: String, key_authorization: String) {
@@ -115,17 +164,35 @@ impl Published {
             .write()
             .expect("nothing panics while holding the challenge lock")
             .insert(token.clone(), key_authorization);
-        self.0.push(token);
+        self.tokens.push(token);
+    }
+
+    fn add_certificate(&mut self, name: &str, certificate: Arc<CertifiedKey>) {
+        TLS_CHALLENGES
+            .write()
+            .expect("nothing panics while holding the challenge lock")
+            .insert(name.to_owned(), certificate);
+        self.names.push(name.to_owned());
     }
 }
 
 impl Drop for Published {
     fn drop(&mut self) {
-        let mut challenges = CHALLENGES
-            .write()
-            .expect("nothing panics while holding the challenge lock");
-        for token in &self.0 {
-            challenges.remove(token);
+        if !self.tokens.is_empty() {
+            let mut challenges = CHALLENGES
+                .write()
+                .expect("nothing panics while holding the challenge lock");
+            for token in &self.tokens {
+                challenges.remove(token);
+            }
+        }
+        if !self.names.is_empty() {
+            let mut challenges = TLS_CHALLENGES
+                .write()
+                .expect("nothing panics while holding the challenge lock");
+            for name in &self.names {
+                challenges.remove(name);
+            }
         }
     }
 }
@@ -343,10 +410,11 @@ impl Domain {
     }
 }
 
-/// Who answers HTTP-01 challenges on `http_port`.
+/// Who answers the challenges: for HTTP-01, whoever listens on `http_port`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChallengePort {
-    /// A plain `http` server of the configuration.
+    /// A listener of the configuration: a plain `http` server for HTTP-01,
+    /// the TLS listeners of the `tls = "auto"` servers for TLS-ALPN-01.
     Served,
 
     /// Nothing of the configuration uses the port: a challenge-only
@@ -359,6 +427,9 @@ enum ChallengePort {
 
 impl ChallengePort {
     fn of(config: &Config) -> Self {
+        if config.acme.challenge == AcmeChallenge::TlsAlpn01 {
+            return Self::Served;
+        }
         let port = config.acme.http_port;
         let mut users = config.servers.iter().enumerate().filter(|(_, server)| {
             server.protocol != Protocol::Udp
@@ -580,14 +651,19 @@ impl Manager {
             }
         };
 
+        let challenge = self.settings.challenge;
         let mut ok = true;
         for (domain, mut guard) in due {
             println!("ACME => Obtaining a certificate for {}", domain.name);
-            let result =
-                match tokio::time::timeout(ISSUE_TIMEOUT, issue(&account, &domain.name)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(String::from("timed out")),
-                };
+            let result = match tokio::time::timeout(
+                ISSUE_TIMEOUT,
+                issue(&account, &domain, challenge),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(String::from("timed out")),
+            };
             let installed = result.and_then(|(cert, key)| {
                 self.storage
                     .save(&domain.name, cert.as_bytes(), key.as_bytes())
@@ -675,11 +751,15 @@ fn install(domain: &Domain, cert: &[u8], key: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs one HTTP-01 order for `name`. Returns the PEM certificate chain and
-/// the PEM private key.
-async fn issue(account: &Account, name: &str) -> Result<(String, String), String> {
+/// Runs one order for `domain`, validated with `challenge`. Returns the PEM
+/// certificate chain and the PEM private key.
+async fn issue(
+    account: &Account,
+    domain: &Domain,
+    challenge: AcmeChallenge,
+) -> Result<(String, String), String> {
     let error = |err: instant_acme::Error| err.to_string();
-    let identifiers = [Identifier::Dns(name.to_owned())];
+    let identifiers = [Identifier::Dns(domain.name.clone())];
     let mut order = account
         .new_order(&NewOrder::new(&identifiers))
         .await
@@ -694,14 +774,29 @@ async fn issue(account: &Account, name: &str) -> Result<(String, String), String
             AuthorizationStatus::Valid => continue,
             status => return Err(format!("authorization is {status:?}")),
         }
-        let mut challenge = authorization
-            .challenge(ChallengeType::Http01)
-            .ok_or("the CA offers no http-01 challenge")?;
-        published.add(
-            challenge.token.clone(),
-            challenge.key_authorization().as_str().to_owned(),
-        );
-        challenge.set_ready().await.map_err(error)?;
+        let mut offered = match challenge {
+            AcmeChallenge::Http01 => {
+                let offered = authorization
+                    .challenge(ChallengeType::Http01)
+                    .ok_or("the CA offers no http-01 challenge")?;
+                published.add(
+                    offered.token.clone(),
+                    offered.key_authorization().as_str().to_owned(),
+                );
+                offered
+            }
+            AcmeChallenge::TlsAlpn01 => {
+                let offered = authorization
+                    .challenge(ChallengeType::TlsAlpn01)
+                    .ok_or("the CA offers no tls-alpn-01 challenge")?;
+                let digest = offered.key_authorization().digest();
+                let certificate = challenge_certified_key(domain, digest.as_ref())
+                    .map_err(|err| format!("challenge certificate: {err}"))?;
+                published.add_certificate(&domain.name, certificate);
+                offered
+            }
+        };
+        offered.set_ready().await.map_err(error)?;
     }
 
     let retries = RetryPolicy::new().timeout(Duration::from_secs(120));
@@ -1070,6 +1165,14 @@ mod tests {
             port(&server("0.0.0.0:8080", "protocol = \"tcp\"")),
             ChallengePort::Blocked(why) if why.contains("server[0] (tcp)")
         ));
+        // TLS-ALPN-01 does not use the port at all.
+        assert_eq!(
+            port(&format!(
+                "challenge = \"tls-alpn-01\"\n{}",
+                server("0.0.0.0:8080", "protocol = \"tcp\"")
+            )),
+            ChallengePort::Served
+        );
         assert_eq!(
             port(&format!(
                 "{}{}",
@@ -1134,5 +1237,173 @@ mod tests {
 
         drop(published);
         assert!(challenge_response(&Method::GET, path).is_none());
+    }
+
+    /// TLS handshake with `address` for `name`, offering only `alpn`.
+    /// Returns the leaf certificate, the negotiated protocol and whether the
+    /// server closed the connection right after.
+    async fn handshake(
+        address: SocketAddr,
+        name: &str,
+        alpn: &[u8],
+    ) -> io::Result<(Vec<u8>, Option<Vec<u8>>, bool)> {
+        use tokio::io::AsyncReadExt;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::rustls::pki_types::ServerName;
+
+        let mut client = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCertificate))
+            .with_no_client_auth();
+        client.alpn_protocols = vec![alpn.to_vec()];
+        let stream = tokio::net::TcpStream::connect(address).await?;
+        let server_name = ServerName::try_from(name.to_owned()).unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(server_name, stream)
+            .await?;
+        let connection = tls.get_ref().1;
+        let leaf = connection.peer_certificates().unwrap()[0].to_vec();
+        let negotiated = connection.alpn_protocol().map(<[u8]>::to_vec);
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut byte)).await;
+        // A close without close_notify is an error, and still a close.
+        let closed = matches!(read, Ok(Ok(0) | Err(_)));
+        Ok((leaf, negotiated, closed))
+    }
+
+    #[tokio::test]
+    async fn tls_alpn_challenge_certificate_is_served_to_validations_only() {
+        let config = Config::from_toml(
+            "[[server]]\nlisten = \"127.0.0.1:0\"\nhost = \"alpn.test\"\ntls = \"auto\"\n\
+             forward = \"127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        let master = Master::from_config(&config).unwrap();
+        let address = master.sockets()[0];
+        let domain = Domain {
+            name: String::from("alpn.test"),
+            resolvers: master.cert_resolvers(0),
+        };
+        tokio::task::spawn(master.run());
+
+        // No pending challenge: a validation handshake fails.
+        assert!(
+            handshake(address, "alpn.test", TLS_ALPN_PROTOCOL)
+                .await
+                .is_err()
+        );
+
+        let digest = [7; 32];
+        let mut published = Published::default();
+        published.add_certificate(
+            &domain.name,
+            challenge_certified_key(&domain, &digest).unwrap(),
+        );
+
+        // Case insensitive, as SNI is.
+        let (leaf, negotiated, closed) = handshake(address, "ALPN.test", TLS_ALPN_PROTOCOL)
+            .await
+            .unwrap();
+        assert_eq!(negotiated.as_deref(), Some(TLS_ALPN_PROTOCOL));
+        assert!(closed, "nothing is served after a validation handshake");
+        let (_, certificate) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+        let names = certificate.subject_alternative_name().unwrap().unwrap();
+        assert_eq!(
+            names.value.general_names,
+            [x509_parser::extensions::GeneralName::DNSName("alpn.test")]
+        );
+        let identifier = certificate
+            .extensions()
+            .iter()
+            .find(|extension| extension.oid.to_id_string() == "1.3.6.1.5.5.7.1.31")
+            .expect("the acmeIdentifier extension");
+        assert!(identifier.critical);
+        // DER octet string of the 32 digest bytes.
+        assert_eq!(identifier.value, [&[0x04, 0x20][..], &digest[..]].concat());
+
+        // Only for that name, and never to ordinary clients.
+        assert!(
+            handshake(address, "other.test", TLS_ALPN_PROTOCOL)
+                .await
+                .is_err()
+        );
+        assert!(handshake(address, "alpn.test", b"http/1.1").await.is_err());
+
+        // The real certificate goes to ordinary clients only.
+        let (cert, key) = certificate_for("alpn.test");
+        install(&domain, cert.as_bytes(), key.as_bytes()).unwrap();
+        let (real, negotiated, closed) =
+            handshake(address, "alpn.test", b"http/1.1").await.unwrap();
+        assert_ne!(real, leaf);
+        assert_eq!(negotiated.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(!closed, "an ordinary connection waits for a request");
+        let (again, ..) = handshake(address, "alpn.test", TLS_ALPN_PROTOCOL)
+            .await
+            .unwrap();
+        assert_eq!(again, leaf);
+
+        drop(published);
+        assert!(
+            handshake(address, "alpn.test", TLS_ALPN_PROTOCOL)
+                .await
+                .is_err(),
+            "a withdrawn challenge, even with a real certificate installed"
+        );
+    }
+
+    /// Accepts any server certificate; the test inspects it itself.
+    #[derive(Debug)]
+    struct AnyCertificate;
+
+    impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AnyCertificate {
+        fn verify_server_cert(
+            &self,
+            _: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            _: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+            _: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: tokio_rustls::rustls::pki_types::UnixTime,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::ServerCertVerified,
+            tokio_rustls::rustls::Error,
+        > {
+            Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            _: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+            tokio_rustls::rustls::Error,
+        > {
+            Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            _: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+            tokio_rustls::rustls::Error,
+        > {
+            Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+            ServerConfig::builder()
+                .crypto_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn certificate_for(name: &str) -> (String, String) {
+        let certified = rcgen::generate_simple_self_signed(vec![name.to_owned()]).unwrap();
+        (certified.cert.pem(), certified.signing_key.serialize_pem())
     }
 }

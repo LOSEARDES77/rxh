@@ -104,7 +104,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 ## 0.5: TLS and security
 
 - [x] Automatic HTTPS with ACME HTTP-01, certificate storage and renewal.
-- [ ] ACME TLS-ALPN-01.
+- [x] ACME TLS-ALPN-01.
 - [ ] ACME DNS-01 and wildcard certificates (Cloudflare, Route53,
       RFC 2136).
 - [ ] mTLS on listeners with the four Traefik modes, and the client

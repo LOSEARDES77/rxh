@@ -24,6 +24,7 @@ httpdate.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 instant-acme.workspace = true
+rcgen.workspace = true
 regex.workspace = true
 rxh-core.workspace = true
 serde.workspace = true
@@ -38,7 +39,6 @@ x509-parser.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-rcgen.workspace = true
 rxh-test-util = { path = "../util" }
 tempfile.workspace = true
 
