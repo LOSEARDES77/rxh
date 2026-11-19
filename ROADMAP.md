@@ -135,7 +135,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [ ] Packages: static musl binaries, `.deb`, `.rpm`, AUR and Homebrew,
       built by CI.
 - [x] Shell completions and man pages from clap.
-- [ ] systemd integration: `sd_notify` readiness, socket activation.
+- [x] systemd integration: `sd_notify` readiness, socket activation.
 - [ ] Docker Swarm, Podman, Consul, etcd and Nomad providers.
 - [ ] Kubernetes Ingress and Gateway API.
 

@@ -25,6 +25,7 @@ use crate::include;
 use crate::master::{Master, ServerInfo};
 use crate::per_core;
 use crate::registry::Registry;
+use crate::systemd;
 
 fn read_file(path: &Path) -> Result<String, Error> {
     Ok(std::fs::read_to_string(path)
@@ -319,6 +320,9 @@ impl Daemon {
             None
         };
 
+        systemd::warn_unused();
+        systemd::notify("READY=1\nSTATUS=Running");
+
         let mut signals = Signals::new()?;
         let mut polls = tokio::time::interval(WATCH_INTERVAL);
         polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -380,6 +384,7 @@ impl Daemon {
         }
 
         println!("Main => Shutting down");
+        systemd::notify("STOPPING=1");
         generation.stop().await
     }
 
@@ -398,7 +403,27 @@ impl Daemon {
         }
     }
 
+    /// Reloads the configuration file, reporting the reload to systemd.
     async fn reload(&self, generation: &mut Generation, admin: &AdminState) -> Result<(), String> {
+        systemd::reloading();
+        let outcome = self.reload_file(generation, admin).await;
+        // The previous configuration keeps running after a failure, so the
+        // service is ready either way.
+        systemd::notify(&match &outcome {
+            Ok(()) => "READY=1\nSTATUS=Running".to_owned(),
+            Err(message) => format!(
+                "READY=1\nSTATUS=Reload failed: {}",
+                message.replace('\n', " ")
+            ),
+        });
+        outcome
+    }
+
+    async fn reload_file(
+        &self,
+        generation: &mut Generation,
+        admin: &AdminState,
+    ) -> Result<(), String> {
         let path = self
             .config_path()
             .ok_or("no configuration file to reload")?;

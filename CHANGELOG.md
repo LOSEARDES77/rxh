@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- systemd integration: `rxh run` reports readiness, reloads (with the
+  failure reason in `STATUS=`) and shutdown over `NOTIFY_SOCKET`, and takes
+  socket-activated listeners from `LISTEN_FDS`, matched to `listen` and
+  `[admin] listen` by address and kept across reloads.
+  `dist/rxh.service` is now `Type=notify-reload`; `dist/rxh.socket` is a
+  socket activation example.
 - `rxh completions SHELL` prints the completion script for bash, zsh, fish,
   elvish or PowerShell, and `rxh man` prints the rxh(1) man page
   (`rxh man --dir DIR` writes `rxh.1` and one `rxh-COMMAND.1` page per

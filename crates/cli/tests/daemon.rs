@@ -1259,3 +1259,133 @@ fn remote_admin_without_a_token_does_not_start() {
     let stderr = stderr_of(&rxh_bare(directory.path(), &["run"]));
     assert!(stderr.contains("set token"), "{stderr}");
 }
+
+/// Starts `rxh run` the way systemd does with socket activation: `sockets`
+/// become descriptors 3, 4... and `LISTEN_PID` names the daemon itself.
+#[cfg(target_os = "linux")]
+fn start_socket_activated(directory: &Path, sockets: [std::os::fd::OwnedFd; 2]) -> Daemon {
+    let [first, second] = sockets;
+    // Standard input and output carry the sockets past the close-on-exec of
+    // every other descriptor; the shell moves them to 3 and 4 and execs rxh,
+    // which keeps its process id.
+    let script = "exec 3<&0 4>&1 0</dev/null 1>/dev/null; \
+                  LISTEN_PID=$$ LISTEN_FDS=2 exec \"$0\" run --config rxh.toml";
+    Daemon(
+        Command::new("sh")
+            .current_dir(directory)
+            .args(["-c", script, RXH])
+            .stdin(Stdio::from(first))
+            .stdout(Stdio::from(second))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon starts"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_activation_serves_on_the_sockets_systemd_passes() {
+    let first = backend("first").await;
+    let second = backend("second").await;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+
+    // Held by the test, without SO_REUSEPORT: rxh cannot bind them itself.
+    let web = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let web_address = web.local_addr().expect("address");
+    let socket = dir.join("admin.sock");
+    let admin = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let address = format!("unix/{}", socket.display());
+    let config = |backend: SocketAddr| {
+        format!(
+            "[admin]\nlisten = \"{address}\"\n\
+             [[server]]\nlisten = \"{web_address}\"\nforward = \"{backend}\"\n"
+        )
+    };
+    std::fs::write(dir.join("rxh.toml"), config(first)).expect("write");
+
+    let mut daemon = start_socket_activated(dir, [web.into(), admin.into()]);
+    wait_for_body(web_address, "first").await;
+    let status = assert_success(&rxh_bare(dir, &["status"]));
+    assert!(status.contains(&web_address.to_string()), "{status}");
+
+    // A reload takes the same socket again.
+    std::fs::write(dir.join("rxh.toml"), config(second)).expect("write");
+    assert_success(&rxh_bare(dir, &["reload"]));
+    wait_for_body(web_address, "second").await;
+
+    // The socket file belongs to systemd: rxh leaves it on exit.
+    assert_success(&rxh_bare(dir, &["stop"]));
+    let exited = daemon.0.wait().expect("daemon exits");
+    assert!(exited.success(), "{exited}");
+    assert!(socket.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sd_notify_reports_readiness_reloads_and_stopping() {
+    use std::os::unix::net::UnixDatagram;
+
+    let backend = backend("backend").await;
+    let web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let config = format!(
+        "[admin]\nenabled = false\n[[server]]\nlisten = \"{web}\"\nforward = \"{backend}\"\n"
+    );
+    std::fs::write(dir.join("rxh.toml"), &config).expect("write");
+    let notify = dir.join("notify.sock");
+    let receiver = UnixDatagram::bind(&notify).expect("bind");
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let receive = || {
+        let mut buffer = [0; 512];
+        let length = receiver.recv(&mut buffer).expect("notification");
+        String::from_utf8_lossy(&buffer[..length]).into_owned()
+    };
+
+    let daemon = Daemon(
+        Command::new(RXH)
+            .current_dir(dir)
+            .args(["run", "--config", "rxh.toml"])
+            .env("NOTIFY_SOCKET", &notify)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon starts"),
+    );
+    assert_eq!(receive(), "READY=1\nSTATUS=Running");
+    // Ready means serving.
+    assert_eq!(try_get(web).await.as_deref(), Some("backend"));
+
+    let pid = daemon.0.id().to_string();
+    let signal = |name: &str| {
+        let killed = Command::new("kill")
+            .args([name, &pid])
+            .status()
+            .expect("kill runs");
+        assert!(killed.success());
+    };
+    signal("-HUP");
+    let reloading = receive();
+    assert!(
+        reloading.starts_with("RELOADING=1\nMONOTONIC_USEC="),
+        "{reloading}"
+    );
+    assert_eq!(receive(), "READY=1\nSTATUS=Running");
+
+    // A failed reload keeps the old configuration, so the service stays ready.
+    std::fs::write(dir.join("rxh.toml"), "[[server]]\nlisten = 1").expect("write");
+    signal("-HUP");
+    assert!(receive().starts_with("RELOADING=1\n"));
+    let failed = receive();
+    assert!(
+        failed.starts_with("READY=1\nSTATUS=Reload failed: "),
+        "{failed}"
+    );
+    assert!(!failed["READY=1\n".len()..].contains('\n'), "{failed}");
+
+    signal("-TERM");
+    assert_eq!(receive(), "STOPPING=1");
+}
