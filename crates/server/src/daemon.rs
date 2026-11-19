@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use rxh_core::config::{AdminListen, Config, ConfigError, IncludedConfig, Runtime};
+use rxh_core::config::{AdminListen, Config, ConfigError, Docker, IncludedConfig, Runtime};
 use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -338,8 +338,8 @@ impl Daemon {
         systemd::notify("READY=1\nSTATUS=Running");
 
         let (docker_updates, mut containers) = mpsc::channel::<Vec<Container>>(1);
-        // Endpoint being followed and the task that follows it.
-        let mut docker_watch: Option<(String, AbortOnDrop)> = None;
+        // Settings being followed and the task that follows them.
+        let mut docker_watch: Option<(Docker, AbortOnDrop)> = None;
 
         let mut signals = Signals::new()?;
         let mut polls = tokio::time::interval(WATCH_INTERVAL);
@@ -348,16 +348,16 @@ impl Daemon {
         loop {
             // After every change of configuration: `[docker]` may be new,
             // gone or point somewhere else.
-            let endpoint = generation
-                .config
-                .docker
-                .as_ref()
-                .map(|docker| &docker.endpoint);
-            if endpoint != docker_watch.as_ref().map(|(endpoint, _)| endpoint) {
-                docker_watch = endpoint.map(|endpoint| {
-                    println!("Docker => Following the containers of {endpoint}");
-                    let task = docker::watch(endpoint.clone(), docker_updates.clone());
-                    (endpoint.clone(), AbortOnDrop(tokio::task::spawn(task)))
+            let settings = generation.config.docker.as_ref();
+            if settings != docker_watch.as_ref().map(|(settings, _)| settings) {
+                docker_watch = settings.map(|settings| {
+                    println!(
+                        "Docker => Following the {:?} containers of {}",
+                        settings.provider,
+                        settings.endpoint()
+                    );
+                    let task = docker::watch(settings.clone(), docker_updates.clone());
+                    (settings.clone(), AbortOnDrop(tokio::task::spawn(task)))
                 });
             }
 

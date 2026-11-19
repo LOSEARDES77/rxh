@@ -18,7 +18,7 @@ watch = true
 [admin]                  # admin API
 [log]                    # access logs
 [acme]                   # automatic HTTPS (tls = "auto")
-[docker]                 # routes to Docker containers from their labels
+[docker]                 # routes to Docker, Podman or Swarm containers from their labels
 [upstream.NAME]          # named load balancing pools, any number
 [[server]]               # listeners, any number
 ```
@@ -557,6 +557,7 @@ therefore obtains new certificates instead of serving the old CA's.
 
 ```toml
 [docker]
+provider = "docker"      # or "podman", "swarm"
 endpoint = "unix:///var/run/docker.sock"
 listen = "0.0.0.0:80"
 ```
@@ -569,7 +570,9 @@ configuration file.
 
 | Key | Default | Description |
 |---|---|---|
-| `endpoint` | `"unix:///var/run/docker.sock"` | Docker Engine API: `unix:///path/to/docker.sock` or `tcp://host:port` (plain TCP, for a socket proxy; TLS is not supported). |
+| `provider` | `"docker"` | Engine that runs the containers: `"docker"`, `"podman"` or `"swarm"`, see [Podman](#podman) and [Docker Swarm](#docker-swarm). |
+| `endpoint` | `"unix:///var/run/docker.sock"`, `"unix:///run/podman/podman.sock"` with Podman | Engine API: `unix:///path/to/docker.sock` or `tcp://host:port` (plain TCP, for a socket proxy; TLS is not supported). |
+| `refresh` | `"15s"` | How often the Swarm services and tasks are listed. Unused by Docker and Podman, whose events are followed. |
 | `listen` | `"0.0.0.0:80"` | Address of the HTTP servers made from `rxh.http.host` labels. Servers of the file can listen on the same address. |
 
 Labels of a container:
@@ -630,7 +633,66 @@ dropping connections.
   health checks or header rules); put a server of the file in front for
   those.
 - The Docker socket gives control of the host. Prefer a socket proxy that
-  only allows `GET /containers/json` and `GET /events`.
+  only allows `GET /containers/json` and `GET /events` (`GET /services` and
+  `GET /tasks` for Swarm).
+
+### Podman
+
+```toml
+[docker]
+provider = "podman"
+# Rootless: the socket of the user, enabled with
+# `systemctl --user enable --now podman.socket`.
+endpoint = "unix://{env.XDG_RUNTIME_DIR}/podman/podman.sock"
+listen = "0.0.0.0:80"
+```
+
+Podman is followed through its Docker compatible API with the same labels;
+`podman-compose` sets the Compose labels, so its replicas share a pool too.
+The difference is how containers are reached: the network of rootless
+containers lives in a namespace the host cannot route to, so a container
+that publishes the chosen port (`-p 8080` or `-p 127.0.0.1::8080`) is
+reached at that host port, on `127.0.0.1` when published on every address.
+A port that is not published is reached at the container address, as with
+Docker, which works for rootful Podman only.
+
+### Docker Swarm
+
+```toml
+[docker]
+provider = "swarm"
+endpoint = "unix:///var/run/docker.sock"   # of a manager node
+listen = "0.0.0.0:80"
+refresh = "15s"
+```
+
+In Swarm mode the labels are read from the services (`deploy.labels` in a
+stack file, `docker service create --label`), and every running task of a
+service labelled `rxh.enable=true` is a member of its pool. The pool
+defaults to the service name (`STACK_SERVICE` for a stack). A task is
+reached at its address on the first network of the service by name, the
+`ingress` routing mesh left out, so rxh must be attached to that overlay
+network, typically as a service on a manager node. `rxh.http.port` and
+`rxh.tcp.port` may be left out when the service publishes exactly one TCP
+port: its target port is used.
+
+```yaml
+# stack.yaml, `docker stack deploy -c stack.yaml shop`
+services:
+  web:
+    image: my-app
+    deploy:
+      replicas: 3
+      labels:
+        rxh.enable: "true"
+        rxh.http.host: shop.example.com
+        rxh.http.port: "8080"
+```
+
+Swarm only sends the events of a node's own containers, so the services and
+tasks are listed every `refresh` instead: a task that starts or stops is
+routed within that delay. Tasks are reached directly, not through the
+virtual IP of the service.
 
 ## `[upstream.NAME]`: load balancing pools
 

@@ -1,5 +1,11 @@
 //! Docker provider: turns the `rxh.*` labels of the running containers into
 //! pools and servers, and follows the Docker events to keep them current.
+//! Podman is the same through its Docker compatible API, except that a
+//! container is reached at the host port it publishes, if any: the network
+//! of rootless containers cannot be reached from the host. In Swarm mode the
+//! running tasks of the services take the place of the containers, with the
+//! labels of their service, and are listed every `refresh`: the events of the
+//! tasks of other nodes do not reach this one.
 //!
 //! | Label             | Meaning                                                   |
 //! |-------------------|-----------------------------------------------------------|
@@ -19,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -28,7 +34,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper::{Request, Response, header};
 use hyper_util::rt::TokioIo;
-use rxh_core::config::{Backend, Config, Policy, Server, UpstreamGroup};
+use rxh_core::config::{Backend, Config, ContainerProvider, Docker, Policy, Server, UpstreamGroup};
 use rxh_core::matcher::HostPattern;
 use serde::Deserialize;
 use serde_json::json;
@@ -45,6 +51,12 @@ const CONTAINERS: &str =
 /// `start` and `die` events of the containers labelled `rxh.enable=true`.
 const EVENTS: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B\
                       %22start%22%2C%22die%22%5D%2C%22label%22%3A%5B%22rxh.enable%3Dtrue%22%5D%7D";
+
+/// Swarm services labelled `rxh.enable=true`.
+const SERVICES: &str = "/services?filters=%7B%22label%22%3A%5B%22rxh.enable%3Dtrue%22%5D%7D";
+
+/// Swarm tasks meant to run.
+const TASKS: &str = "/tasks?filters=%7B%22desired-state%22%3A%5B%22running%22%5D%7D";
 
 /// Wait before connecting again to a Docker daemon that failed.
 const RETRY: Duration = Duration::from_secs(2);
@@ -63,6 +75,11 @@ pub(crate) struct Container {
     address: Option<IpAddr>,
     /// TCP ports the container exposes, sorted.
     ports: Vec<u16>,
+    /// Host addresses of the exposed ports, when they are to be preferred
+    /// over `address` (Podman).
+    published: BTreeMap<u16, SocketAddr>,
+    /// Swarm service of a task: its default pool.
+    service: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -83,8 +100,24 @@ struct Listed {
 #[serde(rename_all = "PascalCase")]
 struct ListedPort {
     private_port: u16,
+    public_port: Option<u16>,
+    #[serde(rename = "IP")]
+    ip: Option<String>,
     #[serde(rename = "Type")]
     protocol: String,
+}
+
+impl ListedPort {
+    /// Where the host publishes the port; a wildcard is reached on loopback.
+    fn published(&self) -> Option<SocketAddr> {
+        let port = self.public_port.filter(|port| *port != 0)?;
+        let ip: IpAddr = match self.ip.as_deref() {
+            None | Some("" | "0.0.0.0") => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some("::") => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            Some(ip) => ip.parse().ok()?,
+        };
+        Some(SocketAddr::new(ip, port))
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -106,8 +139,9 @@ struct ListedNetwork {
     ip_address: String,
 }
 
-impl From<Listed> for Container {
-    fn from(listed: Listed) -> Self {
+impl Listed {
+    fn into_container(self, provider: ContainerProvider) -> Container {
+        let listed = self;
         let address: Option<IpAddr> = if listed.host_config.network_mode == "host" {
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
         } else {
@@ -119,34 +153,184 @@ impl From<Listed> for Container {
                 .values()
                 .find_map(|network| network.ip_address.parse().ok())
         };
-        let mut ports: Vec<u16> = listed
+        let tcp: Vec<ListedPort> = listed
             .ports
             .unwrap_or_default()
-            .iter()
+            .into_iter()
             .filter(|port| port.protocol == "tcp")
-            .map(|port| port.private_port)
             .collect();
+        let mut ports: Vec<u16> = tcp.iter().map(|port| port.private_port).collect();
         ports.sort_unstable();
         ports.dedup();
+        let mut published: BTreeMap<u16, SocketAddr> = BTreeMap::new();
+        if provider == ContainerProvider::Podman {
+            // The IPv4 entry comes first when a port is published twice.
+            for port in &tcp {
+                if let Some(address) = port.published() {
+                    published.entry(port.private_port).or_insert(address);
+                }
+            }
+        }
         let name = match listed.names.first() {
             Some(name) => name.trim_start_matches('/').to_owned(),
             None => listed.id.chars().take(12).collect(),
         };
-        Self {
+        Container {
             id: listed.id,
             name,
             labels: listed.labels.unwrap_or_default(),
             address,
             ports,
+            published,
+            service: None,
         }
     }
 }
 
-/// Parses the body of `GET /containers/json`.
-fn parse_containers(body: &[u8]) -> Result<Vec<Container>, String> {
+/// Parses the body of `GET /containers/json` of a Docker or Podman API.
+fn parse_containers(body: &[u8], provider: ContainerProvider) -> Result<Vec<Container>, String> {
     let listed: Vec<Listed> =
         serde_json::from_slice(body).map_err(|err| format!("container list: {err}"))?;
-    Ok(listed.into_iter().map(Container::from).collect())
+    Ok(listed
+        .into_iter()
+        .map(|listed| listed.into_container(provider))
+        .collect())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmService {
+    #[serde(rename = "ID")]
+    id: String,
+    spec: SwarmServiceSpec,
+    #[serde(default)]
+    endpoint: SwarmEndpoint,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmServiceSpec {
+    name: String,
+    labels: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmEndpoint {
+    ports: Option<Vec<SwarmPort>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmPort {
+    #[serde(default)]
+    protocol: String,
+    target_port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmTask {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "ServiceID")]
+    service_id: String,
+    #[serde(default)]
+    slot: u64,
+    #[serde(rename = "NodeID", default)]
+    node_id: String,
+    status: SwarmTaskStatus,
+    networks_attachments: Option<Vec<SwarmAttachment>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmTaskStatus {
+    state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmAttachment {
+    network: SwarmNetwork,
+    #[serde(default)]
+    addresses: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmNetwork {
+    spec: SwarmNetworkSpec,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SwarmNetworkSpec {
+    name: String,
+    #[serde(default)]
+    ingress: bool,
+}
+
+/// Turns the bodies of `GET /services` and `GET /tasks` into one container
+/// per running task of the listed services.
+fn parse_swarm(services: &[u8], tasks: &[u8]) -> Result<Vec<Container>, String> {
+    let services: Vec<SwarmService> =
+        serde_json::from_slice(services).map_err(|err| format!("service list: {err}"))?;
+    let tasks: Vec<SwarmTask> =
+        serde_json::from_slice(tasks).map_err(|err| format!("task list: {err}"))?;
+    let mut containers: Vec<Container> = Vec::new();
+    for task in tasks {
+        let Some(service) = services
+            .iter()
+            .find(|service| service.id == task.service_id)
+        else {
+            continue;
+        };
+        if task.status.state != "running" {
+            continue;
+        }
+        let mut ports: Vec<u16> = match &service.endpoint.ports {
+            Some(ports) => ports
+                .iter()
+                .filter(|port| port.protocol == "tcp")
+                .map(|port| port.target_port)
+                .collect(),
+            None => Vec::new(),
+        };
+        ports.sort_unstable();
+        ports.dedup();
+        // The routing mesh (`ingress`) only carries published ports; with
+        // several other networks the first one by name wins, as for Docker.
+        let mut attachments: Vec<&SwarmAttachment> = task
+            .networks_attachments
+            .iter()
+            .flatten()
+            .filter(|attachment| !attachment.network.spec.ingress)
+            .collect();
+        attachments.sort_by(|a, b| a.network.spec.name.cmp(&b.network.spec.name));
+        let address: Option<IpAddr> = attachments.iter().find_map(|attachment| {
+            let first = attachment.addresses.first()?;
+            let ip = first.split_once('/').map_or(first.as_str(), |(ip, _)| ip);
+            ip.parse().ok()
+        });
+        let name = &service.spec.name;
+        // Replicated tasks have a slot, global ones one task per node.
+        let name = if task.slot > 0 {
+            format!("{name}.{}", task.slot)
+        } else {
+            format!("{name}.{}", task.node_id)
+        };
+        containers.push(Container {
+            id: task.id,
+            name,
+            labels: service.spec.labels.clone().unwrap_or_default(),
+            address,
+            ports,
+            published: BTreeMap::new(),
+            service: Some(service.spec.name.clone()),
+        });
+    }
+    Ok(containers)
 }
 
 /// What the labels of one container ask for.
@@ -233,9 +417,15 @@ impl Container {
                 ));
             }
         };
-        let address = self
-            .address
-            .ok_or("has no IP address on a Docker network")?;
+        let backend = match self.published.get(&port) {
+            Some(published) => *published,
+            None => SocketAddr::new(
+                self.address.ok_or(format!(
+                    "has no IP address on a network and does not publish port {port}"
+                ))?,
+                port,
+            ),
+        };
 
         let pool = match pool {
             Some(pool) => pool.to_owned(),
@@ -256,13 +446,17 @@ impl Container {
             policy,
             hosts,
             tcp_listen,
-            backend: Backend::new(SocketAddr::new(address, port).to_string()),
+            backend: Backend::new(backend.to_string()),
         })
     }
 
-    /// `PROJECT-SERVICE` for Compose containers, so the replicas of a service
-    /// share a pool, else the container name.
+    /// The Swarm service of a task, `PROJECT-SERVICE` for Compose
+    /// containers, so the replicas of a service share a pool, else the
+    /// container name.
     fn default_pool(&self) -> String {
+        if let Some(service) = &self.service {
+            return service.clone();
+        }
         let label = |name: &str| self.labels.get(name);
         match (
             label("com.docker.compose.project"),
@@ -442,14 +636,20 @@ struct Actor {
     id: String,
 }
 
-/// Sends the routable containers of the Docker daemon at `endpoint` to
+/// Sends the routable containers of the engine `settings` point at to
 /// `updates`: once after connecting, then after every container that starts
-/// or dies. While Docker cannot be reached nothing is sent, so the last
-/// containers stay routed, and the connection is retried forever.
-pub(crate) async fn watch(endpoint: String, updates: mpsc::Sender<Vec<Container>>) {
+/// or dies, or every `refresh` for Swarm. While the engine cannot be reached
+/// nothing is sent, so the last containers stay routed, and the connection is
+/// retried forever.
+pub(crate) async fn watch(settings: Docker, updates: mpsc::Sender<Vec<Container>>) {
+    let endpoint = settings.endpoint();
     let mut last_error = String::new();
     loop {
-        match follow(&endpoint, &updates).await {
+        let outcome = match settings.provider {
+            ContainerProvider::Swarm => poll_swarm(endpoint, settings.refresh, &updates).await,
+            provider => follow(endpoint, provider, &updates).await,
+        };
+        match outcome {
             Ok(()) => return,
             Err(reason) => {
                 if reason != last_error {
@@ -463,7 +663,27 @@ pub(crate) async fn watch(endpoint: String, updates: mpsc::Sender<Vec<Container>
 }
 
 /// Returns `Ok` once nothing listens to `updates` anymore.
-async fn follow(endpoint: &str, updates: &mpsc::Sender<Vec<Container>>) -> Result<(), String> {
+async fn poll_swarm(
+    endpoint: &str,
+    refresh: Duration,
+    updates: &mpsc::Sender<Vec<Container>>,
+) -> Result<(), String> {
+    loop {
+        let services = list(endpoint, SERVICES, "service list").await?;
+        let tasks = list(endpoint, TASKS, "task list").await?;
+        if updates.send(parse_swarm(&services, &tasks)?).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(refresh).await;
+    }
+}
+
+/// Returns `Ok` once nothing listens to `updates` anymore.
+async fn follow(
+    endpoint: &str,
+    provider: ContainerProvider,
+    updates: &mpsc::Sender<Vec<Container>>,
+) -> Result<(), String> {
     // Subscribed before listing, so a container that starts in between is
     // listed again instead of missed.
     let mut events = get(endpoint, EVENTS).await?.into_body();
@@ -472,16 +692,8 @@ async fn follow(endpoint: &str, updates: &mpsc::Sender<Vec<Container>>) -> Resul
     // running: those are left out until they start again.
     let mut dead: BTreeSet<String> = BTreeSet::new();
     loop {
-        let list = get(endpoint, CONTAINERS);
-        let body = tokio::time::timeout(LIST_TIMEOUT, async {
-            Limited::new(list.await?.into_body(), MAX_LIST_BODY)
-                .collect()
-                .await
-                .map_err(|err| format!("container list: {err}"))
-        })
-        .await
-        .map_err(|_| String::from("container list: timeout"))??;
-        let mut containers = parse_containers(&body.to_bytes())?;
+        let body = list(endpoint, CONTAINERS, "container list").await?;
+        let mut containers = parse_containers(&body, provider)?;
         containers.retain(|container| !dead.contains(&container.id));
         if updates.send(containers).await.is_err() {
             return Ok(());
@@ -496,6 +708,19 @@ async fn follow(endpoint: &str, updates: &mpsc::Sender<Vec<Container>>) -> Resul
             dead.remove(&event.actor.id);
         }
     }
+}
+
+/// Body of the list at `path`, `what` naming it in errors.
+async fn list(endpoint: &str, path: &str, what: &str) -> Result<Bytes, String> {
+    tokio::time::timeout(LIST_TIMEOUT, async {
+        Limited::new(get(endpoint, path).await?.into_body(), MAX_LIST_BODY)
+            .collect()
+            .await
+            .map(|body| body.to_bytes())
+            .map_err(|err| format!("{what}: {err}"))
+    })
+    .await
+    .map_err(|_| format!("{what}: timeout"))?
 }
 
 /// Next line of the event stream, which has one JSON document per line.
@@ -582,6 +807,8 @@ mod tests {
             labels,
             address: address.parse().ok(),
             ports: ports.to_vec(),
+            published: BTreeMap::new(),
+            service: None,
         }
     }
 
@@ -834,7 +1061,7 @@ mod tests {
            "HostConfig":{"NetworkMode":"host"},"NetworkSettings":{"Networks":{"host":{"IPAddress":""}}}},
           {"Id":"none"}
         ]"#;
-        let containers = parse_containers(body).unwrap();
+        let containers = parse_containers(body, ContainerProvider::Docker).unwrap();
         assert_eq!(containers[0].name, "shop-web-1");
         assert_eq!(containers[0].address, "172.20.0.5".parse().ok());
         assert_eq!(containers[0].ports, [80]);
@@ -843,6 +1070,131 @@ mod tests {
         assert_eq!(containers[1].address, "127.0.0.1".parse().ok());
         assert_eq!(containers[2].address, None);
 
-        assert!(parse_containers(b"{\"message\":\"no\"}").is_err());
+        assert!(parse_containers(b"{\"message\":\"no\"}", ContainerProvider::Docker).is_err());
+        // Docker reaches containers on their network, published or not.
+        assert!(
+            containers
+                .iter()
+                .all(|container| container.published.is_empty())
+        );
+    }
+
+    #[test]
+    fn podman_containers_are_reached_at_their_published_ports() {
+        // Rootless Podman with pasta: no address on a network.
+        let body = br#"[
+          {"Id":"a1","Names":["web"],
+           "Labels":{"rxh.enable":"true","rxh.http.host":"app.test"},
+           "Ports":[{"IP":"0.0.0.0","PrivatePort":8000,"PublicPort":41669,"Type":"tcp"},
+                    {"IP":"::","PrivatePort":8000,"PublicPort":41669,"Type":"tcp"},
+                    {"IP":"10.1.2.3","PrivatePort":9000,"PublicPort":9001,"Type":"tcp"},
+                    {"IP":"::","PrivatePort":9100,"PublicPort":9101,"Type":"tcp"},
+                    {"IP":"0.0.0.0","PrivatePort":53,"PublicPort":5353,"Type":"udp"},
+                    {"PrivatePort":9200,"Type":"tcp"}],
+           "HostConfig":{"NetworkMode":"pasta"},"NetworkSettings":{"Networks":{}}},
+          {"Id":"b2","Names":["db"],
+           "Labels":{"rxh.enable":"true","rxh.tcp.listen":":5432"},
+           "Ports":[{"PrivatePort":5432,"Type":"tcp"}],
+           "HostConfig":{"NetworkMode":"bridge"},
+           "NetworkSettings":{"Networks":{"podman":{"IPAddress":"10.88.0.4"}}}}
+        ]"#;
+        let containers = parse_containers(body, ContainerProvider::Podman).unwrap();
+        let published: Vec<(u16, String)> = containers[0]
+            .published
+            .iter()
+            .map(|(port, address)| (*port, address.to_string()))
+            .collect();
+        assert_eq!(
+            published,
+            [
+                (8000, "127.0.0.1:41669".into()),
+                (9000, "10.1.2.3:9001".into()),
+                (9100, "[::1]:9101".into()),
+            ]
+        );
+        assert_eq!(containers[0].address, None);
+
+        let mut containers = containers;
+        containers[0]
+            .labels
+            .insert("rxh.http.port".into(), "8000".into());
+        let (_, routed) = plan(&config(""), &containers);
+        assert_eq!(routed.ignored, [""; 0]);
+        assert_eq!(members(&routed, "web"), ["127.0.0.1:41669"]);
+        // Not published: the address on the network.
+        assert_eq!(members(&routed, "db"), ["10.88.0.4:5432"]);
+
+        // A port that is neither published nor reachable on a network.
+        containers[0]
+            .labels
+            .insert("rxh.http.port".into(), "9200".into());
+        let (_, routed) = plan(&config(""), &containers[..1]);
+        assert!(
+            routed.ignored[0]
+                .contains("has no IP address on a network and does not publish port 9200"),
+            "{:?}",
+            routed.ignored
+        );
+
+        // The same list from Docker ignores the published ports.
+        let docker = parse_containers(body, ContainerProvider::Docker).unwrap();
+        assert!(docker[0].published.is_empty());
+    }
+
+    #[test]
+    fn swarm_tasks_are_the_containers_of_their_service() {
+        let services = br#"[
+          {"ID":"s1","Spec":{"Name":"shop_web","Labels":{"rxh.enable":"true","rxh.http.host":"shop.test"}},
+           "Endpoint":{"Ports":[{"Protocol":"tcp","TargetPort":80,"PublishedPort":8080},
+                                {"Protocol":"udp","TargetPort":53,"PublishedPort":53}]}},
+          {"ID":"s2","Spec":{"Name":"metrics","Labels":{"rxh.enable":"true","rxh.http.host":"metrics.test",
+                                                        "rxh.http.port":"9100"}},
+           "Endpoint":{}}
+        ]"#;
+        let attachments = |address: &str| {
+            format!(
+                r#"[{{"Network":{{"Spec":{{"Name":"ingress","Ingress":true}}}},"Addresses":["10.0.0.9/24"]}},
+                    {{"Network":{{"Spec":{{"Name":"shop_default"}}}},"Addresses":["{address}/24"]}},
+                    {{"Network":{{"Spec":{{"Name":"z_other"}}}},"Addresses":["10.9.9.9/24"]}}]"#
+            )
+        };
+        let tasks = format!(
+            r#"[
+              {{"ID":"t1","ServiceID":"s1","Slot":1,"NodeID":"n1","Status":{{"State":"running"}},
+                "NetworksAttachments":{}}},
+              {{"ID":"t2","ServiceID":"s1","Slot":2,"NodeID":"n2","Status":{{"State":"running"}},
+                "NetworksAttachments":{}}},
+              {{"ID":"t3","ServiceID":"s1","Slot":3,"NodeID":"n2","Status":{{"State":"starting"}},
+                "NetworksAttachments":{}}},
+              {{"ID":"t4","ServiceID":"s2","NodeID":"n1","Status":{{"State":"running"}},
+                "NetworksAttachments":[{{"Network":{{"Spec":{{"Name":"host"}}}},"Addresses":["10.2.0.1/16"]}}]}},
+              {{"ID":"t5","ServiceID":"unlabelled","Slot":1,"Status":{{"State":"running"}}}}
+            ]"#,
+            attachments("10.0.1.5"),
+            attachments("10.0.1.6"),
+            attachments("10.0.1.7"),
+        );
+        let containers = parse_swarm(services, tasks.as_bytes()).unwrap();
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["shop_web.1", "shop_web.2", "metrics.n1"]);
+        assert_eq!(containers[0].ports, [80]);
+        assert!(containers[2].ports.is_empty());
+
+        let (effective, routed) = plan(&config(""), &containers);
+        assert_eq!(routed.ignored, [""; 0]);
+        assert_eq!(members(&routed, "shop_web"), ["10.0.1.5:80", "10.0.1.6:80"]);
+        assert_eq!(members(&routed, "metrics"), ["10.2.0.1:9100"]);
+        assert_eq!(effective.servers.len(), 2);
+
+        assert!(
+            parse_swarm(b"{}", b"[]")
+                .unwrap_err()
+                .contains("service list")
+        );
+        assert!(
+            parse_swarm(b"[]", b"[{}]")
+                .unwrap_err()
+                .contains("task list")
+        );
     }
 }

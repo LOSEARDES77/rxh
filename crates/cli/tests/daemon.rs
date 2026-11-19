@@ -17,7 +17,12 @@ use tokio::net::{TcpListener, TcpStream};
 const RXH: &str = env!("CARGO_BIN_EXE_rxh");
 
 async fn backend(tag: &'static str) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    backend_at(SocketAddr::from(([127, 0, 0, 1], 0)), tag).await
+}
+
+/// A backend on `address` answering `tag`.
+async fn backend_at(address: SocketAddr, tag: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind(address).await.expect("bind");
     let address = listener.local_addr().expect("address");
     tokio::task::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
@@ -1544,6 +1549,150 @@ async fn docker_containers_are_routed_by_their_labels_and_followed_live() {
     assert_ne!(get_host(web, "app.test").await.as_deref(), Some("b"));
     assert_eq!(try_get(tcp).await, None);
     assert_eq!(get_host(web, "file.test").await.as_deref(), Some("file"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn podman_containers_are_routed_through_their_published_ports() {
+    let podman = rxh_test_util::DockerApi::start().await;
+    let published = backend("published").await;
+    let (admin, web) = (free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let config = |provider: &str| {
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\
+             [docker]\nprovider = \"{provider}\"\nendpoint = \"{}\"\nlisten = \"{web}\"\n",
+            podman.endpoint()
+        )
+    };
+    std::fs::write(dir.join("rxh.toml"), config("podman")).expect("write config");
+
+    // A rootless container: no address on a network, port 80 published on
+    // the port of the backend.
+    let container = serde_json::json!({
+        "Id": "rootless",
+        "Names": ["rootless"],
+        "Labels": { "rxh.enable": "true", "rxh.http.host": "app.test" },
+        "Ports": [{ "IP": "0.0.0.0", "PrivatePort": 80, "PublicPort": published.port(), "Type": "tcp" }],
+        "HostConfig": { "NetworkMode": "pasta" },
+        "NetworkSettings": { "Networks": {} },
+    });
+    podman.publish(&docker_list(&[&container]), "start", "rootless");
+    let _daemon = start_daemon(dir);
+    wait_for_backends(web, "app.test", &["published"], 1).await;
+
+    podman.publish("[]", "die", "rootless");
+    for _ in 0..250 {
+        if get_host(web, "app.test").await.as_deref() != Some("published") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(
+        get_host(web, "app.test").await.as_deref(),
+        Some("published")
+    );
+
+    // Docker reaches containers on their network only: this one is ignored.
+    podman.publish(&docker_list(&[&container]), "start", "rootless");
+    std::fs::write(dir.join("rxh.toml"), config("docker")).expect("write config");
+    assert_success(&rxh(dir, admin, &["reload"]));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_ne!(
+        get_host(web, "app.test").await.as_deref(),
+        Some("published")
+    );
+}
+
+/// One Swarm task of the service `s1`, running or not, at `ip`.
+fn swarm_task(id: &str, slot: u64, state: &str, ip: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ID": id,
+        "ServiceID": "s1",
+        "Slot": slot,
+        "NodeID": "node",
+        "Status": { "State": state },
+        "NetworksAttachments": [
+            { "Network": { "Spec": { "Name": "ingress", "Ingress": true } }, "Addresses": ["10.0.0.2/24"] },
+            { "Network": { "Spec": { "Name": "shop_default" } }, "Addresses": [format!("{ip}/24")] },
+        ],
+    })
+}
+
+// Replicas of a service share a port, so the second one needs its own
+// loopback address, which only Linux routes without configuration.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn swarm_services_are_routed_to_their_running_tasks() {
+    let swarm = rxh_test_util::DockerApi::start().await;
+    let a = backend("a").await;
+    let b = backend_at(SocketAddr::from(([127, 0, 0, 2], a.port())), "b").await;
+    let (admin, web) = (free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\
+             [docker]\nprovider = \"swarm\"\nendpoint = \"{}\"\nlisten = \"{web}\"\n\
+             refresh = \"50ms\"\n",
+            swarm.endpoint()
+        ),
+    )
+    .expect("write config");
+    let route_updates = || {
+        std::fs::read_to_string(dir.join("stdout.log"))
+            .expect("log")
+            .matches("Docker containers changed, updating the routes")
+            .count()
+    };
+    let services = serde_json::json!([{
+        "ID": "s1",
+        "Spec": { "Name": "shop_web", "Labels": { "rxh.enable": "true", "rxh.http.host": "shop.test" } },
+        "Endpoint": { "Ports": [{ "Protocol": "tcp", "TargetPort": a.port(), "PublishedPort": 8080 }] },
+    }])
+    .to_string();
+    let tasks = |tasks: &[serde_json::Value]| serde_json::to_string(tasks).expect("serializes");
+
+    swarm.publish_swarm(
+        &services,
+        &tasks(&[swarm_task("t1", 1, "running", "127.0.0.1")]),
+    );
+    let _daemon = start_daemon_logged(dir);
+    wait_for_backends(web, "shop.test", &["a"], 1).await;
+
+    // A second replica is picked up by the next poll, without events.
+    swarm.publish_swarm(
+        &services,
+        &tasks(&[
+            swarm_task("t1", 1, "running", "127.0.0.1"),
+            swarm_task("t2", 2, "running", &b.ip().to_string()),
+            swarm_task("t3", 3, "preparing", "127.0.0.3"),
+        ]),
+    );
+    wait_for_backends(web, "shop.test", &["a", "b"], 20).await;
+
+    // A task that stops leaves the pool.
+    swarm.publish_swarm(
+        &services,
+        &tasks(&[
+            swarm_task("t1", 1, "shutdown", "127.0.0.1"),
+            swarm_task("t2", 2, "running", &b.ip().to_string()),
+        ]),
+    );
+    wait_for_backends(web, "shop.test", &["b"], 20).await;
+    assert_eq!(route_updates(), 1);
+
+    // The service goes away with its route.
+    swarm.publish_swarm("[]", "[]");
+    for _ in 0..250 {
+        if get_host(web, "shop.test").await.as_deref() != Some("b") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(get_host(web, "shop.test").await.as_deref(), Some("b"));
+    assert_eq!(route_updates(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

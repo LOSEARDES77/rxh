@@ -827,31 +827,76 @@ impl Default for Log {
 }
 
 /// Docker provider (`[docker]`): running containers labelled `rxh.enable=true`
-/// become pools and servers, followed live through the Docker events.
+/// become pools and servers, followed live through the Docker events, or the
+/// tasks of the Swarm services labelled `rxh.enable=true`, polled.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Docker {
-    /// Docker Engine API: `unix:///path/to/docker.sock` or `tcp://host:port`.
-    #[serde(default = "default::docker_endpoint")]
-    pub endpoint: String,
+    /// Engine that runs the containers.
+    #[serde(default)]
+    pub provider: ContainerProvider,
+
+    /// Engine API: `unix:///path/to/docker.sock` or `tcp://host:port`.
+    /// Defaults to the system socket of the provider, see [`Docker::endpoint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 
     /// Address of the HTTP servers made from `rxh.http.host` labels.
     #[serde(default = "default::docker_listen")]
     pub listen: SocketAddr,
+
+    /// How often the Swarm services and tasks are listed. Docker and Podman
+    /// containers are followed through events instead.
+    #[serde(default = "default::docker_refresh", with = "duration")]
+    pub refresh: Duration,
+}
+
+/// Engine behind `[docker]`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerProvider {
+    /// Docker Engine: containers reached at their address on their network.
+    #[default]
+    Docker,
+    /// Podman, through its Docker compatible API: containers reached at the
+    /// host port they publish, which rootless containers need, else at
+    /// their address on their network.
+    Podman,
+    /// Docker Swarm mode: the running tasks of the services, reached at
+    /// their address on their first network other than `ingress`.
+    Swarm,
 }
 
 impl Default for Docker {
     fn default() -> Self {
         Self {
-            endpoint: default::docker_endpoint(),
+            provider: ContainerProvider::default(),
+            endpoint: None,
             listen: default::docker_listen(),
+            refresh: default::docker_refresh(),
         }
     }
 }
 
 impl Docker {
+    /// The `endpoint` set, or the system socket of the provider.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        match (&self.endpoint, self.provider) {
+            (Some(endpoint), _) => endpoint,
+            (None, ContainerProvider::Docker | ContainerProvider::Swarm) => {
+                "unix:///var/run/docker.sock"
+            }
+            (None, ContainerProvider::Podman) => "unix:///run/podman/podman.sock",
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
-        let valid = match self.endpoint.split_once("://") {
+        if self.refresh.is_zero() {
+            return Err(String::from("refresh must be longer than 0s"));
+        }
+        let endpoint = self.endpoint();
+        let valid = match endpoint.split_once("://") {
             Some(("unix", path)) => path.starts_with('/'),
             Some(("tcp", address)) => matches!(
                 BackendAddress::parse(address),
@@ -866,8 +911,7 @@ impl Docker {
             Ok(())
         } else {
             Err(format!(
-                "endpoint must be unix:///path or tcp://host:port, got {:?}",
-                self.endpoint
+                "endpoint must be unix:///path or tcp://host:port, got {endpoint:?}"
             ))
         }
     }
@@ -4097,8 +4141,8 @@ mod default {
         String::from("/")
     }
 
-    pub fn docker_endpoint() -> String {
-        String::from("unix:///var/run/docker.sock")
+    pub fn docker_refresh() -> Duration {
+        Duration::from_secs(15)
     }
 
     pub fn docker_listen() -> SocketAddr {
@@ -5297,8 +5341,10 @@ mod tests {
 
         let config = Config::from_toml("[docker]\n").expect("valid");
         let docker = config.docker.as_ref().expect("enabled by the table");
-        assert_eq!(docker.endpoint, "unix:///var/run/docker.sock");
+        assert_eq!(docker.provider, ContainerProvider::Docker);
+        assert_eq!(docker.endpoint(), "unix:///var/run/docker.sock");
         assert_eq!(docker.listen, "0.0.0.0:80".parse().expect("address"));
+        assert_eq!(docker.refresh, Duration::from_secs(15));
         let text = toml::to_string(&config).expect("serializes");
         assert_eq!(
             Config::from_toml(&text).expect("round trip").docker,
@@ -5316,7 +5362,7 @@ mod tests {
                 .expect(endpoint)
                 .docker
                 .expect("set");
-            assert_eq!(docker.endpoint, endpoint);
+            assert_eq!(docker.endpoint(), endpoint);
             assert_eq!(docker.listen.port(), 8080);
         }
 
@@ -5336,6 +5382,59 @@ mod tests {
         assert!(Config::from_toml("[docker]\nlisten = \"80\"\n").is_err());
         assert!(Config::from_toml("[docker]\nnetwork = \"web\"\n").is_err());
         assert!(IncludedConfig::from_toml("[docker]\n").is_err());
+    }
+
+    #[test]
+    fn docker_section_selects_podman_or_swarm() {
+        let docker = |extra: &str| -> Docker {
+            Config::from_toml(&format!("[docker]\n{extra}"))
+                .expect(extra)
+                .docker
+                .expect("set")
+        };
+        let podman = docker("provider = \"podman\"\n");
+        assert_eq!(podman.provider, ContainerProvider::Podman);
+        assert_eq!(podman.endpoint(), "unix:///run/podman/podman.sock");
+        let rootless = docker(
+            "provider = \"podman\"\nendpoint = \"unix:///run/user/1000/podman/podman.sock\"\n",
+        );
+        assert_eq!(
+            rootless.endpoint(),
+            "unix:///run/user/1000/podman/podman.sock"
+        );
+
+        let swarm = docker("provider = \"swarm\"\nrefresh = \"5s\"\n");
+        assert_eq!(swarm.provider, ContainerProvider::Swarm);
+        assert_eq!(swarm.endpoint(), "unix:///var/run/docker.sock");
+        assert_eq!(swarm.refresh, Duration::from_secs(5));
+        let text = toml::to_string(&Config {
+            docker: Some(swarm.clone()),
+            ..Config::default()
+        })
+        .expect("serializes");
+        assert_eq!(
+            Config::from_toml(&text).expect("round trip").docker,
+            Some(swarm)
+        );
+
+        for (extra, reason) in [
+            ("provider = \"kubernetes\"\n", "unknown variant"),
+            ("provider = \"Docker\"\n", "unknown variant"),
+            (
+                "refresh = \"0s\"\n",
+                "docker: refresh must be longer than 0s",
+            ),
+            ("refresh = \"soon\"\n", "refresh"),
+            (
+                "provider = \"podman\"\nendpoint = \"podman.sock\"\n",
+                "docker: endpoint must be",
+            ),
+        ] {
+            let err = Config::from_toml(&format!("[docker]\n{extra}"))
+                .expect_err(extra)
+                .to_string();
+            assert!(err.contains(reason), "{extra}: {err}");
+        }
     }
 
     #[test]
