@@ -2565,6 +2565,12 @@ pub struct UpstreamGroup {
     #[serde(default)]
     pub h2c: bool,
 
+    /// Translate gRPC-Web requests (`application/grpc-web`, binary and
+    /// `-text`) to gRPC for the backends, and their responses back (Envoy
+    /// `grpc_web` filter). Needs `h2c`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grpc_web: bool,
+
     /// HTTP/2 connections kept open to each backend with `h2c`; requests
     /// are spread over them in turn.
     #[serde(default = "default::http2_conns_per_host")]
@@ -2801,6 +2807,7 @@ impl UpstreamGroup {
             read_timeout: None,
             write_timeout: None,
             h2c: false,
+            grpc_web: false,
             http2_conns_per_host: default::http2_conns_per_host(),
             keepalive: default::keepalive(),
             keepalive_idle_conns_per_host: default::keepalive_idle_conns_per_host(),
@@ -2951,12 +2958,35 @@ impl UpstreamGroup {
             ));
         }
 
+        if self.grpc_web && !self.h2c {
+            return Err(String::from(
+                "grpc_web needs h2c = true: gRPC backends speak HTTP/2",
+            ));
+        }
+
         if let Some(health) = &self.health
             && (health.passes == 0 || health.fails == 0)
         {
             return Err(String::from(
                 "health.passes and health.fails must be at least 1",
             ));
+        }
+
+        if let Some(health) = &self.health {
+            if health.grpc && (health.uri.is_some() || health.body.is_some()) {
+                return Err(String::from(
+                    "health.grpc cannot be combined with health.uri or health.body",
+                ));
+            }
+            // The TLS handshake of a pool offers one ALPN protocol.
+            if health.grpc && self.uses_tls() && !self.h2c {
+                return Err(String::from(
+                    "health.grpc on TLS backends needs h2c = true, to negotiate HTTP/2",
+                ));
+            }
+            if health.grpc_service.is_some() && !health.grpc {
+                return Err(String::from("health.grpc_service needs health.grpc = true"));
+            }
         }
 
         if let Some(hooks) = self
@@ -3194,6 +3224,15 @@ pub struct ActiveHealth {
     /// Path and query requested by HTTP checks (Caddy `health_uri`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+
+    /// Check with the gRPC health checking protocol
+    /// (`grpc.health.v1.Health/Check` over HTTP/2) instead of HTTP or TCP.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grpc: bool,
+
+    /// Service name sent in gRPC checks; the server as a whole when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_service: Option<String>,
 
     /// Port to check instead of the backend port (Caddy `health_port`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7649,6 +7688,42 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
             let err = invalid(&text);
             assert!(err.contains(expected), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn grpc_health_and_grpc_web() {
+        let parse = |pool: &str| Config::from_toml(&format!("upstream.web = {pool}\n"));
+        let group = |pool: &str| parse(pool).unwrap().upstreams.remove("web").unwrap();
+        let error = |pool: &str| match parse(pool) {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+
+        let plain = group("{ backends = [\"a:1\"], health = {} }");
+        assert!(!plain.grpc_web);
+        let health = plain.health.unwrap();
+        assert!(!health.grpc);
+        assert_eq!(health.grpc_service, None);
+
+        let grpc = group(
+            "{ backends = [\"a:1\"], h2c = true, grpc_web = true, \
+             health = { grpc = true, grpc_service = \"echo.Echo\" } }",
+        );
+        assert!(grpc.grpc_web);
+        let health = grpc.health.unwrap();
+        assert!(health.grpc);
+        assert_eq!(health.grpc_service.as_deref(), Some("echo.Echo"));
+
+        let message = error("{ backends = [\"a:1\"], grpc_web = true }");
+        assert!(message.contains("grpc_web needs h2c"), "{message}");
+        let message = error("{ backends = [\"a:1\"], health = { grpc = true, uri = \"/\" } }");
+        assert!(message.contains("health.grpc cannot"), "{message}");
+        let message = error("{ backends = [\"a:1\"], health = { grpc = true, body = \"ok\" } }");
+        assert!(message.contains("health.grpc cannot"), "{message}");
+        let message = error("{ backends = [\"https://a:1\"], health = { grpc = true } }");
+        assert!(message.contains("needs h2c"), "{message}");
+        let message = error("{ backends = [\"a:1\"], health = { grpc_service = \"x\" } }");
+        assert!(message.contains("grpc_service needs"), "{message}");
     }
 
     #[test]

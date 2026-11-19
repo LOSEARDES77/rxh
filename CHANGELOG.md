@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- gRPC health checks: `health = { grpc = true, grpc_service = "NAME" }` on
+  a pool checks each backend with the gRPC health checking protocol
+  (`grpc.health.v1.Health/Check` over HTTP/2) and keeps it in rotation
+  while it answers `SERVING`.
+- gRPC-Web: `grpc_web = true` on an `h2c` pool lets browsers call its gRPC
+  backends. `application/grpc-web` and base64 `application/grpc-web-text`
+  requests are sent on as gRPC, and the trailers of the response come back
+  as the last frame of the body.
 - Custom error pages: `error_pages = { "404" = "404.html", "5xx" =
   "50x.html" }` on an `http` server replaces the body of the error
   responses rxh answers itself (no matching route, IP lists, rate limits,

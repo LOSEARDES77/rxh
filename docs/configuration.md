@@ -1000,6 +1000,7 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `read_timeout` | unset | `read_timeout` | An upstream read that makes no progress for this long fails the connection (also idle pooled connections and upgraded tunnels). |
 | `write_timeout` | unset | `write_timeout` | An upstream write that makes no progress for this long fails the connection. |
 | `h2c` | `false` | `h2c://` | Speak cleartext HTTP/2 to the backends, over `http2_conns_per_host` shared connections each. |
+| `grpc_web` | `false` | Envoy `grpc_web` | Translate gRPC-Web requests to gRPC and the responses back, see [gRPC-Web](#grpc-web). Needs `h2c`. |
 | `http2_conns_per_host` | `1` | | HTTP/2 connections kept open to each backend of an `h2c` pool. The first requests open them, later ones use them in turn, and a closed one is replaced by the next request. More than one helps when a backend limits the concurrent streams of a connection, or when one TCP connection is the bottleneck. A burst on a backend without any open connection may open more; those carry one request and are closed. `0` is rejected. Ignored without `h2c`. |
 | `keepalive` | `"2m"` | `keepalive` | How long idle upstream HTTP connections are kept. `"0s"` disables pooling. |
 | `keepalive_idle_conns_per_host` | `32` | `keepalive_idle_conns_per_host` | Idle connections kept per backend. |
@@ -1036,6 +1037,29 @@ Example: four HTTP/2 connections to each gRPC backend:
 backends = ["10.0.0.1:50051", "10.0.0.2:50051"]
 h2c = true
 http2_conns_per_host = 4
+```
+
+#### gRPC-Web
+
+Browsers cannot read HTTP trailers, where gRPC puts the status of a call,
+so they speak gRPC-Web instead. With `grpc_web = true` a request with the
+content type `application/grpc-web` or `application/grpc-web-text` (the
+same in base64), with or without a suffix like `+proto`, reaches the
+backends as `application/grpc` with `te: trailers`. The response gets the
+content type the client used, and its trailers are appended to the body as
+a frame flagged `0x80`. Clients may use HTTP/1.1 or HTTP/2. Unary and server
+streaming calls work; each chunk of a `-text` response is padded base64 of
+its own. Other requests of the pool, native gRPC included, are not touched.
+A `-text` body that is not base64 gets `502`. Browsers on another origin
+also need [`cors`](#cors) on the route, exposing `grpc-status` and
+`grpc-message`.
+
+```toml
+[upstream.grpc]
+backends = ["10.0.0.1:50051", "10.0.0.2:50051"]
+h2c = true
+grpc_web = true
+health = { grpc = true }
 ```
 
 Example: fewer, larger writes to clients of a backend that sends many small
@@ -1123,12 +1147,15 @@ validation fails without it. `srv` backends keep the target name, so
 
 ### `[upstream.NAME.health]`: active health checks
 
-Checks run in the background for every backend. With `uri` the check is an
-HTTP request; without it, a TCP connect.
+Checks run in the background for every backend. With `grpc` the check is a
+call of the gRPC health checking protocol; with `uri` an HTTP request;
+without either, a TCP connect.
 
 | Key | Default | Description |
 |---|---|---|
 | `uri` | | Path and query to request. |
+| `grpc` | `false` | Call `grpc.health.v1.Health/Check` over HTTP/2 (TLS when the pool uses it, which then needs `h2c = true`). The backend passes while it answers `SERVING`; `NOT_SERVING`, an error status such as `UNIMPLEMENTED` or no gRPC answer fail it. `headers` are sent as metadata. Cannot be combined with `uri` or `body`. |
+| `grpc_service` | | Service name of gRPC checks. Unset asks for the server as a whole. |
 | `port` | backend port | Check this port on the backend host. |
 | `upstream` | | Check this fixed `host:port` for every backend. |
 | `interval` | `"30s"` | Time between checks. |

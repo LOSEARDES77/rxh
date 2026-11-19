@@ -153,7 +153,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] Retry budgets and hedged requests.
 - [x] Custom error pages. Upstream errors can already be replaced with
       `handle_response`; errors RXH generates itself cannot.
-- [ ] gRPC health checks and gRPC-Web.
+- [x] gRPC health checks and gRPC-Web.
 - [x] Layer 4 matchers (SNI, HTTP, SSH) and routing; receiving PROXY
       protocol; PROXY protocol on the HTTP transport.
 

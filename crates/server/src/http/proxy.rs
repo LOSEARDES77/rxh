@@ -27,6 +27,7 @@ use tokio::sync::watch;
 
 use crate::http::body::{self, BodyError, Guarded};
 use crate::http::cache::{self, Cache};
+use crate::http::grpc_web;
 use crate::http::headers::{self, Forwarding};
 use crate::http::mirror::{self, Mirror};
 use crate::http::response::{self, BoxResponse};
@@ -102,6 +103,14 @@ pub(crate) async fn forward(
         }
     }
 
+    let settings = group.pool.settings();
+    // Set for a gRPC-Web request, which the backend gets as gRPC.
+    let web = if settings.grpc_web && client_upgrade.is_none() {
+        grpc_web::translate_request(&mut parts.headers)
+    } else {
+        None
+    };
+
     let copies: Vec<&Mirror> = match client_upgrade {
         None => route
             .mirror
@@ -122,7 +131,6 @@ pub(crate) async fn forward(
 
     set_target(&mut parts, h2c);
 
-    let settings = group.pool.settings();
     // Set when the request body turns out to be larger than `max_body_size`.
     let too_large: Option<Arc<AtomicBool>> = route.max_body_size.map(|_| Arc::default());
     let was_too_large = || {
@@ -146,6 +154,9 @@ pub(crate) async fn forward(
         }
         _ => body::incoming(incoming),
     };
+    if let Some(encoding) = web {
+        outgoing = grpc_web::request_body(outgoing, encoding);
+    }
     if settings.request_buffers > 0 && client_upgrade.is_none() {
         outgoing = match body::buffer(outgoing, settings.request_buffers).await {
             Ok(buffered) => buffered,
@@ -399,6 +410,9 @@ pub(crate) async fn forward(
     }
 
     let mut client_response = upstream_response.map(body::incoming);
+    if let Some(encoding) = web {
+        grpc_web::translate_response(&mut client_response, encoding);
+    }
     if settings.response_buffers > 0 {
         let (parts, body) = client_response.into_parts();
         client_response = match body::buffer(body, settings.response_buffers).await {
