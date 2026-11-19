@@ -9,13 +9,8 @@ use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::header::LOCATION;
 use hyper::{HeaderMap, Method, Request, StatusCode};
+use rxh_test_util::free_address;
 use tokio::net::TcpStream;
-
-/// A port that is free right now, for addresses two servers must agree on.
-fn free_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
-}
 
 async fn get_host(address: SocketAddr, host: &str, uri: &str) -> (StatusCode, HeaderMap, Bytes) {
     let request = Request::get(uri)

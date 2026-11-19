@@ -13,14 +13,10 @@ use hyper::{HeaderMap, Method, Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use rxh_server::Daemon;
 use rxh_server::config::Config;
+use rxh_test_util::free_address;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-
-fn free_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
-}
 
 /// Sends one request to the admin API and returns status, headers and the
 /// body parsed as JSON (`Value::Null` when it is not JSON).
@@ -92,7 +88,7 @@ async fn body_of(address: SocketAddr) -> String {
 async fn routes_answer_with_status_codes_and_json() {
     let first = util::backend("first").await;
     let second = util::backend("second").await;
-    let (admin, web) = (free_port(), free_port());
+    let (admin, web) = (free_address(), free_address());
     let directory = tempfile::tempdir().expect("temp dir");
     let config_path = directory.path().join("rxh.toml");
     fs::write(
@@ -219,7 +215,7 @@ async fn routes_answer_with_status_codes_and_json() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_host_or_origin_is_forbidden() {
-    let admin = free_port();
+    let admin = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let config_path = directory.path().join("rxh.toml");
     fs::write(&config_path, format!("[admin]\nlisten = \"{admin}\"\n")).expect("write");
@@ -254,7 +250,7 @@ async fn foreign_host_or_origin_is_forbidden() {
 async fn reload_applies_valid_files_and_rejects_broken_ones() {
     let first = util::backend("first").await;
     let second = util::backend("second").await;
-    let (admin, web) = (free_port(), free_port());
+    let (admin, web) = (free_address(), free_address());
     let directory = tempfile::tempdir().expect("temp dir");
     let config_path = directory.path().join("rxh.toml");
     let config = |backend: SocketAddr| {
@@ -299,7 +295,7 @@ async fn failed_reload_after_stopping_the_old_listeners_restores_them() {
     let old = util::backend("old").await;
     let new = util::backend("new").await;
     let echo = util::udp_echo("e:").await;
-    let (admin, web) = (free_port(), free_port());
+    let (admin, web) = (free_address(), free_address());
     // UDP listeners bind without SO_REUSEPORT: a busy port fails with
     // `AddrInUse`, which makes the daemon stop the old generation first.
     let squatter = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -342,7 +338,7 @@ async fn failed_reload_after_stopping_the_old_listeners_restores_them() {
 async fn udp_listener_is_rebound_on_reload() {
     let one = util::udp_echo("one:").await;
     let two = util::udp_echo("two:").await;
-    let admin = free_port();
+    let admin = free_address();
     let listen = UdpSocket::bind("127.0.0.1:0")
         .expect("bind")
         .local_addr()
@@ -385,7 +381,7 @@ async fn udp_listener_is_rebound_on_reload() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_ends_the_daemon_and_memory_configs_cannot_reload() {
-    let admin = free_port();
+    let admin = free_address();
     let config = Config::from_toml(&format!("[admin]\nlisten = \"{admin}\"\n")).expect("valid");
     let daemon = tokio::task::spawn(Daemon::from_config(config).run());
     util::eventually(async || TcpStream::connect(admin).await.is_ok()).await;

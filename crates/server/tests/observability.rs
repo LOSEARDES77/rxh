@@ -3,23 +3,18 @@
 mod util;
 
 use std::fs;
-use std::net::SocketAddr;
 
 use hyper::StatusCode;
 use rxh_server::Daemon;
+use rxh_test_util::free_address;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-
-fn free_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_and_json_access_log() {
     let web_backend = util::backend("hello").await;
     let echo = util::tcp_echo("e:").await;
-    let (admin, web, raw) = (free_port(), free_port(), free_port());
+    let (admin, web, raw) = (free_address(), free_address(), free_address());
     let directory = tempfile::tempdir().expect("temp dir");
     let log_path = directory.path().join("access.log");
     let config_path = directory.path().join("rxh.toml");
@@ -142,7 +137,12 @@ async fn l4_connections_ending_any_way_write_one_json_record() {
     let echo = util::tcp_echo("e:").await;
     let udp = util::udp_echo("u:").await;
     let dead = util::dead_address();
-    let (admin, idle, broken, datagrams) = (free_port(), free_port(), free_port(), free_port());
+    let (admin, idle, broken, datagrams) = (
+        free_address(),
+        free_address(),
+        free_address(),
+        free_address(),
+    );
     let directory = tempfile::tempdir().expect("temp dir");
     let log_path = directory.path().join("l4.log");
     let config_path = directory.path().join("rxh.toml");

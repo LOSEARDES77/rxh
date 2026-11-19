@@ -14,6 +14,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use rxh_server::{Daemon, Master};
+use rxh_test_util::free_address;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::client::danger::{
@@ -24,12 +25,6 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
-
-/// A port that is free right now.
-fn free_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
-}
 
 /// Accepts any server certificate; the tests compare it themselves.
 #[derive(Debug)]

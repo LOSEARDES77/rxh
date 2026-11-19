@@ -1799,6 +1799,7 @@ dependencies = [
  "libc",
  "rxh-core",
  "rxh-server",
+ "rxh-test-util",
  "serde",
  "serde_json",
  "tempfile",
