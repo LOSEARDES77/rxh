@@ -39,6 +39,7 @@ mod systemd;
 mod tcp;
 mod timeout;
 mod tls;
+mod tracer;
 mod udp;
 mod upstream;
 

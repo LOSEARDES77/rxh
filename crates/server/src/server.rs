@@ -38,6 +38,7 @@ use crate::systemd;
 use crate::tcp;
 use crate::timeout::{Stamp, Watched};
 use crate::tls::{self, CertResolver};
+use crate::tracer::Tracer;
 use crate::udp::{self, UdpSettings};
 
 /// Deadline for the TLS handshake when `read_header_timeout` is unset.
@@ -80,6 +81,7 @@ enum Handler {
     Http {
         routes: Arc<[Route]>,
         http2: bool,
+        tracer: Option<Arc<Tracer>>,
     },
     Tcp {
         routes: Arc<[tcp::Route]>,
@@ -334,6 +336,10 @@ impl Server {
                         Handler::Http {
                             routes: routes.into(),
                             http2: server.http2,
+                            tracer: config
+                                .tracing
+                                .as_ref()
+                                .map(|tracing| Arc::new(Tracer::new(tracing))),
                         }
                     }
                 };
@@ -811,7 +817,11 @@ async fn serve<S>(
             )
             .await;
         }
-        Handler::Http { routes, http2 } => {
+        Handler::Http {
+            routes,
+            http2,
+            tracer,
+        } => {
             let activity = Arc::new(Activity::default());
             let service = Service {
                 routes: Arc::clone(routes),
@@ -822,6 +832,7 @@ async fn serve<S>(
                 local,
                 activity: Arc::clone(&activity),
                 logger: Arc::clone(&context.log.logger),
+                tracer: tracer.clone(),
             };
             let stamp = Stamp::new();
             let io = TokioIo::new(Watched::new(stream, Arc::clone(&stamp)));

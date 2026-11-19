@@ -17,6 +17,7 @@ watch = true
 
 [admin]                  # admin API
 [log]                    # access logs
+[tracing]                # OpenTelemetry spans and W3C trace context
 [acme]                   # automatic HTTPS (tls = "auto")
 [docker]                 # routes to Docker, Podman or Swarm containers from their labels
 [consul]                 # routes to Consul catalog services from their tags
@@ -459,14 +460,15 @@ JSON lines for HTTP requests have `ts` (RFC 3339 UTC with milliseconds),
 `server` (server name, or its listen address), `remote`, `client_ip` (after
 `trusted_proxies`), `method`, `uri`, `proto`, `status`, `duration_ms` (time
 until the response headers were ready) and `upstream` (backend address, or
-`null` for files, cache hits and errors). TCP connections have `ts`,
+`null` for files, cache hits and errors) and `trace_id` (`null` without
+[`[tracing]`](#tracing-opentelemetry)). TCP connections have `ts`,
 `server`, `protocol`, `remote`, `upstream`, `bytes_sent` (client to backend),
 `bytes_received`, `duration_ms`; UDP sessions are logged when they end, with
 `protocol = "udp"`. Log files are opened when the configuration loads, so
 reload after rotating them.
 
 ```json
-{"ts":"2025-01-01T12:00:00.123Z","server":"web","remote":"203.0.113.5:51000","client_ip":"203.0.113.5","method":"GET","uri":"/api/users","proto":"HTTP/1.1","status":200,"duration_ms":3.4,"upstream":"10.0.0.1:8080"}
+{"ts":"2025-01-01T12:00:00.123Z","server":"web","remote":"203.0.113.5:51000","client_ip":"203.0.113.5","method":"GET","uri":"/api/users","proto":"HTTP/1.1","status":200,"duration_ms":3.4,"upstream":"10.0.0.1:8080","trace_id":null}
 ```
 
 ### Metrics
@@ -487,6 +489,59 @@ Counters survive reloads; upstream series are read from the live pools.
 
 `server` is the server name, or its listen address when unnamed (requests that
 match no route use the listener name).
+
+## `[tracing]`: OpenTelemetry
+
+Off unless the table is present. With it, every request of the `http`
+servers becomes one span, sent to an OpenTelemetry collector (or Jaeger,
+Tempo, any OTLP endpoint) over OTLP/HTTP in JSON.
+
+```toml
+[tracing]
+endpoint = "http://127.0.0.1:4318/v1/traces"
+service_name = "edge"
+sample_ratio = 0.1
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `endpoint` | required | `http://` or `https://` URL of the OTLP traces endpoint. The path is not added for you: collectors listen on `/v1/traces`. |
+| `service_name` | `"rxh"` | `service.name` of the spans. |
+| `sample_ratio` | `1.0` | Share of the traces that start at rxh that are sampled, from `0` to `1`. The decision comes from the trace ID, so services with the same ratio keep the same traces. |
+
+Trace context follows the W3C `traceparent` header:
+
+- A request with a valid `traceparent` continues that trace: the span of
+  rxh is a child of the caller's span and keeps the caller's sampling
+  decision, whatever `sample_ratio` says. `tracestate` is passed on
+  untouched.
+- A request without one, with a malformed one or with several starts a new
+  trace, and its `tracestate` is dropped.
+- Backends, `forward_auth` services and mirrors receive a `traceparent`
+  that names the span of rxh as their parent, also for traces that are not
+  sampled (flags `00`).
+
+Without `[tracing]`, `traceparent` and `tracestate` reach the backends as
+the client sent them.
+
+Each span is a server span named after the method and the `uri` of the
+`match` entry (`GET /api`), from the arrival of the request until the
+response headers are ready, with the attributes `http.request.method`,
+`url.scheme`, `url.path`, `url.query`, `network.protocol.version`,
+`server.address` and `server.port` (the `Host`), `client.address` (after
+`trusted_proxies`), `http.response.status_code`, `http.route`, `rxh.server`
+and `rxh.upstream`.
+Responses with a 5xx status mark the span as an error. JSON access lines
+carry the `trace_id`.
+
+Spans are sent in batches one second after the first of the batch
+finished. A collector that does not answer with a 2xx status within 10
+seconds loses the batch; this is logged once until it answers again, and
+requests are never held back. At most 2048 spans wait per listener, more
+are dropped, and the spans of the last second before rxh stops are not
+sent. OTLP over gRPC, request headers for the collector, spans for layer 4
+connections and separate client spans per backend attempt are not
+implemented.
 
 ## `[acme]`: automatic HTTPS
 
