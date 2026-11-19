@@ -1,6 +1,7 @@
 //! Reverse proxy handler: picks a backend, rewrites the request, streams the
 //! response back and feeds passive health checks.
 
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,6 +16,7 @@ use hyper::Uri;
 use hyper::Version;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderValue};
+use hyper::http::request::Parts;
 use hyper::http::uri::PathAndQuery;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
@@ -26,8 +28,9 @@ use tokio::sync::watch;
 use crate::http::body::{self, BodyError, Guarded};
 use crate::http::cache::{self, Cache};
 use crate::http::headers::{self, Forwarding};
+use crate::http::mirror::{self, Mirror};
 use crate::http::response::{self, BoxResponse};
-use crate::http::service::{Route, Service, UpstreamAddress};
+use crate::http::service::{Route, Service, Site, UpstreamAddress};
 use crate::http::transport::{Permit, SendError};
 use crate::proxy_protocol;
 use crate::registry::Group;
@@ -99,23 +102,25 @@ pub(crate) async fn forward(
         }
     }
 
-    if h2c {
-        parts.headers.remove(header::CONNECTION);
-        parts.headers.remove(header::UPGRADE);
-        let host = parts
-            .headers
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("localhost");
-        let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
-        parts.uri = format!("http://{host}{path}")
-            .parse()
-            .unwrap_or_else(|_| Uri::from_static("/"));
-        parts.version = Version::HTTP_2;
-    } else {
-        parts.uri = origin_form(parts.uri);
-        parts.version = Version::HTTP_11;
-    }
+    let copies: Vec<&Mirror> = match client_upgrade {
+        None => route
+            .mirror
+            .iter()
+            .filter(|mirror| mirror.takes_turn())
+            .collect(),
+        Some(_) => Vec::new(),
+    };
+    // Taken before the request is changed for the forward's backends.
+    let mirrored = (!copies.is_empty()).then(|| {
+        let mut copy = Request::new(());
+        *copy.method_mut() = parts.method.clone();
+        *copy.uri_mut() = parts.uri.clone();
+        *copy.version_mut() = parts.version;
+        *copy.headers_mut() = parts.headers.clone();
+        copy
+    });
+
+    set_target(&mut parts, h2c);
 
     let settings = group.pool.settings();
     // Set when the request body turns out to be larger than `max_body_size`.
@@ -144,15 +149,44 @@ pub(crate) async fn forward(
     if settings.request_buffers > 0 && client_upgrade.is_none() {
         outgoing = match body::buffer(outgoing, settings.request_buffers).await {
             Ok(buffered) => buffered,
-            Err(_) if was_too_large() => return response::payload_too_large(),
-            Err(err) => {
-                eprintln!(
-                    "{} => reading the request body failed: {err}",
-                    site.log_name
-                );
-                return response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST");
-            }
+            Err(err) => return unreadable_body(site, &err, was_too_large()),
         };
+    }
+    if let Some(mirrored) = mirrored {
+        let len = if hyper::body::Body::is_end_stream(&outgoing) {
+            Some(0)
+        } else {
+            hyper::body::Body::size_hint(&outgoing).exact()
+        };
+        let copies: Vec<&Mirror> = copies
+            .into_iter()
+            .filter(|mirror| mirror.fits(len))
+            .collect();
+        if !copies.is_empty() {
+            let bytes: Bytes = match outgoing.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(err) => return unreadable_body(site, &err, was_too_large()),
+            };
+            outgoing = body::full(bytes.clone());
+            for mirror in copies {
+                let mut copy = rebuild(&mirrored).into_parts().0;
+                set_target(&mut copy, mirror.group().transport.is_h2c());
+                let client = mirror::Client {
+                    peer_ip: connection.peer.ip(),
+                    client_ip,
+                    secure: site.tls,
+                    preface: site
+                        .proxy_protocol
+                        .map(|version| {
+                            proxy_protocol::header(version, connection.peer, connection.local)
+                        })
+                        .unwrap_or_default(),
+                    sets_host: sets_host(route),
+                };
+                let request = Request::from_parts(copy, body::full(bytes.clone()));
+                mirror.spawn(request, client, Arc::clone(site));
+            }
+        }
     }
     let mut outgoing = Request::from_parts(parts, outgoing);
     let transport = &group.transport;
@@ -163,12 +197,7 @@ pub(crate) async fn forward(
     let preface = &preface;
     let mut stale_attempts = 0;
     // Like Caddy, HTTPS backends get their own host as `Host` unless the user sets it.
-    let rewrite_host = group.dialer.is_tls()
-        && !route
-            .request
-            .set
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("host"));
+    let rewrite_host = group.dialer.is_tls() && !sets_host(route);
 
     // Like Caddy, bodyless requests with a retryable method (safe methods
     // unless `retry_match.method` says otherwise) are retried on another
@@ -374,6 +403,49 @@ pub(crate) async fn forward(
     client_response.map(|body| Guarded::new(body, (guard, permit)).boxed())
 }
 
+/// Answer to a request whose body could not be read.
+fn unreadable_body(site: &Site, err: &BodyError, too_large: bool) -> BoxResponse {
+    if too_large {
+        return response::payload_too_large();
+    }
+    eprintln!(
+        "{} => reading the request body failed: {err}",
+        site.log_name
+    );
+    response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST")
+}
+
+/// Whether the route sets `Host` itself, which then reaches HTTPS backends.
+fn sets_host(route: &Route) -> bool {
+    route
+        .request
+        .set
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("host"))
+}
+
+/// Request target and version for a backend: an absolute URI over HTTP/2
+/// for h2c backends, the origin form over HTTP/1.1 for the others.
+fn set_target(parts: &mut Parts, h2c: bool) {
+    if h2c {
+        parts.headers.remove(header::CONNECTION);
+        parts.headers.remove(header::UPGRADE);
+        let host = parts
+            .headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("localhost");
+        let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
+        parts.uri = format!("http://{host}{path}")
+            .parse()
+            .unwrap_or_else(|_| Uri::from_static("/"));
+        parts.version = Version::HTTP_2;
+    } else {
+        parts.uri = origin_form(mem::take(&mut parts.uri));
+        parts.version = Version::HTTP_11;
+    }
+}
+
 /// Request target sent to an HTTP/1.1 backend: path and query only. A target
 /// already in that form, which is what HTTP/1.1 clients send, is kept as is.
 fn origin_form(uri: Uri) -> Uri {
@@ -457,7 +529,7 @@ fn rebuild(head: &Request<()>) -> Request<body::Body> {
 }
 
 /// Points `Host` (and the authority of an absolute URI) at the backend.
-fn set_backend_host<B>(request: &mut Request<B>, address: &str) {
+pub(crate) fn set_backend_host<B>(request: &mut Request<B>, address: &str) {
     let Ok(BackendAddress::Tcp { host, port, .. }) = BackendAddress::parse(address) else {
         return;
     };

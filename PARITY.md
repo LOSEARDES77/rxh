@@ -231,7 +231,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 | Feature | Inspired by | Notes |
 |---|---|---|
 | Traffic splitting and canary releases between pools (weighted services) | Traefik weighted services, Envoy | Done: `forward = [{ pool = "v1", weight = 90 }, { pool = "v2", weight = 10 }]` on `http` (per request) and `tcp` (per connection) servers, in smooth weighted round robin order like Traefik's WRR service. A pool with no available member gives its turn to the next one, like Traefik's `healthCheck` on weighted services. Unlike Traefik: no sticky cookie, no nesting of splits, no UDP, and the targets are named pools only. |
-| Request mirroring (shadow traffic) | Traefik mirroring, Nginx `mirror`, Envoy | |
+| Request mirroring (shadow traffic) | Traefik mirroring, Nginx `mirror`, Envoy | Done: `mirror = { pool = "shadow", percent = 10, max_body_size = "1MiB" }` (or a list) on `forward` routes of `http` servers, like Traefik's `mirrors` with `percent` and `maxBodySize`. Copies go out in the background and their responses are dropped. Unlike Traefik: bodies without a `Content-Length` are not copied, the default body limit is 1 MiB instead of unlimited, the share is spread evenly instead of random, and no `mirrorBody = false`. |
 | Circuit breaker on error ratio or latency | Traefik `CircuitBreaker`, Envoy outlier detection | |
 | Slow start for recovered or new backends | Nginx Plus `slow_start`, HAProxy `slowstart` | Ramp weight up over a duration. |
 | Backend drain and maintenance states through CLI and admin API | HAProxy runtime API (`set server state drain`) | `rxh upstream drain web 10.0.0.1:80`. |

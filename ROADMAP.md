@@ -144,7 +144,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 ## 0.7: traffic management
 
 - [x] Weighted pools for canary releases and traffic splitting.
-- [ ] Request mirroring.
+- [x] Request mirroring.
 - [ ] Circuit breaker on error ratio or latency.
 - [ ] Slow start for new and recovered backends.
 - [ ] Drain and maintenance states: `rxh upstream drain web 10.0.0.1:80`.

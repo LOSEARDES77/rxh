@@ -9,6 +9,10 @@ Changed.
 
 ### Added
 
+- Request mirroring: `mirror = { pool = "shadow", percent = 10 }` on a
+  `forward` route sends a copy of the requests (a share of them with
+  `percent`) to other pools in the background and drops their responses.
+  Bodies are copied up to `max_body_size` (1 MiB by default).
 - Traffic splitting for canary releases: `forward = [{ pool = "v1", weight
   = 90 }, { pool = "v2", weight = 10 }]` splits the requests of an `http`
   server, or the connections of a `tcp` server, between named pools by

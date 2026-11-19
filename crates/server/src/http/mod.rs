@@ -6,6 +6,7 @@ pub(crate) mod cache;
 pub(crate) mod cors;
 pub(crate) mod encode;
 pub(crate) mod headers;
+pub(crate) mod mirror;
 pub(crate) mod proxy;
 pub(crate) mod rate_limit;
 pub(crate) mod response;
