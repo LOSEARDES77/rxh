@@ -4,6 +4,9 @@
 #   alpine      alpine, static musl binary (`alpine`, `0.x-alpine`, ...).
 #   distroless  gcr.io/distroless/cc-debian12, glibc, no shell (`distroless`, ...).
 #
+#   musl-binary  only the static musl binary, for the release packages:
+#                docker build -f dist/Dockerfile --target musl-binary --output out .
+#
 # Build:  docker build -f dist/Dockerfile --target alpine -t rxh:alpine .
 # Run:    docker run -p 80:80 -v $PWD/rxh.toml:/etc/rxh/rxh.toml:ro rxh
 #
@@ -26,6 +29,9 @@ COPY . .
 RUN cargo build --release --locked -p rxh-cli \
     && mkdir -p /out/data \
     && cp target/release/rxh /out/rxh
+
+FROM scratch AS musl-binary
+COPY --from=build-musl /out/rxh /rxh
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS distroless
 COPY --from=build-gnu /out/rxh /usr/local/bin/rxh
