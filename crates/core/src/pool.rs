@@ -203,15 +203,16 @@ impl Breaker {
         }
     }
 
-    /// Counts a finished request.
-    fn record(&self, error: bool, slow: bool) {
+    /// Counts a finished request. Returns true when a trial request closed
+    /// the breaker.
+    fn record(&self, error: bool, slow: bool) -> bool {
         let settings = &self.settings;
         let now = Instant::now();
         let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
 
         let open = match Self::phase(&mut window, now) {
             // Late result of a request sent before the breaker opened.
-            CircuitState::Open => return,
+            CircuitState::Open => return false,
             CircuitState::HalfOpen => error || slow,
             CircuitState::Closed => {
                 // shortcut: fixed windows, a burst split over two windows goes
@@ -233,9 +234,9 @@ impl Breaker {
                         || (settings.latency.is_some()
                             && reaches(window.slow, settings.latency_ratio)));
                 if !trips {
-                    return;
+                    return false;
                 }
-                true
+                trips
             }
         };
 
@@ -249,6 +250,50 @@ impl Breaker {
             Phase::Closed
         };
         self.tripped.store(open, Ordering::Relaxed);
+        !open
+    }
+}
+
+/// Slow start of one backend: its share of the traffic grows linearly from
+/// nothing to full over `duration`.
+#[derive(Debug)]
+struct Ramp {
+    duration: Duration,
+    /// False once the ramp is over, so the request path takes no lock.
+    ramping: AtomicBool,
+    started: Mutex<Instant>,
+}
+
+impl Ramp {
+    fn new(duration: Duration) -> Self {
+        Self {
+            duration,
+            ramping: AtomicBool::new(false),
+            started: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn start(&self) {
+        let mut started = self.started.lock().unwrap_or_else(PoisonError::into_inner);
+        *started = Instant::now();
+        self.ramping.store(true, Ordering::Relaxed);
+    }
+
+    /// Draws whether one request may go to the backend: always once the ramp
+    /// is over, before that with a chance equal to the elapsed share of it.
+    fn admits(&self) -> bool {
+        if !self.ramping.load(Ordering::Relaxed) {
+            return true;
+        }
+        let started = self.started.lock().unwrap_or_else(PoisonError::into_inner);
+        let elapsed = started.elapsed();
+        if elapsed >= self.duration {
+            self.ramping.store(false, Ordering::Relaxed);
+            return true;
+        }
+        let millis =
+            |duration: Duration| usize::try_from(duration.as_millis()).unwrap_or(usize::MAX);
+        random::below(millis(self.duration).max(1)) < millis(elapsed)
     }
 }
 
@@ -283,6 +328,7 @@ pub struct Upstream {
     fail_count: AtomicU32,
     failures: Mutex<VecDeque<Instant>>,
     breaker: Option<Breaker>,
+    ramp: Option<Ramp>,
 }
 
 impl Upstream {
@@ -290,6 +336,7 @@ impl Upstream {
         backend: Backend,
         passive: Option<PassiveHealth>,
         breaker: Option<CircuitBreaker>,
+        slow_start: Option<Duration>,
         cookie_secret: Option<&str>,
     ) -> Self {
         let cookie = cookie_secret.map(|secret| cookie_value(secret, &backend.address));
@@ -309,6 +356,7 @@ impl Upstream {
             fail_count: AtomicU32::new(0),
             failures: Mutex::new(VecDeque::new()),
             breaker: breaker.map(Breaker::new),
+            ramp: slow_start.map(Ramp::new),
         }
     }
 
@@ -352,6 +400,18 @@ impl Upstream {
         self.breaker.as_ref().map(Breaker::state)
     }
 
+    /// Starts the slow start ramp, for pools that have one.
+    fn start_ramp(&self) {
+        if let Some(ramp) = &self.ramp {
+            ramp.start();
+        }
+    }
+
+    /// False when slow start turns away this request.
+    fn ramp_admits(&self) -> bool {
+        self.ramp.as_ref().is_none_or(Ramp::admits)
+    }
+
     fn is_full(&self) -> bool {
         // A half open breaker lets one trial request through at a time.
         if self.circuit() == Some(CircuitState::HalfOpen) && self.active_requests() > 0 {
@@ -388,7 +448,10 @@ impl Upstream {
             failures.pop_front();
         }
         let count = failures.len() as u32;
-        self.fail_count.store(count, Ordering::Relaxed);
+        let before = self.fail_count.swap(count, Ordering::Relaxed);
+        if before >= passive.max_fails && count < passive.max_fails {
+            self.start_ramp();
+        }
         count
     }
 
@@ -418,16 +481,20 @@ impl Upstream {
     /// the circuit breaker.
     pub fn record_failure(&self) {
         self.passive_failure();
-        if let Some(breaker) = &self.breaker {
-            breaker.record(/* error= */ true, /* slow= */ false);
-        }
+        self.breaker_record(/* error= */ true, /* slow= */ false);
     }
 
     /// Records a connection that was established, for the circuit breaker of
     /// pools without HTTP responses to judge.
     pub fn record_success(&self) {
-        if let Some(breaker) = &self.breaker {
-            breaker.record(/* error= */ false, /* slow= */ false);
+        self.breaker_record(/* error= */ false, /* slow= */ false);
+    }
+
+    fn breaker_record(&self, error: bool, slow: bool) {
+        if let Some(breaker) = &self.breaker
+            && breaker.record(error, slow)
+        {
+            self.start_ramp();
         }
     }
 
@@ -455,7 +522,7 @@ impl Upstream {
                 .iter()
                 .any(|matcher| matcher.matches(status));
             let slow = settings.latency.is_some_and(|limit| latency > limit);
-            breaker.record(error, slow);
+            self.breaker_record(error, slow);
         }
 
         let Some(passive) = &self.passive else {
@@ -485,6 +552,7 @@ impl Upstream {
             let streak = self.check_passes.fetch_add(1, Ordering::Relaxed) + 1;
             if !healthy && streak >= passes {
                 self.checked_healthy.store(true, Ordering::Relaxed);
+                self.start_ramp();
                 return Some(true);
             }
         } else {
@@ -615,6 +683,7 @@ impl Pool {
             backend,
             self.settings.passive.clone(),
             self.settings.circuit_breaker.clone(),
+            self.settings.slow_start,
             self.settings.cookie_secret(),
         )
     }
@@ -727,7 +796,9 @@ impl Pool {
             {
                 return Err(PoolError::AlreadyExists(backend.address));
             }
-            upstreams.push(Arc::new(self.make_upstream(backend)));
+            let upstream = self.make_upstream(backend);
+            upstream.start_ramp();
+            upstreams.push(Arc::new(upstream));
         }
         *guard = Arc::new(Members::new(upstreams));
         Ok(())
@@ -758,6 +829,7 @@ impl Pool {
             }
             let mut upstream = self.make_upstream(backend);
             upstream.dynamic = true;
+            upstream.start_ramp();
             upstreams.push(Arc::new(upstream));
         }
         let unchanged = upstreams.len() == guard.upstreams.len()
@@ -789,6 +861,7 @@ impl Pool {
         let cookie_secret = |pool: &Pool| pool.settings.cookie_secret().map(str::to_owned);
         let reusable = self.settings.passive == previous.settings.passive
             && self.settings.circuit_breaker == previous.settings.circuit_breaker
+            && self.settings.slow_start == previous.settings.slow_start
             && cookie_secret(self) == cookie_secret(previous);
 
         let mut guard = self.members.write().unwrap_or_else(PoisonError::into_inner);
@@ -851,23 +924,26 @@ impl Pool {
         let upstreams = &members.upstreams;
         let missing = || match node.fallback {
             Some(next) => self.choose(Node::from(next), members, context),
-            None => pick_random(upstreams).map(Selection::plain),
+            None => slow_start(|ready| pick_random(upstreams, ready)).map(Selection::plain),
         };
 
         let picked = match node.policy {
             Policy::Cookie => return self.select_cookie(node, members, context, missing),
-            Policy::Random => pick_random(upstreams),
-            Policy::RandomChoose => pick_random_choose(upstreams, node.choose),
-            Policy::First => upstreams
-                .iter()
-                .find(|upstream| upstream.is_available())
-                .cloned(),
-            Policy::RoundRobin => self.rotate(upstreams, upstreams.len(), |turn| turn),
+            Policy::Random => slow_start(|ready| pick_random(upstreams, ready)),
+            Policy::RandomChoose => {
+                slow_start(|ready| pick_random_choose(upstreams, node.choose, ready))
+            }
+            Policy::First => {
+                slow_start(|ready| upstreams.iter().find(|upstream| ready(upstream)).cloned())
+            }
+            Policy::RoundRobin => {
+                slow_start(|ready| self.rotate(upstreams, upstreams.len(), |turn| turn, ready))
+            }
             Policy::WeightedRoundRobin => {
                 let order = &members.weighted_order;
-                self.rotate(upstreams, order.len(), |turn| order[turn])
+                slow_start(|ready| self.rotate(upstreams, order.len(), |turn| order[turn], ready))
             }
-            Policy::LeastConn => pick_least_conn(upstreams),
+            Policy::LeastConn => slow_start(|ready| pick_least_conn(upstreams, ready)),
             Policy::IpHash => pick_rendezvous(upstreams, ip_key(context.peer_ip).as_bytes()),
             Policy::ClientIpHash => {
                 pick_rendezvous(upstreams, ip_key(context.client_ip).as_bytes())
@@ -895,6 +971,7 @@ impl Pool {
         upstreams: &[Arc<Upstream>],
         turns: usize,
         member: impl Fn(usize) -> usize,
+        ready: Ready<'_>,
     ) -> Option<Arc<Upstream>> {
         if turns == 0 {
             return None;
@@ -902,7 +979,7 @@ impl Pool {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         (0..turns)
             .map(|offset| &upstreams[member((start + offset) % turns)])
-            .find(|upstream| upstream.is_available())
+            .find(|upstream| ready(upstream))
             .cloned()
     }
 
@@ -1003,11 +1080,22 @@ fn ip_key(ip: IpAddr) -> String {
     ip.to_canonical().to_string()
 }
 
-fn pick_random(upstreams: &[Arc<Upstream>]) -> Option<Arc<Upstream>> {
-    // Reservoir sampling over the available members.
+/// Test of whether a member may take the request being placed.
+type Ready<'a> = &'a dyn Fn(&Upstream) -> bool;
+
+/// Runs a policy with slow start: members still ramping up are turned away
+/// at random. When that leaves no member, the policy runs again without
+/// slow start, so a pool of ramping members still answers.
+fn slow_start(pick: impl Fn(Ready<'_>) -> Option<Arc<Upstream>>) -> Option<Arc<Upstream>> {
+    pick(&|upstream| upstream.is_available() && upstream.ramp_admits())
+        .or_else(|| pick(&Upstream::is_available))
+}
+
+fn pick_random(upstreams: &[Arc<Upstream>], ready: Ready<'_>) -> Option<Arc<Upstream>> {
+    // Reservoir sampling over the ready members.
     let mut chosen = None;
     let mut seen = 0;
-    for upstream in upstreams.iter().filter(|upstream| upstream.is_available()) {
+    for upstream in upstreams.iter().filter(|upstream| ready(upstream)) {
         seen += 1;
         if random::below(seen) == 0 {
             chosen = Some(upstream);
@@ -1016,10 +1104,14 @@ fn pick_random(upstreams: &[Arc<Upstream>]) -> Option<Arc<Upstream>> {
     chosen.cloned()
 }
 
-fn pick_random_choose(upstreams: &[Arc<Upstream>], choose: usize) -> Option<Arc<Upstream>> {
+fn pick_random_choose(
+    upstreams: &[Arc<Upstream>],
+    choose: usize,
+    ready: Ready<'_>,
+) -> Option<Arc<Upstream>> {
     let mut sample: Vec<&Arc<Upstream>> = Vec::with_capacity(choose);
     let mut seen = 0;
-    for upstream in upstreams.iter().filter(|upstream| upstream.is_available()) {
+    for upstream in upstreams.iter().filter(|upstream| ready(upstream)) {
         seen += 1;
         if sample.len() < choose {
             sample.push(upstream);
@@ -1036,12 +1128,12 @@ fn pick_random_choose(upstreams: &[Arc<Upstream>], choose: usize) -> Option<Arc<
         .cloned()
 }
 
-fn pick_least_conn(upstreams: &[Arc<Upstream>]) -> Option<Arc<Upstream>> {
+fn pick_least_conn(upstreams: &[Arc<Upstream>], ready: Ready<'_>) -> Option<Arc<Upstream>> {
     let mut best: Option<&Arc<Upstream>> = None;
     let mut best_load = usize::MAX;
     let mut ties = 0;
 
-    for upstream in upstreams.iter().filter(|upstream| upstream.is_available()) {
+    for upstream in upstreams.iter().filter(|upstream| ready(upstream)) {
         let load = upstream.active_requests();
         if load < best_load {
             best = Some(upstream);
@@ -1659,5 +1751,133 @@ mod tests {
         }
         assert_eq!(plain.circuit(), None);
         assert!(plain.is_healthy());
+    }
+
+    fn slow_start_pool(policy: Policy, slow_start: Duration) -> Pool {
+        let mut group = group(policy, &[("10.0.0.1:80", 1), ("10.0.0.2:80", 1)]);
+        group.slow_start = Some(slow_start);
+        group.passive = Some(PassiveHealth {
+            fail_duration: Duration::from_millis(40),
+            max_fails: 1,
+            unhealthy_status: Vec::new(),
+            unhealthy_latency: None,
+            unhealthy_request_count: 0,
+        });
+        Pool::new("p", &group).unwrap()
+    }
+
+    /// Requests out of 1000 that go to `address`.
+    fn picks_of(pool: &Pool, address: &str) -> usize {
+        (0..1000).filter(|_| selected(pool) == address).count()
+    }
+
+    #[test]
+    fn slow_start_ramps_up_added_backends() {
+        let long = Duration::from_secs(3600);
+        for policy in [
+            Policy::RoundRobin,
+            Policy::WeightedRoundRobin,
+            Policy::Random,
+            Policy::RandomChoose,
+            Policy::LeastConn,
+            Policy::First,
+        ] {
+            let pool = slow_start_pool(policy, long);
+            // Members at startup take their full share at once.
+            for upstream in pool.upstreams() {
+                assert!(upstream.ramp_admits());
+            }
+
+            // Busy old members, so load aware policies would favour the new one.
+            let _busy: Vec<RequestGuard> = pool
+                .upstreams()
+                .iter()
+                .map(Upstream::start_request)
+                .collect();
+            pool.add(Backend::new("10.0.0.3:80")).unwrap();
+            assert_eq!(picks_of(&pool, "10.0.0.3:80"), 0, "{policy:?}");
+
+            // Without slow start the new member gets traffic at once.
+            let plain = Pool::new("p", &group(policy, &[("10.0.0.1:80", 1)])).unwrap();
+            let _busy = plain.upstreams()[0].start_request();
+            plain.add(Backend::new("10.0.0.3:80")).unwrap();
+            if policy != Policy::First {
+                assert!(picks_of(&plain, "10.0.0.3:80") > 100, "{policy:?}");
+            }
+        }
+
+        // Members found by DNS ramp up as well.
+        let pool = slow_start_pool(Policy::RoundRobin, long);
+        pool.sync_dynamic(vec![Backend::new("10.0.1.1:80")]);
+        assert_eq!(picks_of(&pool, "10.0.1.1:80"), 0);
+    }
+
+    #[test]
+    fn slow_start_share_grows_with_time_and_ends() {
+        let pool = slow_start_pool(Policy::RoundRobin, Duration::from_secs(10));
+        pool.add(Backend::new("10.0.0.3:80")).unwrap();
+        let added = Arc::clone(&pool.upstreams()[2]);
+        let ramp = added.ramp.as_ref().unwrap();
+
+        // Half way: half of its round robin share of 1000 / 3.
+        *ramp.started.lock().unwrap() = Instant::now() - Duration::from_secs(5);
+        let picks = picks_of(&pool, "10.0.0.3:80");
+        assert!((100..240).contains(&picks), "{picks}");
+
+        *ramp.started.lock().unwrap() = Instant::now() - Duration::from_secs(10);
+        assert!((330..=334).contains(&picks_of(&pool, "10.0.0.3:80")));
+        assert!(!ramp.ramping.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn slow_start_still_serves_when_only_ramping_members_are_left() {
+        let pool = slow_start_pool(Policy::RoundRobin, Duration::from_secs(3600));
+        pool.remove("10.0.0.1:80");
+        pool.remove("10.0.0.2:80");
+        pool.add(Backend::new("10.0.0.3:80")).unwrap();
+        assert_eq!(picks_of(&pool, "10.0.0.3:80"), 1000);
+    }
+
+    #[test]
+    fn slow_start_ramps_up_recovered_backends() {
+        let long = Duration::from_secs(3600);
+
+        // Active health checks.
+        let pool = slow_start_pool(Policy::RoundRobin, long);
+        let second = Arc::clone(&pool.upstreams()[1]);
+        assert_eq!(second.record_check(false, 1, 1), Some(false));
+        assert_eq!(picks_of(&pool, "10.0.0.2:80"), 0);
+        assert_eq!(second.record_check(true, 1, 1), Some(true));
+        assert!(second.is_available());
+        assert_eq!(picks_of(&pool, "10.0.0.2:80"), 0);
+
+        // Passive health checks, once the failure expires.
+        let pool = slow_start_pool(Policy::RoundRobin, long);
+        let second = Arc::clone(&pool.upstreams()[1]);
+        second.record_failure();
+        assert!(!second.is_healthy());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(second.is_healthy());
+        assert_eq!(picks_of(&pool, "10.0.0.2:80"), 0);
+
+        // Circuit breaker, after a good trial request.
+        let mut group = group(
+            Policy::RoundRobin,
+            &[("10.0.0.1:80", 1), ("10.0.0.2:80", 1)],
+        );
+        group.slow_start = Some(long);
+        group.circuit_breaker = Some(breaker(Some(0.5), None));
+        let pool = Pool::new("p", &group).unwrap();
+        let second = Arc::clone(&pool.upstreams()[1]);
+        for _ in 0..4 {
+            second.record_failure();
+        }
+        assert_eq!(second.circuit(), Some(CircuitState::Open));
+        std::thread::sleep(Duration::from_millis(60));
+        // The half open trial is not held back by slow start.
+        assert!(picks_of(&pool, "10.0.0.2:80") > 0);
+        second.record_response(200, Duration::ZERO);
+        assert_eq!(second.circuit(), Some(CircuitState::Closed));
+        assert_eq!(picks_of(&pool, "10.0.0.2:80"), 0);
     }
 }

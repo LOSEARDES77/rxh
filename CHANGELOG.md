@@ -9,6 +9,10 @@ Changed.
 
 ### Added
 
+- Slow start: `slow_start = "30s"` on a pool ramps the share of traffic of
+  a backend up from nothing to full when it joins at runtime (admin API,
+  DNS or service discovery) or comes back from active or passive health
+  checks or an open circuit breaker. Applies to the non hash policies.
 - Circuit breaker: `circuit_breaker = { error_ratio = 0.3, latency =
   "500ms" }` on a pool takes a backend out of rotation for `open_duration`
   when its share of failed requests, or of responses slower than `latency`,
