@@ -132,7 +132,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
       pool or server.
 - [x] Environment variable placeholders and secret files in the
       configuration.
-- [ ] Packages: static musl binaries, `.deb`, `.rpm`, AUR and Homebrew,
+- [x] Packages: static musl binaries, `.deb`, `.rpm`, AUR and Homebrew,
       built by CI.
 - [x] Shell completions and man pages from clap.
 - [x] systemd integration: `sd_notify` readiness, socket activation.

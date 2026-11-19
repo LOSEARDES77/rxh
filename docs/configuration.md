@@ -201,6 +201,49 @@ rxh completions fish > /usr/share/fish/vendor_completions.d/rxh.fish
 rxh man --dir /usr/share/man/man1
 ```
 
+## Installing a release package
+
+Every `v*` tag publishes a GitHub release with these files (the `Release`
+workflow, [`.github/workflows/release.yml`](../.github/workflows/release.yml)):
+
+| File | Contents |
+|---|---|
+| `rxh-0.3.0-x86_64-unknown-linux-musl.tar.gz`, `rxh-0.3.0-aarch64-unknown-linux-musl.tar.gz` | static musl binary, runs on any Linux distribution |
+| `rxh-0.3.0-x86_64-apple-darwin.tar.gz`, `rxh-0.3.0-aarch64-apple-darwin.tar.gz` | macOS binary |
+| `rxh_0.3.0_amd64.deb`, `rxh_0.3.0_arm64.deb` | Debian and Ubuntu |
+| `rxh-0.3.0-1.x86_64.rpm`, `rxh-0.3.0-1.aarch64.rpm` | Fedora, RHEL, openSUSE |
+| `PKGBUILD` | the `rxh-bin` AUR package |
+| `rxh.rb` | the Homebrew formula (macOS and Linux) |
+| `SHA256SUMS` | checksums of every file above it |
+
+Each archive holds `rxh`, the man pages (`man/`), the bash, zsh and fish
+completions (`completions/`), the systemd units with `ExecStart=/usr/bin/rxh`
+(`systemd/`), the default package configuration `rxh.toml` and the license.
+The `.deb`, `.rpm` and AUR packages install them in the usual places:
+`/usr/bin/rxh`, `/etc/rxh/rxh.toml` (kept on upgrade when edited),
+`/usr/lib/systemd/system/rxh.service` and `rxh.socket`, man pages and
+completions. They do not enable or start the service. The default
+configuration has no `[[server]]`, so the daemon only runs the admin API on
+`127.0.0.1:2019` until servers are added.
+
+```sh
+sudo apt install ./rxh_0.3.0_amd64.deb      # or: sudo dnf install ./rxh-0.3.0-1.x86_64.rpm
+sudoedit /etc/rxh/rxh.toml
+sudo systemctl enable --now rxh
+yay -S rxh-bin                              # Arch Linux, from the AUR
+brew install loseardes77/rxh/rxh            # Homebrew tap; `brew services start rxh`
+```
+
+Homebrew installs the configuration at `$(brew --prefix)/etc/rxh/rxh.toml`.
+The AUR package and the Homebrew tap are updated by the workflow for
+releases only (not pre-releases), and only when the repository has the
+`AUR_SSH_PRIVATE_KEY` secret, or the `HOMEBREW_TAP` variable
+(`owner/homebrew-rxh`) and the `HOMEBREW_TAP_TOKEN` secret; otherwise the
+`PKGBUILD` and `rxh.rb` of the release can be published by hand. To build the
+same files locally, see the comments of [`dist/stage.sh`](../dist/stage.sh),
+[`dist/nfpm.yaml`](../dist/nfpm.yaml), [`dist/pkgbuild.sh`](../dist/pkgbuild.sh)
+and [`dist/homebrew.sh`](../dist/homebrew.sh).
+
 ## Running under systemd
 
 [`dist/rxh.service`](../dist/rxh.service) runs `rxh run` as a

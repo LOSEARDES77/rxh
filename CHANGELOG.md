@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- Release packages built by the `Release` workflow on `v*` tags and attached
+  to the GitHub release: static musl archives for x86_64 and aarch64 Linux,
+  macOS archives, `.deb` and `.rpm` packages (nfpm), the `rxh-bin` AUR
+  `PKGBUILD` and a Homebrew formula, with `SHA256SUMS`. Packages install the
+  binary in `/usr/bin`, the systemd units, man pages, shell completions and a
+  default `/etc/rxh/rxh.toml` that only runs the admin API. The AUR package
+  and a Homebrew tap are updated for releases when their credentials are set
+  in the repository.
 - Official container images for linux/amd64 and linux/arm64, published on
   GHCR (and Docker Hub when configured) by the `Images` workflow on release
   tags: `latest`/`0.x`/`0.x.y` on Debian slim, `-alpine` with a static musl

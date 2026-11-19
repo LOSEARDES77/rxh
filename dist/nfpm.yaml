@@ -1,0 +1,50 @@
+# .deb and .rpm packages, built by .github/workflows/release.yml from a
+# directory laid out by dist/stage.sh. Run nfpm from that directory: the
+# sources are relative to it.
+#
+#   cd STAGE && VERSION=0.3.0 ARCH=amd64 nfpm package -f /path/to/dist/nfpm.yaml -p deb
+#
+# ARCH is the Go name (amd64, arm64): nfpm turns it into amd64/x86_64 or
+# arm64/aarch64. The binary is static (musl), so there are no dependencies.
+# The service is installed but neither enabled nor started.
+name: rxh
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: LOSEARDES77 <https://github.com/LOSEARDES77>
+description: Reverse proxy and layer 4 load balancer with live upstream management.
+vendor: RXH
+homepage: https://github.com/LOSEARDES77/rxh
+license: MIT
+contents:
+  - src: ./rxh
+    dst: /usr/bin/rxh
+    file_info:
+      mode: 0755
+  - src: ./rxh.toml
+    dst: /etc/rxh/rxh.toml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: ./systemd/rxh.service
+    dst: /usr/lib/systemd/system/rxh.service
+  - src: ./systemd/rxh.socket
+    dst: /usr/lib/systemd/system/rxh.socket
+  - src: ./man/*.1
+    dst: /usr/share/man/man1/
+  - src: ./completions/rxh.bash
+    dst: /usr/share/bash-completion/completions/rxh
+  - src: ./completions/_rxh
+    dst: /usr/share/zsh/vendor-completions/_rxh
+    packager: deb
+  - src: ./completions/_rxh
+    dst: /usr/share/zsh/site-functions/_rxh
+    packager: rpm
+  - src: ./completions/rxh.fish
+    dst: /usr/share/fish/vendor_completions.d/rxh.fish
+  - src: ./LICENSE
+    dst: /usr/share/doc/rxh/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/rxh/README.md

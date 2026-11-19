@@ -1,0 +1,181 @@
+name: Release
+
+# Release packages on `v*` tags, attached to a GitHub release:
+#
+#   rxh-VERSION-TARGET.tar.gz   static musl binaries for x86_64 and aarch64
+#                               Linux, native binaries for macOS (dist/stage.sh)
+#   rxh_VERSION_ARCH.deb        dist/nfpm.yaml
+#   rxh-VERSION-1.ARCH.rpm      dist/nfpm.yaml
+#   PKGBUILD                    `rxh-bin` AUR package (dist/pkgbuild.sh)
+#   rxh.rb                      Homebrew formula (dist/homebrew.sh)
+#   SHA256SUMS
+#
+# Every target builds on a native runner. For releases (not pre-releases), the
+# PKGBUILD is pushed to the AUR when the AUR_SSH_PRIVATE_KEY secret is set, and
+# the formula to the tap named by the HOMEBREW_TAP variable (`owner/homebrew-rxh`)
+# with the HOMEBREW_TAP_TOKEN secret when both are set.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NFPM_VERSION: v2.43.1
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against the crate version
+        shell: bash
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_NAME#v}" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $crate"
+            exit 1
+          fi
+          echo "VERSION=$crate" >> "$GITHUB_ENV"
+      # The static musl binary comes from the stage the alpine image uses.
+      - name: Build (musl)
+        if: matrix.arch
+        run: |
+          docker build -f dist/Dockerfile --target musl-binary --output out .
+          file out/rxh | tee /dev/stderr | grep -q 'static'
+      - name: Build (macOS)
+        if: ${{ !matrix.arch }}
+        run: |
+          cargo build --release --locked -p rxh-cli
+          mkdir out && cp target/release/rxh out/rxh
+      - name: Archive
+        run: |
+          name="rxh-$VERSION-${{ matrix.target }}"
+          sh dist/stage.sh out/rxh "$name"
+          mkdir packages
+          tar -czf "packages/$name.tar.gz" "$name"
+          echo "STAGE=$name" >> "$GITHUB_ENV"
+      - name: .deb and .rpm
+        if: matrix.arch
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          GOBIN="$RUNNER_TEMP" go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@$NFPM_VERSION"
+          cd "$STAGE"
+          for packager in deb rpm; do
+            "$RUNNER_TEMP/nfpm" package -f ../dist/nfpm.yaml -p "$packager" -t ../packages/
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      prerelease: ${{ steps.publish.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          pattern: packages-*
+          merge-multiple: true
+      - name: Checksums, PKGBUILD and formula
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          (cd packages && sha256sum * > SHA256SUMS)
+          sh dist/pkgbuild.sh "$version" packages/SHA256SUMS > packages/PKGBUILD
+          sh dist/homebrew.sh "$version" packages/SHA256SUMS > packages/rxh.rb
+      - name: Publish the release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case $GITHUB_REF_NAME in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          gh release create "$GITHUB_REF_NAME" packages/* \
+            --title "rxh ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag \
+            $([ "$prerelease" = true ] && echo --prerelease)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recipes
+          path: |
+            packages/PKGBUILD
+            packages/rxh.rb
+          retention-days: 1
+
+  aur:
+    needs: release
+    if: needs.release.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: recipes
+      - if: env.AUR_SSH_PRIVATE_KEY != ''
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: rxh-bin
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ github.actor }}
+          commit_email: ${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: rxh ${{ github.ref_name }}
+
+  homebrew:
+    needs: release
+    if: needs.release.outputs.prerelease == 'false' && vars.HOMEBREW_TAP != ''
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        with:
+          name: recipes
+      - uses: actions/checkout@v4
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        with:
+          repository: ${{ vars.HOMEBREW_TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Push the formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        run: |
+          mkdir -p tap/Formula
+          cp rxh.rb tap/Formula/rxh.rb
+          cd tap
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git add Formula/rxh.rb
+          git commit -m "rxh ${GITHUB_REF_NAME#v}"
+          git push

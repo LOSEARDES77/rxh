@@ -141,7 +141,11 @@ variants too, see [Running in a container](docs/configuration.md#running-in-a-co
 docker run -p 80:80 -v "$PWD/rxh.toml:/etc/rxh/rxh.toml:ro" ghcr.io/loseardes77/rxh
 ```
 
-Docker and systemd files are in [`dist/`](dist).
+Or install a release package: static musl binaries, `.deb`, `.rpm`, the
+`rxh-bin` AUR package and a Homebrew formula are published on every release
+(see [Installing a release package](docs/configuration.md#installing-a-release-package)).
+
+Docker, systemd and packaging files are in [`dist/`](dist).
 
 ## Quick start
 

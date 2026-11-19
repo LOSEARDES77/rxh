@@ -1,0 +1,11 @@
+# Configuration of the rxh service installed by the packages. With no
+# [[server]] the daemon only runs the admin API on http://127.0.0.1:2019,
+# where `rxh status` and `rxh upstream` reach it.
+#
+# Add servers here and apply them with `systemctl reload rxh`. Reference:
+# https://github.com/LOSEARDES77/rxh/blob/main/docs/configuration.md
+#
+# [[server]]
+# name = "app"
+# listen = "0.0.0.0:80"
+# forward = "127.0.0.1:8080"
