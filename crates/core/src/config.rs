@@ -2515,6 +2515,10 @@ pub struct UpstreamGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive: Option<PassiveHealth>,
 
+    /// Circuit breaker on the error ratio or the latency of each backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreaker>,
+
     /// TLS settings for connections to the backends. Setting this table
     /// enables TLS even without `https://` backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2663,6 +2667,7 @@ impl UpstreamGroup {
             backends,
             health: None,
             passive: None,
+            circuit_breaker: None,
             tls: None,
             dynamic: None,
         }
@@ -2769,6 +2774,10 @@ impl UpstreamGroup {
             && passive.max_fails == 0
         {
             return Err(String::from("passive.max_fails must be at least 1"));
+        }
+
+        if let Some(breaker) = &self.circuit_breaker {
+            breaker.validate()?;
         }
 
         if let Some(health) = &self.health
@@ -3093,6 +3102,83 @@ impl HealthHooks {
                     "health.hooks.webhook must be an http:// or https:// URL, got {webhook:?}"
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+/// Circuit breaker of each backend of a pool. A backend whose share of
+/// failed or slow requests in a `window` reaches a ratio is taken out of
+/// rotation (open) for `open_duration`, then gets one trial request (half
+/// open) that closes the breaker again or reopens it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitBreaker {
+    /// Share of failed requests, `0.5` for half of them, that opens the
+    /// breaker. Failed dials, broken responses and `error_status` count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_ratio: Option<f64>,
+
+    /// Response statuses counted as errors.
+    #[serde(default = "default::breaker_error_status")]
+    pub error_status: Vec<StatusMatcher>,
+
+    /// Responses slower than this (time to headers) count as slow.
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub latency: Option<Duration>,
+
+    /// Share of slow responses that opens the breaker. `0.5` trips on the
+    /// median latency, `0.05` on the 95th percentile.
+    #[serde(default = "default::breaker_latency_ratio")]
+    pub latency_ratio: f64,
+
+    /// Period over which requests are counted.
+    #[serde(default = "default::breaker_duration", with = "duration")]
+    pub window: Duration,
+
+    /// Requests in a window below which the breaker never opens.
+    #[serde(default = "default::breaker_min_requests")]
+    pub min_requests: u32,
+
+    /// How long an open breaker keeps its backend out of rotation.
+    #[serde(default = "default::breaker_duration", with = "duration")]
+    pub open_duration: Duration,
+}
+
+impl CircuitBreaker {
+    fn validate(&self) -> Result<(), String> {
+        let is_ratio = |ratio: f64| ratio > 0.0 && ratio <= 1.0;
+        if self.error_ratio.is_none() && self.latency.is_none() {
+            return Err(String::from(
+                "circuit_breaker needs 'error_ratio' or 'latency'",
+            ));
+        }
+        if !self.error_ratio.is_none_or(is_ratio) {
+            return Err(String::from(
+                "circuit_breaker.error_ratio must be above 0 and at most 1",
+            ));
+        }
+        if !is_ratio(self.latency_ratio) {
+            return Err(String::from(
+                "circuit_breaker.latency_ratio must be above 0 and at most 1",
+            ));
+        }
+        if self.latency.is_some_and(|latency| latency.is_zero()) {
+            return Err(String::from("circuit_breaker.latency must be above 0"));
+        }
+        if self.window.is_zero() || self.open_duration.is_zero() {
+            return Err(String::from(
+                "circuit_breaker.window and circuit_breaker.open_duration must be above 0",
+            ));
+        }
+        if self.min_requests == 0 {
+            return Err(String::from(
+                "circuit_breaker.min_requests must be at least 1",
+            ));
         }
         Ok(())
     }
@@ -4544,6 +4630,22 @@ mod default {
         Duration::from_secs(30)
     }
 
+    pub fn breaker_error_status() -> Vec<super::StatusMatcher> {
+        vec![super::StatusMatcher::Class(5)]
+    }
+
+    pub fn breaker_latency_ratio() -> f64 {
+        0.5
+    }
+
+    pub fn breaker_duration() -> Duration {
+        Duration::from_secs(10)
+    }
+
+    pub fn breaker_min_requests() -> u32 {
+        10
+    }
+
     pub fn rate_limit_per() -> Duration {
         Duration::from_secs(1)
     }
@@ -4729,6 +4831,65 @@ mod tests {
         assert!(
             matches!(&config.servers[0].patterns[0].action, Action::Forward(Forward::Group(name)) if name == "db")
         );
+    }
+
+    #[test]
+    fn circuit_breaker_keys_and_defaults() {
+        let parse = |breaker: &str| {
+            Config::from_toml(&format!(
+                "[upstream.api]\nbackends = [\"127.0.0.1:81\"]\ncircuit_breaker = {breaker}\n"
+            ))
+        };
+
+        let config = parse("{ error_ratio = 0.3 }").unwrap();
+        let breaker = config.upstreams["api"].circuit_breaker.as_ref().unwrap();
+        assert_eq!(
+            breaker,
+            &CircuitBreaker {
+                error_ratio: Some(0.3),
+                error_status: vec![StatusMatcher::Class(5)],
+                latency: None,
+                latency_ratio: 0.5,
+                window: Duration::from_secs(10),
+                min_requests: 10,
+                open_duration: Duration::from_secs(10),
+            }
+        );
+
+        let config = parse(
+            "{ latency = \"250ms\", latency_ratio = 1, error_status = [502, \"4xx\"], \
+             window = \"1m\", min_requests = 3, open_duration = \"5s\" }",
+        )
+        .unwrap();
+        let breaker = config.upstreams["api"].circuit_breaker.as_ref().unwrap();
+        assert_eq!(breaker.error_ratio, None);
+        assert_eq!(breaker.latency, Some(Duration::from_millis(250)));
+        assert_eq!(breaker.latency_ratio, 1.0);
+        assert_eq!(breaker.error_status.len(), 2);
+        assert_eq!(breaker.window, Duration::from_secs(60));
+        assert_eq!(breaker.min_requests, 3);
+        assert_eq!(breaker.open_duration, Duration::from_secs(5));
+
+        let invalid = |breaker: &str| parse(breaker).unwrap_err().to_string();
+        assert!(invalid("{}").contains("needs 'error_ratio' or 'latency'"));
+        assert!(invalid("{ window = \"1s\" }").contains("needs 'error_ratio' or 'latency'"));
+        for ratio in ["0", "-0.1", "1.5", "nan"] {
+            let message = invalid(&format!("{{ error_ratio = {ratio} }}"));
+            assert!(message.contains("error_ratio must be above 0"), "{message}");
+            let message = invalid(&format!("{{ latency = \"1s\", latency_ratio = {ratio} }}"));
+            assert!(
+                message.contains("latency_ratio must be above 0"),
+                "{message}"
+            );
+        }
+        assert!(invalid("{ latency = \"0s\" }").contains("latency must be above 0"));
+        assert!(invalid("{ error_ratio = 0.5, window = \"0s\" }").contains("must be above 0"));
+        assert!(
+            invalid("{ error_ratio = 0.5, open_duration = \"0s\" }").contains("must be above 0")
+        );
+        assert!(invalid("{ error_ratio = 0.5, min_requests = 0 }").contains("at least 1"));
+        assert!(invalid("{ error_ratio = 0.5, error_status = [\"9xx\"] }").contains("9xx"));
+        assert!(invalid("{ error_ratio = 0.5, threshold = 3 }").contains("threshold"));
     }
 
     const SPLIT_POOLS: &str = "[upstream.v1]\nbackends = [\"127.0.0.1:81\"]\n\

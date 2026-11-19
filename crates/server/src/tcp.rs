@@ -197,6 +197,7 @@ pub(crate) async fn proxy<S>(
         }
     };
 
+    selection.upstream.record_success();
     let _guard = selection.upstream.start_request();
     let address = selection.upstream.address();
 

@@ -972,6 +972,7 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `tls` | | `transport http { tls }` | Table of TLS client settings, see below. Setting it enables TLS for every backend, also without `https://`. |
 | `health` | | active health checks | Table, see below. |
 | `passive` | | passive health checks | Table, see below. |
+| `circuit_breaker` | | Traefik `CircuitBreaker` | Table, see below. |
 
 Example: at most 8 connections per backend, uploads up to 64 KiB buffered
 before they are sent, responses up to 1 MiB buffered:
@@ -1026,7 +1027,7 @@ binary `"KiB"`, `"MiB"`, `"GiB"` (powers of 1024). No fractions.
 | `cookie` | The backend whose signed value is in cookie `key` (`lb` by default). New clients get one through `fallback` and a `Set-Cookie`. | http |
 
 Only available backends are picked: healthy for active and passive checks,
-and below `unhealthy_request_count`. When none is available the client gets
+with a circuit breaker that is not open, and below `unhealthy_request_count`. When none is available the client gets
 `503` (HTTP) or the connection is closed (TCP/UDP).
 
 ### `[upstream.NAME.tls]`: TLS to the backends
@@ -1150,6 +1151,54 @@ Failed dials always count.
 | `unhealthy_status` | `[]` | Statuses that count as failures, like `["5xx", 429]`. |
 | `unhealthy_latency` | unset | Responses slower than this (time to headers) count as failures. |
 | `unhealthy_request_count` | `0` | Requests in flight above which a backend is skipped. `0` means no limit. |
+
+### `[upstream.NAME.circuit_breaker]`: circuit breaker
+
+Each backend of the pool gets a breaker that watches its real traffic. While
+it is **closed**, requests are counted over `window`. When the share of
+failed requests reaches `error_ratio`, or the share of slow ones reaches
+`latency_ratio`, the breaker **opens** and the backend is out of rotation for
+`open_duration`: the other backends take its requests, and when none is left
+the client gets `503` (or the next pool of a weighted split takes over).
+After `open_duration` the breaker is **half open**: the backend gets one
+trial request at a time. A good answer closes the breaker and starts a new
+window; a failed or slow one opens it again for `open_duration`.
+
+At least one of `error_ratio` and `latency` is required; with both, either
+condition opens the breaker.
+
+| Key | Default | Description |
+|---|---|---|
+| `error_ratio` | unset | Share of failed requests that opens the breaker, above `0` up to `1` (`0.5` is half of them). Failed dials, response header timeouts, broken responses and `error_status` responses are failures. |
+| `error_status` | `["5xx"]` | Response statuses that count as failures, like `["5xx", 429]`. |
+| `latency` | unset | Responses slower than this (time to headers) count as slow. |
+| `latency_ratio` | `0.5` | Share of slow responses that opens the breaker, above `0` up to `1`. `0.5` opens when the median latency is over `latency`, `0.05` when the 95th percentile is. |
+| `window` | `"10s"` | Period over which requests are counted. Counters start from zero every `window`. |
+| `min_requests` | `10` | Requests in a window below which the breaker stays closed. |
+| `open_duration` | `"10s"` | How long an open breaker keeps its backend out before the trial request. |
+
+```toml
+[upstream.api]
+backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
+
+[upstream.api.circuit_breaker]
+error_ratio = 0.3        # 30% of the requests failed...
+latency = "500ms"        # ...or half of them took over 500ms
+window = "10s"
+min_requests = 20
+open_duration = "30s"
+```
+
+The breaker differs from `passive` checks in counting a ratio instead of a
+number of failures, so it follows the traffic volume, and in probing with a
+single request before the backend takes its full share again. Both can be
+set on the same pool.
+
+On `tcp` servers an established connection is a success and a failed dial a
+failure; `latency` has no effect. `udp` sessions never report a success, so
+do not set a breaker on pools used by `udp` servers. The state is per
+backend and per process, starts closed after a reload, and is shown as
+`circuit` (`closed`, `open`, `half_open`) in `GET /pools` of the admin API.
 
 ## `[[server]]`: listeners
 
