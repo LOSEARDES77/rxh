@@ -9,6 +9,10 @@ Changed.
 
 ### Added
 
+- `watch = true`: the daemon reloads when the configuration file or one of
+  its included files changes (added and removed include matches too), with
+  the validation and rollback of `rxh reload`. Contents are polled every
+  500 ms and a change is applied once it stayed the same for one poll.
 - `[admin] listen = "unix//run/rxh/admin.sock"`: the admin API on a unix
   socket only the daemon's user can open (mode `0600`, stale sockets
   replaced, removed on shutdown). `rxh --admin unix//path` and `RXH_ADMIN`

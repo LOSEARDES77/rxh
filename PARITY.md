@@ -218,7 +218,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 | Docker image and Compose examples with tags | Traefik images (`traefik:v3`, `v3.x`) | Publish `rxh:latest`, `rxh:0.x`, `rxh:0.x.y` and `-alpine`/distroless variants for amd64 and arm64 on GHCR and Docker Hub from CI on release tags. |
 | Docker Swarm, Podman and Kubernetes Ingress / Gateway API providers | Traefik | |
 | Consul, etcd and Nomad service discovery | Traefik, HAProxy | |
-| File provider watch: reload automatically when the config file changes | Traefik file provider `watch = true` | inotify/kqueue, debounced, same validation as `rxh reload`. |
+| File provider watch: reload automatically when the config file changes | Traefik file provider `watch = true` | Done: top level `watch = true` reloads when the main file or an included file changes (files added to or removed from an `include` pattern too), with the same validation and rollback as `rxh reload`. Contents polled every 500 ms and applied once stable for one poll, instead of inotify/kqueue (no new dependency, works on network file systems); a rejected edit is not retried until the files change again. Not a CLI flag (Traefik `--providers.file.watch`), and turning it on needs one manual reload. |
 | Upload a full configuration through the admin API (`POST /load`) | Caddy, Traefik API | |
 
 ### Traffic management

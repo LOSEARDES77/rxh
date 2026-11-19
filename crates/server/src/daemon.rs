@@ -10,7 +10,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rxh_core::config::{AdminListen, Config, IncludedConfig, Runtime};
 use tokio::sync::{mpsc, oneshot};
@@ -151,7 +151,74 @@ impl Generation {
 
 enum Event {
     Reload,
+    /// `watch = true` noticed an edit; the watcher already took it in.
+    Watch,
     Stop,
+}
+
+/// How often `watch = true` reads the configuration files.
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Contents of the configuration file and of the files it includes. `None`
+/// for a file that cannot be read.
+#[derive(Clone, PartialEq)]
+struct Snapshot(Vec<(PathBuf, Option<Vec<u8>>)>);
+
+impl Snapshot {
+    fn take(path: &Path) -> Self {
+        // A file that does not parse hides its includes; the list grows back
+        // once it is fixed, which is a change too.
+        let files: Vec<PathBuf> = config_files(path).unwrap_or_else(|_| vec![path.to_owned()]);
+        Self(
+            files
+                .into_iter()
+                .map(|file| {
+                    let contents: Option<Vec<u8>> = std::fs::read(&file).ok();
+                    (file, contents)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Polls the configuration files for `watch = true`. Contents are compared
+/// rather than modification times, which can be coarse or restored by tools.
+struct Watcher {
+    path: PathBuf,
+    /// Contents of the last reload attempt, successful or not: a rejected
+    /// edit is not retried until the files change again.
+    loaded: Snapshot,
+    /// Contents at the previous poll. A change is reloaded once it stayed the
+    /// same for a whole interval, so a file still being written is not read.
+    last: Snapshot,
+}
+
+impl Watcher {
+    fn new(path: &Path) -> Self {
+        let loaded = Snapshot::take(path);
+        Self {
+            path: path.to_owned(),
+            last: loaded.clone(),
+            loaded,
+        }
+    }
+
+    /// Records the files a reload requested elsewhere is about to read.
+    fn loading(&mut self) {
+        self.loaded = Snapshot::take(&self.path);
+        self.last = self.loaded.clone();
+    }
+
+    /// Whether the files changed and settled since the last reload.
+    fn poll(&mut self) -> bool {
+        let now = Snapshot::take(&self.path);
+        let settled = now == self.last && now != self.loaded;
+        if settled {
+            self.loaded = now.clone();
+        }
+        self.last = now;
+        settled
+    }
 }
 
 impl Daemon {
@@ -175,6 +242,8 @@ impl Daemon {
     /// Runs until `SIGTERM`, `SIGINT` or `POST /stop`. `SIGHUP` and
     /// `POST /reload` reload the configuration file.
     pub async fn run(self) -> Result<(), Error> {
+        // Taken before loading, so an edit made while starting is noticed.
+        let mut watcher = self.config_path().map(Watcher::new);
         let config = match &self.source {
             Source::Memory(config) => {
                 config.validate()?;
@@ -222,6 +291,8 @@ impl Daemon {
         };
 
         let mut signals = Signals::new()?;
+        let mut polls = tokio::time::interval(WATCH_INTERVAL);
+        polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             let event = tokio::select! {
@@ -229,11 +300,21 @@ impl Daemon {
                 Some(control) = controls.recv() => match control {
                     Control::Stop => Event::Stop,
                     Control::Reload(reply) => {
+                        if let Some(watcher) = &mut watcher {
+                            watcher.loading();
+                        }
                         let outcome = self.reload(&mut generation, &admin_state).await;
                         let _ = reply.send(outcome);
                         continue;
                     }
                 },
+                _ = polls.tick(), if generation.config.watch => {
+                    if !watcher.as_mut().is_some_and(Watcher::poll) {
+                        continue;
+                    }
+                    println!("Main => Configuration file changed");
+                    Event::Watch
+                }
                 result = &mut generation.task => {
                     return match result {
                         Ok(Ok(())) => Ok(()),
@@ -245,7 +326,10 @@ impl Daemon {
 
             match event {
                 Event::Stop => break,
-                Event::Reload => {
+                Event::Reload | Event::Watch => {
+                    if let (Event::Reload, Some(watcher)) = (&event, &mut watcher) {
+                        watcher.loading();
+                    }
                     if let Err(message) = self.reload(&mut generation, &admin_state).await {
                         eprintln!(
                             "Main => Reload failed, keeping the running configuration: {message}"
@@ -412,6 +496,42 @@ forward = "@api"
 
     fn server(name: &str) -> String {
         format!("[[server]]\nname = \"{name}\"\nlisten = \"127.0.0.1:0\"\nforward = \"@api\"\n")
+    }
+
+    #[test]
+    fn watcher_reloads_settled_changes_of_every_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("rxh.toml");
+        write(dir.path(), "rxh.toml", "include = [\"conf.d/*.toml\"]\n");
+        let mut watcher = Watcher::new(&main);
+        assert!(!watcher.poll(), "nothing changed");
+
+        // Reloaded on the poll after the one that saw the change.
+        write(dir.path(), "conf.d/a.toml", &server("a"));
+        assert!(!watcher.poll(), "not settled yet");
+        assert!(watcher.poll(), "new included file");
+        assert!(!watcher.poll(), "reloaded once");
+
+        write(dir.path(), "conf.d/a.toml", &server("b"));
+        assert!(!watcher.poll());
+        write(dir.path(), "conf.d/a.toml", &server("c"));
+        assert!(!watcher.poll(), "still being written");
+        assert!(watcher.poll(), "edited included file");
+
+        // A broken main file is tried once, then fixing it is a change.
+        write(dir.path(), "rxh.toml", "include = [");
+        assert!(!watcher.poll());
+        assert!(watcher.poll(), "broken file is tried");
+        assert!(!watcher.poll(), "and not retried");
+        write(dir.path(), "rxh.toml", "include = [\"conf.d/*.toml\"]\n");
+        assert!(!watcher.poll());
+        assert!(watcher.poll(), "fixed file");
+
+        // A reload requested elsewhere already read the edit.
+        fs::remove_file(dir.path().join("conf.d/a.toml")).expect("remove");
+        watcher.loading();
+        assert!(!watcher.poll());
+        assert!(!watcher.poll());
     }
 
     #[test]

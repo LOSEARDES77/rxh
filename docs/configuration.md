@@ -13,6 +13,7 @@ The file has six parts, and top level keys must come before the first table:
 ```toml
 grace_period = "30s"     # top level options
 runtime = "per_core"
+watch = true
 
 [admin]                  # admin API
 [log]                    # access logs
@@ -27,6 +28,7 @@ runtime = "per_core"
 |---|---|---|
 | `grace_period` | unset (wait forever) | Time open connections get to finish on stop or reload before they are closed. Idle keep-alive HTTP connections are closed right away. |
 | `runtime` | `"shared"` | Threading model of the listeners: `"shared"` or `"per_core"`, see [Runtime](#runtime). |
+| `watch` | `false` | Reload when the file or one of its included files changes, see [Watching the files](#watching-the-files). |
 | `include` | `[]` | Files merged into this one, see [Includes](#includes). Must come before the first `[table]`. |
 
 ## Runtime
@@ -96,6 +98,29 @@ include = ["conf.d/*.toml", "extra.toml"]
   which is created if missing and added to `include` if not already covered.
 - `rxh config show [--json]` prints the effective merged configuration, from
   the running daemon when reachable, else from the files.
+
+## Watching the files
+
+```toml
+watch = true
+include = ["conf.d/*.toml"]
+```
+
+With `watch = true` the daemon reads the configuration file and the files
+its `include` list matches every 500 ms and reloads when their contents
+change, exactly as `rxh reload` or `SIGHUP` would: zero downtime, and a file
+that does not parse or validate is reported on standard error while the
+running configuration keeps serving. A change is applied once the files
+stayed the same for one interval, so a file still being written is not read
+halfway; in practice a reload follows an edit within about a second. A new
+file matching an `include` pattern, or a deleted one, counts as a change.
+
+A rejected edit is not tried again until the files change once more. Setting
+`watch = false` in the file stops the watching after that reload; turning it
+on takes a manual `rxh reload`, since nothing watches the file yet. Files
+are polled rather than followed with inotify or kqueue, which works the
+same on every platform and on network file systems. Certificate files of
+`tls = { cert, key }` are watched on their own and need no `watch`.
 
 ## Quick commands without a file
 
