@@ -33,6 +33,14 @@ Changed.
   tagged `rxh.enable=true` in every namespace. etcd: keys
   `PREFIX/SERVICE/INSTANCE/OPTION` read through the v3 JSON gateway. An
   unreachable catalog keeps its last routes; a pool belongs to one provider.
+- Kubernetes provider, first cut: a `[kubernetes]` table (`endpoint`,
+  `token`, `ingress_class`, `listen`, `refresh`) routes the hosts of the
+  Ingresses and of the Gateway API HTTPRoutes to the ready endpoints of
+  their Services, one pool per Service port, listed every `refresh` (default
+  15s). The API is reached over plain HTTP (`kubectl proxy` by default).
+  Only whole hosts are routed: path rules, HTTPRoute matches, filters and
+  traffic splitting are reported and left out; Gateways, TLS Secrets and
+  status updates are not handled yet (see `docs/configuration.md`).
 - systemd integration: `rxh run` reports readiness, reloads (with the
   failure reason in `STATUS=`) and shutdown over `NOTIFY_SOCKET`, and takes
   socket-activated listeners from `LISTEN_FDS`, matched to `listen` and

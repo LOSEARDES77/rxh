@@ -97,6 +97,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nomad: Option<Catalog>,
 
+    /// Routes the hosts of the Kubernetes Ingresses and Gateway API
+    /// HTTPRoutes to the ready endpoints of their Services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<Catalog>,
+
     /// Maximum time to wait for open connections during shutdown or reload.
     /// `None` waits forever, like Caddy's default.
     #[serde(
@@ -212,7 +217,7 @@ impl Config {
                 .validate()
                 .map_err(|err| ConfigError::Invalid(format!("docker: {err}")))?;
         }
-        for kind in [CatalogKind::Consul, CatalogKind::Etcd, CatalogKind::Nomad] {
+        for kind in CatalogKind::ALL {
             if let Some(catalog) = self.catalog(kind) {
                 catalog
                     .validate(kind)
@@ -633,13 +638,15 @@ impl Config {
             .map(|(index, server)| server.label(index))
     }
 
-    /// The `[consul]`, `[etcd]` or `[nomad]` section, if present.
+    /// The `[consul]`, `[etcd]`, `[nomad]` or `[kubernetes]` section, if
+    /// present.
     #[must_use]
     pub fn catalog(&self, kind: CatalogKind) -> Option<&Catalog> {
         match kind {
             CatalogKind::Consul => self.consul.as_ref(),
             CatalogKind::Etcd => self.etcd.as_ref(),
             CatalogKind::Nomad => self.nomad.as_ref(),
+            CatalogKind::Kubernetes => self.kubernetes.as_ref(),
         }
     }
 
@@ -947,9 +954,11 @@ impl Docker {
     }
 }
 
-/// Service catalog provider: `[consul]`, `[etcd]` or `[nomad]`. Each
-/// service instance becomes a member of a pool, with the `rxh.*` options of
-/// its tags (Consul, Nomad) or keys (etcd), like the labels of `[docker]`.
+/// Service catalog provider: `[consul]`, `[etcd]`, `[nomad]` or
+/// `[kubernetes]`. Each service instance becomes a member of a pool, with
+/// the `rxh.*` options of its tags (Consul, Nomad) or keys (etcd), like the
+/// labels of `[docker]`; in Kubernetes the hosts come from the Ingresses and
+/// HTTPRoutes and the instances are the ready endpoints of their Services.
 /// The catalog is listed every `refresh`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -960,7 +969,8 @@ pub struct Catalog {
     pub endpoint: Option<String>,
 
     /// ACL token sent to Consul (`X-Consul-Token`) or Nomad
-    /// (`X-Nomad-Token`). Not accepted by `[etcd]`.
+    /// (`X-Nomad-Token`), or bearer token sent to the Kubernetes API. Not
+    /// accepted by `[etcd]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
@@ -968,6 +978,12 @@ pub struct Catalog {
     /// where it defaults to `rxh/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+
+    /// Only the Ingresses of this class (`spec.ingressClassName` or the
+    /// `kubernetes.io/ingress.class` annotation) are routed. Only accepted
+    /// by `[kubernetes]`, where every Ingress is routed without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_class: Option<String>,
 
     /// Address of the HTTP servers made from `rxh.http.host` options.
     #[serde(default = "default::docker_listen")]
@@ -987,9 +1003,14 @@ pub enum CatalogKind {
     Etcd,
     /// `[nomad]`.
     Nomad,
+    /// `[kubernetes]`.
+    Kubernetes,
 }
 
 impl CatalogKind {
+    /// Every kind.
+    pub const ALL: [Self; 4] = [Self::Consul, Self::Etcd, Self::Nomad, Self::Kubernetes];
+
     /// Name of the section in the configuration file.
     #[must_use]
     pub fn section(self) -> &'static str {
@@ -997,16 +1018,18 @@ impl CatalogKind {
             Self::Consul => "consul",
             Self::Etcd => "etcd",
             Self::Nomad => "nomad",
+            Self::Kubernetes => "kubernetes",
         }
     }
 
-    /// Port of the HTTP API of a local agent.
+    /// Port of the HTTP API of a local agent, or of `kubectl proxy`.
     #[must_use]
     pub fn default_endpoint(self) -> &'static str {
         match self {
             Self::Consul => "http://127.0.0.1:8500",
             Self::Etcd => "http://127.0.0.1:2379",
             Self::Nomad => "http://127.0.0.1:4646",
+            Self::Kubernetes => "http://127.0.0.1:8001",
         }
     }
 }
@@ -1017,6 +1040,7 @@ impl Default for Catalog {
             endpoint: None,
             token: None,
             prefix: None,
+            ingress_class: None,
             listen: default::docker_listen(),
             refresh: default::docker_refresh(),
         }
@@ -1053,15 +1077,22 @@ impl Catalog {
                 "endpoint must be http://host:port, got {endpoint:?}"
             ));
         }
+        match (kind, self.ingress_class.as_deref()) {
+            (CatalogKind::Kubernetes, Some("")) => {
+                return Err(String::from("ingress_class cannot be empty"));
+            }
+            (CatalogKind::Kubernetes, _) | (_, None) => {}
+            (_, Some(_)) => {
+                return Err(String::from("ingress_class is only used by [kubernetes]"));
+            }
+        }
         match (kind, &self.token, &self.prefix) {
             (CatalogKind::Etcd, Some(_), _) => Err(String::from("token is not supported")),
             (CatalogKind::Etcd, _, Some(prefix)) if prefix.is_empty() => {
                 Err(String::from("prefix cannot be empty"))
             }
-            (CatalogKind::Consul | CatalogKind::Nomad, _, Some(_)) => {
-                Err(String::from("prefix is only used by [etcd]"))
-            }
-            _ => Ok(()),
+            (CatalogKind::Etcd, ..) | (_, _, None) => Ok(()),
+            (_, _, Some(_)) => Err(String::from("prefix is only used by [etcd]")),
         }
     }
 }
@@ -5615,8 +5646,61 @@ endpoint = \"http://consul.service:8500\"\ntoken = \"secret\"\n\
             let err = Config::from_toml(text).expect_err(text).to_string();
             assert!(err.contains(reason), "{text}: {err}");
         }
-        for section in ["[consul]\n", "[etcd]\n", "[nomad]\n"] {
+        for section in ["[consul]\n", "[etcd]\n", "[nomad]\n", "[kubernetes]\n"] {
             assert!(IncludedConfig::from_toml(section).is_err(), "{section}");
+        }
+    }
+
+    #[test]
+    fn kubernetes_section_has_defaults_and_validates() {
+        assert_eq!(Config::from_toml("").expect("valid").kubernetes, None);
+        let config = Config::from_toml("[kubernetes]\n").expect("valid");
+        let kubernetes = config.catalog(CatalogKind::Kubernetes).expect("set");
+        // The address `kubectl proxy` listens at.
+        assert_eq!(
+            kubernetes.endpoint(CatalogKind::Kubernetes),
+            "http://127.0.0.1:8001"
+        );
+        assert_eq!(kubernetes.listen, "0.0.0.0:80".parse().expect("address"));
+        assert_eq!(kubernetes.refresh, Duration::from_secs(15));
+        assert_eq!(kubernetes.ingress_class, None);
+
+        let text = "[kubernetes]\nendpoint = \"http://10.0.0.1:8080\"\ntoken = \"t\"\n\
+                    ingress_class = \"rxh\"\nlisten = \"127.0.0.1:8080\"\nrefresh = \"5s\"\n";
+        let config = Config::from_toml(text).expect("valid");
+        let kubernetes = config.kubernetes.as_ref().expect("set");
+        assert_eq!(kubernetes.token.as_deref(), Some("t"));
+        assert_eq!(kubernetes.ingress_class.as_deref(), Some("rxh"));
+        assert_eq!(kubernetes.refresh, Duration::from_secs(5));
+        let round_trip =
+            Config::from_toml(&toml::to_string(&config).expect("serializes")).expect("round trip");
+        assert_eq!(round_trip.kubernetes, config.kubernetes);
+
+        for (text, reason) in [
+            (
+                "[kubernetes]\nendpoint = \"https://10.96.0.1:443\"\n",
+                "kubernetes: endpoint must be",
+            ),
+            (
+                "[kubernetes]\nrefresh = \"0s\"\n",
+                "kubernetes: refresh must be longer than 0s",
+            ),
+            (
+                "[kubernetes]\ningress_class = \"\"\n",
+                "kubernetes: ingress_class cannot be empty",
+            ),
+            (
+                "[kubernetes]\nprefix = \"rxh/\"\n",
+                "kubernetes: prefix is only used by [etcd]",
+            ),
+            (
+                "[consul]\ningress_class = \"rxh\"\n",
+                "consul: ingress_class is only used by [kubernetes]",
+            ),
+            ("[kubernetes]\nnamespace = \"x\"\n", "unknown field"),
+        ] {
+            let err = Config::from_toml(text).expect_err(text).to_string();
+            assert!(err.contains(reason), "{text}: {err}");
         }
     }
 

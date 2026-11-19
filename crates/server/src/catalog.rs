@@ -12,6 +12,8 @@
 //!   (`http.host`, `pool`...). The default pool is `SERVICE`; an instance is
 //!   enabled unless its `enable` key says otherwise.
 //!
+//! `[kubernetes]` is listed by the `kubernetes` module with the same client.
+//!
 //! Catalogs are listed every `refresh`. While one cannot be reached nothing
 //! is sent, so the instances last listed stay routed.
 
@@ -28,6 +30,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::docker::{self, Container, Provider, Updates};
+use crate::kubernetes;
 
 /// Sends the instances of the catalog `kind` to `updates`, every
 /// `settings.refresh`, until nothing listens to `updates` anymore.
@@ -59,31 +62,27 @@ pub(crate) async fn watch(kind: CatalogKind, settings: Catalog, updates: Updates
 }
 
 /// HTTP API of one catalog.
-struct Client<'a> {
+pub(crate) struct Client {
     /// `tcp://host:port`, as [`docker::fetch`] takes it.
     endpoint: String,
     authority: String,
-    token: Option<(&'static str, &'a str)>,
+    /// Header that carries the token, and its value.
+    token: Option<(&'static str, String)>,
 }
 
-impl<'a> Client<'a> {
-    fn new(kind: CatalogKind, settings: &'a Catalog) -> Result<Self, String> {
+impl Client {
+    fn new(kind: CatalogKind, settings: &Catalog) -> Result<Self, String> {
         let endpoint = settings.endpoint(kind);
         let authority = BackendAddress::parse(endpoint)
             .ok()
             .and_then(|address| address.host_port())
             .ok_or_else(|| format!("invalid endpoint {endpoint:?}"))?;
-        let token = match kind {
-            CatalogKind::Consul => settings
-                .token
-                .as_deref()
-                .map(|token| ("x-consul-token", token)),
-            CatalogKind::Nomad => settings
-                .token
-                .as_deref()
-                .map(|token| ("x-nomad-token", token)),
+        let token = settings.token.as_ref().and_then(|token| match kind {
+            CatalogKind::Consul => Some(("x-consul-token", token.clone())),
+            CatalogKind::Nomad => Some(("x-nomad-token", token.clone())),
+            CatalogKind::Kubernetes => Some(("authorization", format!("Bearer {token}"))),
             CatalogKind::Etcd => None,
-        };
+        });
         Ok(Self {
             endpoint: format!("tcp://{authority}"),
             authority,
@@ -102,8 +101,8 @@ impl<'a> Client<'a> {
             .method(method)
             .uri(path)
             .header(header::HOST, &self.authority);
-        if let Some((name, token)) = self.token {
-            request = request.header(name, token);
+        if let Some((name, token)) = &self.token {
+            request = request.header(*name, token);
         }
         let request = request
             .body(Full::new(body))
@@ -111,7 +110,7 @@ impl<'a> Client<'a> {
         docker::fetch(&self.endpoint, request, what).await
     }
 
-    async fn get(&self, path: &str, what: &str) -> Result<Bytes, String> {
+    pub(crate) async fn get(&self, path: &str, what: &str) -> Result<Bytes, String> {
         self.send(Method::GET, path, Bytes::new(), what).await
     }
 }
@@ -150,6 +149,7 @@ async fn list(kind: CatalogKind, settings: &Catalog) -> Result<Vec<Container>, S
                 .await?;
             containers = parse_etcd(&body, prefix)?;
         }
+        CatalogKind::Kubernetes => containers = kubernetes::list(&client, settings).await?,
     }
     Ok(containers)
 }
@@ -200,6 +200,7 @@ fn instance(
         ports: if port == 0 { Vec::new() } else { vec![port] },
         published: BTreeMap::new(),
         service: Some(service),
+        rejected: None,
     }
 }
 

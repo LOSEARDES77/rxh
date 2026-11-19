@@ -26,7 +26,8 @@
 //! The service catalogs (`[consul]`, `[etcd]`, `[nomad]`, see the `catalog`
 //! module) turn their service instances into [`Container`]s with the same
 //! options, so they are planned here too, with servers named after their
-//! section (`consul-POOL`).
+//! section (`consul-POOL`). So does `[kubernetes]`, see the `kubernetes`
+//! module.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -90,6 +91,7 @@ impl Provider {
             Self::Catalog(CatalogKind::Consul) => "Consul",
             Self::Catalog(CatalogKind::Etcd) => "etcd",
             Self::Catalog(CatalogKind::Nomad) => "Nomad",
+            Self::Catalog(CatalogKind::Kubernetes) => "Kubernetes",
         }
     }
 
@@ -113,6 +115,8 @@ impl Provider {
     pub(crate) fn noun(self) -> &'static str {
         match self {
             Self::Docker => "container",
+            // Ingresses and HTTPRoutes are reported too, not only endpoints.
+            Self::Catalog(CatalogKind::Kubernetes) => "object",
             Self::Catalog(_) => "instance",
         }
     }
@@ -134,6 +138,8 @@ pub(crate) struct Container {
     pub(crate) published: BTreeMap<u16, SocketAddr>,
     /// Swarm or catalog service: the default pool.
     pub(crate) service: Option<String>,
+    /// Why the provider cannot route this, reported like a bad label.
+    pub(crate) rejected: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +244,7 @@ impl Listed {
             ports,
             published,
             service: None,
+            rejected: None,
         }
     }
 }
@@ -384,6 +391,7 @@ fn parse_swarm(services: &[u8], tasks: &[u8]) -> Result<Vec<Container>, String> 
             ports,
             published: BTreeMap::new(),
             service: Some(service.spec.name.clone()),
+            rejected: None,
         });
     }
     Ok(containers)
@@ -400,6 +408,9 @@ struct Target {
 
 impl Container {
     fn target(&self) -> Result<Target, String> {
+        if let Some(reason) = &self.rejected {
+            return Err(reason.clone());
+        }
         let mut pool: Option<&str> = None;
         let mut policy: Option<Policy> = None;
         let mut hosts: Vec<String> = Vec::new();
@@ -903,6 +914,7 @@ mod tests {
             ports: ports.to_vec(),
             published: BTreeMap::new(),
             service: None,
+            rejected: None,
         }
     }
 

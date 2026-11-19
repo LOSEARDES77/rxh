@@ -366,7 +366,7 @@ impl Daemon {
                     (settings.clone(), AbortOnDrop(tokio::task::spawn(task)))
                 });
             }
-            for kind in [CatalogKind::Consul, CatalogKind::Etcd, CatalogKind::Nomad] {
+            for kind in CatalogKind::ALL {
                 let settings = generation.config.catalog(kind);
                 if settings == catalog_watches.get(&kind).map(|(settings, _)| settings) {
                     continue;

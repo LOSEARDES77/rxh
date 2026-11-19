@@ -22,6 +22,7 @@ mod health;
 mod hooks;
 mod http;
 mod include;
+mod kubernetes;
 mod l4match;
 mod log;
 mod master;

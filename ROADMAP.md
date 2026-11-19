@@ -138,7 +138,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] systemd integration: `sd_notify` readiness, socket activation.
 - [x] Docker Swarm and Podman providers.
 - [x] Consul, etcd and Nomad providers.
-- [ ] Kubernetes Ingress and Gateway API.
+- [x] Kubernetes Ingress and Gateway API (first cut: whole hosts over plain HTTP, see
+  `docs/configuration.md` for what is missing).
 
 ## 0.7: traffic management
 

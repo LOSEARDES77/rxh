@@ -1956,3 +1956,113 @@ async fn etcd_keys_are_routed_and_followed() {
             .all(|head| head.starts_with("post /v3/kv/range "))
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kubernetes_ingresses_and_http_routes_are_routed_to_ready_endpoints() {
+    use serde_json::{Value, json};
+
+    let api = rxh_test_util::CatalogApi::start().await;
+    let (a, b) = (backend("a").await, backend("b").await);
+    let web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+
+    let list = |items: Value| json!({ "items": items }).to_string();
+    let ingress = |name: &str, class: &str, host: &str| -> Value {
+        json!({
+            "metadata": { "name": name, "namespace": "default" },
+            "spec": { "ingressClassName": class, "rules": [{ "host": host, "http": { "paths": [{
+                "path": "/", "pathType": "Prefix",
+                "backend": { "service": { "name": "web", "port": { "number": 80 } } },
+            }] } }] },
+        })
+    };
+    // The backends listen on different ports, so each has its own slice.
+    let slice = |backend: SocketAddr, ready: bool| -> Value {
+        json!({
+            "metadata": {
+                "name": format!("web-{}", backend.port()), "namespace": "default",
+                "labels": { "kubernetes.io/service-name": "web" },
+            },
+            "ports": [{ "port": backend.port(), "protocol": "TCP" }],
+            "endpoints": [{
+                "addresses": [backend.ip().to_string()], "conditions": { "ready": ready },
+            }],
+        })
+    };
+    let ingresses = "GET /apis/networking.k8s.io/v1/ingresses";
+    let slices = "GET /apis/discovery.k8s.io/v1/endpointslices";
+    api.publish(
+        ingresses,
+        &list(json!([
+            ingress("shop", "rxh", "shop.test"),
+            ingress("other", "nginx", "other.test"),
+        ])),
+    );
+    api.publish(
+        "GET /api/v1/services",
+        &list(json!([{
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": { "ports": [{ "port": 80, "targetPort": 8080 }] },
+        }])),
+    );
+    api.publish(slices, &list(json!([slice(a, true)])));
+
+    // No HTTPRoute list: the API answers 404, like without the Gateway API.
+    let _daemon = start_with_catalog(
+        dir,
+        &format!(
+            "[kubernetes]\nendpoint = \"{}\"\ntoken = \"s3cret\"\ningress_class = \"rxh\"\n\
+             listen = \"{web}\"\nrefresh = \"50ms\"\n",
+            api.endpoint()
+        ),
+    );
+    wait_for_backends(web, "shop.test", &["a"], 1).await;
+    assert!(
+        api.requests()
+            .iter()
+            .all(|head| head.contains("authorization: bearer s3cret")),
+        "{:?}",
+        api.requests()
+    );
+    // The Ingress of another class is left to its controller.
+    assert_ne!(get_host(web, "other.test").await.as_deref(), Some("a"));
+
+    // A second ready endpoint joins without rebuilding the listeners.
+    api.publish(slices, &list(json!([slice(a, true), slice(b, true)])));
+    wait_for_backends(web, "shop.test", &["a", "b"], 20).await;
+    // An endpoint that is not ready gets no requests.
+    api.publish(slices, &list(json!([slice(a, false), slice(b, true)])));
+    wait_for_backends(web, "shop.test", &["b"], 20).await;
+    assert_eq!(log_count(dir, "Kubernetes objects changed"), 1);
+
+    // An HTTPRoute adds its hostname to the pool of the Service port.
+    api.publish(
+        "GET /apis/gateway.networking.k8s.io/v1/httproutes",
+        &list(json!([{
+            "metadata": { "name": "route", "namespace": "default" },
+            "spec": {
+                "hostnames": ["route.test"],
+                "rules": [{ "backendRefs": [{ "name": "web", "port": 80 }] }],
+            },
+        }])),
+    );
+    wait_for_backends(web, "route.test", &["b"], 1).await;
+    wait_for_backends(web, "shop.test", &["b"], 1).await;
+
+    // A list that cannot be read keeps what was last listed.
+    api.publish(ingresses, "<html>");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_backends(web, "shop.test", &["b"], 20).await;
+
+    // Deleted, the Ingress goes away with its host; the HTTPRoute stays.
+    api.publish(ingresses, &list(json!([])));
+    for _ in 0..250 {
+        if get_host(web, "shop.test").await.as_deref() != Some("b") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(get_host(web, "shop.test").await.as_deref(), Some("b"));
+    wait_for_backends(web, "route.test", &["b"], 1).await;
+}
