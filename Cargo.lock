@@ -1869,6 +1869,7 @@ dependencies = [
  "serde",
  "sha2",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

@@ -130,7 +130,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] File watch: reload when the configuration file changes.
 - [x] `POST /load` to upload a full configuration, and `PATCH` for one
       pool or server.
-- [ ] Environment variable placeholders and secret files in the
+- [x] Environment variable placeholders and secret files in the
       configuration.
 - [ ] Packages: static musl binaries, `.deb`, `.rpm`, AUR and Homebrew,
       built by CI. Shell completions and man pages from clap.
