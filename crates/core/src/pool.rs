@@ -7,14 +7,14 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use http::header;
 use http::{HeaderMap, Uri};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::config::{Backend, CircuitBreaker, Fallback, PassiveHealth, Policy, UpstreamGroup};
@@ -124,6 +124,46 @@ pub struct UpstreamStatus {
     /// State of the circuit breaker, for pools that have one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub circuit: Option<CircuitState>,
+
+    /// State set by an operator: ready, draining or in maintenance.
+    pub state: BackendState,
+}
+
+/// State of a backend set by an operator, like HAProxy's `set server state`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendState {
+    /// Takes new requests.
+    #[default]
+    Ready,
+
+    /// Takes no new requests, except those of its `cookie` sticky sessions.
+    /// Requests and connections in flight finish.
+    Drain,
+
+    /// Takes no new requests at all. Requests and connections in flight
+    /// finish.
+    Maintenance,
+}
+
+impl BackendState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Drain,
+            2 => Self::Maintenance,
+            _ => Self::Ready,
+        }
+    }
+}
+
+impl fmt::Display for BackendState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ready => "ready",
+            Self::Drain => "drain",
+            Self::Maintenance => "maintenance",
+        })
+    }
 }
 
 /// State of the circuit breaker of a backend.
@@ -329,6 +369,8 @@ pub struct Upstream {
     failures: Mutex<VecDeque<Instant>>,
     breaker: Option<Breaker>,
     ramp: Option<Ramp>,
+    /// [`BackendState`] as its discriminant.
+    state: AtomicU8,
 }
 
 impl Upstream {
@@ -357,6 +399,7 @@ impl Upstream {
             failures: Mutex::new(VecDeque::new()),
             breaker: breaker.map(Breaker::new),
             ramp: slow_start.map(Ramp::new),
+            state: AtomicU8::new(BackendState::Ready as u8),
         }
     }
 
@@ -388,10 +431,31 @@ impl Upstream {
             && self.circuit() != Some(CircuitState::Open)
     }
 
-    /// Healthy and not over the `unhealthy_request_count` limit.
+    /// Ready, healthy and not over the `unhealthy_request_count` limit.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        self.is_healthy() && !self.is_full()
+        self.state() == BackendState::Ready && self.is_healthy() && !self.is_full()
+    }
+
+    /// Like [`Upstream::is_available`], but a draining backend still takes
+    /// the requests of its sticky sessions.
+    fn takes_sticky(&self) -> bool {
+        self.state() != BackendState::Maintenance && self.is_healthy() && !self.is_full()
+    }
+
+    /// State set by an operator.
+    #[must_use]
+    pub fn state(&self) -> BackendState {
+        BackendState::from_u8(self.state.load(Ordering::Relaxed))
+    }
+
+    /// Sets the operator state. A backend put back to ready ramps up again,
+    /// for pools with slow start.
+    pub fn set_state(&self, state: BackendState) {
+        let before = BackendState::from_u8(self.state.swap(state as u8, Ordering::Relaxed));
+        if state == BackendState::Ready && before != BackendState::Ready {
+            self.start_ramp();
+        }
     }
 
     /// State of the circuit breaker, for pools that have one.
@@ -587,6 +651,7 @@ impl Upstream {
             total_requests: self.total.load(Ordering::Relaxed),
             fails: self.fails(),
             circuit: self.circuit(),
+            state: self.state(),
         }
     }
 }
@@ -884,6 +949,31 @@ impl Pool {
         *guard = Arc::new(Members::new(upstreams));
     }
 
+    /// Copies the operator state of the members of `previous`, the same pool
+    /// in the generation being replaced, to the members with the same
+    /// address, so a reload does not put drained backends back to work.
+    pub fn inherit_states(&self, previous: &Pool) {
+        let members = self.members();
+        for old in &previous.members().upstreams {
+            if let Some(upstream) = members.upstreams.iter().find(|u| u.address == old.address) {
+                upstream
+                    .state
+                    .store(old.state.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Sets the operator state of the member at `address`. Returns false if it
+    /// is not a member.
+    pub fn set_state(&self, address: &str, state: BackendState) -> bool {
+        let members = self.members();
+        let Some(upstream) = members.upstreams.iter().find(|u| u.address == address) else {
+            return false;
+        };
+        upstream.set_state(state);
+        true
+    }
+
     /// Removes a backend. Returns false if it was not a member. Connections
     /// already open to it are not interrupted.
     pub fn remove(&self, address: &str) -> bool {
@@ -996,7 +1086,7 @@ impl Pool {
             .headers
             .and_then(|headers| find_cookie(headers, name))
             && let Some(upstream) = members.upstreams.iter().find(|upstream| {
-                upstream.cookie.as_deref() == Some(value) && upstream.is_available()
+                upstream.cookie.as_deref() == Some(value) && upstream.takes_sticky()
             })
         {
             return Some(Selection::plain(Arc::clone(upstream)));
@@ -1594,6 +1684,91 @@ mod tests {
             assert_eq!(selection.upstream.address(), first.upstream.address());
             assert!(selection.set_cookie.is_none());
         }
+    }
+
+    #[test]
+    fn drained_and_maintenance_backends_take_no_new_requests() {
+        for policy in [Policy::RoundRobin, Policy::LeastConn, Policy::IpHash] {
+            let pool = Pool::new("t", &group(policy, &[("a:1", 1), ("b:1", 1)])).unwrap();
+            assert!(pool.set_state("a:1", BackendState::Drain));
+            for _ in 0..10 {
+                assert_eq!(pick(&pool, &context()), "b:1", "{policy:?}");
+            }
+            assert!(pool.set_state("b:1", BackendState::Maintenance));
+            assert!(pool.select(&context()).is_none(), "{policy:?}");
+            assert!(!pool.is_available());
+
+            assert!(pool.set_state("a:1", BackendState::Ready));
+            assert_eq!(pick(&pool, &context()), "a:1", "{policy:?}");
+        }
+
+        let pool = Pool::new("t", &group(Policy::RoundRobin, &[("a:1", 1)])).unwrap();
+        assert!(!pool.set_state("z:1", BackendState::Drain));
+        let status = pool.status();
+        assert_eq!(status.upstreams[0].state, BackendState::Ready);
+        pool.set_state("a:1", BackendState::Drain);
+        let status = pool.status();
+        assert_eq!(status.upstreams[0].state, BackendState::Drain);
+        assert!(status.upstreams[0].healthy);
+        assert!(!status.upstreams[0].available);
+    }
+
+    #[test]
+    fn drained_backend_keeps_its_sticky_sessions_until_maintenance() {
+        let mut config = group(Policy::Cookie, &[("a:1", 1), ("b:1", 1)]);
+        config.secret = Some("s3cret".into());
+        let pool = Pool::new("t", &config).unwrap();
+        let first = pool.select(&context()).unwrap();
+        let address = first.upstream.address().to_owned();
+        let pair = first.set_cookie.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            pair.split(';').next().unwrap().parse().unwrap(),
+        );
+        let sticky = SelectContext {
+            headers: Some(&headers),
+            ..context()
+        };
+
+        pool.set_state(&address, BackendState::Drain);
+        assert_eq!(pool.select(&sticky).unwrap().upstream.address(), address);
+        for _ in 0..10 {
+            assert_ne!(pick(&pool, &context()), address, "new sessions avoid it");
+        }
+
+        pool.set_state(&address, BackendState::Maintenance);
+        let moved = pool.select(&sticky).unwrap();
+        assert_ne!(moved.upstream.address(), address);
+        assert!(
+            moved.set_cookie.is_some(),
+            "the session moves to another backend"
+        );
+    }
+
+    #[test]
+    fn ready_again_ramps_up_with_slow_start() {
+        let mut config = group(Policy::RoundRobin, &[("a:1", 1), ("b:1", 1)]);
+        config.slow_start = Some(Duration::from_secs(3600));
+        let pool = Pool::new("t", &config).unwrap();
+        pool.set_state("a:1", BackendState::Maintenance);
+        pool.set_state("a:1", BackendState::Ready);
+        let to_a = (0..50).filter(|_| pick(&pool, &context()) == "a:1").count();
+        assert!(
+            to_a <= 3,
+            "{to_a} of 50 requests went to the ramping backend"
+        );
+    }
+
+    #[test]
+    fn reload_keeps_operator_states() {
+        let config = group(Policy::RoundRobin, &[("a:1", 1), ("b:1", 1)]);
+        let old = Pool::new("t", &config).unwrap();
+        old.set_state("a:1", BackendState::Drain);
+        let new = Pool::new("t", &config).unwrap();
+        new.inherit_states(&old);
+        assert_eq!(new.upstreams()[0].state(), BackendState::Drain);
+        assert_eq!(new.upstreams()[1].state(), BackendState::Ready);
     }
 
     #[test]

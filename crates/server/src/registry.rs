@@ -178,11 +178,13 @@ impl Registry {
     }
 
     /// Seeds the DNS driven pools with the members of the same pools in
-    /// `previous`, see [`Pool::inherit_dynamic`].
-    pub(crate) fn inherit_dynamic(&self, previous: &Registry) {
+    /// `previous` and keeps the drain and maintenance states of the members,
+    /// see [`Pool::inherit_dynamic`] and [`Pool::inherit_states`].
+    pub(crate) fn inherit(&self, previous: &Registry) {
         for (name, group) in &self.groups {
             if let Some(old) = previous.groups.get(name) {
                 group.pool.inherit_dynamic(&old.pool);
+                group.pool.inherit_states(&old.pool);
             }
         }
     }
@@ -261,7 +263,7 @@ mod tests {
             .sync_dynamic(vec![rxh_core::config::Backend::new("10.0.0.1:80")]);
 
         let new = Registry::build(&config).unwrap();
-        new.inherit_dynamic(&old);
+        new.inherit(&old);
         assert_eq!(new.get("dns").unwrap().pool.upstreams().len(), 1);
         assert!(new.get("other").unwrap().pool.upstreams().is_empty());
     }

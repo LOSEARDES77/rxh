@@ -411,6 +411,42 @@ curl -X PATCH localhost:2019/config/server/0 --data-binary 'name = "front"'
   create or delete them (upload a configuration for that). Inline `forward`
   groups are part of their server.
 
+### Draining backends and maintenance
+
+A backend can be taken out of rotation without removing it, to deploy or
+restart it, like HAProxy's `set server state`:
+
+```bash
+rxh upstream drain web 10.0.0.1:80   # no new requests; sticky sessions stay
+rxh upstream maint web 10.0.0.1:80   # no requests at all (alias of maintenance)
+rxh upstream ready web 10.0.0.1:80   # back into rotation (alias: enable)
+
+# The same through the API; `state` is ready, drain or maintenance.
+curl -X PUT localhost:2019/pools/web/upstreams/state \
+  -d '{"address": "10.0.0.1:80", "state": "drain"}'
+```
+
+| State | New requests and connections | `cookie` sticky sessions | In flight |
+|---|---|---|---|
+| `ready` | yes | yes | finish |
+| `drain` | no | yes | finish |
+| `maintenance` | no | no, they move to another backend | finish |
+
+- The CLI prints how many requests are still in flight; `rxh upstream list`
+  shows `drain` or `maint` in the `STATE` column, and `GET /pools` has
+  `state` on every backend. Wait for `ACTIVE` to reach 0 before stopping the
+  backend.
+- Hash policies (`ip_hash`, `uri_hash`, ...) send the keys of a backend out
+  of rotation to the others, as when it is unhealthy. When no backend is
+  left, the pool answers `503`.
+- The state is runtime only: it is not written to the configuration file
+  and is lost on restart, but a reload (`rxh reload`, `SIGHUP`, `/load`,
+  `PATCH`, `watch`) keeps it for the backends that are still there. Health
+  checks keep running in every state. With `slow_start`, a backend put back
+  to `ready` ramps up again.
+- The address is the one listed by `rxh upstream list`. Answers `404` for an
+  unknown pool or backend and `400` for an unknown state.
+
 ## `[log]`
 
 | Key | Default | Description |
@@ -1222,7 +1258,8 @@ A backend ramps up when it:
   `rxh upstream add`, or found by DNS, Docker or another discovery source;
 - is marked healthy again by active health checks;
 - is healthy again because its `passive` failures expired;
-- has its circuit breaker closed by a good trial request.
+- has its circuit breaker closed by a good trial request;
+- is put back to `ready` after `rxh upstream drain` or `maintenance`.
 
 Backends listed in the configuration take their full share when RXH starts
 or reloads. The ramp applies to `round_robin`, `weighted_round_robin`,
