@@ -146,7 +146,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] Weighted pools for canary releases and traffic splitting.
 - [x] Request mirroring.
 - [x] Circuit breaker on error ratio or latency.
-- [ ] Slow start for new and recovered backends.
+- [x] Slow start for new and recovered backends.
 - [ ] Drain and maintenance states: `rxh upstream drain web 10.0.0.1:80`.
 - [ ] Consistent hashing with bounded loads, Maglev.
 - [ ] Per backend connection limits with a queue.

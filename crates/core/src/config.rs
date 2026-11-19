@@ -2519,6 +2519,15 @@ pub struct UpstreamGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breaker: Option<CircuitBreaker>,
 
+    /// Time over which a backend added at runtime or back from being
+    /// unhealthy ramps up from no share of the traffic to its full share.
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub slow_start: Option<Duration>,
+
     /// TLS settings for connections to the backends. Setting this table
     /// enables TLS even without `https://` backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2668,6 +2677,7 @@ impl UpstreamGroup {
             health: None,
             passive: None,
             circuit_breaker: None,
+            slow_start: None,
             tls: None,
             dynamic: None,
         }
@@ -2778,6 +2788,10 @@ impl UpstreamGroup {
 
         if let Some(breaker) = &self.circuit_breaker {
             breaker.validate()?;
+        }
+
+        if self.slow_start.is_some_and(|duration| duration.is_zero()) {
+            return Err(String::from("slow_start must be above 0"));
         }
 
         if let Some(health) = &self.health
@@ -4831,6 +4845,27 @@ mod tests {
         assert!(
             matches!(&config.servers[0].patterns[0].action, Action::Forward(Forward::Group(name)) if name == "db")
         );
+    }
+
+    #[test]
+    fn slow_start_key() {
+        let parse = |value: &str| {
+            Config::from_toml(&format!(
+                "[upstream.api]\nbackends = [\"127.0.0.1:81\"]\nslow_start = {value}\n"
+            ))
+        };
+
+        let config = parse("\"30s\"").unwrap();
+        assert_eq!(
+            config.upstreams["api"].slow_start,
+            Some(Duration::from_secs(30))
+        );
+        let config = Config::from_toml("[upstream.api]\nbackends = [\"127.0.0.1:81\"]\n").unwrap();
+        assert_eq!(config.upstreams["api"].slow_start, None);
+
+        let invalid = |value: &str| parse(value).unwrap_err().to_string();
+        assert!(invalid("\"0s\"").contains("slow_start must be above 0"));
+        assert!(!invalid("\"soon\"").is_empty());
     }
 
     #[test]

@@ -973,6 +973,7 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 | `health` | | active health checks | Table, see below. |
 | `passive` | | passive health checks | Table, see below. |
 | `circuit_breaker` | | Traefik `CircuitBreaker` | Table, see below. |
+| `slow_start` | unset | Nginx Plus `slow_start` | Duration over which a backend that joins the pool at runtime or comes back healthy ramps up to its full share of the traffic, see [Slow start](#slow-start). `0` is rejected. |
 
 Example: at most 8 connections per backend, uploads up to 64 KiB buffered
 before they are sent, responses up to 1 MiB buffered:
@@ -1199,6 +1200,38 @@ failure; `latency` has no effect. `udp` sessions never report a success, so
 do not set a breaker on pools used by `udp` servers. The state is per
 backend and per process, starts closed after a reload, and is shown as
 `circuit` (`closed`, `open`, `half_open`) in `GET /pools` of the admin API.
+
+### Slow start
+
+`slow_start` gives a backend time to warm up (caches, JIT, connection pools)
+before it takes its full share of the traffic. Its share starts at nothing
+and grows linearly to full over the duration: half way through, it gets half
+of the requests it would normally get.
+
+```toml
+[upstream.api]
+policy = "least_conn"
+backends = ["10.0.0.1:8080", "10.0.0.2:8080"]
+slow_start = "30s"
+health = { uri = "/health", interval = "5s" }
+```
+
+A backend ramps up when it:
+
+- joins the pool at runtime: through `POST /pools/{name}/upstreams` or
+  `rxh upstream add`, or found by DNS, Docker or another discovery source;
+- is marked healthy again by active health checks;
+- is healthy again because its `passive` failures expired;
+- has its circuit breaker closed by a good trial request.
+
+Backends listed in the configuration take their full share when RXH starts
+or reloads. The ramp applies to `round_robin`, `weighted_round_robin`,
+`random`, `random_choose`, `least_conn` and `first`, so a new idle backend is
+not flooded by `least_conn`. Hash policies (`ip_hash`, `client_ip_hash`,
+`uri_hash`, `header`, `query`) and `cookie` ignore it to keep their keys on
+the same backend, except when they fall back to random. When every available
+backend is ramping and slow start turns them all away, the request still
+goes to one of them instead of failing.
 
 ## `[[server]]`: listeners
 
