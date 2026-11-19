@@ -432,6 +432,23 @@ socket, except that `http` servers listing the same address share one socket
 A `udp` server takes exactly one `forward` and no `match`. A `tcp` server
 takes one `forward`, or a `match` list of [layer 4 routes](#match-entries-of-tcp-servers-layer-4-routing).
 
+On Linux a `tcp` server moves the bytes with `splice(2)`, inside the kernel
+and without copying them through rxh, when rxh encrypts neither side: no
+`tls` on the server (TLS passthrough counts as plain bytes) and `host:port`
+backends without upstream TLS. Bytes read ahead for `match` or
+`proxy_protocol_in` are forwarded first. Every other case (TLS termination,
+TLS to the backends, `unix/` backends, other operating systems) copies
+through a buffer, with the same behaviour: timeouts, byte counts in the
+access log and half-closed connections work alike. There is no key to set:
+
+```toml
+# Spliced on Linux: plain TCP on both sides.
+[[server]]
+listen = "0.0.0.0:5432"
+protocol = "tcp"
+forward = "10.0.0.5:5432"
+```
+
 ### Virtual hosts on a shared address
 
 Several `http` servers may list the same `listen` address. They share one

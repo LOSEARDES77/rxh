@@ -67,6 +67,17 @@ impl<S> Timed<S> {
             },
         }
     }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    /// Read and write limits, in that order.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn limits(&self) -> (Option<Duration>, Option<Duration>) {
+        (self.read.limit, self.write.limit)
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Timed<S> {
@@ -132,6 +143,18 @@ impl Stamp {
         self.written.load(Ordering::Relaxed)
     }
 
+    /// Counts `bytes` read from the watched stream, as traffic.
+    pub(crate) fn record_read(&self, bytes: u64) {
+        self.touch();
+        self.read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Counts `bytes` written to the watched stream, as traffic.
+    pub(crate) fn record_written(&self, bytes: u64) {
+        self.touch();
+        self.written.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     fn touch(&self) {
         let millis = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_millis.store(millis, Ordering::Relaxed);
@@ -171,6 +194,11 @@ impl<S> Watched<S> {
     pub(crate) fn new(inner: S, stamp: Arc<Stamp>) -> Self {
         Self { inner, stamp }
     }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn get_ref(&self) -> &S {
+        &self.inner
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
@@ -183,9 +211,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
         let before = buf.filled().len();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
         if result.is_ready() {
-            this.stamp.touch();
             let read = buf.filled().len().saturating_sub(before);
-            this.stamp.read.fetch_add(read as u64, Ordering::Relaxed);
+            this.stamp.record_read(read as u64);
         }
         result
     }
@@ -199,13 +226,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(written) = &result {
-            this.stamp.touch();
-            if let Ok(written) = written {
-                this.stamp
-                    .written
-                    .fetch_add(*written as u64, Ordering::Relaxed);
-            }
+        match &result {
+            Poll::Ready(Ok(written)) => this.stamp.record_written(*written as u64),
+            Poll::Ready(Err(_)) => this.stamp.touch(),
+            Poll::Pending => {}
         }
         result
     }

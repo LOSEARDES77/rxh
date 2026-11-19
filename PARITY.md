@@ -234,7 +234,7 @@ parity. Grouped by area, roughly in priority order inside each group.
 | Redirect and rewrite rules with regex | Nginx `rewrite`, Traefik `RedirectRegex`/`ReplacePath` | HTTP to HTTPS, `redirect` and `rewrite` with placeholders exist; regex captures do not. |
 | Custom error pages per status | Traefik `Errors`, Nginx `error_page`, NPM | |
 | gRPC health checks and gRPC-Web | Envoy, Traefik | |
-| Splice/zero-copy for layer 4 on Linux | HAProxy | |
+| Splice/zero-copy for layer 4 on Linux | HAProxy | Done: `splice(2)` on `tcp` servers when both sides are plain TCP; buffered copy with TLS, `unix/` backends and on other systems. Always on, no option like `nosplice`. |
 
 ### Observability and operations
 

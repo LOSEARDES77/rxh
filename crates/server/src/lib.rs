@@ -25,6 +25,8 @@ mod metrics;
 mod proxy_protocol;
 mod registry;
 mod server;
+#[cfg(target_os = "linux")]
+mod splice;
 mod stream;
 mod tcp;
 mod timeout;

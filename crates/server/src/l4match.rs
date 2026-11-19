@@ -396,6 +396,17 @@ impl<S> Rewind<S> {
             inner,
         }
     }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    /// True while reads return the prefix.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn has_prefix(&self) -> bool {
+        !self.prefix.is_empty()
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Rewind<S> {

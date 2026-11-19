@@ -85,7 +85,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
       cloning addresses and host names on every pick. 84 allocator calls per
       request down to 26, and 7% more requests per second in the
       `throughput` scenario: docs/profiling.md.
-- [ ] `splice` zero copy for TCP on Linux.
+- [x] `splice` zero copy for TCP on Linux, when both sides are plain TCP;
+      buffered copy otherwise and on other systems.
 - [ ] Upstream HTTP/2 connection pool with more than one connection per
       backend.
 - [x] More benchmark scenarios: TLS termination, HTTP/2 clients, large
