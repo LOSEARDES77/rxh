@@ -157,8 +157,9 @@ match no route use the listener name).
 
 `tls = "auto"` on an `http` server obtains a certificate for every name of
 its `host` list from an ACME certificate authority (Let's Encrypt by default)
-with the HTTP-01 challenge (default) or the TLS-ALPN-01 challenge, like
-Caddy's automatic HTTPS:
+with the HTTP-01 challenge (default), the TLS-ALPN-01 challenge or the
+[DNS-01 challenge](#dns-01-and-wildcard-certificates) (the one for wildcard
+names), like Caddy's automatic HTTPS:
 
 ```toml
 [acme]
@@ -179,10 +180,11 @@ forward = "@app"
 | `storage` | `"rxh-data/certificates"` | Directory of the account and the certificates, relative to the directory of the main configuration file (to the current directory for `rxh reverse-proxy` and other runs without a file). |
 | `renew_before` | `"30d"` | Certificates expiring within this time are renewed. |
 | `http_port` | `80` | Plain HTTP port: the CA connects to it for HTTP-01 challenges, and [`https_redirect`](#http-to-https-redirect) listens on it. Change it only behind a port forward or for a test CA. |
-| `challenge` | `"http-01"` | How the CA validates the names: `"http-01"` (a request to port 80) or `"tls-alpn-01"` (a TLS handshake on port 443, no plain HTTP port needed). |
+| `challenge` | `"http-01"` | How the CA validates the names: `"http-01"` (a request to port 80) or `"tls-alpn-01"` (a TLS handshake on port 443, no plain HTTP port needed) or `"dns-01"` (a TXT record created at the DNS provider of [`[acme.dns]`](#dns-01-and-wildcard-certificates); no open port needed, and the only one for wildcards). |
 
 - Every name in `host` must be an exact, fully qualified domain name (no
-  wildcard, IP address or `localhost`); a `tls = "auto"` server without
+  IP address or `localhost`; a wildcard like `*.example.com` only with
+  `challenge = "dns-01"`); a `tls = "auto"` server without
   `host` is a validation error. Each name gets its own certificate and key.
 - Every `http` listener answers `GET /.well-known/acme-challenge/TOKEN` for
   pending challenges before routing. Who answers on `http_port`:
@@ -228,8 +230,8 @@ forward = "@app"
   ```
 
   A TLS terminating balancer or CDN in front of rxh breaks TLS-ALPN-01 (the
-  CA's handshake must arrive untouched); use HTTP-01 there. Only one
-  challenge type is used, there is no fallback to the other.
+  CA's handshake must arrive untouched); use HTTP-01 or DNS-01 there. Only
+  one challenge type is used, there is no fallback to another.
 - On start and reload, stored certificates are served right away. Missing
   ones and ones expiring within `renew_before` are obtained in the
   background and swapped in without a restart; a daily check renews them.
@@ -249,6 +251,78 @@ forward = "@app"
 - Only the daemon (`rxh run`, `rxh start`) manages certificates; an embedded
   `Master` serves `tls = "auto"` names only once a certificate is set through
   `Master::cert_resolvers`.
+
+### DNS-01 and wildcard certificates
+
+With `challenge = "dns-01"` the CA looks up a TXT record at
+`_acme-challenge.NAME`. rxh creates it through the API of the DNS provider
+in `[acme.dns]`, waits `propagation_wait`, asks the CA to validate and
+deletes the record afterwards (also when the order fails or times out).
+Nothing has to be reachable from the internet, and it is the only challenge
+that certifies wildcards:
+
+```toml
+[acme]
+email = "ops@example.com"
+challenge = "dns-01"
+
+[acme.dns]
+provider = "cloudflare"
+api_token = "..."
+
+[[server]]
+listen = "0.0.0.0:443"
+host = ["*.example.com", "example.com"]   # two certificates
+tls = "auto"
+forward = "@app"
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `provider` | required | `"cloudflare"`, `"route53"` or `"rfc2136"`. |
+| `propagation_wait` | `"60s"` | Time between creating the record and asking the CA to validate, for the record to reach every name server of the zone. `"0s"` is allowed. |
+| `api_token` | | Cloudflare (required): API token with the `Zone:Read` and `DNS:Edit` permissions for the zones. |
+| `access_key_id`, `secret_access_key` | | Route 53 (required): access key of an IAM user allowed `route53:ListHostedZonesByName` and `route53:ChangeResourceRecordSets`. |
+| `zone_id` | | Cloudflare, Route 53: identifier of the zone, instead of looking it up by name. Needed for a Cloudflare token without `Zone:Read`, or when a public and a private Route 53 zone share a name. Only for configurations whose names are all in that zone. |
+| `api_url` | the public API | Cloudflare, Route 53: base URL of the API (`http://` or `https://`), for tests and compatible services. |
+| `server` | | RFC 2136 (required): primary name server of the zones, `"host"` or `"host:port"` (port 53; an IPv6 address with a port in brackets). Updates and the zone lookup go over TCP. |
+| `tsig_key`, `tsig_secret` | | RFC 2136: name and base64 secret of the TSIG key that signs the updates (HMAC-SHA256, as `tsig-keygen` makes). Without them updates are unsigned, for servers that allow them by address. |
+
+```toml
+[acme.dns]
+provider = "route53"
+access_key_id = "AKIA..."
+secret_access_key = "..."
+```
+
+```toml
+[acme.dns]
+provider = "rfc2136"          # BIND, Knot, PowerDNS, ...
+server = "ns1.example.com"
+tsig_key = "rxh-key"
+tsig_secret = "bWFkZSB3aXRoIHRzaWcta2V5Z2Vu..."
+```
+
+- Keys of another provider are a validation error, as is
+  `challenge = "dns-01"` without `[acme.dns]`. `[acme.dns]` with another
+  challenge is accepted and unused.
+- A wildcard is one leading label (`*.example.com`). It gets its own
+  certificate, which does not cover `example.com`: list both for both. `host`
+  wildcards match several labels (`a.b.example.com`), certificates only one,
+  so deeper names fail verification in the client.
+- The zone is found by asking the provider for the record name and each of
+  its parents, longest first, so delegated subzones and names of several
+  zones work. A `_acme-challenge` CNAME to another zone is not followed.
+- The secrets are in the configuration file: keep it private (`chmod 600`).
+  `GET /config` on the admin API shows them as `***`.
+- One provider for all names. DNS-01 orders run one at a time. Route 53
+  replaces other TXT values at the challenge name while validating, and only
+  the `aws` partition is supported (no session tokens, China or GovCloud).
+- The HTTP to HTTPS redirect still listens on `http_port` unless
+  `https_redirect = false`; the challenge itself opens no port.
+- A wildcard is stored as `wildcard_.example.com`.
+
+### Certificate storage
 
 Storage layout (files `0600`, directories `0700` on unix; private keys are
 never logged):

@@ -9,6 +9,13 @@ Changed.
 
 ### Added
 
+- `[acme] challenge = "dns-01"` with the `[acme.dns]` table (`provider`
+  `"cloudflare"`, `"route53"` or `"rfc2136"`, their credentials, `zone_id`,
+  `api_url`, `propagation_wait`): `tls = "auto"` certificates validated with
+  the ACME DNS-01 challenge through a TXT record at the DNS provider, with
+  no open port. It allows wildcard names (`host = "*.example.com"`) on
+  `tls = "auto"` servers, stored as `wildcard_.example.com`. The admin API
+  shows the provider secrets as `***`.
 - `[acme] challenge = "tls-alpn-01"` (default `"http-01"`): `tls = "auto"`
   certificates validated with the ACME TLS-ALPN-01 challenge, answered by
   the TLS listener itself on port 443, so no plain HTTP port is needed.
@@ -200,6 +207,13 @@ Changed.
   same PID file now fails in the foreground ("is locked, is rxh already
   running?") instead of exiting silently in the background, and the PID file
   is written before `rxh start` returns.
+
+### Fixed
+
+- Reloading a configuration with a UDP server could fail with "Address
+  already in use" and keep the old configuration: the stopped listener
+  reported its shutdown while its sessions still held the socket. The
+  sessions now end before the listener reports that it has stopped.
 
 ## 0.2.0 (unreleased)
 

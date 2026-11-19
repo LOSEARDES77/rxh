@@ -13,17 +13,11 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use rcgen::CertifiedKey;
 use rxh_server::Master;
+use rxh_test_util::free_address;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-
-/// A port that is free right now. Port 0 cannot be used because both
-/// servers must bind the same address.
-fn free_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
-}
 
 async fn get_host(address: SocketAddr, host: &str) -> (StatusCode, Bytes) {
     let request = Request::get("/")

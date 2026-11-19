@@ -8,6 +8,7 @@
 mod acme;
 mod admin;
 mod daemon;
+mod dns01;
 mod dynamic;
 mod error;
 mod files;

@@ -13,14 +13,10 @@ use hyper::{HeaderMap, Method, Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use rxh_server::Daemon;
 use rxh_server::config::Config;
+use rxh_test_util::free_address;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-
-fn free_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
-}
 
 /// Sends one request to the admin API and returns status, headers and the
 /// body parsed as JSON (`Value::Null` when it is not JSON).
@@ -92,13 +88,15 @@ async fn body_of(address: SocketAddr) -> String {
 async fn routes_answer_with_status_codes_and_json() {
     let first = util::backend("first").await;
     let second = util::backend("second").await;
-    let (admin, web) = (free_port(), free_port());
+    let (admin, web) = (free_address(), free_address());
     let directory = tempfile::tempdir().expect("temp dir");
     let config_path = directory.path().join("rxh.toml");
     fs::write(
         &config_path,
         format!(
             "[admin]\nlisten = \"{admin}\"\n\
+             [acme.dns]\nprovider = \"rfc2136\"\nserver = \"127.0.0.1\"\n\
+             tsig_key = \"rxh.\"\ntsig_secret = \"c2VjcmV0\"\n\
              [upstream.api]\nbackends = [\"{first}\"]\n\
              [[server]]\nname = \"web\"\nlisten = \"{web}\"\nforward = \"@api\"\n"
         ),
@@ -185,6 +183,9 @@ async fn routes_answer_with_status_codes_and_json() {
     assert_eq!(status, StatusCode::OK);
     let backends = config["upstream"]["api"]["backends"].to_string();
     assert!(backends.contains(&second.to_string()), "{config}");
+    // The secrets of the DNS provider never leave the process.
+    assert_eq!(config["acme"]["dns"]["tsig_key"], "rxh.");
+    assert_eq!(config["acme"]["dns"]["tsig_secret"], "***");
 
     // Removing: by query, by JSON body, unknown members and pools.
     let by_query = format!("/pools/api/upstreams?address={second}");
@@ -214,7 +215,7 @@ async fn routes_answer_with_status_codes_and_json() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_host_or_origin_is_forbidden() {
-    let admin = free_port();
+    let admin = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let config_path = directory.path().join("rxh.toml");
     fs::write(&config_path, format!("[admin]\nlisten = \"{admin}\"\n")).expect("write");
@@ -249,7 +250,7 @@ async fn foreign_host_or_origin_is_forbidden() {
 async fn reload_applies_valid_files_and_rejects_broken_ones() {
     let first = util::backend("first").await;
     let second = util::backend("second").await;
-    let (admin, web) = (free_port(), free_port());
+    let (admin, web) = (free_address(), free_address());
     let directory = tempfile::tempdir().expect("temp dir");
     let config_path = directory.path().join("rxh.toml");
     let config = |backend: SocketAddr| {
@@ -294,7 +295,7 @@ async fn failed_reload_after_stopping_the_old_listeners_restores_them() {
     let old = util::backend("old").await;
     let new = util::backend("new").await;
     let echo = util::udp_echo("e:").await;
-    let (admin, web) = (free_port(), free_port());
+    let (admin, web) = (free_address(), free_address());
     // UDP listeners bind without SO_REUSEPORT: a busy port fails with
     // `AddrInUse`, which makes the daemon stop the old generation first.
     let squatter = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -337,7 +338,7 @@ async fn failed_reload_after_stopping_the_old_listeners_restores_them() {
 async fn udp_listener_is_rebound_on_reload() {
     let one = util::udp_echo("one:").await;
     let two = util::udp_echo("two:").await;
-    let admin = free_port();
+    let admin = free_address();
     let listen = UdpSocket::bind("127.0.0.1:0")
         .expect("bind")
         .local_addr()
@@ -370,17 +371,24 @@ async fn udp_listener_is_rebound_on_reload() {
     }
     util::eventually(async || exchange(listen).await == "one:hi").await;
 
-    // The same UDP port cannot be bound twice, so this reload goes through
-    // the stop-then-start path.
-    fs::write(&config_path, config(two)).expect("write");
-    let (status, json) = send(admin, Method::POST, "/reload", "").await;
-    assert_eq!(status, StatusCode::OK, "{json}");
-    util::eventually(async || exchange(listen).await == "two:hi").await;
+    // The same UDP port cannot be bound twice, so each reload goes through
+    // the stop-then-start path. The open sessions share the listening socket:
+    // the stop must close it with them, or the start finds the port in use.
+    for (backend, answer) in [(two, "two:hi"), (one, "one:hi")].repeat(4) {
+        let clients: Vec<_> = (0..16).map(|_| tokio::spawn(exchange(listen))).collect();
+        for client in clients {
+            client.await.expect("client");
+        }
+        fs::write(&config_path, config(backend)).expect("write");
+        let (status, json) = send(admin, Method::POST, "/reload", "").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        util::eventually(async || exchange(listen).await == answer).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_ends_the_daemon_and_memory_configs_cannot_reload() {
-    let admin = free_port();
+    let admin = free_address();
     let config = Config::from_toml(&format!("[admin]\nlisten = \"{admin}\"\n")).expect("valid");
     let daemon = tokio::task::spawn(Daemon::from_config(config).run());
     util::eventually(async || TcpStream::connect(admin).await.is_ok()).await;

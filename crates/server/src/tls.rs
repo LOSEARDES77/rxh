@@ -158,7 +158,7 @@ impl CertResolver {
             && certificates
                 .reserved
                 .iter()
-                .any(|reserved| reserved.eq_ignore_ascii_case(name))
+                .any(|reserved| HostPattern::new(reserved).is_ok_and(|host| host.matches(name)))
         {
             return None;
         }
@@ -316,6 +316,17 @@ mod tests {
             .set(&[String::from("auto.test")], Arc::clone(&keys[0]))
             .unwrap();
         assert!(is(resolver.select(Some("AUTO.test")), &keys[0]));
+
+        // A reserved wildcard covers its subdomains, not the bare domain.
+        resolver.reserve(&[String::from("*.wild.test")]);
+        assert!(resolver.select(Some("x.Wild.test")).is_none());
+        assert!(is(resolver.select(Some("wild.test")), &keys[0]));
+        let (wild, _) = resolver_with(&[&["*.wild.test"]]);
+        let wild = wild.select(Some("x.wild.test")).unwrap();
+        resolver
+            .set(&[String::from("*.wild.test")], Arc::clone(&wild))
+            .unwrap();
+        assert!(is(resolver.select(Some("x.wild.test")), &wild));
     }
 
     #[test]

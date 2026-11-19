@@ -1,6 +1,6 @@
 //! Automatic HTTPS: obtains and renews the certificates of `tls = "auto"`
-//! servers with ACME HTTP-01 or TLS-ALPN-01 (`[acme] challenge`) and swaps
-//! them into the TLS listeners.
+//! servers with ACME HTTP-01, TLS-ALPN-01 or DNS-01 (`[acme] challenge`) and
+//! swaps them into the TLS listeners.
 //!
 //! Files under `[acme] storage`, all written with mode 0600 in 0700
 //! directories on unix:
@@ -12,7 +12,8 @@
 //! ```
 //!
 //! `<CA>` is the `ca` URL without `https://`, every character other than
-//! letters, digits, `.` and `-` replaced by `_`. Certificates are kept per CA,
+//! letters, digits, `.` and `-` replaced by `_`. `<domain>` of a wildcard
+//! `*.example.com` is `wildcard_.example.com`. Certificates are kept per CA,
 //! so switching `ca` (staging to production) obtains new ones instead of
 //! serving the old CA's.
 //!
@@ -32,6 +33,13 @@
 //! TLS-ALPN-01 needs no port of its own: the TLS listeners of the
 //! `tls = "auto"` servers answer a handshake with ALPN `acme-tls/1` with the
 //! pending challenge certificate of the name and close the connection.
+//!
+//! DNS-01 needs no port either: the TXT record `_acme-challenge.NAME` is
+//! created at the DNS provider of `[acme.dns]` (see [`crate::dns01`]), the
+//! order waits `propagation_wait` and the record is deleted when the
+//! validation ends, however it ends. It is the only challenge for wildcard
+//! names. DNS-01 orders of the whole process run one at a time, because a
+//! wildcard and its base name are validated at the same record name.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -52,12 +60,13 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
     NewOrder, OrderStatus, RetryPolicy,
 };
-use rxh_core::config::{self, AcmeChallenge, Config, Protocol, Tls};
+use rxh_core::config::{self, AcmeChallenge, AcmeDns, Config, Protocol, Tls};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 use tokio_rustls::rustls::sign::CertifiedKey;
 
+use crate::dns01;
 use crate::http::body;
 use crate::http::response::{self, BoxResponse};
 use crate::master::Master;
@@ -93,6 +102,9 @@ pub(crate) const TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 /// wide, like [`CHALLENGES`].
 static TLS_CHALLENGES: LazyLock<RwLock<HashMap<String, Arc<CertifiedKey>>>> =
     LazyLock::new(RwLock::default);
+
+/// Held by the DNS-01 order that has records published.
+static DNS_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Orders in flight and recent failures, by name, for every generation.
 static ISSUANCE: LazyLock<Mutex<Issuance>> = LazyLock::new(Mutex::default);
@@ -156,6 +168,8 @@ struct Published {
     tokens: Vec<String>,
     /// Names with a TLS-ALPN-01 certificate.
     names: Vec<String>,
+    /// DNS-01 TXT records and the provider settings they were created with.
+    records: Vec<(AcmeDns, dns01::Record)>,
 }
 
 impl Published {
@@ -173,6 +187,19 @@ impl Published {
             .expect("nothing panics while holding the challenge lock")
             .insert(name.to_owned(), certificate);
         self.names.push(name.to_owned());
+    }
+
+    /// Deletes the DNS-01 records now. What is left when the order is
+    /// cancelled is deleted by a task started on drop.
+    async fn withdraw_records(&mut self) {
+        for (dns, record) in self.records.drain(..) {
+            if let Err(err) = dns01::withdraw(&dns, &record).await {
+                eprintln!(
+                    "ACME => Deleting a DNS-01 record at {}: {err}",
+                    dns.provider
+                );
+            }
+        }
     }
 }
 
@@ -193,6 +220,13 @@ impl Drop for Published {
             for name in &self.names {
                 challenges.remove(name);
             }
+        }
+        if !self.records.is_empty()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let mut rest = Self::default();
+            rest.records = std::mem::take(&mut self.records);
+            runtime.spawn(async move { rest.withdraw_records().await });
         }
     }
 }
@@ -319,10 +353,15 @@ impl Storage {
     }
 
     /// Directory of `domain`, refusing names that are not domain names so a
-    /// name can never escape `root`.
+    /// name can never escape `root`. A wildcard gets a name that every file
+    /// system accepts.
     fn domain_dir(&self, domain: &str) -> io::Result<PathBuf> {
-        config::validate_domain(domain).map_err(io::Error::other)?;
-        Ok(self.root.join(&self.ca_name).join(domain))
+        let (base, dir) = match domain.strip_prefix("*.") {
+            Some(base) => (base, format!("wildcard_.{base}")),
+            None => (domain, domain.to_owned()),
+        };
+        config::validate_domain(base).map_err(io::Error::other)?;
+        Ok(self.root.join(&self.ca_name).join(dir))
     }
 
     fn account_path(&self) -> PathBuf {
@@ -411,6 +450,7 @@ impl Domain {
 }
 
 /// Who answers the challenges: for HTTP-01, whoever listens on `http_port`.
+/// DNS-01 is answered by the DNS provider, with no listener at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChallengePort {
     /// A listener of the configuration: a plain `http` server for HTTP-01,
@@ -427,7 +467,7 @@ enum ChallengePort {
 
 impl ChallengePort {
     fn of(config: &Config) -> Self {
-        if config.acme.challenge == AcmeChallenge::TlsAlpn01 {
+        if config.acme.challenge != AcmeChallenge::Http01 {
             return Self::Served;
         }
         let port = config.acme.http_port;
@@ -595,7 +635,7 @@ impl Manager {
         // Detached: a reload aborts this task, not the orders. The deadline
         // frees the names and the challenge port even if the CA stalls.
         let count = u32::try_from(due.len()).unwrap_or(u32::MAX);
-        let deadline = ACCOUNT_TIMEOUT + ISSUE_TIMEOUT.saturating_mul(count);
+        let deadline = ACCOUNT_TIMEOUT + self.issue_timeout().saturating_mul(count);
         let round = self.clone().issue_round(due);
         let round = tokio::task::spawn(async move {
             let result = tokio::time::timeout(deadline, round).await;
@@ -651,16 +691,11 @@ impl Manager {
             }
         };
 
-        let challenge = self.settings.challenge;
         let mut ok = true;
         for (domain, mut guard) in due {
             println!("ACME => Obtaining a certificate for {}", domain.name);
-            let result = match tokio::time::timeout(
-                ISSUE_TIMEOUT,
-                issue(&account, &domain, challenge),
-            )
-            .await
-            {
+            let order = issue(&account, &domain, &self.settings);
+            let result = match tokio::time::timeout(self.issue_timeout(), order).await {
                 Ok(result) => result,
                 Err(_) => Err(String::from("timed out")),
             };
@@ -692,6 +727,15 @@ impl Manager {
             }
         }
         ok
+    }
+
+    /// Upper bound for one order: [`ISSUE_TIMEOUT`] plus the DNS-01
+    /// propagation wait, which is not the CA's time.
+    fn issue_timeout(&self) -> Duration {
+        match (&self.settings.dns, self.settings.challenge) {
+            (Some(dns), AcmeChallenge::Dns01) => ISSUE_TIMEOUT + dns.propagation_wait,
+            _ => ISSUE_TIMEOUT,
+        }
     }
 
     /// Loads the stored account for the CA, or registers a new one (agreeing
@@ -751,14 +795,19 @@ fn install(domain: &Domain, cert: &[u8], key: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs one order for `domain`, validated with `challenge`. Returns the PEM
-/// certificate chain and the PEM private key.
+/// Runs one order for `domain`, validated with the challenge of `settings`.
+/// Returns the PEM certificate chain and the PEM private key.
 async fn issue(
     account: &Account,
     domain: &Domain,
-    challenge: AcmeChallenge,
+    settings: &config::Acme,
 ) -> Result<(String, String), String> {
     let error = |err: instant_acme::Error| err.to_string();
+    let challenge = settings.challenge;
+    let _one_dns_order = match challenge {
+        AcmeChallenge::Dns01 => Some(DNS_ORDER.lock().await),
+        AcmeChallenge::Http01 | AcmeChallenge::TlsAlpn01 => None,
+    };
     let identifiers = [Identifier::Dns(domain.name.clone())];
     let mut order = account
         .new_order(&NewOrder::new(&identifiers))
@@ -795,13 +844,33 @@ async fn issue(
                 published.add_certificate(&domain.name, certificate);
                 offered
             }
+            AcmeChallenge::Dns01 => {
+                let dns = settings.dns.as_ref().ok_or("[acme.dns] is missing")?;
+                let offered = authorization
+                    .challenge(ChallengeType::Dns01)
+                    .ok_or("the CA offers no dns-01 challenge")?;
+                let name = format!("_acme-challenge.{}", domain.name.trim_start_matches("*."));
+                let value = offered.key_authorization().dns_value();
+                let record = dns01::publish(dns, &name, &value)
+                    .await
+                    .map_err(|err| format!("TXT record {name} at {}: {err}", dns.provider))?;
+                published.records.push((dns.clone(), record));
+                println!(
+                    "ACME => TXT record {name} created at {}, validating in {:?}",
+                    dns.provider, dns.propagation_wait
+                );
+                tokio::time::sleep(dns.propagation_wait).await;
+                offered
+            }
         };
         offered.set_ready().await.map_err(error)?;
     }
 
     let retries = RetryPolicy::new().timeout(Duration::from_secs(120));
-    let status = order.poll_ready(&retries).await.map_err(error)?;
+    let status = order.poll_ready(&retries).await;
+    published.withdraw_records().await;
     drop(published);
+    let status = status.map_err(error)?;
     if status != OrderStatus::Ready {
         return Err(format!("order is {status:?} after validation"));
     }
@@ -1046,6 +1115,13 @@ mod tests {
             .count();
         assert_eq!(leftovers, 2, "no temporary files are left behind");
         assert!(storage.save("../escape", b"C", b"K").is_err());
+        assert!(storage.save("*.../escape", b"C", b"K").is_err());
+        storage.save("*.a.test", b"WILD", b"KEY").unwrap();
+        assert_eq!(
+            fs::read(dir.path().join(ca_dir).join("wildcard_.a.test/cert.pem")).unwrap(),
+            b"WILD"
+        );
+        assert_eq!(storage.load("*.a.test").unwrap().0, b"WILD");
         assert!(storage.load("..").is_err());
 
         assert_eq!(
@@ -1175,6 +1251,14 @@ mod tests {
         );
         assert_eq!(
             port(&format!(
+                "challenge = \"dns-01\"\n{}[acme.dns]\nprovider = \"cloudflare\"\n\
+                 api_token = \"t\"\n",
+                server("0.0.0.0:8080", "protocol = \"tcp\"")
+            )),
+            ChallengePort::Served
+        );
+        assert_eq!(
+            port(&format!(
                 "{}{}",
                 server("10.0.0.1:8080", "protocol = \"tcp\""),
                 server("10.0.0.2:8080", "")
@@ -1237,6 +1321,40 @@ mod tests {
 
         drop(published);
         assert!(challenge_response(&Method::GET, path).is_none());
+    }
+
+    #[tokio::test]
+    async fn dns_records_are_deleted_when_the_order_ends_or_is_cancelled() {
+        let server = rxh_test_util::DnsServer::spawn("127.0.0.1:0", "a.test").await;
+        let config = Config::from_toml(&format!(
+            "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+             [acme.dns]\nprovider = \"rfc2136\"\nserver = \"{}\"\n",
+            server.address()
+        ))
+        .unwrap();
+        let dns = config.acme.dns.unwrap();
+        let name = "_acme-challenge.a.test";
+        let publish = async |value: &str| {
+            let record = dns01::publish(&dns, name, value).await.unwrap();
+            let mut published = Published::default();
+            published.records.push((dns.clone(), record));
+            published
+        };
+
+        let mut published = publish("ended").await;
+        assert_eq!(server.txt(name), ["ended"]);
+        published.withdraw_records().await;
+        assert!(server.txt(name).is_empty());
+
+        // A timed out order only drops what it published.
+        drop(publish("cancelled").await);
+        for _ in 0..200 {
+            if server.txt(name).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(server.txt(name).is_empty(), "deleted in the background");
     }
 
     /// TLS handshake with `address` for `name`, offering only `alpn`.

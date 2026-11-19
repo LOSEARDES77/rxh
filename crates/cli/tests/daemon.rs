@@ -11,14 +11,10 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::Response;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use rxh_test_util::free_address;
 use tokio::net::{TcpListener, TcpStream};
 
 const RXH: &str = env!("CARGO_BIN_EXE_rxh");
-
-fn free_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address")
-}
 
 async fn backend(tag: &'static str) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -110,9 +106,9 @@ async fn cli_manages_a_running_daemon() {
     let first = backend("first").await;
     let second = backend("second").await;
     let tcp_backend = backend("over-tcp").await;
-    let admin = free_port();
-    let web = free_port();
-    let tcp = free_port();
+    let admin = free_address();
+    let web = free_address();
+    let tcp = free_address();
 
     let directory = tempfile::tempdir().expect("temp dir");
     let dir = directory.path();
@@ -217,8 +213,8 @@ async fn cli_manages_a_running_daemon() {
 async fn sighup_and_reload_swap_configuration_without_downtime() {
     let first = backend("backend-1").await;
     let second = backend("backend-2").await;
-    let admin = free_port();
-    let web = free_port();
+    let admin = free_address();
+    let web = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let dir = directory.path();
     let config = |backend: SocketAddr| {
@@ -286,7 +282,7 @@ fn spawn_rxh(directory: &Path, args: &[&str]) -> Daemon {
 async fn file_server_serves_the_directory_without_a_config() {
     let directory = tempfile::tempdir().expect("temp dir");
     std::fs::write(directory.path().join("hello.txt"), "hi there").expect("write");
-    let listen = free_port();
+    let listen = free_address();
 
     let output = Command::new(RXH)
         .args(["file-server", "--root", "/definitely/not/here"])
@@ -315,7 +311,7 @@ async fn file_server_serves_the_directory_without_a_config() {
 #[tokio::test(flavor = "multi_thread")]
 async fn reverse_proxy_forwards_to_the_backends() {
     let first = backend("proxied").await;
-    let listen = free_port();
+    let listen = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
 
     let _proxy = spawn_rxh(
@@ -335,8 +331,8 @@ async fn reverse_proxy_forwards_to_the_backends() {
 async fn includes_are_edited_in_the_file_that_defines_them() {
     let first = backend("first").await;
     let second = backend("second").await;
-    let admin = free_port();
-    let web = free_port();
+    let admin = free_address();
+    let web = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let dir = directory.path();
     std::fs::create_dir(dir.join("conf.d")).expect("mkdir");
@@ -431,10 +427,10 @@ fn assert_failure(output: &Output) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn status_and_listings_render_tables() {
     let live = backend("live").await;
-    let dead = free_port();
-    let spare = free_port();
-    let admin = free_port();
-    let web = free_port();
+    let dead = free_address();
+    let spare = free_address();
+    let admin = free_address();
+    let web = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let dir = directory.path();
     std::fs::write(
@@ -561,7 +557,7 @@ async fn status_and_listings_render_tables() {
 #[test]
 fn commands_fall_back_to_the_file_without_a_daemon() {
     // Nothing listens on this address.
-    let admin = free_port();
+    let admin = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let dir = directory.path();
     std::fs::write(
@@ -697,8 +693,8 @@ async fn start_reload_and_stop_through_the_pid_file() {
     let first = backend("backend-1").await;
     let second = backend("backend-2").await;
     // The admin API is disabled, so the CLI falls back to the PID file.
-    let unused_admin = free_port();
-    let web = free_port();
+    let unused_admin = free_address();
+    let web = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let dir = directory.path();
     let config = |backend: SocketAddr| {
@@ -856,8 +852,8 @@ async fn per_core_runtime_serves_reloads_and_stops() {
     });
     let second = backend("second").await;
 
-    let admin = free_port();
-    let web = free_port();
+    let admin = free_address();
+    let web = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let dir = directory.path();
     let config = |runtime: &str, backend: SocketAddr| {

@@ -419,7 +419,12 @@ impl Config {
                     ));
                 }
                 for host in &server.host {
-                    validate_domain(host).map_err(|err| {
+                    // Only DNS-01 can validate a wildcard.
+                    let name = match host.strip_prefix("*.") {
+                        Some(base) if self.acme.challenge == AcmeChallenge::Dns01 => base,
+                        _ => host,
+                    };
+                    validate_domain(name).map_err(|err| {
                         ConfigError::Invalid(format!("{label}: tls = \"auto\": {err}"))
                     })?;
                 }
@@ -2406,8 +2411,8 @@ pub struct PassiveHealth {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tls {
-    /// Certificates obtained and renewed with ACME (HTTP-01 or TLS-ALPN-01)
-    /// for every name of the server's `host` list, see [`Acme`].
+    /// Certificates obtained and renewed with ACME (HTTP-01, TLS-ALPN-01 or
+    /// DNS-01) for every name of the server's `host` list, see [`Acme`].
     Auto,
 
     /// A PEM certificate chain and its PEM private key, read from files.
@@ -2507,6 +2512,10 @@ pub struct Acme {
     /// How the CA validates the names.
     #[serde(default)]
     pub challenge: AcmeChallenge,
+
+    /// The `[acme.dns]` table: the DNS provider of `challenge = "dns-01"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<AcmeDns>,
 }
 
 /// The `challenge` key of `[acme]`.
@@ -2522,6 +2531,205 @@ pub enum AcmeChallenge {
     /// HTTP port.
     #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
+
+    /// The CA looks up a TXT record at `_acme-challenge.NAME`, which rxh
+    /// creates through the API of the DNS provider in [`AcmeDns`]. The only
+    /// challenge that certifies wildcards; needs no open port.
+    #[serde(rename = "dns-01")]
+    Dns01,
+}
+
+/// The `provider` key of `[acme.dns]`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsProvider {
+    /// Cloudflare API, with `api_token`.
+    Cloudflare,
+
+    /// Amazon Route 53, with `access_key_id` and `secret_access_key`.
+    Route53,
+
+    /// DNS UPDATE (RFC 2136) sent to `server`, signed with TSIG if `tsig_key`
+    /// and `tsig_secret` are set.
+    Rfc2136,
+}
+
+impl fmt::Display for DnsProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Route53 => "route53",
+            Self::Rfc2136 => "rfc2136",
+        })
+    }
+}
+
+/// The `[acme.dns]` table: where DNS-01 challenge records are created.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeDns {
+    /// Who hosts the zones of the certified names.
+    pub provider: DnsProvider,
+
+    /// Cloudflare API token with the `Zone:Read` and `DNS:Edit` permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
+
+    /// Route 53: access key of an IAM user allowed to list hosted zones and
+    /// change record sets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+
+    /// Route 53: secret of `access_key_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+
+    /// Cloudflare and Route 53: identifier of the zone, instead of looking
+    /// it up by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
+
+    /// Cloudflare and Route 53: base URL of the API instead of the public
+    /// one, for tests and compatible services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+
+    /// RFC 2136: primary name server of the zone, `host` or `host:port`
+    /// (port 53 by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+
+    /// RFC 2136: name of the TSIG key (HMAC-SHA256) that signs the updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsig_key: Option<String>,
+
+    /// RFC 2136: base64 secret of `tsig_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsig_secret: Option<String>,
+
+    /// Time between creating the record and asking the CA to validate, for
+    /// the record to reach every name server of the zone.
+    #[serde(default = "default::acme_dns_propagation_wait", with = "duration")]
+    pub propagation_wait: Duration,
+}
+
+impl AcmeDns {
+    /// Replaces the secrets with `***`, for output that leaves the process.
+    pub fn redact(&mut self) {
+        let secrets = [
+            &mut self.api_token,
+            &mut self.secret_access_key,
+            &mut self.tsig_secret,
+        ];
+        let present = secrets.into_iter().flatten();
+        for secret in present {
+            *secret = String::from("***");
+        }
+    }
+
+    /// The decoded `tsig_secret`, if there is one.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the secret is not base64.
+    pub fn tsig_secret_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        self.tsig_secret
+            .as_deref()
+            .map(|secret| decode_base64(secret).ok_or_else(|| String::from("is not base64")))
+            .transpose()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        use DnsProvider::*;
+
+        let provider = self.provider;
+        let keys: [(
+            &str,
+            Option<&String>,
+            &[DnsProvider],
+            /* required= */ bool,
+        ); 8] = [
+            ("api_token", self.api_token.as_ref(), &[Cloudflare], true),
+            (
+                "access_key_id",
+                self.access_key_id.as_ref(),
+                &[Route53],
+                true,
+            ),
+            (
+                "secret_access_key",
+                self.secret_access_key.as_ref(),
+                &[Route53],
+                true,
+            ),
+            (
+                "zone_id",
+                self.zone_id.as_ref(),
+                &[Cloudflare, Route53],
+                false,
+            ),
+            (
+                "api_url",
+                self.api_url.as_ref(),
+                &[Cloudflare, Route53],
+                false,
+            ),
+            ("server", self.server.as_ref(), &[Rfc2136], true),
+            ("tsig_key", self.tsig_key.as_ref(), &[Rfc2136], false),
+            ("tsig_secret", self.tsig_secret.as_ref(), &[Rfc2136], false),
+        ];
+        for (key, value, providers, required) in keys {
+            let used = providers.contains(&provider);
+            match value {
+                Some(_) if !used => {
+                    return Err(format!("{key} is not used by provider {provider}"));
+                }
+                Some(value) if value.trim().is_empty() => {
+                    return Err(format!("{key} must not be empty"));
+                }
+                None if used && required => {
+                    return Err(format!("provider {provider} needs {key}"));
+                }
+                _ => {}
+            }
+        }
+        if let Some(url) = &self.api_url
+            && !url.starts_with("https://")
+            && !url.starts_with("http://")
+        {
+            return Err(format!("api_url {url:?} must be an http(s):// URL"));
+        }
+        if self.tsig_key.is_some() != self.tsig_secret.is_some() {
+            return Err(String::from("tsig_key and tsig_secret go together"));
+        }
+        self.tsig_secret_bytes()
+            .map_err(|err| format!("tsig_secret {err}"))?;
+        Ok(())
+    }
+}
+
+/// Decodes standard base64, with or without padding.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut buffer, mut bits) = (0u32, 0);
+    for byte in text.trim_end_matches('=').bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((buffer >> bits) as u8);
+        }
+    }
+    // A lone leftover character carries no whole byte.
+    (text.trim_end_matches('=').len() % 4 != 1).then_some(bytes)
 }
 
 impl Default for Acme {
@@ -2534,6 +2742,7 @@ impl Default for Acme {
             renew_before: default::acme_renew_before(),
             http_port: default::acme_http_port(),
             challenge: AcmeChallenge::default(),
+            dns: None,
         }
     }
 }
@@ -2557,6 +2766,15 @@ impl Acme {
         if self.http_port == 0 {
             return Err(String::from("http_port must not be 0"));
         }
+        match &self.dns {
+            Some(dns) => dns.validate().map_err(|err| format!("dns: {err}"))?,
+            None if self.challenge == AcmeChallenge::Dns01 => {
+                return Err(String::from(
+                    "challenge = \"dns-01\" needs the DNS provider in [acme.dns]",
+                ));
+            }
+            None => {}
+        }
         Ok(())
     }
 }
@@ -2571,7 +2789,10 @@ impl Acme {
 pub fn validate_domain(name: &str) -> Result<(), String> {
     let invalid = |why: &str| Err(format!("{name:?} {why}"));
     if name.starts_with("*.") {
-        return invalid("is a wildcard, ACME HTTP-01 and TLS-ALPN-01 cannot certify wildcards");
+        return invalid(
+            "is a wildcard, which only [acme] challenge = \"dns-01\" can certify \
+             (one label deep, like *.example.com)",
+        );
     }
     if name.is_empty() || name.len() > 253 {
         return invalid("is not a domain name (1 to 253 characters)");
@@ -2870,6 +3091,10 @@ mod default {
 
     pub fn acme_renew_before() -> Duration {
         Duration::from_secs(30 * 24 * 60 * 60)
+    }
+
+    pub fn acme_dns_propagation_wait() -> Duration {
+        Duration::from_secs(60)
     }
 
     pub fn acme_http_port() -> u16 {
@@ -3360,6 +3585,123 @@ mod tests {
     }
 
     #[test]
+    fn acme_dns_challenge_and_wildcards() {
+        let config = |host: &str, acme: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = \"auto\"\nhost = \"{host}\"\n[acme]\n{acme}\n"
+            ))
+        };
+        let dns = |table: &str| {
+            config(
+                "*.a.test",
+                &format!("challenge = \"dns-01\"\n[acme.dns]\n{table}"),
+            )
+        };
+        let error = |result: Result<Config, ConfigError>| match result {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+
+        let cloudflare = dns("provider = \"cloudflare\"\napi_token = \"t0k3n\"").unwrap();
+        assert_eq!(cloudflare.acme.challenge, AcmeChallenge::Dns01);
+        let table = cloudflare.acme.dns.as_ref().unwrap();
+        assert_eq!(table.provider, DnsProvider::Cloudflare);
+        assert_eq!(table.api_token.as_deref(), Some("t0k3n"));
+        assert_eq!(table.propagation_wait, Duration::from_secs(60));
+        // Round trip, as `rxh config show` does.
+        let text = toml::to_string(&cloudflare).unwrap();
+        assert_eq!(Config::from_toml(&text).unwrap().acme, cloudflare.acme);
+
+        let route53 = dns(
+            "provider = \"route53\"\naccess_key_id = \"AKIA\"\nsecret_access_key = \"s\"\n\
+             zone_id = \"Z1\"\napi_url = \"http://127.0.0.1:1\"\npropagation_wait = \"0s\"",
+        )
+        .unwrap();
+        let table = route53.acme.dns.as_ref().unwrap();
+        assert_eq!(table.provider, DnsProvider::Route53);
+        assert_eq!(table.zone_id.as_deref(), Some("Z1"));
+        assert_eq!(table.propagation_wait, Duration::ZERO);
+
+        let rfc2136 = dns(
+            "provider = \"rfc2136\"\nserver = \"ns1.a.test\"\ntsig_key = \"rxh.\"\n\
+             tsig_secret = \"c2VjcmV0\"",
+        )
+        .unwrap();
+        let table = rfc2136.acme.dns.as_ref().unwrap();
+        assert_eq!(table.tsig_secret_bytes().unwrap().unwrap(), b"secret");
+        // Unsigned updates, for servers that allow them by address.
+        assert!(dns("provider = \"rfc2136\"\nserver = \"10.0.0.1:5353\"").is_ok());
+
+        assert!(error(config("a.test", "challenge = \"dns-01\"")).contains("[acme.dns]"));
+        assert!(error(dns("provider = \"cloudflare\"")).contains("needs api_token"));
+        assert!(error(dns("provider = \"cloudflare\"\napi_token = \" \"")).contains("empty"));
+        assert!(
+            error(dns("provider = \"route53\"\naccess_key_id = \"AKIA\""))
+                .contains("needs secret_access_key")
+        );
+        assert!(error(dns("provider = \"rfc2136\"")).contains("needs server"));
+        assert!(
+            error(dns(
+                "provider = \"rfc2136\"\nserver = \"ns\"\napi_token = \"t\""
+            ))
+            .contains("api_token is not used by provider rfc2136")
+        );
+        assert!(
+            error(dns(
+                "provider = \"rfc2136\"\nserver = \"ns\"\ntsig_key = \"k\""
+            ))
+            .contains("go together")
+        );
+        assert!(
+            error(dns(
+                "provider = \"rfc2136\"\nserver = \"ns\"\ntsig_key = \"k\"\ntsig_secret = \"a b\""
+            ))
+            .contains("not base64")
+        );
+        assert!(
+            error(dns(
+                "provider = \"cloudflare\"\napi_token = \"t\"\napi_url = \"ftp://x\""
+            ))
+            .contains("api_url")
+        );
+        assert!(dns("provider = \"gandi\"").is_err());
+        assert!(dns("provider = \"cloudflare\"\napi_token = \"t\"\ntypo = 1").is_err());
+
+        // Wildcards only with DNS-01, one leading label, on a real domain.
+        let token = "[acme.dns]\nprovider = \"cloudflare\"\napi_token = \"t\"";
+        assert!(error(config("*.a.test", token)).contains("dns-01"));
+        assert!(
+            error(config(
+                "*.a.test",
+                &format!("challenge = \"tls-alpn-01\"\n{token}")
+            ))
+            .contains("dns-01")
+        );
+        let dns_host = |host: &str| config(host, &format!("challenge = \"dns-01\"\n{token}"));
+        assert!(dns_host("a.test").is_ok());
+        assert!(error(dns_host("*.test")).contains("fully qualified"));
+        assert!(dns_host("*.*.a.test").is_err());
+
+        let mut redacted = rfc2136.acme.dns.clone().unwrap();
+        redacted.redact();
+        assert_eq!(redacted.tsig_secret.as_deref(), Some("***"));
+        assert_eq!(redacted.tsig_key.as_deref(), Some("rxh."));
+        assert_eq!(redacted.api_token, None);
+    }
+
+    #[test]
+    fn base64_decoding() {
+        assert_eq!(decode_base64("").unwrap(), b"");
+        assert_eq!(decode_base64("Zg==").unwrap(), b"f");
+        assert_eq!(decode_base64("Zm8").unwrap(), b"fo");
+        assert_eq!(decode_base64("Zm9vYmFy").unwrap(), b"foobar");
+        assert_eq!(decode_base64("+/8=").unwrap(), [0xfb, 0xff]);
+        assert_eq!(decode_base64("Z"), None);
+        assert_eq!(decode_base64("Zm9v-mFy"), None);
+    }
+
+    #[test]
     fn tls_auto_and_acme_settings() {
         let auto = |host: &str, extra: &str| {
             format!(
@@ -3439,7 +3781,7 @@ mod tests {
             challenge("\"tls-alpn-01\"").unwrap(),
             AcmeChallenge::TlsAlpn01
         );
-        for rejected in ["\"dns-01\"", "\"TLS-ALPN-01\"", "\"\"", "1"] {
+        for rejected in ["\"dns-02\"", "\"TLS-ALPN-01\"", "\"\"", "1"] {
             assert!(challenge(rejected).is_err(), "{rejected}");
         }
         let mut config = Config::from_toml(&with_acme("challenge = \"tls-alpn-01\"")).unwrap();
