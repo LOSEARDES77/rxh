@@ -1,4 +1,5 @@
-//! IP ranges in CIDR notation, used for `trusted_proxies`.
+//! IP ranges in CIDR notation, used for `trusted_proxies`, `remote_ip`,
+//! `ip_allow` and `ip_deny`.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -50,6 +51,15 @@ impl IpNet {
             _ => false,
         }
     }
+}
+
+/// Returns true if `ip` passes the `ip_allow` and `ip_deny` lists: it is in
+/// no `deny` range, and in an `allow` range unless `allow` is empty. A deny
+/// wins over an allow, so `deny` can cut holes in the `allow` ranges.
+#[must_use]
+pub fn permitted(ip: IpAddr, allow: &[IpNet], deny: &[IpNet]) -> bool {
+    !deny.iter().any(|net| net.contains(ip))
+        && (allow.is_empty() || allow.iter().any(|net| net.contains(ip)))
 }
 
 impl FromStr for IpNet {
@@ -115,6 +125,27 @@ mod tests {
         let single: IpNet = "::1".parse().unwrap();
         assert!(single.contains("::1".parse().unwrap()));
         assert!(!single.contains("::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn permitted_checks_deny_before_allow() {
+        let nets =
+            |list: &[&str]| -> Vec<IpNet> { list.iter().map(|net| net.parse().unwrap()).collect() };
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+
+        assert!(permitted(ip("1.2.3.4"), &[], &[]));
+
+        let allow = nets(&["10.0.0.0/8", "::1"]);
+        assert!(permitted(ip("10.1.2.3"), &allow, &[]));
+        assert!(permitted(ip("::1"), &allow, &[]));
+        assert!(!permitted(ip("11.0.0.1"), &allow, &[]));
+
+        let deny = nets(&["10.0.0.0/24"]);
+        assert!(!permitted(ip("10.0.0.7"), &allow, &deny));
+        assert!(permitted(ip("10.0.1.7"), &allow, &deny));
+        assert!(!permitted(ip("10.0.0.7"), &[], &deny));
+        assert!(permitted(ip("192.168.1.1"), &[], &deny));
+        assert!(!permitted(ip("::ffff:10.0.0.7"), &[], &deny));
     }
 
     #[test]

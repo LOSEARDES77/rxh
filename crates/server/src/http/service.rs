@@ -3,7 +3,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +15,7 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode, Uri};
 use rxh_core::config::{self, Action, ConfigError, Encoding, RequestHeaders, ResponseHeaders};
 use rxh_core::matcher::{MatchInput, RequestMatcher};
-use rxh_core::net::IpNet;
+use rxh_core::net::{self, IpNet};
 use rxh_core::pool::Upstream;
 use rxh_core::template::Template;
 use tokio::sync::{Notify, watch};
@@ -50,6 +50,10 @@ pub(crate) struct Site {
 
     /// Peers allowed to set `X-Forwarded-*`.
     pub(crate) trusted_proxies: Vec<IpNet>,
+
+    /// Server `ip_allow` and `ip_deny`, checked against the client IP.
+    pub(crate) ip_allow: Vec<IpNet>,
+    pub(crate) ip_deny: Vec<IpNet>,
 
     /// True if the listener terminates TLS.
     pub(crate) tls: bool,
@@ -91,6 +95,25 @@ pub(crate) struct Route {
     pub(crate) handle_response: Vec<ResponseHandler>,
     pub(crate) cache: Option<Cache>,
     pub(crate) encode: Vec<Encoding>,
+    /// Entry `ip_allow` and `ip_deny`, on top of the site's.
+    pub(crate) ip_allow: Vec<IpNet>,
+    pub(crate) ip_deny: Vec<IpNet>,
+}
+
+impl Route {
+    /// Returns true if the route or its site has an IP allow or deny list.
+    fn has_ip_lists(&self) -> bool {
+        !(self.ip_allow.is_empty()
+            && self.ip_deny.is_empty()
+            && self.site.ip_allow.is_empty()
+            && self.site.ip_deny.is_empty())
+    }
+
+    /// Returns true if both the site and the route accept `client`.
+    fn permits(&self, client: IpAddr) -> bool {
+        net::permitted(client, &self.site.ip_allow, &self.site.ip_deny)
+            && net::permitted(client, &self.ip_allow, &self.ip_deny)
+    }
 }
 
 /// What a route does.
@@ -138,6 +161,8 @@ impl Site {
             via: Via::new(&by),
             by,
             trusted_proxies: server.trusted_proxies.clone(),
+            ip_allow: server.ip_allow.clone(),
+            ip_deny: server.ip_deny.clone(),
             tls: server.tls.is_some(),
             client_subject_header: server
                 .client_auth
@@ -221,6 +246,8 @@ impl Site {
                 handle_response,
                 cache: Cache::new(&pattern.cache),
                 encode: pattern.encode.clone(),
+                ip_allow: pattern.ip_allow.clone(),
+                ip_deny: pattern.ip_deny.clone(),
             });
         }
 
@@ -334,10 +361,10 @@ impl Service {
             .find(|route| route.matcher.matches(&input));
 
         let server = route.map_or(&*self.log_name, |route| &*route.site.by);
-        // Only computed when a JSON line will be written.
+        // Only computed when an IP list or a JSON line needs it.
         let json = self.logger.is_json();
         let client_ip = match route {
-            Some(route) if json => {
+            Some(route) if json || route.has_ip_lists() => {
                 headers::client_ip(
                     self.peer.ip(),
                     request.headers(),
@@ -347,6 +374,7 @@ impl Service {
             }
             _ => self.peer.ip(),
         };
+        let forbidden = route.is_some_and(|route| !route.permits(client_ip));
         let version = request.version();
 
         let accept_encoding = match route {
@@ -378,6 +406,7 @@ impl Service {
 
         let mut response = match route {
             None => response::not_found(),
+            Some(_) if forbidden => response::forbidden(),
             Some(_) if rewrite_failed => {
                 response::plain(StatusCode::BAD_REQUEST, "HTTP 400 BAD REQUEST")
             }

@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- `ip_allow` and `ip_deny` on servers (`http`, `tcp`, `udp`) and on the
+  `match` entries of `http` servers: lists of CIDR ranges or addresses of
+  the clients accepted and rejected, a deny winning over an allow. HTTP uses
+  the client IP from `X-Forwarded-For` of `trusted_proxies` and answers
+  `403`; `tcp` closes the connection, `udp` drops the datagram.
 - Certificate files (`tls = { cert, key }`) are read again when their
   contents change, checked every 5 seconds, and served to new handshakes
   without a restart or reload. A pair that fails to load keeps the previous

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rxh_core::address::BackendAddress;
+use rxh_core::net::{self, IpNet};
 use rxh_core::pool::{RequestGuard, SelectContext, Upstream};
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
@@ -26,6 +27,8 @@ pub(crate) struct UdpSettings {
     pub(crate) group: Arc<Group>,
     pub(crate) idle_timeout: Duration,
     pub(crate) max_sessions: usize,
+    pub(crate) ip_allow: Vec<IpNet>,
+    pub(crate) ip_deny: Vec<IpNet>,
     pub(crate) log_name: Arc<str>,
 
     /// Server name or listen address, for metrics and JSON lines.
@@ -77,6 +80,10 @@ async fn receive_loop(
     loop {
         let (len, client) = socket.recv_from(&mut buffer).await?;
         while replies.try_join_next().is_some() {}
+        // Dropped without a log line: a rejected client could flood it.
+        if !net::permitted(client.ip(), &settings.ip_allow, &settings.ip_deny) {
+            continue;
+        }
 
         let existing = sessions
             .lock()
