@@ -22,6 +22,11 @@
 //! replica that starts or stops only changes the members; the listeners are
 //! rebuilt, like a reload, only when a pool appears, disappears or changes
 //! its hosts, address or policy.
+//!
+//! The service catalogs (`[consul]`, `[etcd]`, `[nomad]`, see the `catalog`
+//! module) turn their service instances into [`Container`]s with the same
+//! options, so they are planned here too, with servers named after their
+//! section (`consul-POOL`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -29,12 +34,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper::{Request, Response, header};
 use hyper_util::rt::TokioIo;
-use rxh_core::config::{Backend, Config, ContainerProvider, Docker, Policy, Server, UpstreamGroup};
+use rxh_core::config::{
+    Backend, CatalogKind, Config, ContainerProvider, Docker, Policy, Server, UpstreamGroup,
+};
 use rxh_core::matcher::HostPattern;
 use serde::Deserialize;
 use serde_json::json;
@@ -58,6 +65,9 @@ const SERVICES: &str = "/services?filters=%7B%22label%22%3A%5B%22rxh.enable%3Dtr
 /// Swarm tasks meant to run.
 const TASKS: &str = "/tasks?filters=%7B%22desired-state%22%3A%5B%22running%22%5D%7D";
 
+/// Every container of one provider, sent each time they may have changed.
+pub(crate) type Updates = mpsc::Sender<(Provider, Vec<Container>)>;
+
 /// Wait before connecting again to a Docker daemon that failed.
 const RETRY: Duration = Duration::from_secs(2);
 
@@ -65,21 +75,65 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 const MAX_LIST_BODY: usize = 16 * 1024 * 1024;
 
-/// A running container, as far as routing cares.
+/// Provider a [`Container`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Provider {
+    Docker,
+    Catalog(CatalogKind),
+}
+
+impl Provider {
+    /// Prefix of the log lines.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Docker => "Docker",
+            Self::Catalog(CatalogKind::Consul) => "Consul",
+            Self::Catalog(CatalogKind::Etcd) => "etcd",
+            Self::Catalog(CatalogKind::Nomad) => "Nomad",
+        }
+    }
+
+    /// Prefix of the server names.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Catalog(kind) => kind.section(),
+        }
+    }
+
+    /// Where the HTTP servers of the routes listen, if the section is set.
+    fn listen(self, config: &Config) -> Option<SocketAddr> {
+        match self {
+            Self::Docker => config.docker.as_ref().map(|docker| docker.listen),
+            Self::Catalog(kind) => config.catalog(kind).map(|catalog| catalog.listen),
+        }
+    }
+
+    /// What one of its [`Container`]s is, in messages.
+    pub(crate) fn noun(self) -> &'static str {
+        match self {
+            Self::Docker => "container",
+            Self::Catalog(_) => "instance",
+        }
+    }
+}
+
+/// A running container or service instance, as far as routing cares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Container {
-    id: String,
-    name: String,
-    labels: BTreeMap<String, String>,
+    pub(crate) source: Provider,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) labels: BTreeMap<String, String>,
     /// Address rxh reaches the container at, if it has one.
-    address: Option<IpAddr>,
+    pub(crate) address: Option<IpAddr>,
     /// TCP ports the container exposes, sorted.
-    ports: Vec<u16>,
+    pub(crate) ports: Vec<u16>,
     /// Host addresses of the exposed ports, when they are to be preferred
     /// over `address` (Podman).
-    published: BTreeMap<u16, SocketAddr>,
-    /// Swarm service of a task: its default pool.
-    service: Option<String>,
+    pub(crate) published: BTreeMap<u16, SocketAddr>,
+    /// Swarm or catalog service: the default pool.
+    pub(crate) service: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +230,7 @@ impl Listed {
             None => listed.id.chars().take(12).collect(),
         };
         Container {
+            source: Provider::Docker,
             id: listed.id,
             name,
             labels: listed.labels.unwrap_or_default(),
@@ -321,6 +376,7 @@ fn parse_swarm(services: &[u8], tasks: &[u8]) -> Result<Vec<Container>, String> 
             format!("{name}.{}", task.node_id)
         };
         containers.push(Container {
+            source: Provider::Docker,
             id: task.id,
             name,
             labels: service.spec.labels.clone().unwrap_or_default(),
@@ -471,6 +527,7 @@ impl Container {
 /// One pool made from containers and the server in front of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Route {
+    source: Provider,
     pool: String,
     policy: Option<Policy>,
     /// Hosts of the HTTP server; unused with `tcp_listen`.
@@ -480,7 +537,11 @@ pub(crate) struct Route {
 }
 
 impl Route {
-    fn add_to(&self, config: &mut Config, http_listen: SocketAddr) -> Result<(), String> {
+    fn add_to(&self, config: &mut Config) -> Result<(), String> {
+        let http_listen = self
+            .source
+            .listen(config)
+            .expect("routes are only planned for the sections set");
         let pool = &self.pool;
         if config.upstreams.contains_key(pool) {
             return Err(format!(
@@ -493,7 +554,7 @@ impl Route {
         }
         config.upstreams.insert(pool.clone(), group);
 
-        let name = format!("docker-{pool}");
+        let name = format!("{}-{pool}", self.source.name());
         let forward = format!("@{pool}");
         let server = match self.tcp_listen {
             Some(listen) => {
@@ -536,7 +597,7 @@ impl Plan {
 pub(crate) fn log_ignored(ignored: &[String], known: &[String]) {
     for reason in ignored {
         if !known.contains(reason) {
-            eprintln!("Docker => ignored {reason}");
+            eprintln!("{reason}");
         }
     }
 }
@@ -544,22 +605,31 @@ pub(crate) fn log_ignored(ignored: &[String], known: &[String]) {
 /// Plans the routes to `containers` on top of `config`, which is valid, and
 /// returns `config` with the pools and servers of those routes. A container
 /// or pool that cannot be routed, or that would make the configuration
-/// invalid, is left out. Without `[docker]` nothing is added.
+/// invalid, is left out. Containers of a provider whose section is not set
+/// are not routed.
 pub(crate) fn plan(config: &Config, containers: &[Container]) -> (Config, Plan) {
     let mut effective = config.clone();
     let mut plan = Plan::default();
-    let Some(settings) = &config.docker else {
-        return (effective, plan);
-    };
 
-    let mut sorted: Vec<&Container> = containers.iter().collect();
-    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut sorted: Vec<&Container> = containers
+        .iter()
+        .filter(|container| container.source.listen(config).is_some())
+        .collect();
+    sorted.sort_by(|a, b| (a.source, &a.name).cmp(&(b.source, &b.name)));
     for container in sorted {
-        let name = &container.name;
+        let source = container.source;
+        let ignore = |reason: &str| {
+            format!(
+                "{} => ignored {} {}: {reason}",
+                source.label(),
+                source.noun(),
+                container.name
+            )
+        };
         let target = match container.target() {
             Ok(target) => target,
             Err(reason) => {
-                plan.ignored.push(format!("container {name}: {reason}"));
+                plan.ignored.push(ignore(&reason));
                 continue;
             }
         };
@@ -571,6 +641,7 @@ pub(crate) fn plan(config: &Config, containers: &[Container]) -> (Config, Plan) 
             plan.members
                 .insert(target.pool.clone(), vec![target.backend]);
             plan.routes.push(Route {
+                source,
                 pool: target.pool,
                 policy: target.policy,
                 hosts: target.hosts,
@@ -578,12 +649,20 @@ pub(crate) fn plan(config: &Config, containers: &[Container]) -> (Config, Plan) 
             });
             continue;
         };
+        if route.source != source {
+            plan.ignored.push(ignore(&format!(
+                "pool {} is already routed by {}",
+                route.pool,
+                route.source.label()
+            )));
+            continue;
+        }
         if route.policy != target.policy || route.tcp_listen != target.tcp_listen {
-            plan.ignored.push(format!(
-                "container {name}: rxh.policy or rxh.tcp.listen differ from another container \
-                 of pool {}",
+            plan.ignored.push(ignore(&format!(
+                "rxh.policy or rxh.tcp.listen differ from another {} of pool {}",
+                source.noun(),
                 route.pool
-            ));
+            )));
             continue;
         }
         for host in target.hosts {
@@ -605,7 +684,7 @@ pub(crate) fn plan(config: &Config, containers: &[Container]) -> (Config, Plan) 
     routes.retain(|route| {
         let mut candidate = effective.clone();
         let outcome = route
-            .add_to(&mut candidate, settings.listen)
+            .add_to(&mut candidate)
             .and_then(|()| candidate.validate().map_err(|err| err.to_string()));
         match outcome {
             Ok(()) => {
@@ -613,7 +692,11 @@ pub(crate) fn plan(config: &Config, containers: &[Container]) -> (Config, Plan) 
                 true
             }
             Err(reason) => {
-                ignored.push(format!("pool {}: {reason}", route.pool));
+                ignored.push(format!(
+                    "{} => ignored pool {}: {reason}",
+                    route.source.label(),
+                    route.pool
+                ));
                 members.remove(&route.pool);
                 false
             }
@@ -641,7 +724,7 @@ struct Actor {
 /// or dies, or every `refresh` for Swarm. While the engine cannot be reached
 /// nothing is sent, so the last containers stay routed, and the connection is
 /// retried forever.
-pub(crate) async fn watch(settings: Docker, updates: mpsc::Sender<Vec<Container>>) {
+pub(crate) async fn watch(settings: Docker, updates: Updates) {
     let endpoint = settings.endpoint();
     let mut last_error = String::new();
     loop {
@@ -663,15 +746,12 @@ pub(crate) async fn watch(settings: Docker, updates: mpsc::Sender<Vec<Container>
 }
 
 /// Returns `Ok` once nothing listens to `updates` anymore.
-async fn poll_swarm(
-    endpoint: &str,
-    refresh: Duration,
-    updates: &mpsc::Sender<Vec<Container>>,
-) -> Result<(), String> {
+async fn poll_swarm(endpoint: &str, refresh: Duration, updates: &Updates) -> Result<(), String> {
     loop {
         let services = list(endpoint, SERVICES, "service list").await?;
         let tasks = list(endpoint, TASKS, "task list").await?;
-        if updates.send(parse_swarm(&services, &tasks)?).await.is_err() {
+        let containers = parse_swarm(&services, &tasks)?;
+        if updates.send((Provider::Docker, containers)).await.is_err() {
             return Ok(());
         }
         tokio::time::sleep(refresh).await;
@@ -682,11 +762,11 @@ async fn poll_swarm(
 async fn follow(
     endpoint: &str,
     provider: ContainerProvider,
-    updates: &mpsc::Sender<Vec<Container>>,
+    updates: &Updates,
 ) -> Result<(), String> {
     // Subscribed before listing, so a container that starts in between is
     // listed again instead of missed.
-    let mut events = get(endpoint, EVENTS).await?.into_body();
+    let mut events = send(endpoint, docker_request(EVENTS)).await?.into_body();
     let mut buffered: Vec<u8> = Vec::new();
     // Docker can announce a death while it still lists the container as
     // running: those are left out until they start again.
@@ -695,7 +775,7 @@ async fn follow(
         let body = list(endpoint, CONTAINERS, "container list").await?;
         let mut containers = parse_containers(&body, provider)?;
         containers.retain(|container| !dead.contains(&container.id));
-        if updates.send(containers).await.is_err() {
+        if updates.send((Provider::Docker, containers)).await.is_err() {
             return Ok(());
         }
 
@@ -712,8 +792,25 @@ async fn follow(
 
 /// Body of the list at `path`, `what` naming it in errors.
 async fn list(endpoint: &str, path: &str, what: &str) -> Result<Bytes, String> {
+    fetch(endpoint, docker_request(path), what).await
+}
+
+fn docker_request(path: &str) -> Request<Full<Bytes>> {
+    Request::get(path)
+        .header(header::HOST, "docker")
+        .body(Full::default())
+        .expect("static request parts are valid")
+}
+
+/// Body of the answer to `request`, `what` naming it in errors. `endpoint`
+/// is `unix:///path` or `tcp://host:port`.
+pub(crate) async fn fetch(
+    endpoint: &str,
+    request: Request<Full<Bytes>>,
+    what: &str,
+) -> Result<Bytes, String> {
     tokio::time::timeout(LIST_TIMEOUT, async {
-        Limited::new(get(endpoint, path).await?.into_body(), MAX_LIST_BODY)
+        Limited::new(send(endpoint, request).await?.into_body(), MAX_LIST_BODY)
             .collect()
             .await
             .map(|body| body.to_bytes())
@@ -746,37 +843,33 @@ async fn next_line(events: &mut Incoming, buffered: &mut Vec<u8>) -> Result<Vec<
     }
 }
 
-async fn get(endpoint: &str, path: &str) -> Result<Response<Incoming>, String> {
+async fn send(endpoint: &str, request: Request<Full<Bytes>>) -> Result<Response<Incoming>, String> {
     let mut sender = connect(endpoint)
         .await
         .map_err(|err| format!("connect: {err}"))?;
-    let request = Request::get(path)
-        .header(header::HOST, "docker")
-        .body(Empty::<Bytes>::new())
-        .expect("static request parts are valid");
     let response = sender
         .send_request(request)
         .await
         .map_err(|err| err.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Docker API answered {}", response.status()));
+        return Err(format!("API answered {}", response.status()));
     }
     Ok(response)
 }
 
-async fn connect(endpoint: &str) -> io::Result<SendRequest<Empty<Bytes>>> {
+async fn connect(endpoint: &str) -> io::Result<SendRequest<Full<Bytes>>> {
     match endpoint.split_once("://") {
         #[cfg(unix)]
         Some(("unix", path)) => handshake(tokio::net::UnixStream::connect(path).await?).await,
         Some(("tcp", address)) => handshake(TcpStream::connect(address).await?).await,
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "unsupported Docker endpoint",
+            "unsupported endpoint",
         )),
     }
 }
 
-async fn handshake<S>(stream: S) -> io::Result<SendRequest<Empty<Bytes>>>
+async fn handshake<S>(stream: S) -> io::Result<SendRequest<Full<Bytes>>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -802,6 +895,7 @@ mod tests {
             .collect();
         labels.insert("rxh.enable".into(), "true".into());
         Container {
+            source: Provider::Docker,
             id: format!("id-{name}"),
             name: name.to_owned(),
             labels,

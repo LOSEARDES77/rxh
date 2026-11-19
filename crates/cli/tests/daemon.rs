@@ -1741,3 +1741,218 @@ async fn docker_provider_waits_for_docker_and_stops_with_its_section() {
         stderr_of(&output)
     );
 }
+
+/// Writes `rxh.toml` with an admin API and `section`, and starts the daemon.
+fn start_with_catalog(dir: &Path, section: &str) -> Daemon {
+    let admin = free_address();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!("[admin]\nlisten = \"{admin}\"\n{section}"),
+    )
+    .expect("write config");
+    start_daemon_logged(dir)
+}
+
+/// Lines of `stdout.log` in `dir` that contain `text`.
+fn log_count(dir: &Path, text: &str) -> usize {
+    std::fs::read_to_string(dir.join("stdout.log"))
+        .expect("log")
+        .matches(text)
+        .count()
+}
+
+fn consul_entry(id: &str, backend: SocketAddr, tags: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "Node": { "Node": "node-1", "Address": backend.ip().to_string() },
+        "Service": {
+            "ID": id, "Service": "web", "Tags": tags,
+            "Address": "", "Port": backend.port(),
+        },
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn consul_services_are_routed_and_follow_their_health() {
+    let consul = rxh_test_util::CatalogApi::start().await;
+    let (a, b) = (backend("a").await, backend("b").await);
+    let web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let tags = ["rxh.enable=true", "rxh.http.host=web.test", "v2"];
+    let services = r#"{"consul":[],"web":["rxh.enable=true","rxh.http.host=web.test","v2"]}"#;
+    consul.publish("GET /v1/catalog/services", services);
+    let health = "GET /v1/health/service/web?passing=1";
+    let entries = |entries: &[serde_json::Value]| serde_json::to_string(entries).expect("json");
+    consul.publish(health, &entries(&[consul_entry("web-a", a, &tags)]));
+
+    let _daemon = start_with_catalog(
+        dir,
+        &format!(
+            "[consul]\nendpoint = \"{}\"\ntoken = \"s3cret\"\nlisten = \"{web}\"\n\
+             refresh = \"50ms\"\n",
+            consul.endpoint()
+        ),
+    );
+    wait_for_backends(web, "web.test", &["a"], 1).await;
+    assert!(
+        consul
+            .requests()
+            .iter()
+            .all(|head| head.contains("x-consul-token: s3cret")),
+        "{:?}",
+        consul.requests()
+    );
+
+    // A second healthy instance joins without rebuilding the listeners.
+    consul.publish(
+        health,
+        &entries(&[
+            consul_entry("web-a", a, &tags),
+            consul_entry("web-b", b, &tags),
+        ]),
+    );
+    wait_for_backends(web, "web.test", &["a", "b"], 20).await;
+    // An instance whose checks fail is no longer listed as passing.
+    consul.publish(health, &entries(&[consul_entry("web-b", b, &tags)]));
+    wait_for_backends(web, "web.test", &["b"], 20).await;
+    // Once for the first listing only.
+    assert_eq!(log_count(dir, "Consul instances changed"), 1);
+
+    // An answer that cannot be read keeps the instances last listed.
+    consul.publish(health, "<html>");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_backends(web, "web.test", &["b"], 20).await;
+
+    // Untagged, the service goes away with its route.
+    consul.publish("GET /v1/catalog/services", r#"{"web":["v2"]}"#);
+    for _ in 0..250 {
+        if get_host(web, "web.test").await.as_deref() != Some("b") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(get_host(web, "web.test").await.as_deref(), Some("b"));
+    assert_eq!(log_count(dir, "Consul instances changed"), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nomad_services_are_routed_over_tcp_and_http() {
+    let nomad = rxh_test_util::CatalogApi::start().await;
+    let (api, db) = (backend("api").await, backend("db").await);
+    let (web, tcp) = (free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let tcp_tag = format!("rxh.tcp.listen={tcp}");
+    nomad.publish(
+        "GET /v1/services?namespace=*",
+        &serde_json::json!([
+            { "Namespace": "default", "Services": [
+                { "ServiceName": "api", "Tags": ["rxh.enable=true"] },
+                { "ServiceName": "batch", "Tags": [] },
+            ]},
+            { "Namespace": "data", "Services": [
+                { "ServiceName": "db", "Tags": ["rxh.enable=true", tcp_tag] },
+            ]},
+        ])
+        .to_string(),
+    );
+    let registration = |name: &str, backend: SocketAddr, tags: &[&str]| {
+        serde_json::json!([{
+            "ID": format!("_nomad-task-{name}"), "ServiceName": name, "AllocID": "0123456789",
+            "Tags": tags, "Address": backend.ip().to_string(), "Port": backend.port(),
+        }])
+        .to_string()
+    };
+    nomad.publish(
+        "GET /v1/service/api?namespace=default",
+        &registration("api", api, &["rxh.enable=true", "rxh.http.host=api.test"]),
+    );
+    nomad.publish(
+        "GET /v1/service/db?namespace=data",
+        &registration(
+            "db",
+            db,
+            &["rxh.enable=true", &format!("rxh.tcp.listen={tcp}")],
+        ),
+    );
+
+    let _daemon = start_with_catalog(
+        dir,
+        &format!(
+            "[nomad]\nendpoint = \"{}\"\ntoken = \"t0ken\"\nlisten = \"{web}\"\n\
+             refresh = \"50ms\"\n",
+            nomad.endpoint()
+        ),
+    );
+    wait_for_backends(web, "api.test", &["api"], 1).await;
+    wait_for_body(tcp, "db").await;
+    assert!(
+        nomad
+            .requests()
+            .iter()
+            .all(|head| head.contains("x-nomad-token: t0ken"))
+    );
+    assert!(
+        !nomad
+            .requests()
+            .iter()
+            .any(|head| head.contains("/v1/service/batch"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn etcd_keys_are_routed_and_followed() {
+    use base64::Engine;
+
+    let etcd = rxh_test_util::CatalogApi::start().await;
+    let (a, b) = (backend("a").await, backend("b").await);
+    let web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let engine = base64::engine::general_purpose::STANDARD;
+    let range = |pairs: &[(&str, String)]| {
+        let kvs: Vec<serde_json::Value> = pairs
+            .iter()
+            .map(|(key, value)| {
+                serde_json::json!({ "key": engine.encode(key), "value": engine.encode(value) })
+            })
+            .collect();
+        serde_json::json!({ "header": {}, "kvs": kvs }).to_string()
+    };
+    let host = String::from("shop.test");
+    etcd.publish(
+        "POST /v3/kv/range",
+        &range(&[
+            ("apps/shop/a/address", a.to_string()),
+            ("apps/shop/a/http.host", host.clone()),
+        ]),
+    );
+
+    let _daemon = start_with_catalog(
+        dir,
+        &format!(
+            "[etcd]\nendpoint = \"{}\"\nprefix = \"apps/\"\nlisten = \"{web}\"\n\
+             refresh = \"50ms\"\n",
+            etcd.endpoint()
+        ),
+    );
+    wait_for_backends(web, "shop.test", &["a"], 1).await;
+
+    etcd.publish(
+        "POST /v3/kv/range",
+        &range(&[
+            ("apps/shop/a/address", a.to_string()),
+            ("apps/shop/a/http.host", host.clone()),
+            ("apps/shop/b/address", b.to_string()),
+            ("apps/shop/b/http.host", host.clone()),
+        ]),
+    );
+    wait_for_backends(web, "shop.test", &["a", "b"], 20).await;
+    // Only key ranges are asked for.
+    let requests = etcd.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|head| head.starts_with("post /v3/kv/range "))
+    );
+}

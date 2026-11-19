@@ -84,6 +84,19 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<Docker>,
 
+    /// Routes to the healthy instances of the Consul catalog services tagged
+    /// `rxh.enable=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consul: Option<Catalog>,
+
+    /// Routes to the service instances written under a prefix of etcd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etcd: Option<Catalog>,
+
+    /// Routes to the Nomad services tagged `rxh.enable=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nomad: Option<Catalog>,
+
     /// Maximum time to wait for open connections during shutdown or reload.
     /// `None` waits forever, like Caddy's default.
     #[serde(
@@ -198,6 +211,13 @@ impl Config {
             docker
                 .validate()
                 .map_err(|err| ConfigError::Invalid(format!("docker: {err}")))?;
+        }
+        for kind in [CatalogKind::Consul, CatalogKind::Etcd, CatalogKind::Nomad] {
+            if let Some(catalog) = self.catalog(kind) {
+                catalog
+                    .validate(kind)
+                    .map_err(|err| ConfigError::Invalid(format!("{}: {err}", kind.section())))?;
+            }
         }
 
         for (name, group) in &self.upstreams {
@@ -613,6 +633,16 @@ impl Config {
             .map(|(index, server)| server.label(index))
     }
 
+    /// The `[consul]`, `[etcd]` or `[nomad]` section, if present.
+    #[must_use]
+    pub fn catalog(&self, kind: CatalogKind) -> Option<&Catalog> {
+        match kind {
+            CatalogKind::Consul => self.consul.as_ref(),
+            CatalogKind::Etcd => self.etcd.as_ref(),
+            CatalogKind::Nomad => self.nomad.as_ref(),
+        }
+    }
+
     /// Returns this configuration plus one plain `http` server per TLS
     /// server that redirects HTTP to HTTPS (`https_redirect`, on by default
     /// with `tls = "auto"`). It listens on the addresses of the TLS server
@@ -913,6 +943,125 @@ impl Docker {
             Err(format!(
                 "endpoint must be unix:///path or tcp://host:port, got {endpoint:?}"
             ))
+        }
+    }
+}
+
+/// Service catalog provider: `[consul]`, `[etcd]` or `[nomad]`. Each
+/// service instance becomes a member of a pool, with the `rxh.*` options of
+/// its tags (Consul, Nomad) or keys (etcd), like the labels of `[docker]`.
+/// The catalog is listed every `refresh`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Catalog {
+    /// HTTP API: `http://host:port`. Defaults to the local agent, see
+    /// [`Catalog::endpoint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// ACL token sent to Consul (`X-Consul-Token`) or Nomad
+    /// (`X-Nomad-Token`). Not accepted by `[etcd]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+
+    /// Keys of the service instances in etcd. Only accepted by `[etcd]`,
+    /// where it defaults to `rxh/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+
+    /// Address of the HTTP servers made from `rxh.http.host` options.
+    #[serde(default = "default::docker_listen")]
+    pub listen: SocketAddr,
+
+    /// How often the catalog is listed.
+    #[serde(default = "default::docker_refresh", with = "duration")]
+    pub refresh: Duration,
+}
+
+/// Which service catalog a [`Catalog`] is the section of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CatalogKind {
+    /// `[consul]`.
+    Consul,
+    /// `[etcd]`.
+    Etcd,
+    /// `[nomad]`.
+    Nomad,
+}
+
+impl CatalogKind {
+    /// Name of the section in the configuration file.
+    #[must_use]
+    pub fn section(self) -> &'static str {
+        match self {
+            Self::Consul => "consul",
+            Self::Etcd => "etcd",
+            Self::Nomad => "nomad",
+        }
+    }
+
+    /// Port of the HTTP API of a local agent.
+    #[must_use]
+    pub fn default_endpoint(self) -> &'static str {
+        match self {
+            Self::Consul => "http://127.0.0.1:8500",
+            Self::Etcd => "http://127.0.0.1:2379",
+            Self::Nomad => "http://127.0.0.1:4646",
+        }
+    }
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            token: None,
+            prefix: None,
+            listen: default::docker_listen(),
+            refresh: default::docker_refresh(),
+        }
+    }
+}
+
+impl Catalog {
+    /// The `endpoint` set, or the local agent of `kind`.
+    #[must_use]
+    pub fn endpoint(&self, kind: CatalogKind) -> &str {
+        self.endpoint
+            .as_deref()
+            .unwrap_or_else(|| kind.default_endpoint())
+    }
+
+    /// The `prefix` set, or `rxh/`.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("rxh/")
+    }
+
+    fn validate(&self, kind: CatalogKind) -> Result<(), String> {
+        if self.refresh.is_zero() {
+            return Err(String::from("refresh must be longer than 0s"));
+        }
+        let endpoint = self.endpoint(kind);
+        let valid = endpoint.starts_with("http://")
+            && matches!(
+                BackendAddress::parse(endpoint),
+                Ok(BackendAddress::Tcp { host, .. }) if !host.contains('/')
+            );
+        if !valid {
+            return Err(format!(
+                "endpoint must be http://host:port, got {endpoint:?}"
+            ));
+        }
+        match (kind, &self.token, &self.prefix) {
+            (CatalogKind::Etcd, Some(_), _) => Err(String::from("token is not supported")),
+            (CatalogKind::Etcd, _, Some(prefix)) if prefix.is_empty() => {
+                Err(String::from("prefix cannot be empty"))
+            }
+            (CatalogKind::Consul | CatalogKind::Nomad, _, Some(_)) => {
+                Err(String::from("prefix is only used by [etcd]"))
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -5382,6 +5531,93 @@ mod tests {
         assert!(Config::from_toml("[docker]\nlisten = \"80\"\n").is_err());
         assert!(Config::from_toml("[docker]\nnetwork = \"web\"\n").is_err());
         assert!(IncludedConfig::from_toml("[docker]\n").is_err());
+    }
+
+    #[test]
+    fn catalog_sections_have_defaults_and_validate() {
+        let config = Config::from_toml("").expect("valid");
+        assert_eq!(
+            (config.consul, config.etcd, config.nomad),
+            (None, None, None)
+        );
+
+        let config = Config::from_toml(
+            "[consul]
+[etcd]
+[nomad]
+",
+        )
+        .expect("valid");
+        for (kind, endpoint) in [
+            (CatalogKind::Consul, "http://127.0.0.1:8500"),
+            (CatalogKind::Etcd, "http://127.0.0.1:2379"),
+            (CatalogKind::Nomad, "http://127.0.0.1:4646"),
+        ] {
+            let catalog = config.catalog(kind).expect("enabled by the table");
+            assert_eq!(catalog.endpoint(kind), endpoint);
+            assert_eq!(catalog.listen, "0.0.0.0:80".parse().expect("address"));
+            assert_eq!(catalog.refresh, Duration::from_secs(15));
+        }
+        assert_eq!(config.etcd.as_ref().expect("set").prefix(), "rxh/");
+
+        let text = "[consul]
+endpoint = \"http://consul.service:8500\"\ntoken = \"secret\"\n\
+                    listen = \"127.0.0.1:8080\"\nrefresh = \"2s\"\n\
+                    [etcd]\nendpoint = \"http://[::1]:2379\"\nprefix = \"apps/\"\n\
+                    [nomad]\ntoken = \"t\"\n";
+        let config = Config::from_toml(text).expect("valid");
+        let consul = config.consul.as_ref().expect("set");
+        assert_eq!(
+            consul.endpoint(CatalogKind::Consul),
+            "http://consul.service:8500"
+        );
+        assert_eq!(consul.token.as_deref(), Some("secret"));
+        assert_eq!(consul.listen.port(), 8080);
+        assert_eq!(consul.refresh, Duration::from_secs(2));
+        assert_eq!(config.etcd.as_ref().expect("set").prefix(), "apps/");
+        let round_trip =
+            Config::from_toml(&toml::to_string(&config).expect("serializes")).expect("round trip");
+        assert_eq!(
+            (round_trip.consul, round_trip.etcd, round_trip.nomad),
+            (config.consul, config.etcd, config.nomad)
+        );
+
+        for (text, reason) in [
+            (
+                "[consul]\nendpoint = \"127.0.0.1:8500\"\n",
+                "consul: endpoint must be",
+            ),
+            (
+                "[consul]\nendpoint = \"https://consul:8501\"\n",
+                "consul: endpoint must be",
+            ),
+            (
+                "[nomad]\nendpoint = \"http://nomad:4646/v1\"\n",
+                "nomad: endpoint must be",
+            ),
+            (
+                "[etcd]\nendpoint = \"unix:///run/etcd.sock\"\n",
+                "etcd: endpoint must be",
+            ),
+            (
+                "[nomad]\nrefresh = \"0s\"\n",
+                "nomad: refresh must be longer than 0s",
+            ),
+            ("[etcd]\ntoken = \"t\"\n", "etcd: token is not supported"),
+            ("[etcd]\nprefix = \"\"\n", "etcd: prefix cannot be empty"),
+            (
+                "[consul]\nprefix = \"rxh/\"\n",
+                "consul: prefix is only used by [etcd]",
+            ),
+            ("[nomad]\nnamespace = \"x\"\n", "unknown field"),
+            ("[consul]\nlisten = \"80\"\n", "listen"),
+        ] {
+            let err = Config::from_toml(text).expect_err(text).to_string();
+            assert!(err.contains(reason), "{text}: {err}");
+        }
+        for section in ["[consul]\n", "[etcd]\n", "[nomad]\n"] {
+            assert!(IncludedConfig::from_toml(section).is_err(), "{section}");
+        }
     }
 
     #[test]

@@ -24,6 +24,15 @@ Changed.
   they publish, which rootless containers need. `provider = "swarm"` routes
   to the running tasks of the services labelled `rxh.enable=true`, with the
   labels of their service, polled every `[docker] refresh` (default 15s).
+- Consul, etcd and Nomad providers: `[consul]`, `[etcd]` and `[nomad]`
+  tables (`endpoint`, `listen`, `refresh`, plus `token` for Consul and
+  Nomad and `prefix` for etcd) route to the instances of a service catalog,
+  listed every `refresh` (default 15s), with the `rxh.*` options of the
+  Docker labels. Consul: services tagged `rxh.enable=true`, instances whose
+  health checks pass, options from `rxh.KEY=VALUE` tags. Nomad: services
+  tagged `rxh.enable=true` in every namespace. etcd: keys
+  `PREFIX/SERVICE/INSTANCE/OPTION` read through the v3 JSON gateway. An
+  unreachable catalog keeps its last routes; a pool belongs to one provider.
 - systemd integration: `rxh run` reports readiness, reloads (with the
   failure reason in `STATUS=`) and shutdown over `NOTIFY_SOCKET`, and takes
   socket-activated listeners from `LISTEN_FDS`, matched to `listen` and

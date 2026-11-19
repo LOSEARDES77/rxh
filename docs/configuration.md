@@ -19,6 +19,9 @@ watch = true
 [log]                    # access logs
 [acme]                   # automatic HTTPS (tls = "auto")
 [docker]                 # routes to Docker, Podman or Swarm containers from their labels
+[consul]                 # routes to Consul catalog services from their tags
+[etcd]                   # routes to service instances written in etcd
+[nomad]                  # routes to Nomad services from their tags
 [upstream.NAME]          # named load balancing pools, any number
 [[server]]               # listeners, any number
 ```
@@ -693,6 +696,85 @@ Swarm only sends the events of a node's own containers, so the services and
 tasks are listed every `refresh` instead: a task that starts or stops is
 routed within that delay. Tasks are reached directly, not through the
 virtual IP of the service.
+
+## `[consul]`, `[etcd]`, `[nomad]`: routes from a service catalog
+
+```toml
+[consul]
+endpoint = "http://127.0.0.1:8500"
+token = "{env.CONSUL_HTTP_TOKEN}"
+listen = "0.0.0.0:80"
+refresh = "15s"
+```
+
+Each table makes the daemon list a service catalog every `refresh` and
+route to its service instances with the options of the
+[`[docker]` labels](#docker-routes-to-containers-from-their-labels)
+(`rxh.enable`, `rxh.http.host`, `rxh.http.port`, `rxh.tcp.listen`,
+`rxh.tcp.port`, `rxh.pool`, `rxh.policy`). An instance is reached at its
+address and port, so `rxh.http.port` and `rxh.tcp.port` are rarely needed.
+The pool defaults to the service name, and the server of a pool is named
+after the section: `consul-web`. Instances that come and go change the
+members of the pool; the listeners are swapped only when the routes change.
+While a catalog cannot be reached, or answers something that cannot be
+read, the instances last listed stay routed and the catalog is retried
+every `refresh`. The tables can be used together and with `[docker]`, but a
+pool belongs to one of them: an instance of a pool already routed by
+another provider is ignored and reported.
+
+| Key | Default | Description |
+|---|---|---|
+| `endpoint` | `"http://127.0.0.1:8500"` (Consul), `"http://127.0.0.1:2379"` (etcd), `"http://127.0.0.1:4646"` (Nomad) | HTTP API of the catalog: `http://host:port`. HTTPS and Unix sockets are not supported. |
+| `token` | unset | ACL token, sent as `X-Consul-Token` or `X-Nomad-Token`. Not accepted by `[etcd]`. Use a `{env.NAME}` or `{file.PATH}` placeholder to keep it out of the file. |
+| `prefix` | `"rxh/"` | `[etcd]` only: where the instances are written. |
+| `listen` | `"0.0.0.0:80"` | Address of the HTTP servers made from `rxh.http.host` options. |
+| `refresh` | `"15s"` | How often the catalog is listed. |
+
+### Consul
+
+The services of the catalog tagged `rxh.enable=true` are routed, and of
+those only the instances whose health checks pass
+(`/v1/health/service/NAME?passing`). The options are the `rxh.KEY=VALUE`
+tags of each instance; other tags are ignored. An instance without a
+service address is reached at the address of its node.
+
+```sh
+consul services register -name web -port 8080 \
+  -tag rxh.enable=true -tag rxh.http.host=app.example.com
+```
+
+### Nomad
+
+The services of Nomad's native service discovery tagged `rxh.enable=true`
+are routed, in every namespace the token can read, with the `rxh.KEY=VALUE`
+tags of each registration as options. The service API of Nomad does not
+report the health of a registration, so an instance is routed for as long
+as it is registered.
+
+```hcl
+service {
+  name     = "web"
+  port     = "http"
+  provider = "nomad"
+  tags     = ["rxh.enable=true", "rxh.http.host=app.example.com"]
+}
+```
+
+### etcd
+
+Instances are keys under `prefix`, read through the JSON gateway of the
+etcd v3 API (`/v3/kv/range`): `PREFIX/SERVICE/INSTANCE/OPTION`, where
+`OPTION` is `address` (`ip:port`, or an IP with `http.port` or `tcp.port`)
+or an option without its `rxh.` prefix. Every instance is enabled unless
+its `enable` key is not `true`, and its pool defaults to `SERVICE`.
+Authentication is not supported.
+
+```sh
+etcdctl put rxh/web/1/address 10.0.0.5:8080
+etcdctl put rxh/web/1/http.host app.example.com
+etcdctl put rxh/web/2/address 10.0.0.6:8080
+etcdctl put rxh/web/2/http.host app.example.com
+```
 
 ## `[upstream.NAME]`: load balancing pools
 
