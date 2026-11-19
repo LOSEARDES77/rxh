@@ -55,6 +55,7 @@ dial_timeout = "3s"
 keepalive = "2m"               # idle upstream connection lifetime
 keepalive_idle_conns_per_host = 32
 h2c = false                    # cleartext HTTP/2 to backends
+http2_conns_per_host = 1       # HTTP/2 connections per backend with h2c
 backends = [
     "127.0.0.1:8080",
     { address = "127.0.0.1:8081", weight = 3 },

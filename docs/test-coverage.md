@@ -167,7 +167,7 @@ written against an older snapshot: their line numbers and percentages are stale,
    server whose behavior is switchable (200, 302 loop, 500, slow, wrong body, closed socket);
    assert `pool` health flips after `fails`/`passes` thresholds. Use `tokio::time::pause` to avoid sleeps.
 6. **Upstream transport and proxy failure paths: transport done.** `server/tests/upstream_pooling.rs`:
-   h2c (one shared HTTP/2 connection with absolute URIs, redial after the backend closes it, 502 when
+   h2c (one shared HTTP/2 connection with absolute URIs, `http2_conns_per_host` connections used in turn, redial after the backend closes it, 502 when
    it is down), pooling disabled with `keepalive = "0s"` or `keepalive_idle_conns_per_host = 0`, idle
    expiry after `keepalive`, idle connections closed by `read_timeout` replaced without an error, and
    the `keepalive_idle_conns_per_host` cap.

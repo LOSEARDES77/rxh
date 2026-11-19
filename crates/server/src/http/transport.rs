@@ -1,8 +1,8 @@
 //! Upstream HTTP connections with keep-alive pooling.
 //!
 //! HTTP/1.1 connections are reused once the previous response body has been
-//! fully read. With `h2c = true` a single multiplexed HTTP/2 connection is
-//! shared per backend.
+//! fully read. With `h2c = true` up to `http2_conns_per_host` multiplexed
+//! HTTP/2 connections are shared per backend, used in turn.
 //!
 //! Connections opened with a PROXY protocol header belong to the client
 //! connection the header describes, and are only reused for its requests.
@@ -55,6 +55,33 @@ struct Idle {
     since: Instant,
 }
 
+/// HTTP/2 connections to one backend.
+#[derive(Debug, Default)]
+struct Http2Pool {
+    senders: Vec<http2::SendRequest<Body>>,
+    /// Connections being opened, which already count toward the limit.
+    dialing: usize,
+    /// Position of the connection used last.
+    next: usize,
+}
+
+/// One of the `http2_conns_per_host` slots of `address`, held while its
+/// connection is being opened. Dropping it frees the slot, also when the
+/// dial fails or the request is cancelled.
+struct Http2Dial<'a> {
+    pools: &'a Mutex<HashMap<String, Http2Pool>>,
+    address: &'a str,
+}
+
+impl Drop for Http2Dial<'_> {
+    fn drop(&mut self) {
+        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(pool) = pools.get_mut(self.address) {
+            pool.dialing -= 1;
+        }
+    }
+}
+
 /// Slot of `max_conns_per_host`, free again once every clone is dropped.
 pub(crate) type Permit = Option<Arc<OwnedSemaphorePermit>>;
 
@@ -94,7 +121,8 @@ pub(crate) struct Transport {
     /// One semaphore of `max_conns` permits per backend address.
     limits: Mutex<HashMap<String, Arc<Semaphore>>>,
     idle: Arc<Mutex<IdlePool>>,
-    http2: Mutex<HashMap<String, http2::SendRequest<Body>>>,
+    http2_conns: usize,
+    http2: Mutex<HashMap<String, Http2Pool>>,
 }
 
 impl Transport {
@@ -110,6 +138,7 @@ impl Transport {
                 lists: HashMap::new(),
                 swept: Instant::now(),
             })),
+            http2_conns: settings.http2_conns_per_host,
             http2: Mutex::default(),
         }
     }
@@ -125,17 +154,10 @@ impl Transport {
     /// configuration rejects that combination.
     pub(crate) async fn connect(&self, address: &str, preface: &[u8]) -> io::Result<Connection> {
         if self.h2c {
-            let existing = self
-                .http2
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(address)
-                .cloned();
-            if let Some(sender) = existing
-                && !sender.is_closed()
-            {
-                return Ok(Connection::Http2(sender));
-            }
+            let dial: Option<Http2Dial<'_>> = match self.pick_http2(address) {
+                Ok(sender) => return Ok(Connection::Http2(sender)),
+                Err(dial) => dial,
+            };
 
             let stream = self.dialer.dial(address).await?;
             let (sender, connection) = http2::Builder::new(TokioExecutor::new())
@@ -149,10 +171,13 @@ impl Transport {
                     eprintln!("upstream h2c connection error: {err}");
                 }
             });
-            self.http2
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(address.to_owned(), sender.clone());
+            // Without a slot the connection only carries this request.
+            if dial.is_some() {
+                let mut pools = self.http2.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(pool) = pools.get_mut(address) {
+                    pool.senders.push(sender.clone());
+                }
+            }
             return Ok(Connection::Http2(sender));
         }
 
@@ -170,6 +195,36 @@ impl Transport {
             reused: false,
             permit,
         })
+    }
+
+    /// Returns the next open HTTP/2 connection to `address` once the backend
+    /// has `http2_conns_per_host` of them, open or being opened. Otherwise
+    /// the caller dials one: with the returned slot it joins the pool,
+    /// without one (every slot is still dialing) it is not kept.
+    fn pick_http2<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Result<http2::SendRequest<Body>, Option<Http2Dial<'a>>> {
+        let mut pools = self.http2.lock().unwrap_or_else(PoisonError::into_inner);
+        // The address is only copied for the first request to a backend.
+        if !pools.contains_key(address) {
+            pools.insert(address.to_owned(), Http2Pool::default());
+        }
+        let pool = pools.get_mut(address).expect("inserted above");
+        pool.senders.retain(|sender| !sender.is_closed());
+
+        if pool.senders.len() + pool.dialing < self.http2_conns {
+            pool.dialing += 1;
+            return Err(Some(Http2Dial {
+                pools: &self.http2,
+                address,
+            }));
+        }
+        if pool.senders.is_empty() {
+            return Err(None);
+        }
+        pool.next = (pool.next + 1) % pool.senders.len();
+        Ok(pool.senders[pool.next].clone())
     }
 
     /// Waits for one of the `max_conns_per_host` slots of `address`.
