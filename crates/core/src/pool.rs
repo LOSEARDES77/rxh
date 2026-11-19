@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, Mac};
 use http::header;
 use http::{HeaderMap, Uri};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::Notify;
@@ -133,7 +134,7 @@ pub struct UpstreamStatus {
 }
 
 /// State of a backend set by an operator, like HAProxy's `set server state`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendState {
     /// Takes new requests.

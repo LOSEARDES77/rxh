@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- `rxh fmt [--check] [FILE...]` rewrites configuration files in one layout
+  (no indentation, one space around `=`, a blank line before each table,
+  one newline at the end) keeping every comment; `--check` fails when a
+  file needs formatting, for CI.
+- `rxh schema` prints the JSON schema (draft 07) of the configuration file,
+  also shipped as `docs/rxh.schema.json`: with a `#:schema` line, Taplo,
+  Even Better TOML and Tombi complete keys, show their documentation and
+  flag unknown keys and wrong values in the editor.
 - Read only web dashboard: `GET /dashboard` on the admin API
   (`http://127.0.0.1:2019/dashboard` by default) shows listeners, hosts
   with their routes, the live health of every backend and the certificates

@@ -90,6 +90,24 @@ pub(crate) enum Command {
     /// Check the configuration file and exit.
     Validate,
 
+    /// Rewrite configuration files in canonical layout: no indentation, one
+    /// space around `=`, one blank line before each table, comments kept.
+    /// Formats the configuration file when no FILE is given.
+    Fmt {
+        /// Files to format.
+        #[arg(value_name = "FILE")]
+        files: Vec<PathBuf>,
+
+        /// Change nothing; list the files that are not formatted and fail
+        /// if there is any.
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Print the JSON schema of the configuration file, for completion and
+    /// validation in editors (`#:schema` in Taplo, Even Better TOML).
+    Schema,
+
     /// Manage backends of a load balancing pool.
     #[command(subcommand, visible_alias = "peer")]
     Upstream(UpstreamCommand),

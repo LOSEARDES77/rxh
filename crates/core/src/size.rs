@@ -4,8 +4,10 @@
 //! unit like in Caddy: decimal (`KB`, `MB`, `GB`, powers of 1000) or binary
 //! (`KiB`, `MiB`, `GiB`, powers of 1024). Units are case insensitive.
 
+use std::borrow::Cow;
 use std::fmt;
 
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de;
 use serde::{Deserialize, Deserializer};
 
@@ -45,6 +47,24 @@ pub fn parse(input: &str) -> Result<usize, ParseSizeError> {
         _ => return Err(error()),
     };
     value.checked_mul(multiplier).ok_or_else(error)
+}
+
+/// Stands in for size fields in the JSON schema of the configuration.
+pub(crate) struct SizeSchema;
+
+impl JsonSchema for SizeSchema {
+    fn schema_name() -> Cow<'static, str> {
+        "Size".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "A number of bytes, or a size such as `64KiB` or `10MB` (units B, KB, MB, GB, KiB, MiB, GiB, case insensitive).",
+            "type": ["string", "integer"],
+            "minimum": 0,
+            "pattern": "^\\s*[0-9]+\\s*([kKmMgG][iI]?[bB]|[bB])?\\s*$"
+        })
+    }
 }
 
 /// Deserializes a size from a number of bytes or a string such as `10MB`.

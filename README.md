@@ -229,6 +229,8 @@ and [TCP/UDP balancing](examples/tcp-udp.toml). The full reference is in
 | `rxh status [--json]` | Listeners, pools, health and request counters. |
 | `rxh top [-i 1s] [-n N]` | Live requests per second, errors, latency and health per pool, from `/metrics`. |
 | `rxh validate` | Check a configuration file. |
+| `rxh fmt [--check] [FILE...]` | Rewrite configuration files in one layout, keeping comments. |
+| `rxh schema` | Print the JSON schema of the configuration file, for completion in editors. |
 | `rxh upstream list\|add\|rm` | Manage the backends (peers) of a pool, live and in the file. `--no-save` changes only the running daemon. |
 | `rxh pool list\|add\|rm` | Manage `[upstream.NAME]` pools. |
 | `rxh service list\|add\|rm` | Manage `[[server]]` listeners (HTTP, TCP, UDP, files). |

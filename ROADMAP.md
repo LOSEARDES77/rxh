@@ -177,8 +177,8 @@ A release people can run without reading the source.
 
 - [ ] Configuration format frozen, with a documented migration path for
       every later change and `rxh validate` warnings for deprecated keys.
-- [ ] `rxh fmt` and a JSON schema for the TOML file, for editor
-      completion.
+- [x] `rxh fmt` and a JSON schema for the TOML file, for editor
+      completion (`rxh schema`, `docs/rxh.schema.json`).
 - [ ] `rxh adapt` to convert a Caddyfile or a simple `nginx.conf` into RXH
       TOML.
 - [ ] Documentation site with a guide per use case (load balancer, TLS

@@ -26,14 +26,15 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::address::{self, BackendAddress, Scheme};
-use crate::duration;
+use crate::duration::{self, DurationSchema};
 use crate::matcher::{HostPattern, RequestMatcher};
 use crate::net::IpNet;
-use crate::size;
+use crate::size::{self, SizeSchema};
 use crate::status::StatusMatcher;
 use crate::template::Template;
 
@@ -65,7 +66,7 @@ impl From<toml::de::Error> for ConfigError {
 }
 
 /// Entire configuration file.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Admin API settings.
@@ -113,6 +114,7 @@ pub struct Config {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub grace_period: Option<Duration>,
 
     /// How the listeners are spread over the CPUs.
@@ -153,7 +155,7 @@ pub struct Config {
 /// listen = "0.0.0.0:80"
 /// forward = "@api"
 /// ```
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IncludedConfig {
     /// Pools, merged into [`Config::upstreams`].
@@ -174,6 +176,17 @@ impl IncludedConfig {
 }
 
 impl Config {
+    /// JSON schema (draft 07) of the configuration file, for completion and
+    /// validation in editors. Field descriptions come from these doc comments.
+    #[must_use]
+    pub fn json_schema() -> schemars::Schema {
+        let mut schema: schemars::Schema = schemars::generate::SchemaSettings::draft07()
+            .into_generator()
+            .into_root_schema_for::<Config>();
+        schema.insert("title".to_owned(), "RXH configuration".into());
+        schema
+    }
+
     /// Parses and validates a TOML document. `include` is not followed, use
     /// [`Config::parse`] and [`Config::merge`] for that.
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -795,7 +808,7 @@ impl Config {
 
 /// Where the admin API listens: `ip:port` or `unix//absolute/path.sock`
 /// (Caddy syntax, like backend addresses).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(try_from = "String", into = "String")]
 pub enum AdminListen {
     /// TCP address.
@@ -852,7 +865,7 @@ impl From<AdminListen> for String {
 const MIN_ADMIN_TOKEN_LENGTH: usize = 16;
 
 /// Admin API settings. The admin API is how the CLI talks to a running daemon.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Admin {
     /// Disables the admin API when false.
@@ -914,7 +927,7 @@ impl Admin {
 }
 
 /// Line format of access logs.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     /// Human readable one line per request.
@@ -926,7 +939,7 @@ pub enum LogFormat {
 }
 
 /// Access log settings, the `[log]` table.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Log {
     /// Format of access lines.
@@ -952,6 +965,7 @@ pub struct Log {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub min_duration: Option<Duration>,
 
     /// Share of the lines no filter keeps that are written, from 0 to 1.
@@ -999,7 +1013,7 @@ impl Default for Log {
 /// OpenTelemetry tracing, the `[tracing]` table: one span per HTTP request,
 /// sent to a collector over OTLP/HTTP in JSON, and W3C `traceparent`
 /// propagation to the backends.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Tracing {
     /// `http://` or `https://` URL of the OTLP traces endpoint, like
@@ -1050,7 +1064,7 @@ fn validate_http_url(key: &str, value: &str) -> Result<(), String> {
 /// Docker provider (`[docker]`): running containers labelled `rxh.enable=true`
 /// become pools and servers, followed live through the Docker events, or the
 /// tasks of the Swarm services labelled `rxh.enable=true`, polled.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Docker {
     /// Engine that runs the containers.
@@ -1069,11 +1083,12 @@ pub struct Docker {
     /// How often the Swarm services and tasks are listed. Docker and Podman
     /// containers are followed through events instead.
     #[serde(default = "default::docker_refresh", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub refresh: Duration,
 }
 
 /// Engine behind `[docker]`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerProvider {
     /// Docker Engine: containers reached at their address on their network.
@@ -1144,7 +1159,7 @@ impl Docker {
 /// labels of `[docker]`; in Kubernetes the hosts come from the Ingresses and
 /// HTTPRoutes and the instances are the ready endpoints of their Services.
 /// The catalog is listed every `refresh`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
     /// HTTP API: `http://host:port`. Defaults to the local agent, see
@@ -1175,6 +1190,7 @@ pub struct Catalog {
 
     /// How often the catalog is listed.
     #[serde(default = "default::docker_refresh", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub refresh: Duration,
 }
 
@@ -1282,7 +1298,7 @@ impl Catalog {
 }
 
 /// Threading model of the listeners.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Runtime {
     /// One work-stealing runtime: a connection may move between threads.
@@ -1302,7 +1318,7 @@ impl Runtime {
 }
 
 /// Protocol spoken by a listener.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// HTTP/1.1 and HTTP/2 reverse proxy, file server and cache.
@@ -1328,7 +1344,7 @@ impl fmt::Display for Protocol {
 
 /// PROXY protocol header sent to upstreams on new connections of `http` and
 /// `tcp` servers.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyProtocol {
     /// Human readable version 1 header.
@@ -1342,7 +1358,7 @@ pub enum ProxyProtocol {
 ///
 /// A server can describe one pattern inline (`forward`, `serve`, `uri`,
 /// `request`, `response`, `cache`) or many patterns under `match`, not both.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(try_from = "RawServer")]
 pub struct Server {
     /// Socket addresses where this server listens.
@@ -1448,28 +1464,34 @@ pub struct Server {
     /// Time a client has to send the incoming PROXY header and, on `tcp`
     /// servers with layer 4 matchers, the bytes the matchers look at.
     #[serde(with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub match_timeout: Duration,
 
     /// Idle time after which a UDP session is dropped.
     #[serde(with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub udp_idle_timeout: Duration,
 
     /// Time a client has to send the request headers (http only).
     #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     pub read_header_timeout: Option<Duration>,
 
     /// Idle time after which a keep-alive HTTP connection or a `tcp`
     /// connection is closed.
     #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     pub idle_timeout: Option<Duration>,
 
     /// Maximum lifetime of upgraded HTTP tunnels and `tcp` connections.
     #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     pub stream_timeout: Option<Duration>,
 
     /// Time upgraded HTTP tunnels stay open once the listener shuts down or
     /// is replaced by a reload. Unset keeps them open until they end.
     #[serde(skip_serializing_if = "Option::is_none", with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     pub stream_close_delay: Option<Duration>,
 }
 
@@ -1533,10 +1555,11 @@ impl Server {
 }
 
 /// Flat representation of [`Server`] as written in the file.
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RawServer {
     #[serde(deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<SocketAddr>")]
     listen: Vec<SocketAddr>,
     #[serde(default)]
     protocol: Protocol,
@@ -1550,10 +1573,13 @@ struct RawServer {
     encode: Vec<Encoding>,
     uri: Option<String>,
     #[serde(default, deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<String>")]
     host: Vec<String>,
     #[serde(default, deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<String>")]
     path: Vec<String>,
     #[serde(default, deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<String>")]
     method: Vec<String>,
     #[serde(default)]
     header: BTreeMap<String, String>,
@@ -1566,6 +1592,7 @@ struct RawServer {
     #[serde(default)]
     handle_response: Vec<HandleResponse>,
     #[serde(default, deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<Mirror>")]
     mirror: Vec<Mirror>,
     cache: Option<Cache>,
     #[serde(default = "default::max_connections", alias = "connections")]
@@ -1595,16 +1622,22 @@ struct RawServer {
     #[serde(default)]
     proxy_protocol_in: bool,
     #[serde(default = "default::match_timeout", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     match_timeout: Duration,
     #[serde(default = "default::udp_idle_timeout", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     udp_idle_timeout: Duration,
     #[serde(default, with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     read_header_timeout: Option<Duration>,
     #[serde(default, with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     idle_timeout: Option<Duration>,
     #[serde(default, with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     stream_timeout: Option<Duration>,
     #[serde(default, with = "duration::option")]
+    #[schemars(with = "Option<DurationSchema>")]
     stream_close_delay: Option<Duration>,
 }
 
@@ -1724,7 +1757,7 @@ impl TryFrom<RawServer> for Server {
 }
 
 /// One entry of a server's `match` list.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Pattern {
     /// Path prefix to match against.
@@ -1738,6 +1771,7 @@ pub struct Pattern {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub host: Vec<String>,
 
     /// Path patterns: `/exact`, `/prefix/*`, `*.suffix`, `/a/*/b`.
@@ -1746,6 +1780,7 @@ pub struct Pattern {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub path: Vec<String>,
 
     /// HTTP methods, case insensitive.
@@ -1754,6 +1789,7 @@ pub struct Pattern {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub method: Vec<String>,
 
     /// Required request headers. The value `*` only requires presence.
@@ -1829,6 +1865,7 @@ pub struct Pattern {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<Mirror>")]
     pub mirror: Vec<Mirror>,
 
     /// Encodings to compress responses with, in order of preference. Applies
@@ -1846,6 +1883,7 @@ pub struct Pattern {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub sni: Vec<String>,
 
     /// ALPN protocols; any may match (tcp only).
@@ -1854,6 +1892,7 @@ pub struct Pattern {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub alpn: Vec<String>,
 
     /// Protocol detected from the first bytes of the connection (tcp only).
@@ -1866,6 +1905,7 @@ pub struct Pattern {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub http_host: Vec<String>,
 
     /// Regular expression searched in the first `regexp_count` bytes of the
@@ -2017,7 +2057,7 @@ impl Pattern {
 }
 
 /// Protocol recognized by the `protocol` matcher of `tcp` servers.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum L4Protocol {
     /// A TLS ClientHello, or any connection to a `tcp` server that terminates TLS.
@@ -2039,7 +2079,7 @@ pub enum L4Protocol {
 pub const MAX_REGEXP_COUNT: usize = 16 * 1024;
 
 /// Content encoding RXH can produce.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Encoding {
     /// Zstandard (`zstd`).
@@ -2070,7 +2110,7 @@ impl Encoding {
 /// serve = "/var/www"
 /// serve = { root = ".", browse = false, hide = [".git", "*.pem"], precompressed = ["br", "gzip"] }
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(from = "FileServerOption")]
 pub struct FileServer {
     /// Directory the files come from.
@@ -2118,22 +2158,24 @@ impl FileServer {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum FileServerOption {
     Root(String),
     Table(FileServerTable),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FileServerTable {
     root: String,
     #[serde(default = "default::true_value")]
     browse: bool,
     #[serde(default, deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<String>")]
     index: Vec<String>,
     #[serde(default, deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<String>")]
     hide: Vec<String>,
     #[serde(default)]
     precompressed: Vec<Encoding>,
@@ -2158,7 +2200,7 @@ impl From<FileServerOption> for FileServer {
 }
 
 /// Action executed when a [`Pattern`] matches.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     /// Proxy to a load balancing group.
@@ -2182,7 +2224,7 @@ pub enum Action {
 /// redirect = "https://example.com{uri}"
 /// redirect = { to = "/new{path}", status = 301 }
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(from = "RedirectOption")]
 pub struct Redirect {
     /// Value of the `Location` header, a [`Template`].
@@ -2192,14 +2234,14 @@ pub struct Redirect {
     pub status: u16,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum RedirectOption {
     To(String),
     Table(RedirectTable),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RedirectTable {
     to: String,
@@ -2251,7 +2293,7 @@ impl Redirect {
 ///     { status = "5xx", copy_response = 500 },
 /// ]
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandleResponse {
     /// Statuses to handle: codes or classes (`"5xx"`), any may match. Empty
@@ -2261,6 +2303,7 @@ pub struct HandleResponse {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<StatusMatcher>")]
     pub status: Vec<StatusMatcher>,
 
     /// Required response headers. The value `*` only requires presence.
@@ -2291,7 +2334,7 @@ pub struct HandleResponse {
 }
 
 /// Value of `copy_response`: `true` or the status to send.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(untagged)]
 pub enum CopyResponse {
     /// `true` keeps the upstream status; `false` is rejected.
@@ -2379,7 +2422,7 @@ impl HandleResponse {
 /// forward = { policy = "ip_hash", backends = ["127.0.0.1:8080"] }
 /// forward = [{ pool = "v1", weight = 90 }, { pool = "v2", weight = 10 }]
 /// ```
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, JsonSchema)]
 #[serde(from = "ForwardOption")]
 pub enum Forward {
     /// Reference to an entry of [`Config::upstreams`].
@@ -2394,7 +2437,7 @@ pub enum Forward {
 }
 
 /// One pool of a [`Forward::Split`]: `{ pool = "v2", weight = 10 }`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WeightedPool {
     /// Name of an entry of [`Config::upstreams`], without `@`.
@@ -2409,7 +2452,7 @@ pub struct WeightedPool {
 /// One entry of `mirror` on a `forward` route: `{ pool = "shadow", percent =
 /// 10 }`. A copy of the request goes to a member of the pool and its
 /// response is dropped; the client only ever sees the `forward` response.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mirror {
     /// Name of an entry of [`Config::upstreams`], without `@`.
@@ -2425,6 +2468,7 @@ pub struct Mirror {
         default = "default::mirror_max_body_size",
         deserialize_with = "size::deserialize"
     )]
+    #[schemars(with = "SizeSchema")]
     pub max_body_size: usize,
 }
 
@@ -2438,7 +2482,7 @@ impl Serialize for Forward {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum ForwardOption {
     Text(String),
@@ -2473,7 +2517,7 @@ impl From<ForwardOption> for Forward {
 /// fallback = "random"
 /// fallback = { policy = "header", key = "x-user", fallback = "round_robin" }
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(from = "FallbackOption")]
 pub struct Fallback {
     /// Selection policy.
@@ -2496,14 +2540,14 @@ pub struct Fallback {
     pub fallback: Option<Box<Fallback>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum FallbackOption {
     Text(Policy),
     Table(FallbackTable),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FallbackTable {
     policy: Policy,
@@ -2552,7 +2596,7 @@ impl Fallback {
 /// ```toml
 /// retry_match = { method = ["GET", "POST"], status = ["502", "5xx"] }
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RetryMatch {
     /// Methods whose bodyless requests are retried after a failed round trip.
@@ -2603,7 +2647,7 @@ impl RetryMatch {
 /// ```toml
 /// retry_budget = { percent = 20, min_retries = 3 }
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RetryBudget {
     /// Most requests retrying at once, in percent of the requests in flight
@@ -2665,7 +2709,7 @@ impl UpstreamGroup {
 
 /// Load balancing group: backends plus selection, retry and health settings.
 /// Field names follow Caddy's `reverse_proxy` subdirectives.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamGroup {
     /// Selection policy (Caddy `lb_policy`).
@@ -2705,6 +2749,7 @@ pub struct UpstreamGroup {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub try_duration: Option<Duration>,
 
     /// Wait between attempts (Caddy `lb_try_interval`).
@@ -2713,6 +2758,7 @@ pub struct UpstreamGroup {
         alias = "lb_try_interval",
         with = "duration"
     )]
+    #[schemars(with = "DurationSchema")]
     pub try_interval: Duration,
 
     /// Bound on the retries and hedges in flight at once (Envoy
@@ -2728,10 +2774,12 @@ pub struct UpstreamGroup {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub hedge_delay: Option<Duration>,
 
     /// Upstream connect timeout.
     #[serde(default = "default::dial_timeout", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub dial_timeout: Duration,
 
     /// Time from sending a request to receiving the response headers
@@ -2741,6 +2789,7 @@ pub struct UpstreamGroup {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub response_header_timeout: Option<Duration>,
 
     /// An upstream read without progress for this long fails the connection.
@@ -2749,6 +2798,7 @@ pub struct UpstreamGroup {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub read_timeout: Option<Duration>,
 
     /// An upstream write without progress for this long fails the connection.
@@ -2757,6 +2807,7 @@ pub struct UpstreamGroup {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub write_timeout: Option<Duration>,
 
     /// Speak cleartext HTTP/2 to the backends instead of HTTP/1.1.
@@ -2776,6 +2827,7 @@ pub struct UpstreamGroup {
 
     /// How long idle upstream HTTP connections stay in the pool.
     #[serde(default = "default::keepalive", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub keepalive: Duration,
 
     /// Maximum idle upstream HTTP connections kept per backend.
@@ -2800,6 +2852,7 @@ pub struct UpstreamGroup {
 
     /// Longest wait in the queue (HAProxy `timeout queue`).
     #[serde(default = "default::queue_timeout", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub queue_timeout: Duration,
 
     /// Bytes of each request body read before the request is sent upstream.
@@ -2809,6 +2862,7 @@ pub struct UpstreamGroup {
         deserialize_with = "size::deserialize",
         skip_serializing_if = "is_zero"
     )]
+    #[schemars(with = "SizeSchema")]
     pub request_buffers: usize,
 
     /// Bytes of each response body read before the response is sent to the
@@ -2818,6 +2872,7 @@ pub struct UpstreamGroup {
         deserialize_with = "size::deserialize",
         skip_serializing_if = "is_zero"
     )]
+    #[schemars(with = "SizeSchema")]
     pub response_buffers: usize,
 
     /// Responses with a `Content-Length` are written to the client in
@@ -2828,6 +2883,7 @@ pub struct UpstreamGroup {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub flush_interval: Option<Duration>,
 
     /// Backends. Port ranges such as `10.0.0.1:8001-8004` expand to many.
@@ -2853,6 +2909,7 @@ pub struct UpstreamGroup {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub slow_start: Option<Duration>,
 
     /// How the hash policies map a key to a backend.
@@ -2876,7 +2933,7 @@ pub struct UpstreamGroup {
 }
 
 /// IP versions used by [`DynamicUpstreams::a`].
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IpVersion {
     /// `A` records.
@@ -2891,7 +2948,7 @@ pub enum IpVersion {
 /// `a` resolves to plain `ip:port` backends. When the group uses TLS the SNI
 /// and certificate name cannot come from an IP, so `tls.server_name` is
 /// required. `srv` produces `target:port` backends that keep the host name.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicUpstreams {
     /// `name:port`, resolved to its `A` and `AAAA` records.
@@ -2904,6 +2961,7 @@ pub struct DynamicUpstreams {
 
     /// Time between lookups.
     #[serde(default = "default::dynamic_refresh", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub refresh: Duration,
 
     /// DNS servers to ask, default the system configuration.
@@ -2953,7 +3011,7 @@ impl DynamicUpstreams {
 }
 
 /// TLS client settings of an [`UpstreamGroup`] (Caddy `transport http { tls }`).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
     /// Server name sent as SNI and checked against the certificate. Defaults
@@ -3244,7 +3302,7 @@ fn expand_port_range(address: &str) -> Result<Vec<String>, String> {
 /// One backend of an [`UpstreamGroup`].
 ///
 /// Written as `"host:port"` or `{ address = "host:port", weight = 3 }`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(from = "BackendOption")]
 pub struct Backend {
     /// `host:port` of the backend. Host names are resolved on every dial.
@@ -3265,7 +3323,7 @@ impl Backend {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum BackendOption {
     Simple(String),
@@ -3286,7 +3344,7 @@ impl From<BackendOption> for Backend {
 }
 
 /// Algorithm mapping the key of a hash policy to a backend.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HashType {
     /// Highest random weight hashing, computed over the members on each pick.
@@ -3298,7 +3356,7 @@ pub enum HashType {
 }
 
 /// Load balancing policy. Names match Caddy's `lb_policy` values.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Policy {
     /// Uniformly random available backend.
@@ -3416,7 +3474,7 @@ impl FromStr for Policy {
 
 /// Active health checks. With `uri` set the check is an HTTP request,
 /// otherwise it is a plain TCP connect.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveHealth {
     /// Path and query requested by HTTP checks (Caddy `health_uri`).
@@ -3442,10 +3500,12 @@ pub struct ActiveHealth {
 
     /// Time between checks.
     #[serde(default = "default::health_interval", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub interval: Duration,
 
     /// Time limit for one check.
     #[serde(default = "default::health_timeout", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub timeout: Duration,
 
     /// Consecutive passes needed to mark a backend healthy.
@@ -3487,7 +3547,7 @@ pub struct ActiveHealth {
 
 /// Actions run on `healthy` and `unhealthy` events of active health checks,
 /// besides the log line. Each event runs the command, then calls the webhook.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HealthHooks {
     /// Program and arguments, run without a shell. The event is passed in
@@ -3523,7 +3583,7 @@ impl HealthHooks {
 /// failed or slow requests in a `window` reaches a ratio is taken out of
 /// rotation (open) for `open_duration`, then gets one trial request (half
 /// open) that closes the breaker again or reopens it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CircuitBreaker {
     /// Share of failed requests, `0.5` for half of them, that opens the
@@ -3541,6 +3601,7 @@ pub struct CircuitBreaker {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub latency: Option<Duration>,
 
     /// Share of slow responses that opens the breaker. `0.5` trips on the
@@ -3550,6 +3611,7 @@ pub struct CircuitBreaker {
 
     /// Period over which requests are counted.
     #[serde(default = "default::breaker_duration", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub window: Duration,
 
     /// Requests in a window below which the breaker never opens.
@@ -3558,6 +3620,7 @@ pub struct CircuitBreaker {
 
     /// How long an open breaker keeps its backend out of rotation.
     #[serde(default = "default::breaker_duration", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub open_duration: Duration,
 }
 
@@ -3598,11 +3661,12 @@ impl CircuitBreaker {
 
 /// Passive health checks: backends that fail real traffic are taken out of
 /// rotation for `fail_duration`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PassiveHealth {
     /// How long a failure is remembered.
     #[serde(default = "default::fail_duration", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub fail_duration: Duration,
 
     /// Failures within `fail_duration` that mark a backend down.
@@ -3619,6 +3683,7 @@ pub struct PassiveHealth {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub unhealthy_latency: Option<Duration>,
 
     /// Concurrent requests above which a backend is considered full. Zero
@@ -3649,11 +3714,28 @@ pub enum Tls {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TlsFiles {
+    /// PEM certificate chain file.
     cert: String,
+    /// PEM private key file.
     key: String,
+}
+
+impl JsonSchema for Tls {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Tls".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "anyOf": [
+                { "const": "auto", "description": "Certificates from ACME for every name in `host`." },
+                generator.subschema_for::<TlsFiles>(),
+            ]
+        })
+    }
 }
 
 impl Serialize for Tls {
@@ -3704,7 +3786,7 @@ impl<'de> Deserialize<'de> for Tls {
 
 /// What a TLS server asks of client certificates, named after Traefik's
 /// `clientAuthType` values.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientAuthMode {
     /// Asks for a certificate; accepts clients without one and does not
@@ -3742,7 +3824,7 @@ impl ClientAuthMode {
 /// ```toml
 /// client_auth = { ca = "clients-ca.pem", header = "X-Client-Subject" }
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuth {
     /// What is asked of the client.
@@ -3756,6 +3838,7 @@ pub struct ClientAuth {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub ca: Vec<String>,
 
     /// Request header that carries the subject of the verified client
@@ -3792,7 +3875,7 @@ impl ClientAuth {
 }
 
 /// Lowest TLS version a server accepts.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 pub enum TlsVersion {
     /// TLS 1.2 and 1.3.
     #[default]
@@ -3809,7 +3892,7 @@ pub enum TlsVersion {
 /// ```toml
 /// tls_options = { min_version = "1.3", curves = ["X25519", "secp384r1"] }
 /// ```
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TlsOptions {
     /// Lowest protocol version accepted.
@@ -3897,7 +3980,7 @@ impl TlsOptions {
 
 /// The `[acme]` table: where `tls = "auto"` certificates come from and where
 /// they are kept.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Acme {
     /// Contact address registered with the account, for expiry notices.
@@ -3920,6 +4003,7 @@ pub struct Acme {
 
     /// Certificates expiring within this time are renewed.
     #[serde(default = "default::acme_renew_before", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub renew_before: Duration,
 
     /// Port the CA connects to for HTTP-01 challenges.
@@ -3936,7 +4020,7 @@ pub struct Acme {
 }
 
 /// The `challenge` key of `[acme]`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 pub enum AcmeChallenge {
     /// The CA fetches a token over plain HTTP on port 80 (`http_port` here).
     #[default]
@@ -3957,7 +4041,7 @@ pub enum AcmeChallenge {
 }
 
 /// The `provider` key of `[acme.dns]`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsProvider {
     /// Cloudflare API, with `api_token`.
@@ -3982,7 +4066,7 @@ impl fmt::Display for DnsProvider {
 }
 
 /// The `[acme.dns]` table: where DNS-01 challenge records are created.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeDns {
     /// Who hosts the zones of the certified names.
@@ -4027,6 +4111,7 @@ pub struct AcmeDns {
     /// Time between creating the record and asking the CA to validate, for
     /// the record to reach every name server of the zone.
     #[serde(default = "default::acme_dns_propagation_wait", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub propagation_wait: Duration,
 }
 
@@ -4255,7 +4340,7 @@ pub fn validate_domain(name: &str) -> Result<(), String> {
 }
 
 /// Per-pattern request customization.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestConfig {
     /// Method the request is forwarded or served with instead of its own,
@@ -4269,6 +4354,7 @@ pub struct RequestConfig {
         deserialize_with = "size::deserialize_option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<SizeSchema>")]
     pub max_body_size: Option<usize>,
 
     /// Header rules.
@@ -4277,7 +4363,7 @@ pub struct RequestConfig {
 }
 
 /// Per-pattern response customization.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
     /// Header rules.
@@ -4286,7 +4372,7 @@ pub struct ResponseConfig {
 }
 
 /// Request header rules, applied before the request goes upstream.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestHeaders {
     /// `Forwarded` header (RFC 7239) behavior.
@@ -4311,7 +4397,7 @@ pub struct RequestHeaders {
 }
 
 /// Regex rewrite of every value of a header.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderReplace {
     /// Regular expression to look for.
@@ -4364,7 +4450,7 @@ impl ResponseHeaders {
 }
 
 /// Response header rules, applied before the response goes to the client.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseHeaders {
     /// `Via` header behavior.
@@ -4393,7 +4479,7 @@ pub struct ResponseHeaders {
 }
 
 /// `Forwarded` header settings.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedHeader {
     /// Appends to client provided values instead of replacing them.
@@ -4414,7 +4500,7 @@ impl Default for ForwardedHeader {
 }
 
 /// `Via` response header settings.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ViaHeader {
     /// Appends this proxy to the `Via` header of responses.
@@ -4423,7 +4509,7 @@ pub struct ViaHeader {
 }
 
 /// `Server` response header settings.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerHeader {
     /// Replaces the upstream `Server` header with `rxh`.
@@ -4446,7 +4532,7 @@ impl Default for ServerHeader {
 
 /// Token bucket rate limit of requests: `rate` requests every `per`, with
 /// bursts of up to `burst` requests, counted separately for each `key`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
     /// Requests allowed every `per`.
@@ -4454,6 +4540,7 @@ pub struct RateLimit {
 
     /// Period of `rate`.
     #[serde(default = "default::rate_limit_per", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub per: Duration,
 
     /// Requests a client can send at once before `rate` applies. Defaults to
@@ -4488,7 +4575,7 @@ impl RateLimit {
 }
 
 /// What a [`RateLimit`] counts requests by.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(try_from = "String", into = "String")]
 pub enum RateLimitKey {
     /// The client IP: `X-Forwarded-For` of `trusted_proxies`, else the peer.
@@ -4573,7 +4660,7 @@ fn validate_response_policy(
 
 /// Preset of security response headers. Each header is only added when the
 /// response does not already have it.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SecurityHeaders {
     /// No headers; in a match entry, turns the server's preset off.
@@ -4632,16 +4719,18 @@ impl SecurityHeaders {
 
 /// Cross-origin resource sharing: preflight answers and `Access-Control-*`
 /// response headers for the allowed origins.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Cors {
     /// Allowed origins: `https://app.example.com`, `https://*.example.com`
     /// for any subdomain, or `*` for any origin.
     #[serde(deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<String>")]
     pub origins: Vec<String>,
 
     /// Methods allowed in preflight answers.
     #[serde(default = "default::cors_methods", deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany<String>")]
     pub methods: Vec<String>,
 
     /// Request headers allowed in preflight answers. Empty allows the ones
@@ -4651,6 +4740,7 @@ pub struct Cors {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub headers: Vec<String>,
 
     /// Response headers scripts may read besides the safelisted ones.
@@ -4659,6 +4749,7 @@ pub struct Cors {
         deserialize_with = "one_or_many",
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[schemars(with = "OneOrMany<String>")]
     pub expose_headers: Vec<String>,
 
     /// Allows cookies and `Authorization` on cross-origin requests.
@@ -4671,6 +4762,7 @@ pub struct Cors {
         with = "duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<DurationSchema>")]
     pub max_age: Option<Duration>,
 }
 
@@ -4742,7 +4834,7 @@ impl Cors {
 }
 
 /// HTTP Basic authentication (RFC 7617) against bcrypt password hashes.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BasicAuth {
     /// Realm shown in the password prompt of browsers.
@@ -4825,7 +4917,7 @@ impl BasicAuth {
 /// Authentication delegated to an external service (Authelia, Authentik,
 /// oauth2-proxy): it gets the head of each request and decides with the
 /// status of its answer.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardAuth {
     /// `http://` or `https://` URL of the verification endpoint.
@@ -4838,6 +4930,7 @@ pub struct ForwardAuth {
 
     /// Time the service has to answer.
     #[serde(default = "default::forward_auth_timeout", with = "duration")]
+    #[schemars(with = "DurationSchema")]
     pub timeout: Duration,
 }
 
@@ -4866,7 +4959,7 @@ impl ForwardAuth {
 }
 
 /// Response cache for `GET` requests.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Cache {
     /// Turns the cache on.
@@ -4906,18 +4999,20 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+/// A single value or a list of values; the schema of `one_or_many` fields.
+#[derive(Deserialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(rename = "OneOrMany_{T}")]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
 fn one_or_many<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     T: Deserialize<'de>,
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany<T> {
-        One(T),
-        Many(Vec<T>),
-    }
-
     Ok(match OneOrMany::deserialize(deserializer)? {
         OneOrMany::One(item) => vec![item],
         OneOrMany::Many(items) => items,

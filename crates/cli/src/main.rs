@@ -4,10 +4,12 @@ mod cli;
 mod client;
 mod commands;
 mod edit;
+mod fmt;
 mod process;
 mod quick;
 mod top;
 
+use std::fs;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -42,6 +44,8 @@ fn main() -> ExitCode {
                 run_config(config)
             })
         }
+        Some(Command::Fmt { files, check }) => format_files(&cli, files, check),
+        Some(Command::Schema) => schema(),
         Some(Command::HashPassword) => hash_password(),
         Some(Command::Completions { shell }) => completions(shell),
         Some(Command::Man { dir }) => man(dir.as_deref()),
@@ -89,6 +93,41 @@ fn file_server(listen: SocketAddr, root: &Path, browse: bool, encode: bool) -> R
 
 /// `rxh hash-password`: prints the bcrypt hash of the first line of standard
 /// input.
+/// Formats `files`, or the configuration file. With `check`, only reports.
+fn format_files(cli: &Cli, mut files: Vec<PathBuf>, check: bool) -> Result<(), String> {
+    if files.is_empty() {
+        files.push(commands::config_path(cli));
+    }
+    let mut unformatted: usize = 0;
+    for path in &files {
+        let text: String = fs::read_to_string(path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        let formatted: String =
+            fmt::format(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+        if formatted == text {
+            continue;
+        }
+        unformatted += 1;
+        if check {
+            println!("{}", path.display());
+        } else {
+            fs::write(path, formatted)
+                .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+        }
+    }
+    if check && unformatted > 0 {
+        return Err(format!("{unformatted} file(s) not formatted"));
+    }
+    Ok(())
+}
+
+fn schema() -> Result<(), String> {
+    let schema = Config::json_schema();
+    let json: String = serde_json::to_string_pretty(&schema).map_err(|err| err.to_string())?;
+    println!("{json}");
+    Ok(())
+}
+
 fn hash_password() -> Result<(), String> {
     let mut line = String::new();
     std::io::stdin()
