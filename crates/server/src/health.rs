@@ -1,5 +1,6 @@
-//! Active health checks. With `health.uri` set the check is an HTTP request,
-//! otherwise a TCP connect.
+//! Active health checks. With `health.grpc` the check is a call of the gRPC
+//! health checking protocol, with `health.uri` an HTTP request, otherwise a
+//! TCP connect.
 
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use hyper::Method;
 use hyper::Request;
 use hyper::Uri;
 use hyper::header::{self, HeaderName, HeaderValue};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rxh_core::address::BackendAddress;
 use rxh_core::config::ActiveHealth;
 use tokio::sync::mpsc;
@@ -99,6 +100,7 @@ async fn check(group: &Group, settings: &ActiveHealth, address: &str) -> Result<
 
     let attempt = async {
         match &settings.uri {
+            _ if settings.grpc => grpc_check(group, settings, &target).await,
             None => group
                 .dialer
                 .dial(&target)
@@ -203,4 +205,139 @@ async fn http_check(
     }
 
     Err(String::from("too many redirects"))
+}
+
+/// Calls `grpc.health.v1.Health/Check` over HTTP/2 and passes on `SERVING`.
+async fn grpc_check(group: &Group, settings: &ActiveHealth, target: &str) -> Result<(), String> {
+    let authority = match BackendAddress::parse(target) {
+        Ok(address) => address
+            .host_port()
+            .unwrap_or_else(|| String::from("localhost")),
+        Err(_) => target.to_owned(),
+    };
+    let stream = group
+        .dialer
+        .dial(target)
+        .await
+        .map_err(|err| err.to_string())?;
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .map_err(|err| err.to_string())?;
+    tokio::task::spawn(connection);
+
+    let service = settings.grpc_service.as_deref().unwrap_or_default();
+    let mut request = Request::new(Full::new(Bytes::from(grpc_health_request(service))));
+    *request.method_mut() = Method::POST;
+    *request.uri_mut() = format!("http://{authority}/grpc.health.v1.Health/Check")
+        .parse()
+        .map_err(|_| format!("invalid health target {target:?}"))?;
+    let headers = request.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc"),
+    );
+    headers.insert(header::TE, HeaderValue::from_static("trailers"));
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("rxh-health-check"),
+    );
+    for (name, value) in &settings.headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| err.to_string())?;
+        let value = HeaderValue::from_str(value).map_err(|err| err.to_string())?;
+        headers.insert(name, value);
+    }
+
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|err| err.to_string())?;
+    let (parts, body) = response.into_parts();
+    if !parts.status.is_success() {
+        return Err(format!("status {}, expected 200", parts.status));
+    }
+    let collected = Limited::new(body, MAX_BODY)
+        .collect()
+        .await
+        .map_err(|err| err.to_string())?;
+    // An error without a message comes as headers only.
+    let grpc_status = collected
+        .trailers()
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| parts.headers.get("grpc-status"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("missing");
+    if grpc_status != "0" {
+        return Err(format!("grpc-status {grpc_status}, expected 0"));
+    }
+    grpc_health_serving(&collected.to_bytes())
+}
+
+/// Length-prefixed `HealthCheckRequest` for `service`.
+fn grpc_health_request(service: &str) -> Vec<u8> {
+    let mut message = Vec::new();
+    if !service.is_empty() {
+        // Field 1, length-delimited, with a varint length.
+        message.push(0x0a);
+        let mut len = service.len();
+        while len >= 0x80 {
+            message.push(len as u8 | 0x80);
+            len >>= 7;
+        }
+        message.push(len as u8);
+        message.extend_from_slice(service.as_bytes());
+    }
+    let mut frame = vec![0];
+    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&message);
+    frame
+}
+
+/// Checks that `body` is one uncompressed `HealthCheckResponse` with status
+/// `SERVING`.
+fn grpc_health_serving(body: &[u8]) -> Result<(), String> {
+    // The message has a single field: `status` (field 1, varint), omitted
+    // when it is `UNKNOWN` (0).
+    match body {
+        [0, 0, 0, 0, 2, 0x08, 1] => Ok(()),
+        [0, 0, 0, 0, 0] | [0, 0, 0, 0, 2, 0x08, 0] => Err(String::from("status UNKNOWN")),
+        [0, 0, 0, 0, 2, 0x08, 2] => Err(String::from("status NOT_SERVING")),
+        [0, 0, 0, 0, 2, 0x08, 3] => Err(String::from("status SERVICE_UNKNOWN")),
+        _ => Err(String::from("unreadable HealthCheckResponse")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_health_request_frames_the_service_name() {
+        assert_eq!(grpc_health_request(""), [0, 0, 0, 0, 0]);
+        assert_eq!(
+            grpc_health_request("a.B"),
+            [0, 0, 0, 0, 5, 0x0a, 3, b'a', b'.', b'B']
+        );
+        let long = "x".repeat(300);
+        let frame = grpc_health_request(&long);
+        assert_eq!(frame[..5], [0, 0, 0, 1, 47]);
+        // 300 as a varint.
+        assert_eq!(frame[5..8], [0x0a, 0xac, 0x02]);
+        assert_eq!(frame.len(), 5 + 3 + 300);
+    }
+
+    #[test]
+    fn grpc_health_response_must_be_serving() {
+        assert_eq!(grpc_health_serving(&[0, 0, 0, 0, 2, 8, 1]), Ok(()));
+        let failure = |body: &[u8]| grpc_health_serving(body).unwrap_err();
+        assert_eq!(failure(&[0, 0, 0, 0, 2, 8, 2]), "status NOT_SERVING");
+        assert_eq!(failure(&[0, 0, 0, 0, 2, 8, 3]), "status SERVICE_UNKNOWN");
+        assert_eq!(failure(&[0, 0, 0, 0, 0]), "status UNKNOWN");
+        assert_eq!(failure(&[]), "unreadable HealthCheckResponse");
+        // Compressed messages are not requested, so not understood.
+        assert_eq!(
+            failure(&[1, 0, 0, 0, 2, 8, 1]),
+            "unreadable HealthCheckResponse"
+        );
+    }
 }
