@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
-use rxh_core::config::{Config, IncludedConfig, Runtime};
+use rxh_core::config::{AdminListen, Config, IncludedConfig, Runtime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -191,13 +191,14 @@ impl Daemon {
             config_path: self
                 .config_path()
                 .and_then(|path| std::fs::canonicalize(path).ok()),
-            listen: admin_settings.listen,
+            listen: admin_settings.listen.clone(),
+            token: admin_settings.token.clone(),
             current: RwLock::new(generation.current()),
             control,
         });
 
         let _admin = if admin_settings.enabled {
-            let listener = tokio::net::TcpListener::bind(admin_settings.listen).await.map_err(|err| {
+            let listener = admin::Listener::bind(&admin_settings.listen).await.map_err(|err| {
                 io::Error::new(
                     err.kind(),
                     format!(
@@ -206,7 +207,12 @@ impl Daemon {
                     ),
                 )
             })?;
-            println!("Admin => API listening on http://{}", admin_settings.listen);
+            match &admin_settings.listen {
+                AdminListen::Tcp(address) => println!("Admin => API listening on http://{address}"),
+                AdminListen::Unix(path) => {
+                    println!("Admin => API listening on unix socket {}", path.display());
+                }
+            }
             Some(AbortOnDrop(tokio::task::spawn(admin::serve(
                 listener,
                 Arc::clone(&admin_state),
@@ -278,7 +284,7 @@ impl Daemon {
         // be able to bind it.
         acme::release_challenge_port(&config.with_https_redirects()).await;
 
-        if config.admin.listen != admin.listen {
+        if config.admin.listen != admin.listen || config.admin.token != admin.token {
             eprintln!("Main => [admin] changes take effect after a restart");
         }
 
@@ -485,6 +491,7 @@ forward = "@api"
                 started: Instant::now(),
                 config_path: None,
                 listen: "127.0.0.1:0".parse().expect("address"),
+                token: None,
                 current: RwLock::new(generation.current()),
                 control,
             }

@@ -1,11 +1,10 @@
 //! Implementation of the client side commands (everything except `run` and
 //! `start`).
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rxh_core::config::{Action, Forward, Policy};
+use rxh_core::config::{Action, Admin, Forward, Policy};
 use serde_json::{Value, json};
 
 use crate::cli::{
@@ -26,21 +25,24 @@ pub(crate) fn config_path(cli: &Cli) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG))
 }
 
-/// Admin address: `--admin`, else `[admin] listen` of the config file, else
-/// the default.
-fn admin_address(cli: &Cli) -> SocketAddr {
-    if let Some(address) = cli.admin {
-        return address;
-    }
-    rxh_server::load_config(&config_path(cli))
-        .ok()
-        .map(|config| config.admin.listen)
-        .unwrap_or_else(|| rxh_core::config::Admin::default().listen)
+/// Client of the daemon. Address: `--admin`, else `[admin] listen` of the
+/// config file, else the default. Token: `--admin-token`, else `[admin]
+/// token` of the config file, which is never sent to another address.
+fn admin_client(cli: &Cli) -> AdminClient {
+    let admin: Admin = rxh_server::load_config(&config_path(cli))
+        .map(|config| config.admin)
+        .unwrap_or_default();
+    let address = cli.admin.clone().unwrap_or_else(|| admin.listen.clone());
+    let token = cli
+        .admin_token
+        .clone()
+        .or_else(|| admin.token.filter(|_| address == admin.listen));
+    AdminClient::new(address, token)
 }
 
 /// Runs a client command.
 pub(crate) async fn execute(cli: &Cli, command: Command) -> Result<(), String> {
-    let client = AdminClient::new(admin_address(cli));
+    let client = admin_client(cli);
 
     match command {
         Command::Run

@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use rxh_core::config::AdminListen;
 
 /// RXH: reverse proxy and layer 4 load balancer (HTTP, TCP, UDP) with a
 /// daemon and live upstream management.
@@ -15,10 +16,22 @@ pub(crate) struct Cli {
     #[arg(short, long, global = true, value_name = "FILE", env = "RXH_CONFIG")]
     pub(crate) config: Option<PathBuf>,
 
-    /// Admin API address of the running daemon. Defaults to `[admin] listen`
-    /// from the configuration file, or 127.0.0.1:2019.
+    /// Admin API address of the running daemon, `ip:port` or
+    /// `unix//path/to/admin.sock`. Defaults to `[admin] listen` from the
+    /// configuration file, or 127.0.0.1:2019.
     #[arg(long, global = true, value_name = "ADDR", env = "RXH_ADMIN")]
-    pub(crate) admin: Option<SocketAddr>,
+    pub(crate) admin: Option<AdminListen>,
+
+    /// Token of the admin API. Defaults to `[admin] token` from the
+    /// configuration file when the address is the one of that file.
+    #[arg(
+        long,
+        global = true,
+        value_name = "TOKEN",
+        env = "RXH_ADMIN_TOKEN",
+        hide_env_values = true
+    )]
+    pub(crate) admin_token: Option<String>,
 
     /// PID file of a daemon started with `rxh start`.
     #[arg(

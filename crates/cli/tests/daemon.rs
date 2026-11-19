@@ -1009,3 +1009,150 @@ async fn cert_commands_list_and_reload() {
     assert!(stderr.contains("certificate reload failed"), "{stderr}");
     assert!(stderr.contains("key.pem"), "{stderr}");
 }
+
+/// Runs a CLI command with nothing but the configuration file of `directory`.
+fn rxh_bare(directory: &Path, args: &[&str]) -> Output {
+    Command::new(RXH)
+        .current_dir(directory)
+        .env_remove("RXH_ADMIN")
+        .env_remove("RXH_ADMIN_TOKEN")
+        .env_remove("RXH_CONFIG")
+        .args(args)
+        .output()
+        .expect("rxh runs")
+}
+
+fn stderr_of(output: &Output) -> String {
+    assert!(!output.status.success(), "command must fail");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_talks_to_the_daemon_over_a_unix_socket() {
+    let first = backend("first").await;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let socket = dir.join("admin.sock");
+    let address = format!("unix/{}", socket.display());
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{address}\"\n\n[upstream.api]\nbackends = [\"{first}\"]\n\n\
+             [[server]]\nlisten = \"{}\"\nforward = \"@api\"\n",
+            free_address()
+        ),
+    )
+    .expect("write");
+    let _daemon = start_daemon(dir);
+    for _ in 0..250 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The address comes from the configuration file, or from `--admin`.
+    let status = assert_success(&rxh_bare(dir, &["status"]));
+    assert!(status.contains(&format!("admin {address}")), "{status}");
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let status = assert_success(&rxh_bare(
+        elsewhere.path(),
+        &["--admin", &address, "status"],
+    ));
+    assert!(status.contains(&format!("admin {address}")), "{status}");
+
+    // Live changes and reloads go through the socket too.
+    assert_success(&rxh_bare(dir, &["upstream", "add", "api", "127.0.0.1:1"]));
+    let list = assert_success(&rxh_bare(dir, &["upstream", "list", "api"]));
+    assert!(list.contains("127.0.0.1:1"), "{list}");
+
+    // A second daemon is refused in the foreground.
+    let pid_file = dir.join("second.pid");
+    let pid_file = pid_file.to_str().expect("utf-8 path");
+    let busy = stderr_of(&rxh_bare(dir, &["--pid-file", pid_file, "start"]));
+    assert!(
+        busy.contains(&format!("admin address {address} is busy")),
+        "{busy}"
+    );
+
+    let missing = stderr_of(&rxh_bare(
+        dir,
+        &["--admin", "unix//nonexistent/admin.sock", "status"],
+    ));
+    assert!(missing.contains("daemon is not reachable"), "{missing}");
+    let relative = stderr_of(&rxh_bare(dir, &["--admin", "unix/admin.sock", "status"]));
+    assert!(relative.contains("invalid admin address"), "{relative}");
+
+    assert_success(&rxh_bare(dir, &["stop"]));
+    assert!(!socket.exists(), "the socket file is removed on stop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_sends_the_admin_token() {
+    let token = "cli-admin-token-0123456789";
+    let admin = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!("[admin]\nlisten = \"{admin}\"\ntoken = \"{token}\"\n"),
+    )
+    .expect("write");
+    let _daemon = start_daemon(dir);
+    for _ in 0..250 {
+        if TcpStream::connect(admin).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let admin = admin.to_string();
+
+    // The token of the configuration file is used for the address of that file.
+    assert_success(&rxh_bare(dir, &["status"]));
+    assert_success(&rxh_bare(dir, &["--admin", &admin, "status"]));
+    let shown = assert_success(&rxh_bare(dir, &["config", "show", "--json"]));
+    assert!(
+        !shown.contains(token),
+        "the daemon redacts the token: {shown}"
+    );
+
+    // Without the file, the token comes from the flag or the environment.
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let remote = elsewhere.path();
+    let denied = stderr_of(&rxh_bare(remote, &["--admin", &admin, "status"]));
+    assert!(denied.contains("401"), "{denied}");
+    assert!(denied.contains("Authorization: Bearer"), "{denied}");
+    let wrong = [
+        "--admin",
+        &admin,
+        "--admin-token",
+        "not-the-right-token",
+        "stop",
+    ];
+    let denied = stderr_of(&rxh_bare(remote, &wrong));
+    assert!(denied.contains("401"), "{denied}");
+    assert_success(&rxh_bare(
+        remote,
+        &["--admin", &admin, "--admin-token", token, "status"],
+    ));
+    let from_env = Command::new(RXH)
+        .current_dir(remote)
+        .env_remove("RXH_CONFIG")
+        .env("RXH_ADMIN", &admin)
+        .env("RXH_ADMIN_TOKEN", token)
+        .arg("stop")
+        .output()
+        .expect("rxh runs");
+    assert_success(&from_env);
+}
+
+#[test]
+fn remote_admin_without_a_token_does_not_start() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = "[admin]\nlisten = \"0.0.0.0:2019\"\n";
+    std::fs::write(directory.path().join("rxh.toml"), config).expect("write");
+
+    let stderr = stderr_of(&rxh_bare(directory.path(), &["run"]));
+    assert!(stderr.contains("set token"), "{stderr}");
+}

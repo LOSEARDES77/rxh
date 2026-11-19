@@ -118,7 +118,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] Basic auth (`basic_auth`), forward auth (`forward_auth`: Authelia,
       Authentik, oauth2-proxy).
 - [x] Security header presets and CORS.
-- [ ] Admin API over a unix socket, and optional token authentication for
+- [x] Admin API over a unix socket, and optional token authentication for
       remote admin.
 
 ## 0.6: discovery and deployment
