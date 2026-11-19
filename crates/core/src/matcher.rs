@@ -3,6 +3,7 @@
 //! All matchers of an entry must match (AND). Inside one list (`host`, `path`,
 //! `method`) any item may match (OR). An empty matcher matches everything.
 
+use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -58,6 +59,17 @@ impl HostPattern {
             host.len() > self.name.len() && host.ends_with(&self.name)
         } else {
             host == self.name
+        }
+    }
+}
+
+/// Lowercase pattern, like `*.example.com`.
+impl fmt::Display for HostPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.wildcard {
+            write!(f, "*{}", self.name)
+        } else {
+            f.write_str(&self.name)
         }
     }
 }
@@ -302,6 +314,8 @@ mod tests {
         assert!(wild.matches("A.B.example.com:443"));
         assert!(!wild.matches("example.com"));
         assert!(!wild.matches("badexample.com"));
+        assert_eq!(exact.to_string(), "example.com");
+        assert_eq!(wild.to_string(), "*.example.com");
 
         assert!(
             HostPattern::new("[::1]")

@@ -4,12 +4,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::mem;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use hyper::header::HeaderValue;
 use rxh_core::config::{self, ClientAuth, Protocol, Tls, TlsOptions, TlsVersion};
 use rxh_core::matcher::HostPattern;
+use serde::Serialize;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
 use tokio_rustls::rustls::crypto::{self, CryptoProvider};
@@ -23,6 +25,7 @@ use tokio_rustls::rustls::{
 };
 
 use crate::acme;
+use crate::log;
 use crate::stream;
 
 /// Picks a certificate by SNI. Exact host names beat wildcards; a client
@@ -30,7 +33,8 @@ use crate::stream;
 /// certificate, except for names passed to [`CertResolver::reserve`].
 ///
 /// Certificates can be added or replaced while the listener runs, see
-/// [`CertResolver::set`].
+/// [`CertResolver::set`]. Certificates loaded from files are read again
+/// when the files change, see [`CertResolver::reload_files`].
 #[derive(Debug)]
 pub struct CertResolver {
     provider: Arc<CryptoProvider>,
@@ -39,6 +43,9 @@ pub struct CertResolver {
     /// When a failed handshake was last logged, by server name.
     failures_logged: Mutex<HashMap<String, Instant>>,
 }
+
+/// Time between two checks of the certificate files for changes.
+const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Minimum time between two "no certificate" lines for one name.
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -49,6 +56,59 @@ struct Certificates {
     default: Option<Arc<CertifiedKey>>,
     /// Lowercase names that never get the default certificate.
     reserved: Vec<String>,
+    /// Certificates loaded from files, one entry per pair of paths.
+    files: Vec<FileCertificate>,
+}
+
+#[derive(Debug, Clone)]
+struct FileCertificate {
+    cert: String,
+    key: String,
+    /// Hash of the contents of `cert` and `key` when they were last read,
+    /// `None` if they could not be. Contents, not modification times, which
+    /// miss a rewrite within the same clock tick.
+    contents: Option<[u8; 32]>,
+    /// What the files gave, as served now (with its OCSP staple).
+    served: Arc<CertifiedKey>,
+}
+
+/// Contents of a certificate file and its key file.
+fn read_pair(cert: &str, key: &str) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    Ok((fs::read(cert)?, fs::read(key)?))
+}
+
+fn hash_pair(pair: &io::Result<(Vec<u8>, Vec<u8>)>) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let (cert, key) = pair.as_ref().ok()?;
+    let mut hasher = Sha256::new();
+    // The length keeps `ab` + `c` apart from `a` + `bc`.
+    hasher.update(cert.len().to_be_bytes());
+    hasher.update(cert);
+    hasher.update(key);
+    Some(hasher.finalize().into())
+}
+
+/// A certificate served by a listener, for `rxh cert list`.
+#[derive(Debug, Serialize)]
+pub(crate) struct CertificateInfo {
+    pub(crate) subject: String,
+    pub(crate) issuer: String,
+    /// DNS names of the subject alternative name extension.
+    pub(crate) names: Vec<String>,
+    pub(crate) not_before: String,
+    pub(crate) not_after: String,
+    /// Whole days until `not_after`, negative once expired.
+    pub(crate) days_left: i64,
+    /// Host patterns this certificate answers for.
+    pub(crate) hosts: Vec<String>,
+    /// Served to clients whose name matches no host.
+    pub(crate) default: bool,
+    /// `"file"` or `"acme"`.
+    pub(crate) source: &'static str,
+    pub(crate) cert_file: Option<String>,
+    pub(crate) key_file: Option<String>,
+    pub(crate) ocsp_stapled: bool,
 }
 
 impl CertResolver {
@@ -107,19 +167,15 @@ impl CertResolver {
             .map(|host| HostPattern::new(host))
             .collect::<Result<_, _>>()?;
 
-        let mut guard = self
-            .certificates
-            .write()
-            .expect("nothing panics while holding the certificate lock");
-        let mut certificates = Certificates::clone(&guard);
-        for pattern in patterns {
-            match certificates.hosts.iter_mut().find(|(p, _)| *p == pattern) {
-                Some((_, existing)) => *existing = Arc::clone(&key),
-                None => certificates.hosts.push((pattern, Arc::clone(&key))),
+        self.update(|certificates| {
+            for pattern in patterns {
+                match certificates.hosts.iter_mut().find(|(p, _)| *p == pattern) {
+                    Some((_, existing)) => *existing = Arc::clone(&key),
+                    None => certificates.hosts.push((pattern, Arc::clone(&key))),
+                }
             }
-        }
-        certificates.default.get_or_insert(key);
-        *guard = Arc::new(certificates);
+            certificates.default.get_or_insert(key);
+        });
         Ok(())
     }
 
@@ -132,25 +188,146 @@ impl CertResolver {
     /// Panics if the certificate map lock is poisoned, which cannot happen
     /// because nothing panics while holding it.
     pub fn reserve(&self, names: &[String]) {
+        self.update(|certificates| {
+            certificates
+                .reserved
+                .extend(names.iter().map(|name| name.to_ascii_lowercase()));
+        });
+    }
+
+    /// Serves the certificate of the PEM files `cert` and `key` for `hosts`,
+    /// like [`CertResolver::set`], and remembers the files for
+    /// [`CertResolver::reload_files`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if a file cannot be read or parsed, or a host pattern is
+    /// invalid.
+    pub(crate) fn load_files(&self, hosts: &[String], cert: &str, key: &str) -> io::Result<()> {
+        let known = self
+            .snapshot()
+            .files
+            .iter()
+            .find(|file| file.cert == cert && file.key == key)
+            .map(|file| Arc::clone(&file.served));
+        if let Some(served) = known {
+            return self.set(hosts, served).map_err(io::Error::other);
+        }
+        let pair = read_pair(cert, key);
+        let contents = hash_pair(&pair);
+        let (cert_pem, key_pem) = pair?;
+        let file = FileCertificate {
+            cert: cert.to_owned(),
+            key: key.to_owned(),
+            contents,
+            served: self.certified_key(&cert_pem, &key_pem)?,
+        };
+        self.set(hosts, Arc::clone(&file.served))
+            .map_err(io::Error::other)?;
+        self.update(|certificates| certificates.files.push(file));
+        Ok(())
+    }
+
+    /// Reads the certificate files again and serves what they hold now, for
+    /// new handshakes. Without `force`, only files whose contents changed since
+    /// they were last read. Files that fail to load keep their previous certificate
+    /// and are tried again when they change.
+    ///
+    /// Returns the certificate path of every pair read, with the error if it
+    /// failed.
+    pub(crate) fn reload_files(&self, force: bool) -> Vec<(String, Result<(), String>)> {
+        let mut outcomes = Vec::new();
+        for file in &self.snapshot().files {
+            let pair = read_pair(&file.cert, &file.key);
+            let contents = hash_pair(&pair);
+            if !force && contents == file.contents {
+                continue;
+            }
+            let loaded = pair.and_then(|(cert, key)| self.certified_key(&cert, &key));
+            self.update(|certificates| {
+                let Some(current) = certificates
+                    .files
+                    .iter_mut()
+                    .find(|current| current.cert == file.cert && current.key == file.key)
+                else {
+                    return;
+                };
+                current.contents = contents;
+                if let Ok(new) = &loaded {
+                    let old = mem::replace(&mut current.served, Arc::clone(new));
+                    let served = certificates.hosts.iter_mut().map(|(_, key)| key);
+                    for key in served.chain(&mut certificates.default) {
+                        if Arc::ptr_eq(key, &old) {
+                            *key = Arc::clone(new);
+                        }
+                    }
+                }
+            });
+            let outcome = loaded
+                .map(drop)
+                .map_err(|err| format!("{} / {}: {err}", file.cert, file.key));
+            outcomes.push((file.cert.clone(), outcome));
+        }
+        outcomes
+    }
+
+    /// Every distinct certificate served, described.
+    pub(crate) fn certificates(&self) -> Vec<CertificateInfo> {
+        let certificates = self.snapshot();
+        let mut infos = Vec::new();
+        for key in self.keys() {
+            let Some(info) = describe(&key) else {
+                continue;
+            };
+            let file = certificates
+                .files
+                .iter()
+                .find(|file| Arc::ptr_eq(&file.served, &key));
+            let hosts = certificates
+                .hosts
+                .iter()
+                .filter(|(_, served)| Arc::ptr_eq(served, &key))
+                .map(|(pattern, _)| pattern.to_string())
+                .collect();
+            infos.push(CertificateInfo {
+                hosts,
+                default: certificates
+                    .default
+                    .as_ref()
+                    .is_some_and(|default| Arc::ptr_eq(default, &key)),
+                source: if file.is_some() { "file" } else { "acme" },
+                cert_file: file.map(|file| file.cert.clone()),
+                key_file: file.map(|file| file.key.clone()),
+                ocsp_stapled: key.ocsp.is_some(),
+                ..info
+            });
+        }
+        infos
+    }
+
+    fn snapshot(&self) -> Arc<Certificates> {
+        Arc::clone(
+            &self
+                .certificates
+                .read()
+                .expect("nothing panics while holding the certificate lock"),
+        )
+    }
+
+    /// Applies `change` to a copy of the certificates and publishes it.
+    fn update(&self, change: impl FnOnce(&mut Certificates)) {
         let mut guard = self
             .certificates
             .write()
             .expect("nothing panics while holding the certificate lock");
         let mut certificates = Certificates::clone(&guard);
-        certificates
-            .reserved
-            .extend(names.iter().map(|name| name.to_ascii_lowercase()));
+        change(&mut certificates);
         *guard = Arc::new(certificates);
     }
 
     /// Every distinct certificate served.
     pub(crate) fn keys(&self) -> Vec<Arc<CertifiedKey>> {
-        let certificates = Arc::clone(
-            &self
-                .certificates
-                .read()
-                .expect("nothing panics while holding the certificate lock"),
-        );
+        let certificates = self.snapshot();
         let mut keys: Vec<Arc<CertifiedKey>> = Vec::new();
         let served = certificates.hosts.iter().map(|(_, key)| key);
         for key in served.chain(&certificates.default) {
@@ -164,27 +341,19 @@ impl CertResolver {
     /// Serves `new` wherever `old` is served. Does nothing if `old` was
     /// replaced in the meantime.
     pub(crate) fn replace(&self, old: &Arc<CertifiedKey>, new: Arc<CertifiedKey>) {
-        let mut guard = self
-            .certificates
-            .write()
-            .expect("nothing panics while holding the certificate lock");
-        let mut certificates = Certificates::clone(&guard);
-        let served = certificates.hosts.iter_mut().map(|(_, key)| key);
-        for key in served.chain(&mut certificates.default) {
-            if Arc::ptr_eq(key, old) {
-                *key = Arc::clone(&new);
+        self.update(|certificates| {
+            let served = certificates.hosts.iter_mut().map(|(_, key)| key);
+            let files = certificates.files.iter_mut().map(|file| &mut file.served);
+            for key in served.chain(&mut certificates.default).chain(files) {
+                if Arc::ptr_eq(key, old) {
+                    *key = Arc::clone(&new);
+                }
             }
-        }
-        *guard = Arc::new(certificates);
+        });
     }
 
     pub(crate) fn select(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
-        let certificates = Arc::clone(
-            &self
-                .certificates
-                .read()
-                .expect("nothing panics while holding the certificate lock"),
-        );
+        let certificates = self.snapshot();
         let matching = |wildcard: bool| {
             let name = server_name?;
             certificates
@@ -254,6 +423,70 @@ impl ResolvesServerCert for CertResolver {
         }
         key
     }
+}
+
+/// Serves what the certificate files of `resolver` hold whenever they
+/// change. Runs until dropped.
+pub(crate) async fn watch_files(resolver: Arc<CertResolver>) {
+    let mut interval = tokio::time::interval(FILE_CHECK_INTERVAL);
+    loop {
+        interval.tick().await;
+        log_reloads(&resolver.reload_files(/* force= */ false));
+    }
+}
+
+/// Logs the outcomes of [`CertResolver::reload_files`].
+pub(crate) fn log_reloads(outcomes: &[(String, Result<(), String>)]) {
+    for (cert, outcome) in outcomes {
+        match outcome {
+            Ok(()) => println!("TLS => Reloaded {cert}"),
+            Err(err) => eprintln!("TLS => {err}, keeping the previous certificate"),
+        }
+    }
+}
+
+/// Subject, issuer, names and validity of the end entity certificate of
+/// `key`; the fields that depend on the resolver are left empty.
+fn describe(key: &CertifiedKey) -> Option<CertificateInfo> {
+    use x509_parser::extensions::GeneralName;
+
+    let (_, certificate) = x509_parser::parse_x509_certificate(key.end_entity_cert().ok()?).ok()?;
+    let validity = certificate.validity();
+    let time = |time: &x509_parser::time::ASN1Time| {
+        let seconds = u64::try_from(time.timestamp()).unwrap_or(0);
+        log::rfc3339(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+    };
+    let names = certificate
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|extension| {
+            let dns = extension.value.general_names.iter();
+            dns.filter_map(|name| match name {
+                GeneralName::DNSName(name) => Some((*name).to_owned()),
+                _ => None,
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    Some(CertificateInfo {
+        subject: certificate.subject().to_string(),
+        issuer: certificate.issuer().to_string(),
+        names,
+        not_before: time(&validity.not_before),
+        not_after: time(&validity.not_after),
+        days_left: (validity.not_after.timestamp() - now).div_euclid(86_400),
+        hosts: Vec::new(),
+        default: false,
+        source: "acme",
+        cert_file: None,
+        key_file: None,
+        ocsp_stapled: false,
+    })
 }
 
 /// Accepts any client certificate, or none unless `mandatory`: the modes
@@ -406,14 +639,9 @@ pub(crate) fn acceptor(
         match &server.tls {
             None => {}
             Some(Tls::Auto) => resolver.reserve(&server.host),
-            Some(Tls::Files { cert, key }) => {
-                let certified = resolver
-                    .certified_key(&fs::read(cert)?, &fs::read(key)?)
-                    .map_err(|err| io::Error::other(format!("{cert} / {key}: {err}")))?;
-                resolver
-                    .set(&server.host, certified)
-                    .map_err(io::Error::other)?;
-            }
+            Some(Tls::Files { cert, key }) => resolver
+                .load_files(&server.host, cert, key)
+                .map_err(|err| io::Error::other(format!("{cert} / {key}: {err}")))?,
         }
     }
 
@@ -597,5 +825,94 @@ mod tests {
                 .set(&[String::from("a.*")], Arc::clone(&keys[0]))
                 .is_err()
         );
+    }
+
+    fn write_pair(dir: &std::path::Path, name: &str) -> (String, String) {
+        let generated = rcgen::generate_simple_self_signed(vec![name.to_owned()]).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        fs::write(&cert, generated.cert.pem()).unwrap();
+        fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+        (
+            cert.to_str().unwrap().to_owned(),
+            key.to_str().unwrap().to_owned(),
+        )
+    }
+
+    fn names(resolver: &CertResolver) -> Vec<Vec<String>> {
+        let infos = resolver.certificates();
+        infos.into_iter().map(|info| info.names).collect()
+    }
+
+    #[test]
+    fn reload_files_swaps_changed_files_and_keeps_broken_ones_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_pair(dir.path(), "one.test");
+        let (resolver, _) = resolver_with(&[]);
+        let hosts = [String::from("a.test")];
+        resolver.load_files(&hosts, &cert, &key).unwrap();
+        // The same pair for more names is one certificate, read once.
+        resolver
+            .load_files(&[String::from("b.test")], &cert, &key)
+            .unwrap();
+        assert_eq!(resolver.keys().len(), 1);
+        assert!(resolver.reload_files(false).is_empty(), "nothing changed");
+
+        // OCSP stapling replaces the key; the files still follow it.
+        let served = resolver.select(Some("a.test")).unwrap();
+        let stapled = Arc::new(CertifiedKey {
+            ocsp: Some(vec![1]),
+            ..CertifiedKey::clone(&served)
+        });
+        resolver.replace(&served, stapled);
+        assert!(resolver.certificates()[0].ocsp_stapled);
+
+        write_pair(dir.path(), "two.test");
+        let outcomes = resolver.reload_files(false);
+        assert_eq!(outcomes, [(cert.clone(), Ok(()))]);
+        assert_eq!(names(&resolver), [[String::from("two.test")]]);
+        let info = &resolver.certificates()[0];
+        assert_eq!(info.hosts, ["a.test", "b.test"]);
+        assert!(info.default);
+        assert!(!info.ocsp_stapled, "a new certificate has no staple yet");
+        assert_eq!(
+            (info.source, info.cert_file.as_deref()),
+            ("file", Some(cert.as_str()))
+        );
+
+        // A broken file is reported once, then left alone until it changes.
+        fs::write(&key, "garbage").unwrap();
+        let outcomes = resolver.reload_files(false);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1.as_ref().unwrap_err().contains("key.pem"));
+        assert!(resolver.reload_files(false).is_empty());
+        assert_eq!(names(&resolver), [[String::from("two.test")]]);
+        assert_eq!(resolver.reload_files(true).len(), 1, "force reads it again");
+
+        write_pair(dir.path(), "three.test");
+        assert!(resolver.reload_files(false)[0].1.is_ok());
+        assert!(resolver.select(Some("b.test")).is_some());
+        assert_eq!(names(&resolver), [[String::from("three.test")]]);
+    }
+
+    #[test]
+    fn certificates_describe_acme_ones_and_expiry() {
+        let mut params = rcgen::CertificateParams::new(vec![String::from("old.test")]).unwrap();
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let signing = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&signing).unwrap();
+        let resolver = CertResolver::new(Arc::clone(ServerConfig::builder().crypto_provider()));
+        let key = resolver
+            .certified_key(cert.pem().as_bytes(), signing.serialize_pem().as_bytes())
+            .unwrap();
+        resolver.set(&[String::from("*.old.test")], key).unwrap();
+
+        let info = &resolver.certificates()[0];
+        assert_eq!(info.source, "acme");
+        assert_eq!(info.cert_file, None);
+        assert_eq!(info.hosts, ["*.old.test"]);
+        assert_eq!(info.names, ["old.test"]);
+        assert_eq!(info.not_after, "2001-01-01T00:00:00.000Z");
+        assert!(info.days_left < -9000, "{}", info.days_left);
     }
 }

@@ -9,6 +9,14 @@ Changed.
 
 ### Added
 
+- Certificate files (`tls = { cert, key }`) are read again when their
+  contents change, checked every 5 seconds, and served to new handshakes
+  without a restart or reload. A pair that fails to load keeps the previous
+  certificate.
+- `rxh cert list [--json]` (`GET /certificates`): the certificates of every
+  TLS listener, file and ACME ones, with names, expiry date, days left,
+  source file and OCSP staple, soonest expiry first. `rxh cert reload`
+  (`POST /certificates/reload`) reads every certificate file now.
 - `tls_options = { min_version, cipher_suites, curves, ocsp_stapling }` on
   servers with `tls`: the lowest TLS version accepted (`"1.2"`, the default,
   or `"1.3"`), the cipher suites offered (IANA names) and the key exchange

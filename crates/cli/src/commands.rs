@@ -9,7 +9,8 @@ use rxh_core::config::{Action, Forward, Policy};
 use serde_json::{Value, json};
 
 use crate::cli::{
-    Cli, Command, ConfigCommand, PoolCommand, ServiceCommand, ServiceProtocol, UpstreamCommand,
+    CertCommand, Cli, Command, ConfigCommand, PoolCommand, ServiceCommand, ServiceProtocol,
+    UpstreamCommand,
 };
 use crate::client::{AdminClient, ClientError};
 use crate::edit::{self, ConfigFile, PoolSpec, ServiceSpec};
@@ -51,6 +52,8 @@ pub(crate) async fn execute(cli: &Cli, command: Command) -> Result<(), String> {
         Command::Reload => reload(cli, &client).await,
         Command::Status { json } => status(&client, json).await,
         Command::Validate => validate(&config_path(cli)),
+        Command::Cert(CertCommand::List { json }) => cert_list(&client, json).await,
+        Command::Cert(CertCommand::Reload) => cert_reload(&client).await,
         Command::Policies => {
             policies();
             Ok(())
@@ -146,6 +149,94 @@ async fn status(client: &AdminClient, raw: bool) -> Result<(), String> {
     for pool in status["pools"].as_array().into_iter().flatten() {
         println!();
         print_pool(pool);
+    }
+    Ok(())
+}
+
+async fn cert_list(client: &AdminClient, raw: bool) -> Result<(), String> {
+    let certificates = client
+        .get("/certificates")
+        .await
+        .map_err(|err| err.to_string())?;
+    if raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&certificates).map_err(|err| err.to_string())?
+        );
+        return Ok(());
+    }
+    let certificates = certificates.as_array().cloned().unwrap_or_default();
+    if certificates.is_empty() {
+        println!("No TLS listener");
+        return Ok(());
+    }
+    println!(
+        "{:<22} {:<30} {:<20} {:>5} {:<6} SOURCE",
+        "LISTEN", "HOSTS", "EXPIRES", "DAYS", "OCSP"
+    );
+    for certificate in &certificates {
+        println!("{}", cert_row(certificate));
+    }
+    Ok(())
+}
+
+/// One line of `rxh cert list`.
+fn cert_row(certificate: &Value) -> String {
+    let strings = |field: &str| -> Vec<&str> {
+        certificate[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    };
+    let mut hosts = strings("hosts");
+    if hosts.is_empty() {
+        hosts = strings("names");
+    }
+    let mut hosts = hosts.join(",");
+    if certificate["default"].as_bool() == Some(true) {
+        hosts.push_str(" (default)");
+    }
+    // `2026-11-19T10:00:00.000Z` without the milliseconds.
+    let expires = certificate["not_after"].as_str().unwrap_or("?");
+    let expires = expires.split('.').next().unwrap_or(expires);
+    let days = certificate["days_left"].as_i64().unwrap_or(0);
+    let days = if days < 0 {
+        String::from("EXPIRED")
+    } else {
+        days.to_string()
+    };
+    let source = match certificate["cert_file"].as_str() {
+        Some(file) => file,
+        None => certificate["source"].as_str().unwrap_or("?"),
+    };
+    let ocsp = if certificate["ocsp_stapled"].as_bool() == Some(true) {
+        "yes"
+    } else {
+        "no"
+    };
+    format!(
+        "{:<22} {:<30} {:<20} {:>5} {:<6} {source}",
+        certificate["listen"].as_str().unwrap_or("?"),
+        hosts,
+        expires,
+        days,
+        ocsp,
+    )
+}
+
+async fn cert_reload(client: &AdminClient) -> Result<(), String> {
+    let answer = client
+        .post("/certificates/reload", None)
+        .await
+        .map_err(|err| format!("certificate reload failed: {err}"))?;
+    let reloaded = answer["reloaded"].as_array().cloned().unwrap_or_default();
+    if reloaded.is_empty() {
+        println!("No certificate files to reload");
+    }
+    for cert in reloaded {
+        println!("Reloaded {}", cert.as_str().unwrap_or("?"));
     }
     Ok(())
 }
@@ -662,6 +753,31 @@ mod tests {
             backends: vec![backend.to_owned()],
             ..PoolSpec::default()
         }
+    }
+
+    #[test]
+    fn cert_rows_mark_expired_and_fall_back_to_names() {
+        let row = cert_row(&json!({
+            "listen": "0.0.0.0:443",
+            "hosts": [],
+            "names": ["a.test", "b.test"],
+            "not_after": "2001-01-01T00:00:00.000Z",
+            "days_left": -3,
+            "default": false,
+            "source": "acme",
+            "ocsp_stapled": true,
+        }));
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            [
+                "0.0.0.0:443",
+                "a.test,b.test",
+                "2001-01-01T00:00:00",
+                "EXPIRED",
+                "yes",
+                "acme"
+            ]
+        );
     }
 
     #[test]

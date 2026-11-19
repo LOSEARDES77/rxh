@@ -11,6 +11,8 @@
 //! | `POST`   | `/pools/{name}/upstreams`     | Add `{"address", "weight"}`         |
 //! | `DELETE` | `/pools/{name}/upstreams`     | Remove `{"address"}`                |
 //! | `GET`    | `/metrics`                    | Prometheus metrics                  |
+//! | `GET`    | `/certificates`               | Certificates served, with expiry    |
+//! | `POST`   | `/certificates/reload`        | Read certificate files again        |
 //! | `POST`   | `/reload`                     | Reload the configuration file       |
 //! | `POST`   | `/stop`                       | Graceful shutdown                   |
 //!
@@ -44,6 +46,7 @@ use crate::files;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
+use crate::tls::{self, CertificateInfo};
 
 const MAX_BODY: usize = 64 * 1024;
 
@@ -198,6 +201,8 @@ async fn handle(
                 }
             }
         }
+        (&Method::GET, ["certificates"]) => json_response(StatusCode::OK, &certificates(&state)),
+        (&Method::POST, ["certificates", "reload"]) => reload_certificates(&state),
         (&Method::POST, ["stop"]) => {
             let _ = state.control.send(Control::Stop).await;
             json_response(StatusCode::OK, &json!({ "stopping": true }))
@@ -219,6 +224,62 @@ fn registry(state: &AdminState) -> Arc<Registry> {
             .unwrap_or_else(PoisonError::into_inner)
             .registry,
     )
+}
+
+#[derive(Serialize)]
+struct ListenerCertificate {
+    listen: SocketAddr,
+    #[serde(flatten)]
+    certificate: CertificateInfo,
+}
+
+/// Certificates of every TLS listener, soonest expiry first.
+fn certificates(state: &AdminState) -> Vec<ListenerCertificate> {
+    let current = state.current.read().unwrap_or_else(PoisonError::into_inner);
+    let mut certificates: Vec<ListenerCertificate> = Vec::new();
+    for server in &current.servers {
+        let Some(resolver) = &server.cert_resolver else {
+            continue;
+        };
+        for certificate in resolver.certificates() {
+            certificates.push(ListenerCertificate {
+                listen: server.address,
+                certificate,
+            });
+        }
+    }
+    certificates.sort_by(|a, b| a.certificate.not_after.cmp(&b.certificate.not_after));
+    certificates
+}
+
+/// Reads every certificate file again, changed or not. Files that fail
+/// keep their previous certificate, and make the answer an error.
+fn reload_certificates(state: &AdminState) -> Response<Full<Bytes>> {
+    let resolvers: Vec<_> = state
+        .current
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .servers
+        .iter()
+        .filter_map(|server| server.cert_resolver.clone())
+        .collect();
+    let mut reloaded = Vec::new();
+    let mut errors = Vec::new();
+    for resolver in resolvers {
+        let outcomes = resolver.reload_files(/* force= */ true);
+        tls::log_reloads(&outcomes);
+        for (cert, outcome) in outcomes {
+            match outcome {
+                Ok(()) => reloaded.push(cert),
+                Err(err) => errors.push(err),
+            }
+        }
+    }
+    if errors.is_empty() {
+        json_response(StatusCode::OK, &json!({ "reloaded": reloaded }))
+    } else {
+        error(StatusCode::BAD_REQUEST, &errors.join("; "))
+    }
 }
 
 fn add_upstream(state: &AdminState, name: &str, body: UpstreamBody) -> Response<Full<Bytes>> {

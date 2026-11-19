@@ -956,3 +956,56 @@ fn per_core_runtime_fails_to_start_on_a_busy_address() {
         .expect("rxh runs");
     assert!(assert_failure(&output).contains("runtime"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cert_commands_list_and_reload() {
+    let admin = free_address();
+    let web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let certificate = rxh_test_util::OcspCertificate::new(None);
+    std::fs::write(dir.join("chain.pem"), &certificate.chain_pem).expect("write chain");
+    std::fs::write(dir.join("key.pem"), &certificate.key_pem).expect("write key");
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\n\
+             [[server]]\nlisten = \"{web}\"\nprotocol = \"tcp\"\nhost = \"tls.test\"\n\
+             forward = \"{}\"\ntls = {{ cert = \"chain.pem\", key = \"key.pem\" }}\n",
+            free_address()
+        ),
+    )
+    .expect("write config");
+    let _daemon = start_daemon(dir);
+    for _ in 0..250 {
+        if TcpStream::connect(web).await.is_ok() && TcpStream::connect(admin).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let list = assert_success(&rxh(dir, admin, &["cert", "list"]));
+    let mut lines = list.lines();
+    let header = lines.next().expect("header");
+    assert!(
+        header.starts_with("LISTEN") && header.contains("EXPIRES"),
+        "{list}"
+    );
+    let row = lines.next().expect("one certificate");
+    assert!(row.starts_with(&web.to_string()), "{row}");
+    assert!(row.contains("tls.test (default)"), "{row}");
+    assert!(row.ends_with("chain.pem"), "{row}");
+    assert!(!row.contains("EXPIRED"), "{row}");
+
+    let json = assert_success(&rxh(dir, admin, &["cert", "ls", "--json"]));
+    let json: serde_json::Value = serde_json::from_str(&json).expect("JSON");
+    assert_eq!(json[0]["names"], serde_json::json!(["tls.test"]));
+
+    let reload = assert_success(&rxh(dir, admin, &["cert", "reload"]));
+    assert_eq!(reload.trim(), "Reloaded chain.pem");
+
+    std::fs::write(dir.join("key.pem"), "broken").expect("break the key");
+    let stderr = assert_failure(&rxh(dir, admin, &["cert", "reload"]));
+    assert!(stderr.contains("certificate reload failed"), "{stderr}");
+    assert!(stderr.contains("key.pem"), "{stderr}");
+}

@@ -46,6 +46,9 @@ pub struct ServerInfo {
 
     /// Live state.
     pub state: watch::Receiver<State>,
+
+    /// Certificates of a listener that terminates TLS.
+    pub cert_resolver: Option<Arc<CertResolver>>,
 }
 
 /// Owner of all [`Server`]s of one configuration.
@@ -104,6 +107,7 @@ impl Master {
                 protocol: server.protocol(),
                 name: server.name().map(str::to_owned),
                 state: server.subscribe(),
+                cert_resolver: server.cert_resolver().cloned(),
             });
             servers.push(server);
         }
@@ -138,6 +142,7 @@ impl Master {
                 protocol: server.protocol(),
                 name: server.name().map(str::to_owned),
                 state: server.subscribe(),
+                cert_resolver: None,
             });
             servers.push(server);
         }

@@ -73,6 +73,10 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Service(ServiceCommand),
 
+    /// Certificates served by the running daemon.
+    #[command(subcommand, visible_alias = "certs")]
+    Cert(CertCommand),
+
     /// List load balancing policies.
     Policies,
 
@@ -132,6 +136,21 @@ pub(crate) enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CertCommand {
+    /// List the certificates of every TLS listener, soonest expiry first.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Print the raw JSON from the admin API.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read every certificate file again now. The daemon also does it by
+    /// itself within seconds of a change.
+    Reload,
 }
 
 #[derive(Debug, Subcommand)]
@@ -345,6 +364,20 @@ mod tests {
             panic!("unexpected parse: {cli:?}");
         };
         assert_eq!(to, ["a:1", "b:2"]);
+    }
+
+    #[test]
+    fn parses_cert_commands() {
+        let cli = Cli::parse_from(["rxh", "cert", "ls", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Cert(CertCommand::List { json: true }))
+        ));
+        let cli = Cli::parse_from(["rxh", "certs", "reload"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Cert(CertCommand::Reload))
+        ));
     }
 
     #[test]
