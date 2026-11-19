@@ -137,7 +137,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] Shell completions and man pages from clap.
 - [x] systemd integration: `sd_notify` readiness, socket activation.
 - [x] Docker Swarm and Podman providers.
-- [ ] Consul, etcd and Nomad providers.
+- [x] Consul, etcd and Nomad providers.
 - [ ] Kubernetes Ingress and Gateway API.
 
 ## 0.7: traffic management

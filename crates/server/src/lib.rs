@@ -7,6 +7,7 @@
 
 mod acme;
 mod admin;
+mod catalog;
 mod change;
 mod daemon;
 mod dns01;

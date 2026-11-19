@@ -7,20 +7,24 @@
 //! drains its connections in the background. If the configuration is invalid
 //! the old generation keeps running untouched.
 
+use std::collections::BTreeMap;
 use std::env::VarError;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use rxh_core::config::{AdminListen, Config, ConfigError, Docker, IncludedConfig, Runtime};
+use rxh_core::config::{
+    AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime,
+};
 use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::acme;
 use crate::admin::{self, AdminState, Control, Current};
-use crate::docker::{self, Container, Route};
+use crate::catalog;
+use crate::docker::{self, Container, Provider, Route};
 use crate::error::Error;
 use crate::include;
 use crate::master::{Master, ServerInfo};
@@ -112,11 +116,12 @@ struct Generation {
     task: JoinHandle<Result<(), Error>>,
     /// Health checks, DNS refreshes and the ACME manager.
     health_checks: JoinSet<()>,
-    /// Docker containers the pools were last synchronized with.
+    /// Docker containers and catalog instances the pools were last
+    /// synchronized with, sorted by source.
     containers: Vec<Container>,
     /// Docker routes the listeners were built for.
     routes: Vec<Route>,
-    /// Containers and pools Docker has that are not routed, already logged.
+    /// Containers, instances and pools that are not routed, already logged.
     ignored: Vec<String>,
 }
 
@@ -337,9 +342,10 @@ impl Daemon {
         systemd::warn_unused();
         systemd::notify("READY=1\nSTATUS=Running");
 
-        let (docker_updates, mut containers) = mpsc::channel::<Vec<Container>>(1);
+        let (docker_updates, mut containers) = mpsc::channel::<(Provider, Vec<Container>)>(1);
         // Settings being followed and the task that follows them.
         let mut docker_watch: Option<(Docker, AbortOnDrop)> = None;
+        let mut catalog_watches: BTreeMap<CatalogKind, (Catalog, AbortOnDrop)> = BTreeMap::new();
 
         let mut signals = Signals::new()?;
         let mut polls = tokio::time::interval(WATCH_INTERVAL);
@@ -360,11 +366,36 @@ impl Daemon {
                     (settings.clone(), AbortOnDrop(tokio::task::spawn(task)))
                 });
             }
+            for kind in [CatalogKind::Consul, CatalogKind::Etcd, CatalogKind::Nomad] {
+                let settings = generation.config.catalog(kind);
+                if settings == catalog_watches.get(&kind).map(|(settings, _)| settings) {
+                    continue;
+                }
+                match settings {
+                    Some(settings) => {
+                        println!(
+                            "{} => Following the services of {}",
+                            Provider::Catalog(kind).label(),
+                            settings.endpoint(kind)
+                        );
+                        let task = catalog::watch(kind, settings.clone(), docker_updates.clone());
+                        let task = AbortOnDrop(tokio::task::spawn(task));
+                        catalog_watches.insert(kind, (settings.clone(), task));
+                    }
+                    None => {
+                        catalog_watches.remove(&kind);
+                    }
+                }
+            }
 
             let event = tokio::select! {
                 event = signals.next() => event,
-                Some(containers) = containers.recv() => {
-                    self.follow_docker(containers, &mut generation, &admin_state).await;
+                Some((source, update)) = containers.recv() => {
+                    let mut merged = generation.containers.clone();
+                    merged.retain(|container| container.source != source);
+                    merged.extend(update);
+                    merged.sort_by_key(|container| container.source);
+                    self.follow_docker(source, merged, &mut generation, &admin_state).await;
                     continue;
                 }
                 Some(control) = controls.recv() => match control {
@@ -473,11 +504,13 @@ impl Daemon {
         self.apply(config, containers, generation, admin).await
     }
 
-    /// Takes in the containers Docker runs now. Replicas that come and go
+    /// Takes in the containers Docker runs and the catalog instances now.
+    /// Replicas that come and go
     /// only change the members of the running pools; a change of routes
     /// swaps the generation, as a reload does.
     async fn follow_docker(
         &self,
+        source: Provider,
         containers: Vec<Container>,
         generation: &mut Generation,
         admin: &AdminState,
@@ -493,11 +526,15 @@ impl Daemon {
             generation.containers = containers;
             return;
         }
-        println!("Main => Docker containers changed, updating the routes");
+        println!(
+            "Main => {} {}s changed, updating the routes",
+            source.label(),
+            source.noun()
+        );
         // On top of the live members, like a change from the admin API.
         let config = generation.current().live_config();
         if let Err(message) = self.apply(config, containers, generation, admin).await {
-            eprintln!("Main => Docker routes not updated, keeping the running ones: {message}");
+            eprintln!("Main => Provider routes not updated, keeping the running ones: {message}");
         }
     }
 

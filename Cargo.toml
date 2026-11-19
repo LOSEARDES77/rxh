@@ -15,6 +15,7 @@ rxh-core = { path = "crates/core", version = "0.3.0" }
 rxh-server = { path = "crates/server", version = "0.3.0" }
 
 async-compression = { version = "0.4.52", features = ["tokio", "gzip", "zstd", "brotli"] }
+base64 = "0.22.1"
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys"] }
 bcrypt = "0.19.3"
 bytes = "1.12.2"
