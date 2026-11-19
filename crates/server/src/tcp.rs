@@ -167,6 +167,9 @@ pub(crate) async fn proxy<S>(
     // Every way a connection can end writes one access record in JSON mode;
     // text mode keeps the operational messages.
     let json = |upstream: Option<&str>, sent: u64, received: u64| {
+        if !log.logger.keeps(None, started.elapsed()) {
+            return;
+        }
         log.logger.access_json(|| {
             serde_json::json!({
                 "ts": log::now(),
@@ -228,14 +231,17 @@ pub(crate) async fn proxy<S>(
         result = copy => match result {
             Ok((sent, received)) => {
                 json(Some(address), sent, received);
-                log.logger.access_text(|line| {
-                    log::push(
-                        line,
-                        format_args!(
-                            "{peer} -> {log_name} TCP {address} sent {sent}B received {received}B"
-                        ),
-                    );
-                });
+                if log.logger.keeps(None, started.elapsed()) {
+                    log.logger.access_text(|line| {
+                        log::push(
+                            line,
+                            format_args!(
+                                "{peer} -> {log_name} TCP {address} sent {sent}B received \
+                                 {received}B"
+                            ),
+                        );
+                    });
+                }
             }
             Err(err) => {
                 let (sent, received) = moved();

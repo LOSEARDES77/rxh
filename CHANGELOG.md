@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- Access log filters and sampling: `status` (codes or classes such as
+  `"5xx"`) and `min_duration` in `[log]` always write the matching lines
+  and drop the others; `sample_ratio` writes a random share of the lines no
+  filter keeps (1 by default, 0 once a filter is set). Layer 4 connections
+  are filtered by `min_duration` and sampled.
 - OpenTelemetry tracing: a `[tracing]` table (`endpoint`, `service_name`,
   `sample_ratio`) sends one span per HTTP request to an OTLP/HTTP
   collector in JSON. The W3C `traceparent` of the caller is continued, or

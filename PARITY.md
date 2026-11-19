@@ -138,7 +138,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `encode zstd br gzip` | `encode` on a route | ✅ | Files and proxied responses; no minimum length or custom type list. |
 | `grace_period` | `grace_period` | ✅ | Default waits forever, like Caddy. Idle keep-alive connections close at once. |
 | Connection limit | `max_connections` | ➕ | |
-| Structured access logs | `[log]` `format = "json"`, `output`, `access` | ✅ | Text or JSON lines on stdout, stderr or a file; no field selection or rotation. |
+| Structured access logs | `[log]` `format = "json"`, `output`, `access`, `status`, `min_duration`, `sample_ratio` | ✅ | Text or JSON lines on stdout, stderr or a file; no field selection or rotation. |
 | Prometheus metrics | `GET /metrics` on the admin API | ✅ | Requests, latency histogram, L4 connections, per upstream requests, failures, in flight and health. |
 
 ## Layer 4 (Caddy needs the caddy-l4 plugin)
@@ -250,6 +250,6 @@ parity. Grouped by area, roughly in priority order inside each group.
 |---|---|---|
 | OpenTelemetry tracing (W3C trace context propagation) | Traefik, Envoy | Done: `[tracing]` sends one server span per HTTP request over OTLP/HTTP JSON and continues or starts the `traceparent` sent to backends, with parent-based ratio sampling (`sample_ratio`). No OTLP/gRPC, no collector headers, no per-attempt client spans, no layer 4 spans. |
 | Dashboard web UI and management UI | Traefik dashboard, Nginx Proxy Manager | Future plan: an NPM-like UI on top of the admin API (hosts, certificates, access lists, live health). |
-| Access log filters and sampling | Traefik access logs | |
+| Access log filters and sampling | Traefik access logs | Done: `[log]` `status` and `min_duration` always write the matching lines (any filter matching is enough, like Traefik), `sample_ratio` writes a random share of the others. No `retryAttempts` filter, no per-server filters, no field selection. |
 | Health check events to webhooks | Caddy events, HAProxy agent checks | |
 | Plugin or WASM middleware | Traefik plugins, Envoy WASM | |

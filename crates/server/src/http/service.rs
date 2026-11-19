@@ -671,34 +671,36 @@ impl Service {
                 },
             );
         }
-        self.logger.access(
-            |line| {
-                log::push(
-                    line,
-                    format_args!(
-                        "{} -> {} {method} {uri} HTTP {} {elapsed:?}",
-                        self.peer,
-                        route.map_or(&*self.log_name, |route| &route.site.log_name),
-                        response.status(),
-                    ),
-                );
-            },
-            || {
-                serde_json::json!({
-                    "ts": log::now(),
-                    "server": server,
-                    "remote": self.peer.to_string(),
-                    "client_ip": client_ip.to_string(),
-                    "method": method.as_str(),
-                    "uri": uri.to_string(),
-                    "proto": format!("{version:?}"),
-                    "status": status,
-                    "duration_ms": log::millis(elapsed),
-                    "upstream": upstream.as_deref().map(Upstream::address),
-                    "trace_id": trace.as_ref().map(Trace::id),
-                })
-            },
-        );
+        if self.logger.keeps(Some(status), elapsed) {
+            self.logger.access(
+                |line| {
+                    log::push(
+                        line,
+                        format_args!(
+                            "{} -> {} {method} {uri} HTTP {} {elapsed:?}",
+                            self.peer,
+                            route.map_or(&*self.log_name, |route| &route.site.log_name),
+                            response.status(),
+                        ),
+                    );
+                },
+                || {
+                    serde_json::json!({
+                        "ts": log::now(),
+                        "server": server,
+                        "remote": self.peer.to_string(),
+                        "client_ip": client_ip.to_string(),
+                        "method": method.as_str(),
+                        "uri": uri.to_string(),
+                        "proto": format!("{version:?}"),
+                        "status": status,
+                        "duration_ms": log::millis(elapsed),
+                        "upstream": upstream.as_deref().map(Upstream::address),
+                        "trace_id": trace.as_ref().map(Trace::id),
+                    })
+                },
+            );
+        }
 
         response
     }
