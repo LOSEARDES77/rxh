@@ -20,6 +20,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::acme;
 use crate::admin::{self, AdminState, Control, Current};
+use crate::docker::{self, Container, Route};
 use crate::error::Error;
 use crate::include;
 use crate::master::{Master, ServerInfo};
@@ -111,22 +112,32 @@ struct Generation {
     task: JoinHandle<Result<(), Error>>,
     /// Health checks, DNS refreshes and the ACME manager.
     health_checks: JoinSet<()>,
+    /// Docker containers the pools were last synchronized with.
+    containers: Vec<Container>,
+    /// Docker routes the listeners were built for.
+    routes: Vec<Route>,
+    /// Containers and pools Docker has that are not routed, already logged.
+    ignored: Vec<String>,
 }
 
 impl Generation {
-    /// Starts `config`. Relative `[acme]` paths are joined to `base`.
+    /// Starts `config` with routes to the Docker `containers`. Relative
+    /// `[acme]` paths are joined to `base`.
     async fn start(
         config: Config,
         previous: Option<&Registry>,
         base: &Path,
+        containers: Vec<Container>,
     ) -> Result<Self, Error> {
-        // What runs has the implicit HTTP to HTTPS redirect servers; what the
-        // admin API shows and edits is the configuration as written.
-        let effective = config.with_https_redirects();
+        // What runs has the implicit HTTP to HTTPS redirect servers and the
+        // Docker routes; what the admin API shows and edits is the
+        // configuration as written.
+        let (effective, plan) = docker::plan(&config.with_https_redirects(), &containers);
         let registry = Arc::new(Registry::build(&effective)?);
         if let Some(previous) = previous {
             registry.inherit_dynamic(previous);
         }
+        plan.sync(&registry);
         let (stop, stopped) = oneshot::channel::<()>();
         let (servers, acme, task) = match effective.runtime {
             Runtime::Shared => {
@@ -155,6 +166,9 @@ impl Generation {
             stop: Some(stop),
             task,
             health_checks,
+            containers,
+            routes: plan.routes,
+            ignored: plan.ignored,
         })
     }
 
@@ -282,7 +296,7 @@ impl Daemon {
             Source::File(path) => load_config(path)?,
         };
         let admin_settings = config.admin.clone();
-        let mut generation = Generation::start(config, None, self.base_dir()).await?;
+        let mut generation = Generation::start(config, None, self.base_dir(), Vec::new()).await?;
 
         let (control, mut controls) = mpsc::channel(8);
         let admin_state = Arc::new(AdminState {
@@ -323,13 +337,36 @@ impl Daemon {
         systemd::warn_unused();
         systemd::notify("READY=1\nSTATUS=Running");
 
+        let (docker_updates, mut containers) = mpsc::channel::<Vec<Container>>(1);
+        // Endpoint being followed and the task that follows it.
+        let mut docker_watch: Option<(String, AbortOnDrop)> = None;
+
         let mut signals = Signals::new()?;
         let mut polls = tokio::time::interval(WATCH_INTERVAL);
         polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
+            // After every change of configuration: `[docker]` may be new,
+            // gone or point somewhere else.
+            let endpoint = generation
+                .config
+                .docker
+                .as_ref()
+                .map(|docker| &docker.endpoint);
+            if endpoint != docker_watch.as_ref().map(|(endpoint, _)| endpoint) {
+                docker_watch = endpoint.map(|endpoint| {
+                    println!("Docker => Following the containers of {endpoint}");
+                    let task = docker::watch(endpoint.clone(), docker_updates.clone());
+                    (endpoint.clone(), AbortOnDrop(tokio::task::spawn(task)))
+                });
+            }
+
             let event = tokio::select! {
                 event = signals.next() => event,
+                Some(containers) = containers.recv() => {
+                    self.follow_docker(containers, &mut generation, &admin_state).await;
+                    continue;
+                }
                 Some(control) = controls.recv() => match control {
                     Control::Stop => Event::Stop,
                     Control::Reload(reply) => {
@@ -345,7 +382,10 @@ impl Daemon {
                         // Patched on top of the live members, so backends
                         // added at runtime survive the swap.
                         let outcome = match change.apply(&generation.current().live_config()) {
-                            Ok(config) => self.apply(config, &mut generation, &admin_state).await,
+                            Ok(config) => {
+                                let containers = generation.containers.clone();
+                                self.apply(config, containers, &mut generation, &admin_state).await
+                            }
                             Err(message) => Err(message),
                         };
                         let _ = reply.send(outcome);
@@ -429,13 +469,44 @@ impl Daemon {
             .ok_or("no configuration file to reload")?;
         println!("Main => Reloading {}", path.display());
         let config = load_config(path).map_err(|err| err.to_string())?;
-        self.apply(config, generation, admin).await
+        let containers = generation.containers.clone();
+        self.apply(config, containers, generation, admin).await
     }
 
-    /// Swaps the running generation for one of `config`, which is valid.
+    /// Takes in the containers Docker runs now. Replicas that come and go
+    /// only change the members of the running pools; a change of routes
+    /// swaps the generation, as a reload does.
+    async fn follow_docker(
+        &self,
+        containers: Vec<Container>,
+        generation: &mut Generation,
+        admin: &AdminState,
+    ) {
+        if containers == generation.containers {
+            return;
+        }
+        let (_, plan) = docker::plan(&generation.config.with_https_redirects(), &containers);
+        docker::log_ignored(&plan.ignored, &generation.ignored);
+        generation.ignored.clone_from(&plan.ignored);
+        if plan.routes == generation.routes {
+            plan.sync(&generation.registry);
+            generation.containers = containers;
+            return;
+        }
+        println!("Main => Docker containers changed, updating the routes");
+        // On top of the live members, like a change from the admin API.
+        let config = generation.current().live_config();
+        if let Err(message) = self.apply(config, containers, generation, admin).await {
+            eprintln!("Main => Docker routes not updated, keeping the running ones: {message}");
+        }
+    }
+
+    /// Swaps the running generation for one of `config`, which is valid,
+    /// routing to the Docker `containers`.
     async fn apply(
         &self,
         config: Config,
+        containers: Vec<Container>,
         generation: &mut Generation,
         admin: &AdminState,
     ) -> Result<(), String> {
@@ -448,8 +519,13 @@ impl Daemon {
         }
 
         let previous_registry = Arc::clone(&generation.registry);
-        let started =
-            Generation::start(config.clone(), Some(&previous_registry), self.base_dir()).await;
+        let started = Generation::start(
+            config.clone(),
+            Some(&previous_registry),
+            self.base_dir(),
+            containers.clone(),
+        )
+        .await;
         let next = match started {
             Ok(next) => next,
             Err(Error::Io(err)) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -457,15 +533,21 @@ impl Daemon {
                 // twice: stop first, then start, restoring the old
                 // configuration if the new one still fails.
                 let previous = Config::clone(&generation.config);
+                let previous_containers = generation.containers.clone();
                 let old = std::mem::replace(generation, placeholder().await?);
                 old.stop().await.map_err(|err| err.to_string())?;
-                match Generation::start(config, Some(&previous_registry), self.base_dir()).await {
+                let base = self.base_dir();
+                match Generation::start(config, Some(&previous_registry), base, containers).await {
                     Ok(next) => next,
                     Err(err) => {
-                        *generation =
-                            Generation::start(previous, Some(&previous_registry), self.base_dir())
-                                .await
-                                .map_err(|err| err.to_string())?;
+                        *generation = Generation::start(
+                            previous,
+                            Some(&previous_registry),
+                            base,
+                            previous_containers,
+                        )
+                        .await
+                        .map_err(|err| err.to_string())?;
                         *admin
                             .current
                             .write()
@@ -477,6 +559,8 @@ impl Daemon {
             Err(err) => return Err(err.to_string()),
         };
 
+        // A new configuration can clash with other containers.
+        docker::log_ignored(&next.ignored, &generation.ignored);
         let old = std::mem::replace(generation, next);
         *admin
             .current
@@ -495,7 +579,7 @@ impl Daemon {
 
 /// Empty generation used while swapping.
 async fn placeholder() -> Result<Generation, String> {
-    Generation::start(Config::default(), None, Path::new(""))
+    Generation::start(Config::default(), None, Path::new(""), Vec::new())
         .await
         .map_err(|err| err.to_string())
 }

@@ -9,6 +9,15 @@ Changed.
 
 ### Added
 
+- Docker provider: with a `[docker]` table (`endpoint`, `listen`) the daemon
+  routes to the running containers labelled `rxh.enable=true`. `rxh.http.host`
+  and `rxh.http.port` make an HTTP route, `rxh.tcp.listen` and `rxh.tcp.port`
+  a TCP server, `rxh.pool` groups replicas and `rxh.policy` picks the load
+  balancing policy. Docker events are followed live: containers join and
+  leave their pool as they start and die, and the listeners are swapped
+  without dropping connections only when the routes themselves change. A
+  container with wrong labels is ignored and reported; an unreachable Docker
+  keeps the last routes and is retried.
 - systemd integration: `rxh run` reports readiness, reloads (with the
   failure reason in `STATUS=`) and shutdown over `NOTIFY_SOCKET`, and takes
   socket-activated listeners from `LISTEN_FDS`, matched to `listen` and

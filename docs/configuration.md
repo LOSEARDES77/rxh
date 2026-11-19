@@ -8,7 +8,7 @@ Durations are strings like `250ms`, `5s`, `1m30s` or `2h` (units `ns`, `us`,
 `ms`, `s`, `m`, `h`, `d`), or plain integers meaning seconds. Unknown keys
 are errors, so typos do not go unnoticed.
 
-The file has six parts, and top level keys must come before the first table:
+The file has seven parts, and top level keys must come before the first table:
 
 ```toml
 grace_period = "30s"     # top level options
@@ -18,6 +18,7 @@ watch = true
 [admin]                  # admin API
 [log]                    # access logs
 [acme]                   # automatic HTTPS (tls = "auto")
+[docker]                 # routes to Docker containers from their labels
 [upstream.NAME]          # named load balancing pools, any number
 [[server]]               # listeners, any number
 ```
@@ -551,6 +552,85 @@ Accounts and certificates are kept per CA: the directory name is the `ca` URL
 without `https://`, other characters than letters, digits, `.` and `-`
 replaced by `_`. Switching `ca` (for example from staging to production)
 therefore obtains new certificates instead of serving the old CA's.
+
+## `[docker]`: routes to containers from their labels
+
+```toml
+[docker]
+endpoint = "unix:///var/run/docker.sock"
+listen = "0.0.0.0:80"
+```
+
+With a `[docker]` table the daemon asks Docker for the running containers
+labelled `rxh.enable=true`, routes to them as their other `rxh.*` labels say,
+and follows the Docker events: a container is routed when it starts and
+dropped when it dies, without a reload. Nothing is written to the
+configuration file.
+
+| Key | Default | Description |
+|---|---|---|
+| `endpoint` | `"unix:///var/run/docker.sock"` | Docker Engine API: `unix:///path/to/docker.sock` or `tcp://host:port` (plain TCP, for a socket proxy; TLS is not supported). |
+| `listen` | `"0.0.0.0:80"` | Address of the HTTP servers made from `rxh.http.host` labels. Servers of the file can listen on the same address. |
+
+Labels of a container:
+
+| Label | Description |
+|---|---|
+| `rxh.enable` | `true` to route to the container. Containers without it are never looked at. |
+| `rxh.http.host` | Host names of an HTTP route on `[docker] listen`, comma separated, exact or `*.example.com`. |
+| `rxh.http.port` | Container port of the HTTP route. May be left out when the container exposes exactly one TCP port. |
+| `rxh.tcp.listen` | Address of a `tcp` server for the container: `:5432` (every address) or `127.0.0.1:5432`. |
+| `rxh.tcp.port` | Container port of the TCP route, with the same default as `rxh.http.port`. |
+| `rxh.pool` | Name of the pool. Containers with the same pool are load balanced. Defaults to `PROJECT-SERVICE` for Docker Compose containers, so the replicas of a service share a pool, else to the container name. Letters, digits, `-`, `_` and `.`. |
+| `rxh.policy` | Load balancing policy of the pool, see [Policies](#policies). Default `weighted_round_robin`. |
+
+```yaml
+# compose.yaml
+services:
+  app:
+    image: my-app
+    deploy:
+      replicas: 3
+    labels:
+      rxh.enable: "true"
+      rxh.http.host: app.example.com
+      rxh.http.port: "8080"
+      rxh.policy: least_conn
+  db:
+    image: postgres:16
+    labels:
+      rxh.enable: "true"
+      rxh.tcp.listen: ":5432"
+```
+
+Every pool becomes a server named `docker-POOL` and a pool whose members are
+the containers, at their IP address on the Docker network and the container
+port (published ports are not needed). Both show in `rxh status` and in the
+metrics, not in `rxh config`. A replica that starts or stops only changes the
+members of its pool; when a pool appears, disappears or changes its hosts,
+address or policy the listeners are swapped as a reload does, without
+dropping connections.
+
+- rxh must reach the container addresses: run it on the Docker host or in a
+  container on the same Docker network. A container on several networks is
+  reached at its address on the first one by name; one with
+  `network_mode: host` at `127.0.0.1`.
+- A container is HTTP or TCP: `rxh.http.host` and `rxh.tcp.listen` cannot be
+  combined. The containers of a pool must agree on `rxh.policy` and
+  `rxh.tcp.listen`; their hosts are merged.
+- A container whose labels are wrong (unknown `rxh.*` label, missing port,
+  invalid host or policy), whose pool has the name of an `[upstream.NAME]`
+  of the file, or whose server would make the configuration invalid is
+  ignored and reported once on standard error. The other containers are
+  not affected.
+- While Docker cannot be reached the last known containers stay routed and
+  the connection is retried every 2 seconds. The daemon starts without
+  Docker.
+- The routes are plain HTTP and cannot be tuned beyond the labels (no TLS,
+  health checks or header rules); put a server of the file in front for
+  those.
+- The Docker socket gives control of the host. Prefer a socket proxy that
+  only allows `GET /containers/json` and `GET /events`.
 
 ## `[upstream.NAME]`: load balancing pools
 
