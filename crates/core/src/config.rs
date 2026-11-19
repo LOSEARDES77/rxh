@@ -5673,9 +5673,9 @@ serve = { root = ".", browse = false, hide = [".git"], precompressed = ["br"] }
                 "basic_auth only applies to http servers",
             ),
             (
-                format!(
-                    "[[server]]\nlisten = \"127.0.0.1:1\"\nmatch = [{{ forward = \
-                     \"127.0.0.1:2\", basic_auth = {{ users = {{}} }} }}]"
+                String::from(
+                    "[[server]]\nlisten = \"127.0.0.1:1\"\nmatch = [{ forward = \
+                     \"127.0.0.1:2\", basic_auth = { users = {} } }]",
                 ),
                 "match[0]: basic_auth: users must not be empty",
             ),
