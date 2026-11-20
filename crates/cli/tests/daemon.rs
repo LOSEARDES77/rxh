@@ -374,6 +374,45 @@ fn validate_reports_errors() {
     );
 }
 
+#[test]
+fn validate_warns_about_deprecated_keys_in_every_file() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let main = "include = [\"conf.d/*.toml\"]\n\n[[server]]\nlisten = \"127.0.0.1:1\"\n\
+                connections = 5\nforward = \"@web\"\n";
+    let site = "[upstream.web]\nalgorithm = \"WRR\"\nbackends = [\"127.0.0.1:2\"]\n";
+    std::fs::create_dir(directory.path().join("conf.d")).expect("mkdir");
+    std::fs::write(directory.path().join("rxh.toml"), main).expect("write");
+    std::fs::write(directory.path().join("conf.d/web.toml"), site).expect("write");
+    let validate = || {
+        Command::new(RXH)
+            .current_dir(directory.path())
+            .args(["validate", "-c", "rxh.toml"])
+            .output()
+            .expect("rxh runs")
+    };
+
+    let output = validate();
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "warning: rxh.toml: server[0]: key `connections` is deprecated since 0.3.0, \
+         use `max_connections`",
+        "conf.d/web.toml: upstream.web: key `algorithm` is deprecated since 0.3.0, use `policy`",
+        "conf.d/web.toml: upstream.web: policy `WRR` is deprecated since 0.3.0, \
+         use `weighted_round_robin`",
+    ] {
+        assert!(stderr.contains(expected), "{expected}\n{stderr}");
+    }
+
+    let migrated = main.replace("connections", "max_connections");
+    std::fs::write(directory.path().join("rxh.toml"), migrated).expect("write");
+    let site = site.replace("algorithm = \"WRR\"", "policy = \"weighted_round_robin\"");
+    std::fs::write(directory.path().join("conf.d/web.toml"), site).expect("write");
+    let output = validate();
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
 fn spawn_rxh(directory: &Path, args: &[&str]) -> Daemon {
     Daemon(
         Command::new(RXH)

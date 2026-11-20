@@ -175,8 +175,9 @@ goal of this milestone is to close most of that gap and to keep it closed.
 
 A release people can run without reading the source.
 
-- [ ] Configuration format frozen, with a documented migration path for
-      every later change and `rxh validate` warnings for deprecated keys.
+- [x] Configuration format frozen, with a documented migration path for
+      every later change and `rxh validate` warnings for deprecated keys
+      (`docs/migration.md`).
 - [x] `rxh fmt` and a JSON schema for the TOML file, for editor
       completion (`rxh schema`, `docs/rxh.schema.json`).
 - [x] `rxh adapt` to convert a Caddyfile or a simple `nginx.conf` into RXH

@@ -1,8 +1,10 @@
 # Configuration reference
 
 RXH reads one TOML file (`rxh.toml` by default, `-c` or `RXH_CONFIG` to
-change it). `rxh validate` checks a file without starting anything, and
-[`examples/full.toml`](../examples/full.toml) shows every option at once.
+change it). `rxh validate` checks a file without starting anything and
+warns about deprecated keys (see [Configuration migration](migration.md)),
+and [`examples/full.toml`](../examples/full.toml) shows every option at
+once.
 
 Durations are strings like `250ms`, `5s`, `1m30s` or `2h` (units `ns`, `us`,
 `ms`, `s`, `m`, `h`, `d`), or plain integers meaning seconds. Unknown keys
@@ -1225,7 +1227,7 @@ appear in `rxh status`; inline pools are named `server[INDEX]#PATTERN` or
 
 | Key | Default | Caddy equivalent | Description |
 |---|---|---|---|
-| `policy` | `"weighted_round_robin"` | `lb_policy` | Selection policy, see below. Aliases: `lb_policy`, `algorithm`. |
+| `policy` | `"weighted_round_robin"` | `lb_policy` | Selection policy, see below. Alias: `lb_policy`. The old `algorithm` is deprecated, see [migration](migration.md). |
 | `backends` | `[]` | upstreams | List of addresses or `{ address = "...", weight = N }`. Address forms: `host:port`, `http://host[:port]` (default port 80), `https://host[:port]` (TLS, default port 443) and `unix//absolute/path.sock` (unix socket, not for UDP). Port ranges `"host:8001-8004"` expand to several backends. Host names are resolved on each dial. A pool cannot mix `https://` and plain backends. Alias: `to`. |
 | `choose` | `2` | `random_choose <n>` | Sample size of `random_choose`. |
 | `key` | | `query [key]`, `header [field]`, `cookie [name]` | Query parameter, header or cookie name. Required for `query` and `header`; `cookie` defaults to `lb`. |
@@ -1687,7 +1689,7 @@ socket, except that `http` servers listing the same address share one socket
 | `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. Not allowed on `udp` servers. |
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
 | `match` | | List of patterns instead of `forward`/`serve`/`redirect`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
-| `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. Alias: `connections`. |
+| `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. The old `connections` is deprecated, see [migration](migration.md). |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
 | `client_auth` | | `{ mode, ca, header }`: ask clients for a certificate in the TLS handshake, see [Client certificates (mTLS)](#client-certificates-mtls) (servers with `tls` only). |
 | `tls_options` | | `{ min_version, cipher_suites, curves, ocsp_stapling }`: what the TLS handshake accepts, and OCSP stapling, see [TLS options](#tls-options) (servers with `tls` only). |
