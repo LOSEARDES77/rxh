@@ -170,8 +170,11 @@ goal of this milestone is to close most of that gap and to keep it closed.
       the terminal, built on the metrics endpoint.
 - [x] Read only web dashboard on top of the admin API: hosts,
       certificates, live health.
-- [ ] Management in the dashboard, like Nginx Proxy Manager: edit hosts and
-      certificates, access lists.
+- [x] Management in the dashboard, like Nginx Proxy Manager: edit hosts and
+      certificates, access lists. Forms for every key, saved to the
+      configuration file. No certificate upload: certificate files and ACME
+      are configured, the files get on disk another way. Accounts, first-run
+      setup and OIDC are the next project; this one keeps the bearer token.
 
 ## 1.0: stable
 

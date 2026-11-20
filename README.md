@@ -270,7 +270,13 @@ reachable address.
 | `DELETE` | `/pools/{name}/upstreams` | Remove `{"address": "host:port"}` |
 | `GET` | `/metrics` | Prometheus metrics (text format 0.0.4) |
 | `GET` | `/certificates` | Certificates served, with expiry dates |
-| `GET` | `/dashboard` | Read only web page: listeners, hosts, live health, certificates |
+| `GET` | `/dashboard` | Web UI: statistics of the last hour, hosts, pools, certificates and settings, with forms that save to the configuration file. Served without the token, with `/dashboard/app.js` and `/dashboard/app.css` |
+| `GET` | `/schema` | JSON schema of the configuration |
+| `GET` | `/stats/history` | One hour of counters, one sample every 5 seconds |
+| `GET` | `/config/files` | Configuration files and their tables, secrets as `***` |
+| `PUT` | `/config/files/{index}` | Save the text of one file, validate, reload |
+| `POST` | `/config/entities/{kind}` | Add a `server`, `upstream` or `section` to a file |
+| `PUT`, `DELETE` | `/config/entities/{kind}/{key}` | Save or delete one of them; the file is put back when the change is not valid or does not reload |
 | `POST` | `/certificates/reload` | Read the certificate files again |
 | `POST` | `/reload` | Reload the configuration file |
 | `POST` | `/load` | Run the configuration in the body (TOML or JSON), without writing the file |
@@ -285,6 +291,10 @@ curl -s -X POST localhost:2019/pools/web/upstreams -d '{"address":"10.0.0.13:808
 curl -s -X POST localhost:2019/load --data-binary @new.toml
 curl -s -X PATCH localhost:2019/config/upstream/web -d '{"policy":"least_conn"}'
 ```
+
+`http://127.0.0.1:2019/dashboard` is the web UI over these routes; see
+[Dashboard](docs/configuration.md#dashboard) and
+[Editing from the dashboard](docs/configuration.md#editing-from-the-dashboard).
 
 ## Project layout
 

@@ -519,8 +519,9 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 - Without a token, TCP requests must have a loopback `Host` and `Origin`
   (protection against DNS rebinding). With a token, or on a unix socket, any
   `Host` is accepted. A token set together with a unix socket is checked too.
-- `GET /dashboard` is the only route served without the token: a static
-  page with no data, which asks for the token and sends it on its requests.
+- `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are the
+  only routes served without the token: the page and its script and style
+  hold no data. The page asks for the token and sends it on its requests.
 - The admin API speaks plain HTTP: the token is as private as the network it
   crosses. Use a private network, a VPN or an SSH tunnel
   (`ssh -L 2019:/run/rxh/admin.sock host`), not the open internet.
@@ -534,22 +535,266 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 
 ### Dashboard
 
-`GET /dashboard` on the admin API is a read only web page: listeners and
-their state, hosts with their routes, the live health of every backend, and
-the certificates with their expiry. It refreshes every 2 seconds, is embedded
-in the binary and loads nothing from other sites. It has no key: it is there
-whenever the admin API is. `/dashboard/` redirects to `/dashboard`.
+`GET /dashboard` on the admin API is a web page that shows what the daemon
+does and changes its configuration. It is embedded in the binary, loads
+nothing from other sites, and has no key: it is there whenever the admin API
+is. `/dashboard/` redirects to `/dashboard`.
 
 ```toml
 [admin]
 listen = "127.0.0.1:2019"   # then open http://127.0.0.1:2019/dashboard
 ```
 
+Five tabs:
+
+| Tab | Shows | Changes |
+|---|---|---|
+| Overview | Requests per second, share of `5xx`, latency p95, requests in flight and healthy backends; a chart of requests per second by status class and one of latency p50, p95 and p99, over 5 minutes, 15 minutes or 1 hour; one row per pool and per server with a trend; the certificates that expire within 30 days. | Nothing. |
+| Hosts | Every `[[server]]` of the files: name, host names, listen addresses, protocol, target, TLS, state of its listeners and the file it is in. A server with several `listen` addresses is one row. | New host, Edit, Delete. |
+| Pools | Every pool with its backends: health, state, weight, requests in flight, total requests, failures. | New pool, Edit (backends are part of the pool form), and Ready, Drain, Maintenance on each backend. |
+| Certificates | The certificates served, soonest expiry first, with listener, source, issuer and OCSP staple. | "Reload certificates" (`POST /certificates/reload`), and the `[acme]` form. |
+| Settings | The other sections (`top` level keys, `[admin]`, `[log]`, `[tracing]`, `[docker]`, `[consul]`, `[etcd]`, `[nomad]`, `[kubernetes]`), set or not, and every configuration file as text. | A form per section ("Set up" for one that is not in the file), "Save and reload" of a file edited as text, and the daemon controls: Reload, Upgrade, Stop. |
+
+- Every key of the configuration has a field, drawn from the JSON schema
+  (`GET /schema`), with the description of the key as help. The common keys
+  of a host and of a pool come first, the others are folded by topic. A
+  "Form | TOML" switch at the top of every editor shows the same table as
+  text; the two views are not converted into each other, switching starts
+  again from the file.
+- "Save and reload" writes the file and reloads, see
+  [Editing from the dashboard](#editing-from-the-dashboard). An error of the
+  daemon is shown above the form, which keeps what was typed.
+- When the file changed on disk since the page read it, the save is refused
+  (`409`) and the editor offers "Read again", which replaces what is typed
+  with what the file holds now. For a file edited as text in Settings,
+  "Read again" keeps the typed text and shows next to it what the file
+  holds now.
+- Hosts and pools that are in no file are shown read only with the badge
+  "runtime": those made by Docker, Consul, etcd, Nomad or Kubernetes, the
+  inline pools of a `forward`, and servers changed through `PATCH`.
+- Ready, Drain and Maintenance are the runtime states of
+  [Draining backends and maintenance](#draining-backends-and-maintenance):
+  they last "until restart" and do not change the file.
+- Upgrade and Stop ask to type the word `upgrade` or `stop`. After Upgrade
+  the page keeps working with the new process, whose history starts empty.
+  After Stop the page says the daemon was stopped and asks nothing more.
+- Without a configuration file (the quick commands) nothing can be saved:
+  every tab reads "No configuration file: read only".
+- Light or dark follows the browser (`prefers-color-scheme`). Every control
+  has a label and works from the keyboard: the arrow keys move between the
+  tabs, `Tab` between the controls. Focus is not moved into an editor when
+  it opens, nor back to the list when it closes.
+
 On a remote host, tunnel the admin address
 (`ssh -L 2019:127.0.0.1:2019 host`) and open the same URL. With `token`
-set, the page asks for the token once per browser tab and sends it on its
-requests. A browser cannot open a unix socket: forward it to a local port
+set, the page asks for the token once per browser tab, keeps it in
+`sessionStorage` (gone when the tab is closed) and sends it on its requests;
+a wrong token is asked again. The admin API is plain HTTP: the token and
+everything the page saves cross the network as sent, so keep the tunnel. A
+browser cannot open a unix socket: forward it to a local port
 (`ssh -L 2019:/run/rxh/admin.sock host`).
+
+Differences from the design of the page
+([`docs/superpowers/specs/2026-11-20-webui-design.md`](superpowers/specs/2026-11-20-webui-design.md)):
+a value the form cannot draw gets a JSON box for that key, not a TOML one
+(no key of the schema needs it today); the Overview reads `/stats/history`
+and `/certificates` and not `/status`; the statistics are sampled by a
+thread, not a task, so they outlive the runtimes of the admin API.
+
+#### Statistics history
+
+The daemon takes one sample of its counters every 5 seconds and keeps the
+last 720, one hour, in memory. The history survives reloads and is lost on
+restart and on a binary upgrade. It is always on when the admin API is.
+
+```sh
+curl -s localhost:2019/stats/history | jq '.samples | length'
+```
+
+`GET /stats/history` answers `200` with `interval_seconds` (5), `buckets`
+(the bounds of the duration histogram, in seconds) and `samples`, oldest
+first. A sample has `time` (unix seconds), `servers` (per server: `status`,
+the responses by class `1xx` to `5xx`; `duration_count`, `duration_sum`,
+`duration_buckets`; `connections` of layer 4) and `pools` (per pool:
+`requests`, `failures`, `responses`, `server_errors`, `response_seconds`,
+and the gauges `active`, `healthy`, `backends`). Counters are cumulative:
+the page draws the difference between two samples.
+
+- Latency percentiles are interpolated inside the histogram buckets, whose
+  bounds are 5, 10, 25, 50, 100, 250 and 500 ms, 1, 2.5, 5 and 10 s. Requests
+  faster than 5 ms all fall in the first bucket, so their percentiles show
+  at most 5 ms whatever the real time (a proxy answering in 0.4 ms reads
+  "p95 4.8 ms"); a percentile beyond 10 s shows 10 s. The latency of a pool
+  row is a mean, from `response_seconds`, and has no such floor.
+- "Errors" is the share of `5xx` answers; `4xx` are in the chart only.
+- A server or pool that was removed keeps its row until its samples leave
+  the range.
+- For anything longer than an hour, or kept across restarts, scrape
+  `GET /metrics` with Prometheus.
+
+#### Building the page
+
+The page is a Svelte application in `crates/server/ui`. Its compiled files
+(`crates/server/ui/dist/index.html`, `app.js`, `app.css`) are committed and
+embedded in the binary, so `cargo build`, `cargo install` and the packages
+need neither Bun nor Node. Only a change of the page needs Bun:
+
+```sh
+cd crates/server/ui && bun install && bun run build   # then commit dist/
+bun run check && bun run test                         # types and unit tests
+```
+
+The CI job `ui` runs the same commands and fails when the committed `dist/`
+differs from a fresh build.
+
+### Editing from the dashboard
+
+The page saves through these routes, which `curl` can call too. They need
+the token like every other route, and answer `{"error": "..."}` on failure.
+
+| Method | Path | Body | Success | Failure |
+|---|---|---|---|---|
+| `GET` | `/schema` | | `200`: the JSON schema `rxh schema` prints | |
+| `GET` | `/stats/history` | | `200`, see [Statistics history](#statistics-history) | |
+| `GET` | `/config/files` | | `200`: `editable`, `files`, `entities` | `500` a file cannot be read or parsed (the answer gives the file, line and column, not its text) |
+| `PUT` | `/config/files/{index}` | `{"text", "revision"}` | `200` `{"saved": true}` | `400` not valid TOML, not a valid configuration, reload refused; `404` no such file; `409` |
+| `POST` | `/config/entities/{kind}` | `{"value"}` or `{"toml"}`, `"key"` (name of a pool or section), `"file"` (index, default 0) | `201` `{"key": "..."}` | `400` both or neither of `value` and `toml`, name missing or taken, not valid; `404` unknown kind or file; `409` |
+| `PUT` | `/config/entities/{kind}/{key}` | `{"value"}` or `{"toml"}`, and `"revision"` | `200` `{"saved": true}` | `400` as above, or `revision` missing; `404` unknown kind, or `key` in no file; `409` |
+| `DELETE` | `/config/entities/{kind}/{key}?revision=...` | | `200` `{"saved": true}` | `400` `revision` missing, or the configuration is not valid without it; `404`; `409` |
+
+`409` is answered when `revision` is not the one of the file on disk ("the
+file changed, read it again"), and by every write route when the daemon runs
+without a configuration file. `500` means a file could not be written or
+put back; the message names it. Bodies are JSON, limited to 4 MiB.
+
+```sh
+# The files: the main one first, then the included ones.
+curl -s localhost:2019/config/files | jq '.files[] | {index, path, revision}'
+curl -s localhost:2019/config/files | jq '.entities[] | {kind, key, file}'
+curl -s localhost:2019/schema | jq '.properties | keys'
+
+# Change one pool: the whole table as JSON, with the revision of its file.
+rev=$(curl -s localhost:2019/config/files | jq -r '.files[0].revision')
+curl -X PUT localhost:2019/config/entities/upstream/api \
+  -d '{"value": {"backends": ["10.0.0.1:8080", "10.0.0.2:8080"], "policy": "least_conn"}, "revision": "'$rev'"}'
+
+# The same as TOML: the body of the table, without its header.
+curl -X PUT localhost:2019/config/entities/upstream/api \
+  -d '{"toml": "backends = [\"10.0.0.1:8080\"]\npolicy = \"least_conn\"\n", "revision": "'$rev'"}'
+
+# A new server in the main file, a new pool in the second file.
+curl -X POST localhost:2019/config/entities/server \
+  -d '{"value": {"name": "blog", "listen": "0.0.0.0:8081", "forward": "@api"}}'
+curl -X POST localhost:2019/config/entities/upstream \
+  -d '{"key": "blog", "value": {"backends": ["10.0.0.9:80"]}, "file": 1}'
+
+# Delete the server at position 2 of file 0, then a section.
+curl -X DELETE "localhost:2019/config/entities/server/0:2?revision=$rev"
+curl -X DELETE "localhost:2019/config/entities/section/tracing?revision=$rev"
+
+# Replace a whole file.
+jq -n --rawfile text new.toml --arg revision "$rev" '{text: $text, revision: $revision}' |
+  curl -X PUT localhost:2019/config/files/0 -d @-
+```
+
+- `GET /config/files` lists each file with `index`, `path`, `revision`
+  (the SHA-256 of its text on disk) and `text`, and each table as an
+  entity `{kind, key, file, value, toml}`: `value` is the table as JSON as
+  written (placeholders not replaced, aliases kept), `toml` its text without
+  the header. `editable` is `false`, with no file, when the daemon has no
+  configuration file. Every write changes the revision: read it again
+  before the next one.
+- `kind` is `server`, `upstream` or `section`. The `key` of a pool is its
+  name; of a section `top` (the keys outside any table), `admin`, `log`,
+  `tracing`, `acme`, `docker`, `consul`, `etcd`, `nomad` or `kubernetes`;
+  of a server `{file index}:{position in that file}`, as `GET
+  /config/files` gives it. Positions shift when a server above is deleted:
+  the revision check is what stops a delete from reaching another server.
+  The section `top` cannot be deleted.
+- A `value` is the whole table: a key with a new value is set, a key left
+  out is removed, tables merge by the same rule, arrays are replaced.
+
+What a save does, in order:
+
+1. The revision is compared with the file on disk (`409`).
+2. Only the table of the entity is edited; the rest of the file keeps its
+   text, and inside the table the keys that did not change keep their
+   comments and layout.
+3. The file is written atomically (a temporary file next to it, then a
+   rename), and the whole configuration is loaded from the main file as
+   `rxh validate` does. If it is not valid the file is put back and the
+   answer is `400` with the reason.
+4. The daemon reloads. If the reload is refused (a port in use, a
+   certificate that does not load), the file is put back and the answer is
+   `400` with the reason.
+
+A save that fails leaves every file byte for byte as it was. Two saves never
+run at the same time.
+
+Limits of the edit that keeps comments:
+
+- An array of tables inside an entity that a `value` changes, such as the
+  `[[server.match]]` routes of a server, is written back as one inline
+  array (`match = [{ ... }, { ... }]`) and loses the comments inside it.
+  Left unchanged, it keeps its text. To keep the layout, edit it as TOML.
+- In text sent as `toml`, a comment after the last key is dropped; comments
+  above and beside the keys are kept.
+- A pool written with dotted keys (`upstream.api.backends = [...]`) becomes
+  an `[upstream.api]` table when it is saved as `toml`.
+
+Secrets:
+
+- These keys are shown as `***` by `GET /config/files`, in `value`, `toml`
+  and `text`, when they hold a literal: `token` of `[admin]`, `[consul]`,
+  `[etcd]`, `[nomad]` and `[kubernetes]`; `api_token`, `secret_access_key`
+  and `tsig_secret` of `[acme.dns]`; `secret` of a pool, of an inline pool
+  of `forward`, and of their `fallback` chains.
+- A `***` sent back keeps the value stored in the file; anything else
+  replaces it. A `***` where the file stores nothing is refused (`400`).
+- A value with a placeholder (`{env.NAME}`, `{file.PATH}`) names where the
+  secret is: it is shown and saved as written, never replaced.
+- Not masked: credentials inside header maps (`headers` of a health check,
+  request headers, such as `Authorization = "Bearer ..."`) and the bcrypt
+  hashes of `basic_auth`. Whoever can read the admin API reads them. Keep
+  header credentials out of the file with a placeholder:
+  `headers = { Authorization = "Bearer {file.secrets/health-token}" }`.
+- When a whole file is saved (`PUT /config/files/{index}`), a `***` inside
+  a `[[server]]` is restored only if that server is still the one stored at
+  its position: same `name`, or same `listen` when it has no name. It is
+  refused (`400`, "type its secret again instead of ***") when the server
+  moved, or when its name (else its listen address) is not unique in the
+  file.
+
+File permissions:
+
+- A save keeps the mode of the file. A file that did not exist is created
+  with mode `0600`, because a configuration file can hold secrets. The
+  owner and group are kept only when the process may `chown` (root);
+  otherwise the saved file belongs to the user of the process.
+- The same holds for the CLI commands that edit the files (`rxh upstream
+  add`, `rxh pool add`, `rxh service add`, ...): a file that `rxh` creates
+  as root is readable by root only, and a daemon running as another user
+  cannot read it until it is given (`chown`, or `chmod 640` with its group).
+- To save, the user of the daemon must be able to write each configuration
+  file and the directory it is in (for the temporary file and the rename).
+  Without it the save answers `500` with the error of the system and
+  nothing changes.
+- The packages and the unit do not grant that today. The `.deb`, `.rpm` and
+  AUR packages install `/etc/rxh/rxh.toml` with mode `0644`, owned by root,
+  and [`dist/rxh.service`](../dist/rxh.service) runs the daemon as a
+  dynamic user (`DynamicUser=yes`) with `ConfigurationDirectory=rxh` and
+  `ProtectSystem=strict`: the daemon reads its configuration and cannot
+  write it, so the page of a packaged service shows everything and saves
+  nothing. To let it save, run it as a fixed user that owns the directory,
+  for instance with a drop-in (`systemctl edit rxh`) and
+  `chown -R rxh: /etc/rxh`. This drop-in was not tested with the packages:
+
+  ```ini
+  [Service]
+  DynamicUser=no
+  User=rxh
+  ReadWritePaths=/etc/rxh
+  ```
 
 ### Changing the configuration through the API
 
@@ -578,8 +823,9 @@ curl -X PATCH localhost:2019/config/server/0 --data-binary 'name = "front"'
 - **Nothing is written to disk.** The change lives until the next reload
   (`rxh reload`, `SIGHUP`, `POST /reload`, an edit seen by `watch = true`) or
   restart, which read the configuration file again. To make a change
-  permanent, edit the file or use `rxh pool`, `rxh upstream` and
-  `rxh service`.
+  permanent, edit the file, use `rxh pool`, `rxh upstream` and
+  `rxh service`, or save it through the routes of
+  [Editing from the dashboard](#editing-from-the-dashboard).
 - A body that starts with `{` is JSON, anything else is TOML, whatever the
   `Content-Type`. Bodies are limited to 4 MiB.
 - `POST /load`: `[admin]` in the body is ignored, the API keeps the address
