@@ -253,8 +253,8 @@ again every 5 seconds.
 - The schema renderer handles strings, numbers, booleans, enums, arrays,
   tables, maps (`additionalProperties`), and "one value or a list". Hand
   made controls for `forward`, `match`, `redirect`, `tls` and `serve`.
-  A value the renderer cannot draw falls back to a TOML text box for that
-  key only, so no key is ever unreachable.
+  A value the renderer cannot draw falls back to a JSON text box for that
+  key only (the TOML switch covers the whole table), so no key is ever unreachable.
 
 ### Tests
 
