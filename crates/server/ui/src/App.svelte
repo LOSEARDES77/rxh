@@ -120,7 +120,13 @@
   </div>
 </main>
 
-<dialog bind:this={dialog} aria-labelledby="token-title">
+<!-- Without a token every call fails: the dialog stays until one is given. -->
+<dialog
+  bind:this={dialog}
+  aria-labelledby="token-title"
+  oncancel={(event) => event.preventDefault()}
+  onclose={() => $needsToken && dialog.showModal()}
+>
   <form onsubmit={submitToken}>
     <h2 id="token-title">Admin token</h2>
     <p>This admin API asks for the <code>[admin] token</code> of the configuration.</p>

@@ -862,8 +862,22 @@ mod tests {
                 let text = std::fs::read_to_string(&path).unwrap();
                 // Markup from strings can run injected script, and `style=`
                 // is refused by the `style-src 'self'` policy.
-                for banned in ["innerHTML", "{@html", "style="] {
+                // An absolute API path breaks the page behind a path prefix.
+                for banned in [
+                    "innerHTML",
+                    "{@html",
+                    "style=",
+                    "api(\"/",
+                    "api(`/",
+                    "api('/",
+                ] {
                     assert!(!text.contains(banned), "{} holds {banned}", path.display());
+                }
+                // Every call goes through `api`, which keeps paths relative
+                // and sends the token.
+                let name = path.to_string_lossy();
+                if !name.ends_with("lib/api.ts") && !name.contains(".test.") {
+                    assert!(!text.contains("fetch("), "{} calls fetch", path.display());
                 }
                 files += 1;
             }

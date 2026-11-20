@@ -1,4 +1,5 @@
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import { svelteTesting } from "@testing-library/svelte/vite";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -10,7 +11,7 @@ export default defineConfig({
     renderBuiltUrl: (filename, { hostType }) =>
       hostType === "html" ? `./dashboard/${filename}` : { relative: true },
   },
-  plugins: [svelte()],
+  plugins: [svelte(), svelteTesting()],
   build: {
     outDir: "dist",
     emptyOutDir: true,
