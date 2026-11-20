@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use h3::client::SendRequest;
+use h3::client::{RequestStream, SendRequest};
 use h3::error::Code;
 use http::{HeaderMap, Request, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -22,6 +22,31 @@ pub struct Http3Client {
     connection: Connection,
     sender: SendRequest<h3_quinn::OpenStreams, Bytes>,
     driver: JoinHandle<()>,
+}
+
+/// A request whose head was sent and whose stream is still open.
+pub struct OpenRequest {
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+}
+
+impl OpenRequest {
+    /// Waits for the response head, without ending the request, and
+    /// returns its status.
+    pub async fn status(&mut self) -> io::Result<StatusCode> {
+        let response = self
+            .stream
+            .recv_response()
+            .await
+            .map_err(io::Error::other)?;
+        Ok(response.status())
+    }
+
+    /// Resets the stream in both directions, as a client that gives up on
+    /// the request does.
+    pub fn reset(mut self) {
+        self.stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+        self.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+    }
 }
 
 /// A complete HTTP/3 response.
@@ -129,21 +154,39 @@ impl Http3Client {
         })
     }
 
-    /// Sends the head of `request` and the `partial` body bytes, then resets
-    /// the stream in both directions without reading the response.
-    pub async fn send_and_reset(&mut self, request: Request<()>, partial: &[u8]) -> io::Result<()> {
-        let mut stream = self
+    /// Sends the head of `request` and leaves its stream open: no body, no
+    /// end of stream.
+    pub async fn open(&mut self, request: Request<()>) -> io::Result<OpenRequest> {
+        let stream = self
             .sender
             .send_request(request)
             .await
             .map_err(io::Error::other)?;
-        stream
+        Ok(OpenRequest { stream })
+    }
+
+    /// Sends the head of `request` and the `partial` body bytes, then resets
+    /// the stream in both directions without reading the response.
+    pub async fn send_and_reset(&mut self, request: Request<()>, partial: &[u8]) -> io::Result<()> {
+        let mut request = self.open(request).await?;
+        request
+            .stream
             .send_data(Bytes::copy_from_slice(partial))
             .await
             .map_err(io::Error::other)?;
-        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
-        stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+        request.reset();
         Ok(())
+    }
+
+    /// Sends `frames`, already encoded HTTP/3 frames, as a whole request
+    /// stream and returns every byte of the response stream. For requests
+    /// the h3 client refuses to build, such as one over the server's header
+    /// size limit.
+    pub async fn send_raw(&self, frames: &[u8]) -> io::Result<Vec<u8>> {
+        let (mut send, mut receive) = self.connection.open_bi().await?;
+        send.write_all(frames).await?;
+        send.finish()?;
+        receive.read_to_end(1 << 20).await.map_err(io::Error::other)
     }
 
     /// Resolves when the server closes the connection.

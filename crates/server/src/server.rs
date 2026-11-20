@@ -51,6 +51,10 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// HTTP/1 request heads.
 const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Largest request header section accepted over HTTP/2 and HTTP/3, in bytes:
+/// hyper's HTTP/2 default. HTTP/1 has hyper's own read buffer limit.
+pub(crate) const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
+
 /// Current state of a [`Server`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum State {
@@ -894,6 +898,7 @@ async fn serve<S>(
                 if let Some(timeout) = context.read_header_timeout {
                     http1.header_read_timeout(timeout);
                 }
+                builder.http2().max_header_list_size(MAX_HEADER_LIST_SIZE);
                 drive_http(
                     builder.serve_connection_with_upgrades(io, service),
                     stop,

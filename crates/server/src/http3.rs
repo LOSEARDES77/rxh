@@ -29,13 +29,13 @@ use bytes::{Buf, Bytes};
 use h3::error::{Code, ConnectionError, StreamError};
 use h3::server::{RequestResolver, RequestStream};
 use http::header::{self, HeaderName};
-use http::{Request, Response, Version};
+use http::{HeaderMap, Request, Response, Version};
 use http_body_util::BodyExt;
-use hyper::body::Frame;
+use hyper::body::{Frame, SizeHint};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, EndpointConfig, Incoming, TokioRuntime};
 use socket2::{Domain, Socket, Type};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::quic::Suite;
@@ -45,7 +45,7 @@ use crate::error::Error;
 use crate::http::body::{self, Body, BodyError};
 use crate::http::response::BoxResponse;
 use crate::http::service::Service;
-use crate::server::ConnectionContext;
+use crate::server::{self, ConnectionContext};
 use crate::systemd;
 use crate::tls;
 
@@ -218,7 +218,11 @@ async fn serve_connection(incoming: Incoming, listener: Arc<Listener>) {
             return;
         }
     };
+    // h3 buffers a whole HEADERS frame before it decodes it and checks this
+    // limit, so that buffering is bounded only by time, which Task 4's
+    // `read_header_timeout` covers.
     let mut connection = match h3::server::builder()
+        .max_field_section_size(u64::from(server::MAX_HEADER_LIST_SIZE))
         .build(h3_quinn::Connection::new(connection))
         .await
     {
@@ -265,8 +269,21 @@ async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, s
     let (mut send, receive) = stream.split();
     let (mut parts, ()) = request.into_parts();
     parts.version = Version::HTTP_3;
-    let body = request_body(receive).await;
-    let response = service.respond(Request::from_parts(parts, body)).await;
+    let (reset_sender, reset) = oneshot::channel();
+    let body = request_body(receive, declared_length(&parts.headers), reset_sender).await;
+    let response = tokio::select! {
+        // `respond` first: it counts the request on its first poll.
+        biased;
+        response = service.respond(Request::from_parts(parts, body)) => response,
+        // The client reset the request stream: dropping the response future
+        // cancels the backend request too.
+        // ponytail: a reset after the request stream ended (a `GET` whose end
+        // came with its head) is not seen: h3 0.0.8 hides the
+        // `quinn::SendStream::stopped()` that reports STOP_SENDING, so the
+        // backend request runs until it answers. Race `stopped()` here once
+        // an h3 release exposes it.
+        Ok(()) = reset => return,
+    };
     // An error means the client reset the stream: it wants no answer.
     let _ = send_response(&mut send, response).await;
 }
@@ -279,11 +296,11 @@ struct BodyReader {
     done: bool,
 }
 
+/// Next item of a [`BodyReader`].
+type Next = Option<Result<Frame<Bytes>, StreamError>>;
+
 impl BodyReader {
-    fn poll_frame(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+    fn poll_frame(&mut self, context: &mut Context<'_>) -> Poll<Next> {
         if self.done {
             return Poll::Ready(None);
         }
@@ -296,7 +313,7 @@ impl BodyReader {
                 Ok(None) => self.trailers = true,
                 Err(err) => {
                     self.done = true;
-                    return Poll::Ready(Some(Err(body_error(err))));
+                    return Poll::Ready(Some(Err(err)));
                 }
             }
         }
@@ -304,68 +321,134 @@ impl BodyReader {
         self.done = true;
         Poll::Ready(
             trailers
-                .map_err(body_error)
                 .transpose()
                 .map(|trailers| trailers.map(Frame::trailers)),
         )
     }
 }
 
+/// Length a request declares in a single valid `Content-Length`.
+fn declared_length(headers: &HeaderMap) -> Option<u64> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()?.parse().ok()
+}
+
 fn body_error(err: StreamError) -> BodyError {
     BodyError::Io(io::Error::other(err))
 }
 
-/// Body of the request whose stream `stream` is the receiving half of. A
-/// request that already ended, as most `GET`s do, gets an empty body, so it
-/// goes upstream without one. Any other body is read by a task and handed
-/// over through a channel: the stream itself is not `Sync`.
-async fn request_body(stream: Stream<h3_quinn::RecvStream>) -> Body {
+/// Body of the request whose stream `stream` is the receiving half of, and
+/// whose `Content-Length` is `declared`. A request that already ended, as
+/// most `GET`s do, gets an empty body, so it goes upstream without one. Any
+/// other body is read by [`read_body`] and handed over through a channel:
+/// the stream itself is not `Sync`. `reset` is told if the client resets the
+/// stream before it ends.
+async fn request_body(
+    stream: Stream<h3_quinn::RecvStream>,
+    declared: Option<u64>,
+    reset: oneshot::Sender<()>,
+) -> Body {
     let mut reader = BodyReader {
         stream,
         trailers: false,
         done: false,
     };
     let first = future::poll_fn(|context| Poll::Ready(reader.poll_frame(context))).await;
-    if let Poll::Ready(None) = first {
-        return body::empty();
-    }
+    let first = match first {
+        Poll::Ready(None) => return body::empty(),
+        Poll::Ready(next) => Some(next),
+        Poll::Pending => None,
+    };
 
     let (sender, receiver) = mpsc::channel(1);
-    tokio::task::spawn(async move {
-        if let Poll::Ready(Some(frame)) = first
-            && sender.send(frame).await.is_err()
-        {
-            return;
-        }
-        loop {
-            let frame = tokio::select! {
-                frame = future::poll_fn(|context| reader.poll_frame(context)) => frame,
-                // The body was dropped: the rest of the stream is not needed.
-                () = sender.closed() => return,
-            };
-            let Some(frame) = frame else {
-                return;
-            };
-            if sender.send(frame).await.is_err() {
+    tokio::task::spawn(read_body(reader, first, sender, reset));
+    let received = Received {
+        frames: receiver,
+        remaining: declared,
+    };
+    received.boxed()
+}
+
+/// Hands the frames of `reader` to the body behind `sender`, starting with
+/// `first` if it was already read. Tells `reset` when the client resets the
+/// stream. Once the body is dropped (a backend can answer without it), the
+/// rest of the stream is read and discarded, only to notice a reset, until
+/// the request is answered.
+async fn read_body(
+    mut reader: BodyReader,
+    mut first: Option<Next>,
+    sender: mpsc::Sender<Result<Frame<Bytes>, BodyError>>,
+    mut reset: oneshot::Sender<()>,
+) {
+    loop {
+        let next = match first.take() {
+            Some(next) => next,
+            None => tokio::select! {
+                next = future::poll_fn(|context| reader.poll_frame(context)) => next,
+                // Neither a body nor a request is waiting for the stream.
+                () = async {
+                    sender.closed().await;
+                    reset.closed().await;
+                } => return,
+            },
+        };
+        match next {
+            None => return,
+            Some(Ok(frame)) => {
+                // An error means the body was dropped: keep watching.
+                let _ = sender.send(Ok(frame)).await;
+            }
+            Some(Err(err)) => {
+                if let StreamError::RemoteTerminate { .. } = err {
+                    let _ = reset.send(());
+                }
+                let _ = sender.send(Err(body_error(err))).await;
                 return;
             }
         }
-    });
-    Received(receiver).boxed()
+    }
 }
 
 /// Request body fed by the task that reads its stream.
-struct Received(mpsc::Receiver<Result<Frame<Bytes>, BodyError>>);
+struct Received {
+    frames: mpsc::Receiver<Result<Frame<Bytes>, BodyError>>,
+    /// Bytes the `Content-Length` announces and that did not come yet.
+    remaining: Option<u64>,
+}
 
 impl hyper::body::Body for Received {
     type Data = Bytes;
     type Error = BodyError;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        self.0.poll_recv(context)
+        let this = self.get_mut();
+        let frame = ready!(this.frames.poll_recv(context));
+        if let Some(Ok(frame)) = &frame
+            && let Some(data) = frame.data_ref()
+            && let Some(remaining) = &mut this.remaining
+        {
+            *remaining = remaining.saturating_sub(data.len() as u64);
+        }
+        Poll::Ready(frame)
+    }
+
+    /// Ended once the declared length came (trailers after it are dropped),
+    /// or once the reader task delivered everything.
+    fn is_end_stream(&self) -> bool {
+        self.remaining == Some(0) || (self.frames.is_closed() && self.frames.is_empty())
+    }
+
+    /// Exact when the request declares its length.
+    fn size_hint(&self) -> SizeHint {
+        self.remaining
+            .map_or_else(SizeHint::default, SizeHint::with_exact)
     }
 }
 
