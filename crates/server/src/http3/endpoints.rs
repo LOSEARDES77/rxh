@@ -20,11 +20,15 @@ use crate::systemd;
 /// Longest wait in [`Endpoints::release`] for a closed socket to go away.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Endpoints by listen address.
+type Map = Mutex<HashMap<SocketAddr, Entry>>;
+
 /// QUIC endpoints of the daemon, by listen address. They outlive
 /// generations.
 #[derive(Default)]
 pub(crate) struct Endpoints {
-    endpoints: Mutex<HashMap<SocketAddr, Entry>>,
+    /// Shared with the tasks that drop retired endpoints once they are idle.
+    endpoints: Arc<Map>,
 }
 
 /// One endpoint and the listener it hands new connections to.
@@ -35,15 +39,20 @@ struct Entry {
     /// The UDP socket, gone once the endpoint, its driver and its
     /// connections are.
     socket: Weak<dyn AsyncUdpSocket>,
+    /// Set while no generation serves the address: the endpoint takes no new
+    /// connection and stays here until its open connections are gone, so
+    /// the address never gets a second socket.
+    retired: bool,
 }
 
 impl Endpoints {
     /// Makes `listeners` the ones new connections are served by, binding
-    /// the addresses that have no endpoint yet. Every new address is bound
-    /// before anything changes, so on error the endpoints serve what they
-    /// served before. Endpoints on addresses `listeners` has none for are
-    /// retired: they take no new connection, and close once the generation
-    /// that served them has drained its connections.
+    /// the addresses that have no endpoint yet and reviving retired ones.
+    /// Every new address is bound before anything changes, so on error the
+    /// endpoints serve what they served before. Endpoints on addresses
+    /// `listeners` has none for are retired: they take no new connection,
+    /// and close once the generation that served them has drained its
+    /// connections.
     pub(crate) fn install(&self, listeners: &[Arc<Listener>]) -> Result<(), Error> {
         let mut endpoints = self
             .endpoints
@@ -63,17 +72,22 @@ impl Endpoints {
 
         let addresses: HashSet<SocketAddr> =
             listeners.iter().map(|listener| listener.address).collect();
-        endpoints.retain(|address, entry| {
-            if addresses.contains(address) {
-                return true;
+        for (address, entry) in endpoints.iter_mut() {
+            if addresses.contains(address) || entry.retired {
+                continue;
             }
+            entry.retired = true;
             entry.endpoint.set_server_config(None);
-            let endpoint = entry.endpoint.clone();
-            tokio::task::spawn(async move { endpoint.wait_idle().await });
-            false
-        });
+            tokio::task::spawn(remove_when_idle(
+                Arc::downgrade(&self.endpoints),
+                *address,
+                entry.endpoint.clone(),
+                Weak::clone(&entry.socket),
+            ));
+        }
         for listener in listeners {
-            if let Some(entry) = endpoints.get(&listener.address) {
+            if let Some(entry) = endpoints.get_mut(&listener.address) {
+                entry.retired = false;
                 entry
                     .endpoint
                     .set_server_config(Some(listener.config.clone()));
@@ -87,16 +101,17 @@ impl Endpoints {
                 endpoint,
                 listener: sender,
                 socket,
+                retired: false,
             };
             endpoints.insert(listener.address, entry);
         }
         Ok(())
     }
 
-    /// Closes at once the endpoints on addresses `config` gives to a `udp`
-    /// server, and waits until their sockets are closed, so that server
-    /// can bind them. A server on `0.0.0.0` takes its port on every
-    /// address.
+    /// Closes at once the endpoints, retired ones included, on addresses
+    /// `config` gives to a `udp` server, and waits until their sockets are
+    /// closed, so that server can bind them. A server on `0.0.0.0` takes
+    /// its port on every address.
     pub(crate) async fn release(&self, config: &Config) {
         let udp: Vec<SocketAddr> = config
             .servers
@@ -121,7 +136,7 @@ impl Endpoints {
                     return true;
                 }
                 entry.endpoint.close(listener::no_error(), b"");
-                released.push(Weak::clone(&entry.socket));
+                released.push((*address, Weak::clone(&entry.socket)));
                 false
             });
 
@@ -129,11 +144,19 @@ impl Endpoints {
         // timeout the `udp` server fails to bind and the reload stops the
         // running generation first.
         let closed = async {
-            while released.iter().any(|socket| socket.strong_count() > 0) {
+            while released.iter().any(|(_, socket)| socket.strong_count() > 0) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        let _ = tokio::time::timeout(RELEASE_TIMEOUT, closed).await;
+        if tokio::time::timeout(RELEASE_TIMEOUT, closed).await.is_err() {
+            for (address, socket) in &released {
+                if socket.strong_count() > 0 {
+                    eprintln!(
+                        "Main => HTTP/3 on {address} (UDP): the socket is still open after {RELEASE_TIMEOUT:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Closes every endpoint and its connections at once: when the daemon
@@ -147,6 +170,30 @@ impl Endpoints {
         for (_, entry) in endpoints.drain() {
             entry.endpoint.close(listener::no_error(), b"");
         }
+    }
+}
+
+/// Drops the retired endpoint on `address`, the one over `socket`, from
+/// `endpoints` once it has no connection left. Its socket then closes.
+/// Nothing is dropped if the endpoint was revived meanwhile.
+async fn remove_when_idle(
+    endpoints: Weak<Map>,
+    address: SocketAddr,
+    endpoint: Endpoint,
+    socket: Weak<dyn AsyncUdpSocket>,
+) {
+    endpoint.wait_idle().await;
+    let Some(endpoints) = endpoints.upgrade() else {
+        return;
+    };
+    let mut endpoints = endpoints
+        .lock()
+        .expect("nothing panics while holding the endpoints");
+    let idle = endpoints
+        .get(&address)
+        .is_some_and(|entry| entry.retired && Weak::ptr_eq(&entry.socket, &socket));
+    if idle {
+        endpoints.remove(&address);
     }
 }
 

@@ -12,7 +12,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn::rustls::{ClientConfig, RootCertStore};
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 use tokio::task::JoinHandle;
 
 /// One QUIC connection to an HTTP/3 server, with its request sender.
@@ -49,6 +49,22 @@ impl OpenRequest {
     }
 }
 
+/// A QUIC connection with ALPN `h3` that sends nothing and grants the
+/// server no unidirectional stream, so the server cannot even open its
+/// HTTP/3 control stream.
+pub struct SilentConnection {
+    // Kept so the client socket lives as long as the connection.
+    _endpoint: Endpoint,
+    connection: Connection,
+}
+
+impl SilentConnection {
+    /// Resolves when the server closes the connection.
+    pub async fn closed(&self) {
+        self.connection.closed().await;
+    }
+}
+
 /// A complete HTTP/3 response.
 #[derive(Debug)]
 pub struct Http3Response {
@@ -72,40 +88,14 @@ impl Http3Client {
         root_pem: &str,
         identity: Option<(&str, &str)>,
     ) -> io::Result<Self> {
-        let mut roots = RootCertStore::empty();
-        for cert in CertificateDer::pem_slice_iter(root_pem.as_bytes()) {
-            roots
-                .add(cert.map_err(io::Error::other)?)
-                .map_err(io::Error::other)?;
-        }
-        let builder = ClientConfig::builder().with_root_certificates(roots);
-        let mut tls = match identity {
-            Some((chain, key)) => {
-                let chain: Result<Vec<CertificateDer<'static>>, _> =
-                    CertificateDer::pem_slice_iter(chain.as_bytes()).collect();
-                let chain = chain.map_err(io::Error::other)?;
-                let key =
-                    PrivateKeyDer::from_pem_slice(key.as_bytes()).map_err(io::Error::other)?;
-                builder
-                    .with_client_auth_cert(chain, key)
-                    .map_err(io::Error::other)?
-            }
-            None => builder.with_no_client_auth(),
-        };
-        tls.alpn_protocols = vec![b"h3".to_vec()];
-        let quic = QuicClientConfig::try_from(tls).map_err(io::Error::other)?;
-
-        let local = match address {
-            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-        };
-        let mut endpoint = Endpoint::client(local)?;
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
-        let connection = endpoint
-            .connect(address, server_name)
-            .map_err(io::Error::other)?
-            .await?;
-
+        let (endpoint, connection) = quic_connect(
+            address,
+            server_name,
+            root_pem,
+            identity,
+            TransportConfig::default(),
+        )
+        .await?;
         let (mut driver, sender) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
             .await
             .map_err(io::Error::other)?;
@@ -117,6 +107,23 @@ impl Http3Client {
             connection,
             sender,
             driver,
+        })
+    }
+
+    /// Completes a QUIC handshake with `address` as [`Http3Client::connect`]
+    /// does, then leaves the connection silent: see [`SilentConnection`].
+    pub async fn connect_silent(
+        address: SocketAddr,
+        server_name: &str,
+        root_pem: &str,
+    ) -> io::Result<SilentConnection> {
+        let mut transport = TransportConfig::default();
+        transport.max_concurrent_uni_streams(VarInt::from_u32(0));
+        let (endpoint, connection) =
+            quic_connect(address, server_name, root_pem, None, transport).await?;
+        Ok(SilentConnection {
+            _endpoint: endpoint,
+            connection,
         })
     }
 
@@ -199,4 +206,52 @@ impl Drop for Http3Client {
     fn drop(&mut self) {
         self.driver.abort();
     }
+}
+
+/// Completes a QUIC handshake with `address` under `transport`, checking
+/// its certificate for `server_name` against the certificates of
+/// `root_pem` and presenting `identity` if given.
+async fn quic_connect(
+    address: SocketAddr,
+    server_name: &str,
+    root_pem: &str,
+    identity: Option<(&str, &str)>,
+    transport: TransportConfig,
+) -> io::Result<(Endpoint, Connection)> {
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(root_pem.as_bytes()) {
+        roots
+            .add(cert.map_err(io::Error::other)?)
+            .map_err(io::Error::other)?;
+    }
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let mut tls = match identity {
+        Some((chain, key)) => {
+            let chain: Result<Vec<CertificateDer<'static>>, _> =
+                CertificateDer::pem_slice_iter(chain.as_bytes()).collect();
+            let chain = chain.map_err(io::Error::other)?;
+            let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).map_err(io::Error::other)?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(io::Error::other)?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let quic = QuicClientConfig::try_from(tls).map_err(io::Error::other)?;
+
+    let local = match address {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let mut endpoint = Endpoint::client(local)?;
+    let mut config = quinn::ClientConfig::new(Arc::new(quic));
+    config.transport_config(Arc::new(transport));
+    endpoint.set_default_client_config(config);
+    let connection = endpoint
+        .connect(address, server_name)
+        .map_err(io::Error::other)?
+        .await?;
+
+    Ok((endpoint, connection))
 }

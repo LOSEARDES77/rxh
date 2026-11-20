@@ -39,6 +39,8 @@ pub(crate) struct Listener {
     /// `max_connections`: one permit per open connection, shared with the
     /// TCP listener.
     pub(super) permits: Arc<Semaphore>,
+    /// Number of `permits` in all.
+    pub(super) max_connections: usize,
     /// Tells the open connections to drain, then to close.
     pub(super) phase: watch::Sender<Phase>,
     /// Connections accepted and not closed yet.
@@ -55,13 +57,14 @@ impl fmt::Debug for Listener {
 
 impl Listener {
     /// Listener on `address`, the address of the TCP listener whose
-    /// `context` and connection `permits` it shares, with the certificates
-    /// and client verifier of its TLS acceptor `tls`.
+    /// `context` and `max_connections` connection `permits` it shares, with
+    /// the certificates and client verifier of its TLS acceptor `tls`.
     pub(crate) fn new(
         address: SocketAddr,
         tls: &TlsAcceptor,
         context: Arc<ConnectionContext>,
         permits: Arc<Semaphore>,
+        max_connections: usize,
     ) -> io::Result<Self> {
         let crypto =
             QuicServerConfig::with_initial(tls::quic_config(tls.config()), initial_suite()?)
@@ -80,9 +83,15 @@ impl Listener {
             config,
             context,
             permits,
+            max_connections,
             phase: watch::Sender::new(Phase::Serving),
             open: watch::Sender::new(0),
         })
+    }
+
+    /// Connections accepted and not closed yet.
+    pub(crate) fn open_connections(&self) -> usize {
+        *self.open.borrow()
     }
 
     /// Counts one more open connection, until the guard is dropped.

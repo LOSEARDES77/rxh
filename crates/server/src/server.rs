@@ -425,6 +425,7 @@ impl Server {
                             acceptor,
                             Arc::clone(&context),
                             Arc::clone(&permits),
+                            max_connections,
                         )?))
                     }
                     _ => None,
@@ -606,17 +607,17 @@ impl Server {
                 closing.send_replace(true);
                 while connections.try_join_next().is_some() {}
 
-                let tcp = async {
-                    let pending = connections.len();
-                    if pending == 0 {
-                        return;
-                    }
+                let quic_pending = http3.as_ref().map_or(0, |http3| http3.open_connections());
+                let pending = connections.len() + quic_pending;
+                if pending > 0 {
                     println!("{log_name} => Can't shutdown yet, {pending} pending connections");
                     state.send_replace(State::ShuttingDown(ShutdownState::PendingConnections(
                         pending,
                     )));
-                    stop.send_replace(true);
+                }
+                stop.send_replace(true);
 
+                let tcp = async {
                     let drained = match grace_period {
                         Some(grace) => tokio::time::timeout(grace, drain(&mut connections))
                             .await

@@ -36,22 +36,35 @@ const CONNECTION_FIELDS: [HeaderName; 5] = [
     header::UPGRADE,
 ];
 
-/// Least time a connection that answered its last request stays open, so
-/// the client can acknowledge the responses, unless it closes first.
-const LINGER: Duration = Duration::from_millis(100);
+/// The `max_ack_delay` QUIC peers announce by default (RFC 9000, section
+/// 18.2), part of the probe timeout.
+const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 
 /// Request stream of an HTTP/3 connection, or one of its halves.
 type Stream<S> = RequestStream<S, Bytes>;
 
 /// Serves the requests of one QUIC connection until it closes, under the
 /// limits of `listener`. A connection over a limit is refused, not queued:
-/// the client falls back to TCP.
+/// the client falls back to TCP. No wait in here outlives
+/// [`Phase::Closed`].
 pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>) {
     let context = &listener.context;
     let peer = incoming.remote_address();
     // Refused without a log line: a client over its limit could flood it.
     if *listener.phase.borrow() != Phase::Serving {
         incoming.refuse();
+        return;
+    }
+    let validated = incoming.remote_address_validated();
+    let available = listener.permits.available_permits();
+    if needs_retry(
+        available,
+        listener.max_connections,
+        validated,
+        incoming.may_retry(),
+    ) {
+        // An error hands the attempt back, and dropping it refuses it.
+        let _ = incoming.retry();
         return;
     }
     let Ok(_permit) = Arc::clone(&listener.permits).try_acquire_owned() else {
@@ -96,47 +109,67 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
         .peer_identity()
         .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
         .and_then(|chain| tls::client_subject(&chain));
-
-    // h3 buffers a whole HEADERS frame before it decodes it and checks this
-    // limit, so that buffering is bounded only by time: the first request
-    // head by `read_header_timeout` below, the others by `idle_timeout`.
-    let mut connection = match h3::server::builder()
-        .max_field_section_size(u64::from(server::MAX_HEADER_LIST_SIZE))
-        .build(h3_quinn::Connection::new(quic.clone()))
-        .await
-    {
-        Ok(connection) => connection,
-        Err(err) => {
-            eprintln!("{log_name} => HTTP/3 connection from {peer}: {err}");
-            return;
-        }
-    };
     let service = context
         .http_service(peer, listener.address, client_subject)
         .expect("HTTP/3 listeners belong to HTTP servers");
 
+    // h3 buffers a whole HEADERS frame before it decodes it and checks its
+    // size limit, and opens its own streams while it builds the
+    // connection, which a client that grants no stream credit can stall.
+    // Both are bounded by time: the first request head and the build by
+    // `read_header_timeout`, later heads by `idle_timeout`.
     let activity = Arc::clone(&service.activity);
     let first_request = context
         .read_header_timeout
         .unwrap_or(server::DEFAULT_READ_HEADER_TIMEOUT);
     let first_head = tokio::time::timeout(first_request, activity.first_request());
     let mut first_head = std::pin::pin!(first_head);
+    let mut builder = h3::server::builder();
+    builder.max_field_section_size(u64::from(server::MAX_HEADER_LIST_SIZE));
+    let built = tokio::select! {
+        built = builder.build(h3_quinn::Connection::new(quic.clone())) => Some(built),
+        // No request can come before the connection is built.
+        _ = &mut first_head => None,
+        _ = phase.wait_for(|phase| *phase != Phase::Serving) => None,
+    };
+    let mut connection = match built {
+        Some(Ok(connection)) => connection,
+        Some(Err(err)) => {
+            eprintln!("{log_name} => HTTP/3 connection from {peer}: {err}");
+            return;
+        }
+        None => {
+            quic.close(listener::no_error(), b"");
+            return;
+        }
+    };
+
     let mut waiting_for_head = true;
     let mut sent_goaway = false;
     let mut received_goaway = false;
     // Dropped, and so aborted, when the connection ends: no response can
     // reach the client any more.
     let mut requests = JoinSet::new();
-    // True once every request was answered, false to close at once.
+    // True once every request was answered after a GOAWAY, false to close
+    // at once.
     let answered = loop {
         let current = *phase.borrow_and_update();
         match current {
             Phase::Serving => {}
             Phase::Draining => {
                 if !sent_goaway {
+                    // Nothing to finish: closed at once, like an idle
+                    // keep-alive connection over TCP.
+                    if requests.is_empty() {
+                        break false;
+                    }
                     sent_goaway = true;
-                    // An error means the connection is gone: the loop ends below.
-                    let _ = connection.shutdown(0).await;
+                    tokio::select! {
+                        // An error means the connection is gone: the next
+                        // `accept` says so.
+                        _ = connection.shutdown(0) => {}
+                        _ = phase.wait_for(|phase| *phase == Phase::Closed) => break false,
+                    }
                 }
             }
             Phase::Closed => break false,
@@ -174,19 +207,49 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
     };
     drop(requests);
     if answered {
-        // ponytail: closing drops the stream data the client did not
-        // acknowledge yet, and h3 0.0.8 hides the `SendStream::stopped()`
-        // that reports the acknowledgement: the last responses get a few
-        // round trips to arrive instead. Wait on `stopped()` once h3 exposes
-        // it.
-        let linger = LINGER + 4 * quic.rtt();
         tokio::select! {
-            _ = quic.closed() => return,
+            () = settled(&quic) => {}
             _ = phase.wait_for(|phase| *phase == Phase::Closed) => {}
-            () = tokio::time::sleep(linger) => {}
         }
     }
     quic.close(listener::no_error(), b"");
+}
+
+/// Whether an incoming connection must prove its address with a Retry
+/// before it takes one of `max` connection slots, `available` of them
+/// free. Spoofed Initial packets cost no return path, and each one would
+/// hold a slot, shared with TCP, for up to the handshake deadline. The
+/// extra round trip is only paid when slots are scarce.
+fn needs_retry(available: usize, max: usize, validated: bool, may_retry: bool) -> bool {
+    // ponytail: fixed at half the slots; make it a setting if someone needs
+    // another threshold.
+    !validated && may_retry && available * 2 < max
+}
+
+/// Resolves once the client closed the connection, or once its last
+/// responses are acknowledged: closing earlier would drop the stream data
+/// in flight.
+async fn settled(quic: &quinn::Connection) {
+    // ponytail: h3 0.0.8 hides `quinn::SendStream::stopped()`, which reports
+    // the acknowledgement, and test or browser clients may keep the
+    // connection open after GOAWAY. So the data counts as acknowledged once
+    // the connection sends nothing for two probe timeouts: unacknowledged
+    // data is sent again within one. Wait on `stopped()` once h3 exposes it.
+    let quiet = async {
+        loop {
+            let sent = quic.stats().udp_tx.datagrams;
+            let probe_timeout = 3 * quic.rtt() + MAX_ACK_DELAY;
+            tokio::time::sleep(2 * probe_timeout).await;
+            if quic.stats().udp_tx.datagrams == sent {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        // Also on the idle timeout.
+        _ = quic.closed() => {}
+        () = quiet => {}
+    }
 }
 
 /// Sending half of a request stream. Dropped before its response ended,
@@ -457,5 +520,17 @@ mod tests {
 
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
         assert_eq!(declared_length(&headers), Some(5));
+    }
+
+    #[test]
+    fn retry_when_fewer_than_half_the_slots_are_free() {
+        // Half or more of 4 slots free: no extra round trip.
+        assert!(!needs_retry(2, 4, false, true));
+        // Fewer than half free.
+        assert!(needs_retry(1, 4, false, true));
+        assert!(needs_retry(0, 4, false, true));
+        // A validated address, or a client that already answered a Retry.
+        assert!(!needs_retry(0, 4, true, true));
+        assert!(!needs_retry(0, 4, false, false));
     }
 }

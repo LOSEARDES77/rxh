@@ -154,13 +154,7 @@ impl Generation {
         // The last step that can fail, before the listeners serve: a
         // generation that does not start leaves the QUIC endpoints to the
         // running one.
-        let install = |servers: &[ServerInfo]| {
-            let listeners: Vec<Arc<http3::Listener>> = servers
-                .iter()
-                .filter_map(|server| server.http3.clone())
-                .collect();
-            endpoints.install(&listeners)
-        };
+        let install = |servers: &[ServerInfo]| endpoints.install(&http3_listeners(servers));
         let (stop, stopped) = oneshot::channel::<()>();
         let (servers, acme, task) = match effective.runtime {
             Runtime::Shared => {
@@ -198,6 +192,14 @@ impl Generation {
             routes: plan.routes,
             ignored: plan.ignored,
         })
+    }
+
+    /// Hands the QUIC endpoints back to this running generation after a
+    /// generation that failed to start released or replaced some of them.
+    fn restore_http3(&self, endpoints: &Endpoints) {
+        if let Err(err) = endpoints.install(&http3_listeners(&self.servers)) {
+            eprintln!("Main => HTTP/3 of the running configuration not restored: {err}");
+        }
     }
 
     fn current(&self) -> Current {
@@ -713,7 +715,10 @@ impl Daemon {
                     }
                 }
             }
-            Err(err) => return Err(err.to_string()),
+            Err(err) => {
+                generation.restore_http3(endpoints);
+                return Err(err.to_string());
+            }
         };
 
         // A new configuration can clash with other containers.
@@ -732,6 +737,14 @@ impl Daemon {
         println!("Main => Reload complete");
         Ok(())
     }
+}
+
+/// What `servers` serve over HTTP/3.
+fn http3_listeners(servers: &[ServerInfo]) -> Vec<Arc<http3::Listener>> {
+    servers
+        .iter()
+        .filter_map(|server| server.http3.clone())
+        .collect()
 }
 
 /// Empty generation used while swapping.
