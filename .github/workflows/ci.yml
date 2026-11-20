@@ -26,6 +26,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  ui:
+    name: web UI (check, test, build, committed dist)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/server/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run test
+      - run: bun run build
+      # The Rust binary embeds `dist/`: it must be the build of the sources.
+      - run: git diff --exit-code dist
+      - run: bun audit
+
   coverage:
     name: line coverage (85% or more, without crates/bench)
     runs-on: ubuntu-latest

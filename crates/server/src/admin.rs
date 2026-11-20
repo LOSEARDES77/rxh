@@ -19,7 +19,7 @@
 //! | `DELETE` | `/pools/{name}/upstreams`     | Remove `{"address"}`                |
 //! | `GET`    | `/metrics`                    | Prometheus metrics                  |
 //! | `GET`    | `/certificates`               | Certificates served, with expiry    |
-//! | `GET`    | `/dashboard`                  | Read only web page over the routes  |
+//! | `GET`    | `/dashboard`                  | Web UI over the routes              |
 //! | `POST`   | `/certificates/reload`        | Read certificate files again        |
 //! | `POST`   | `/reload`                     | Reload the configuration file       |
 //! | `POST`   | `/load`                       | Run the configuration in the body   |
@@ -40,9 +40,10 @@
 //! loopback name are rejected, so web pages cannot reach the API through DNS
 //! rebinding.
 //!
-//! `/dashboard` is one static page that reads `/status`, `/config` and
-//! `/certificates` from the browser. It holds no data, so it is served
-//! without the token, which the page asks for and sends on those requests.
+//! `/dashboard` is a static web UI (built from `ui/`, served with
+//! `/dashboard/app.js` and `/dashboard/app.css`) that calls the routes from
+//! the browser. It holds no data, so those three paths are served without
+//! the token, which the page asks for and sends on its requests.
 
 use std::convert::Infallible;
 use std::io;
@@ -82,13 +83,16 @@ use crate::server::{ShutdownState, State};
 use crate::systemd;
 use crate::tls::{self, CertificateInfo};
 
-/// The whole dashboard: markup, style and script, with no other resource.
-const DASHBOARD: &str = include_str!("dashboard.html");
+/// The web UI, built from `ui/` by `bun run build` and committed, so building
+/// the crate needs no JavaScript tooling.
+const UI_INDEX: &str = include_str!("../ui/dist/index.html");
+const UI_SCRIPT: &str = include_str!("../ui/dist/app.js");
+const UI_STYLE: &str = include_str!("../ui/dist/app.css");
 
-/// Lets the dashboard run its inline script and style and call the API it
-/// came from, and nothing else: no other origin, no frames around it.
-const DASHBOARD_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; \
-     style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'";
+/// Lets the web UI load its own script and style and call the API it came
+/// from, and nothing else: no inline code, no other origin, no frames around it.
+const DASHBOARD_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
 
 const MAX_BODY: usize = 64 * 1024;
 
@@ -301,7 +305,11 @@ async fn handle(
     state: Arc<AdminState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let raw_path = request.uri().path();
-    let is_dashboard = request.method() == Method::GET && raw_path.trim_matches('/') == "dashboard";
+    let is_dashboard = request.method() == Method::GET
+        && matches!(
+            raw_path.trim_matches('/'),
+            "dashboard" | "dashboard/app.js" | "dashboard/app.css"
+        );
     // The page calls the API with relative URLs, which only resolve to the
     // API routes from this exact path.
     let is_dashboard_page = raw_path == "/dashboard";
@@ -356,8 +364,14 @@ async fn handle(
                 "samples": crate::history::global().samples(),
             }),
         ),
-        (&Method::GET, ["dashboard"]) if is_dashboard_page => dashboard(),
+        (&Method::GET, ["dashboard"]) if is_dashboard_page => {
+            dashboard(UI_INDEX, "text/html; charset=utf-8")
+        }
         (&Method::GET, ["dashboard"]) => dashboard_redirect(),
+        (&Method::GET, ["dashboard", "app.js"]) => {
+            dashboard(UI_SCRIPT, "text/javascript; charset=utf-8")
+        }
+        (&Method::GET, ["dashboard", "app.css"]) => dashboard(UI_STYLE, "text/css; charset=utf-8"),
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
         (&Method::GET, ["config", "files"]) => config_api::files(&state).await,
         (&Method::GET, ["schema"]) => config_api::schema(),
@@ -786,11 +800,12 @@ pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Resp
     response
 }
 
-fn dashboard() -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from_static(DASHBOARD.as_bytes())));
+/// One file of the web UI.
+fn dashboard(body: &'static str, content_type: &'static str) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
     let headers = response.headers_mut();
     for (name, value) in [
-        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        (header::CONTENT_TYPE, content_type),
         (header::CONTENT_SECURITY_POLICY, DASHBOARD_POLICY),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::CACHE_CONTROL, "no-cache"),
@@ -834,21 +849,37 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_only_reads() {
-        for write in ["POST", "PUT", "PATCH", "DELETE", "method:", "innerHTML"] {
-            assert!(
-                !DASHBOARD.contains(write),
-                "the read only page must not hold {write}"
-            );
+    fn the_front_end_builds_no_markup_from_strings() {
+        let mut directories = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/src")];
+        let mut files = 0;
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                // Markup from strings can run injected script, and `style=`
+                // is refused by the `style-src 'self'` policy.
+                for banned in ["innerHTML", "{@html", "style="] {
+                    assert!(!text.contains(banned), "{} holds {banned}", path.display());
+                }
+                files += 1;
+            }
         }
-        // Relative, so the page also works behind a path prefix of a proxy.
-        for route in [
-            "api(\"status\")",
-            "api(\"config\")",
-            "api(\"certificates\")",
-        ] {
-            assert!(DASHBOARD.contains(route), "{route}");
-        }
+        assert!(files > 0, "the walk must reach the sources to check them");
+    }
+
+    #[test]
+    fn the_built_page_runs_no_inline_script() {
+        // The policy only lets scripts and styles of the same origin run.
+        assert_eq!(UI_INDEX.matches("<script").count(), 1);
+        assert!(
+            UI_INDEX.contains("<script type=\"module\" crossorigin src=\"./dashboard/app.js\">")
+        );
+        assert!(!UI_INDEX.contains("<style"));
+        assert!(!UI_INDEX.contains("style="));
     }
 
     #[test]

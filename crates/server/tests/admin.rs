@@ -579,8 +579,9 @@ async fn dashboard_is_a_page_served_to_local_browsers_only() {
     assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
     let page = String::from_utf8(body.to_vec()).expect("UTF-8 page");
     assert!(page.starts_with("<!doctype html>"));
-    for section in ["Listeners", "Hosts", "Health", "Certificates"] {
-        assert!(page.contains(&format!("<h2>{section}</h2>")), "{section}");
+    // Relative to `/dashboard`, so the page also works behind a path prefix.
+    for asset in ["\"./dashboard/app.js\"", "\"./dashboard/app.css\""] {
+        assert!(page.contains(asset), "{asset}");
     }
 
     // The page calls the API with relative URLs: from `/dashboard/` they
@@ -608,6 +609,42 @@ async fn dashboard_is_a_page_served_to_local_browsers_only() {
 }
 
 const TOKEN: &str = "s3cret-admin-token-0123";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assets_are_served_without_the_token_and_with_the_policy() {
+    let admin = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config_path = directory.path().join("rxh.toml");
+    fs::write(
+        &config_path,
+        format!("[admin]\nlisten = \"{admin}\"\ntoken = \"{TOKEN}\"\n"),
+    )
+    .expect("write");
+    let _daemon = start(&config_path, admin).await;
+
+    for (uri, content_type) in [
+        ("/dashboard", "text/html; charset=utf-8"),
+        ("/dashboard/app.js", "text/javascript; charset=utf-8"),
+        ("/dashboard/app.css", "text/css; charset=utf-8"),
+    ] {
+        let (status, headers, body) = util::get(admin, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(headers[header::CONTENT_TYPE], content_type, "{uri}");
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
+             img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
+            "{uri}"
+        );
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-cache", "{uri}");
+        assert!(!body.is_empty(), "{uri}");
+    }
+
+    // The API the page calls still needs the token.
+    let (status, _, _) = util::get(admin, "/status").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_is_required_on_every_route_when_set() {
@@ -653,7 +690,8 @@ async fn token_is_required_on_every_route_when_set() {
     }
 
     // The dashboard page holds no data and a browser cannot send the token
-    // when it opens it, so only that page is served without one.
+    // when it opens it, so only that page and its assets are served without
+    // one.
     let (status, _, page) = util::get(admin, "/dashboard").await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.starts_with(b"<!doctype html>"));
@@ -666,7 +704,13 @@ async fn token_is_required_on_every_route_when_set() {
     let (status, headers, _) = util::get(admin, "/dashboard/").await;
     assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
     assert_eq!(headers[header::LOCATION], "/dashboard");
-    for (method, uri) in [(Method::POST, "/dashboard"), (Method::GET, "/dashboard/x")] {
+    for (method, uri) in [
+        (Method::POST, "/dashboard"),
+        (Method::GET, "/dashboard/x"),
+        (Method::POST, "/dashboard/app.js"),
+        (Method::GET, "/dashboard/app.js/x"),
+        (Method::GET, "/dashboard//app.css"),
+    ] {
         let (status, _, _) = call(admin, method.clone(), uri, "", &[]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
     }
