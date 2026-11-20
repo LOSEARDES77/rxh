@@ -47,7 +47,8 @@ Proxy Manager: edit hosts and certificates, access lists".
   `***` into the file.
 - Losing comments or the layout of the configuration file outside the table
   that was edited.
-- A Node toolchain in the build, the CI or the packages.
+- `cargo build`, `cargo install` or a package build that needs Node. Node
+  is for people who change the page, and for CI.
 - A page that loads anything from another site.
 - Markup built from strings (`innerHTML`): host names, Docker labels and
   backend addresses are not trusted text.
@@ -99,8 +100,27 @@ Proxy Manager: edit hosts and certificates, access lists".
 the browser only (charts empty on every page load) and over history on disk
 (Prometheus does that).
 
-**Front end**: plain HTML, CSS and JavaScript embedded in the binary
-(chosen) over a framework with a build step.
+**Front end**
+
+1. Svelte 5 with TypeScript and Vite, compiled to static HTML, JavaScript
+   and CSS, and the compiled files committed and embedded (chosen, proposed
+   by the user). Components for the forms, typed API client, unit tests
+   with Vitest. Svelte compiles to plain JavaScript with a small runtime, so
+   the bundle stays small.
+2. Plain HTML, CSS and JavaScript written by hand. No toolchain, but no
+   components, no types and no unit tests for a page of this size.
+3. React or Preact. Larger runtime, nothing this page needs over Svelte.
+
+**Where the front end is built**
+
+1. Compiled output committed in the repository; Rust embeds it; CI rebuilds
+   it and fails when the committed output differs (chosen). Building RXH
+   never needs Node.
+2. `build.rs` runs the front end build. Every `cargo build`, `cargo
+   install`, AUR and Homebrew build would need Node and the network.
+   Rejected.
+3. Only CI builds it, nothing committed. A build from source without Node
+   has no page. Rejected.
 
 ## Design
 
@@ -212,9 +232,15 @@ again every 5 seconds.
 
 ### Front end
 
-- Files embedded with `include_str!`: the page, one stylesheet, a few
-  scripts (API client, charts, schema forms, one per tab). Served under
-  `/dashboard/` without the token, like the page today: they hold no data.
+- Source in `crates/server/ui/` (Svelte 5, TypeScript, Vite), with its
+  `package-lock.json`. `npm run build` writes `crates/server/ui/dist/` with
+  fixed file names (`index.html`, `app.js`, `app.css`), committed and
+  embedded with `include_str!`. Served under `/dashboard/` without the
+  token, like the page today: they hold no data.
+- No runtime dependency beyond Svelte. No component library, no chart
+  library, no web fonts.
+- CI gets a `ui` job: `npm ci`, type check, `npm test`, `npm run build`,
+  then `git diff --exit-code` on `dist/`, and `npm audit`.
 - Content security policy tightened to `script-src 'self'` and
   `style-src 'self'`; no inline script.
 - All requests go through one function that adds the token, kept in
@@ -241,8 +267,12 @@ again every 5 seconds.
   back; include file edited in place; no configuration file answers 409;
   token required; assets served without token and with the policy header.
 - `crates/cli/tests`: the existing edit commands still pass after the move.
-- The `dashboard_only_reads` test becomes: no `innerHTML` in any asset, and
-  every route the scripts call exists.
+- The `dashboard_only_reads` test becomes: no `innerHTML` and no `{@html`
+  in the front end source, and the embedded files are served.
+- Vitest unit tests in `crates/server/ui`: the schema renderer (each schema
+  type gives the right control and the right value back, unknown shape
+  falls back to TOML), rates and percentiles from samples, the API client
+  (token header, 401, 409).
 - End to end, by hand, as `CLAUDE.md` asks: a real `rxh` with a temporary
   configuration and test backends, the page driven in a browser: add a
   host, edit a pool, break a value, drain a backend, watch the charts.
@@ -262,8 +292,8 @@ certificate upload and accounts are not in it).
 - `revision` check against lost updates.
 - Adding or removing a backend goes through the pool form (saved); only
   drain, maintenance and ready are runtime actions.
-- The JavaScript has no unit test runner (that would need Node). It is
-  covered by the route tests, the asset checks and the browser run.
+- Svelte 5, TypeScript, Vite and Vitest; compiled output committed.
+- Charts drawn as SVG by a component of the page, no chart library.
 
 ## Left to the builder
 
