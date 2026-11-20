@@ -31,7 +31,7 @@ export type Entity = {
 /** The answer of `GET config/files`. */
 export type Files = {
   editable: boolean;
-  files: { index: number; path: string; revision: string }[];
+  files: { index: number; path: string; revision: string; text: string }[];
   entities: Entity[];
 };
 

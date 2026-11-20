@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, needsToken, setToken } from "./lib/api";
+  import { api, needsToken, setToken, stopped } from "./lib/api";
   import Certificates from "./tabs/Certificates.svelte";
   import Hosts from "./tabs/Hosts.svelte";
   import Overview from "./tabs/Overview.svelte";
@@ -29,6 +29,7 @@
   let dialog: HTMLDialogElement;
 
   async function refresh() {
+    if ($stopped) return;
     try {
       status = await api<Status>("status");
       failure = "";
@@ -94,31 +95,41 @@
       <div><dt>Configuration</dt><dd><code>{status.config_path ?? "none"}</code></dd></div>
     </dl>
   {/if}
-  {#if failure}
+  {#if failure && !$stopped}
     <p class="failure" role="alert">{failure}</p>
   {/if}
 </header>
 
-<div class="tabs" role="tablist" aria-label="Sections">
-  {#each tabs as tab, index (tab.id)}
-    <button
-      type="button"
-      role="tab"
-      id="tab-{tab.id}"
-      aria-selected={index === selected}
-      aria-controls="panel"
-      tabindex={index === selected ? 0 : -1}
-      onclick={() => select(index)}
-      onkeydown={onTabKey}>{tab.label}</button
-    >
-  {/each}
-</div>
-
-<main>
-  <div id="panel" role="tabpanel" aria-labelledby="tab-{tabs[selected].id}">
-    <Current />
+<!-- Once stopped, the tabs are taken away so nothing asks the API again. -->
+{#if $stopped}
+  <main>
+    <p class="notice" role="status">
+      The daemon was stopped: the proxy no longer serves and this page has no API. Start rxh again
+      on its machine, then reload this page.
+    </p>
+  </main>
+{:else}
+  <div class="tabs" role="tablist" aria-label="Sections">
+    {#each tabs as tab, index (tab.id)}
+      <button
+        type="button"
+        role="tab"
+        id="tab-{tab.id}"
+        aria-selected={index === selected}
+        aria-controls="panel"
+        tabindex={index === selected ? 0 : -1}
+        onclick={() => select(index)}
+        onkeydown={onTabKey}>{tab.label}</button
+      >
+    {/each}
   </div>
-</main>
+
+  <main>
+    <div id="panel" role="tabpanel" aria-labelledby="tab-{tabs[selected].id}">
+      <Current />
+    </div>
+  </main>
+{/if}
 
 <!-- Without a token every call fails: the dialog stays until one is given. -->
 <dialog

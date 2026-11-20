@@ -18,6 +18,12 @@ const tokenWanted = writable(false);
 /** True after the API answered 401, until a token is given. */
 export const needsToken: Readable<boolean> = readonly(tokenWanted);
 
+/**
+ * True once `POST stop` was answered: the API is gone and the page stops
+ * asking it anything.
+ */
+export const stopped = writable(false);
+
 /** Keeps the token for this browser tab and sends it from now on. */
 export function setToken(token: string): void {
   sessionStorage.setItem(TOKEN_KEY, token);

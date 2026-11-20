@@ -16,8 +16,9 @@
 
   let {
     schema,
-    // One entity of `GET config/files`, or where to write a new one. The
-    // editor reads it once: draw it under `{#key}` to edit another entity.
+    // One entity of `GET config/files`, or where to write a new one (with
+    // `key`, its name is fixed and not asked for). The editor reads it once:
+    // draw it under `{#key}` to edit another entity.
     entity,
     // Of the file of the entity: `files[entity.file].revision`.
     revision,
@@ -38,6 +39,8 @@
   const id = $props.id();
   const { kind, file } = untrack(() => entity);
   const key = untrack(() => ("value" in entity ? entity.key : undefined));
+  // The name a new entity was given, when it may not be changed.
+  const named = untrack(() => ("value" in entity ? undefined : entity.key));
 
   // What the file holds, to tell edits from it and to go back to it.
   let stored = $state.raw(
@@ -64,7 +67,9 @@
       : key,
   );
   const title =
-    key === undefined ? `New ${noun}` : `${noun.charAt(0).toUpperCase()}${noun.slice(1)} ${shown}`;
+    key === undefined
+      ? `New ${noun}${named === undefined ? "" : ` ${named}`}`
+      : `${noun.charAt(0).toUpperCase()}${noun.slice(1)} ${shown}`;
 
   const shape = $derived(control(schema, entitySchema(schema, kind, key ?? name)));
   const fields = $derived(shape.kind === "table" ? shape.fields : {});
@@ -248,7 +253,7 @@
     </label>
   </div>
 
-  {#if key === undefined && kind !== "server"}
+  {#if key === undefined && kind !== "server" && named === undefined}
     <div class="name">
       <label for="{id}-name">Name</label>
       <input id="{id}-name" type="text" autocomplete="off" bind:value={name} />
