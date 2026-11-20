@@ -102,11 +102,19 @@ impl History {
         });
     }
 
+    /// Pushes a sample. Without a live source, the pools are left out but
+    /// the server counters, process wide, are still sampled.
     fn tick(&self) {
         let state = lock(&self.source).upgrade();
-        if let Some(state) = state {
-            self.push(sample(&admin::registry(&state)));
-        }
+        let sample = match state {
+            Some(state) => sample(&admin::registry(&state)),
+            None => Sample {
+                time: unix_time(),
+                servers: metrics::global().snapshot(),
+                pools: BTreeMap::new(),
+            },
+        };
+        self.push(sample);
     }
 }
 
@@ -127,14 +135,17 @@ pub(crate) fn sample(registry: &Registry) -> Sample {
         }
         pools.insert(group.pool.name().to_owned(), counters);
     }
-    let time: u64 = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
     Sample {
-        time,
+        time: unix_time(),
         servers: metrics::global().snapshot(),
         pools,
     }
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 #[cfg(test)]
@@ -185,10 +196,9 @@ mod tests {
         assert_eq!((pool.requests, pool.active), (1, 1));
     }
 
-    #[test]
-    fn a_second_start_does_not_start_a_second_sampler() {
+    fn admin_state() -> Arc<AdminState> {
         let config = Config::default();
-        let state = Arc::new(AdminState {
+        Arc::new(AdminState {
             started: Instant::now(),
             config_path: None,
             listen: AdminListen::Tcp("127.0.0.1:0".parse().unwrap()),
@@ -200,10 +210,29 @@ mod tests {
             }),
             control: mpsc::channel(1).0,
             saving: tokio::sync::Mutex::new(()),
-        });
+        })
+    }
+
+    #[test]
+    fn a_second_start_does_not_start_a_second_sampler() {
+        let state = admin_state();
         let history: &'static History = Box::leak(Box::default());
         history.start(&state);
         history.start(&state);
         assert_eq!(history.samples().len(), 1);
+    }
+
+    #[test]
+    fn a_dead_source_still_samples_the_servers() {
+        metrics::global().record_http("history-dead-source", 200, Duration::from_millis(1));
+        let history = History::default();
+        let state = admin_state();
+        *lock(&history.source) = Arc::downgrade(&state);
+        drop(state);
+        history.tick();
+        let samples = history.samples();
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].pools.is_empty());
+        assert_eq!(samples[0].servers["history-dead-source"].status[1], 1);
     }
 }
