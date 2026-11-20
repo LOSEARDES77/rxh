@@ -455,7 +455,13 @@ pub fn restore(files: &[&ConfigFile]) -> Result<(), String> {
     }
 }
 
+/// Replaces `path` with `text` through a temporary file and a rename, so a
+/// reader sees the old text or the new one. The text is on disk before the
+/// rename: a power loss cannot leave an empty file under the name.
 fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
+    // A link stays a link: the file it points to is the one replaced.
+    let resolved = fs::canonicalize(path);
+    let path = resolved.as_deref().unwrap_or(path);
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory).map_err(|err| format!("{}: {err}", directory.display()))?;
     }
@@ -463,7 +469,16 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
     write_like(&temporary, path, text).map_err(|err| format!("{}: {err}", temporary.display()))?;
-    fs::rename(&temporary, path).map_err(|err| format!("{}: {err}", path.display()))
+    fs::rename(&temporary, path).map_err(|err| format!("{}: {err}", path.display()))?;
+    // The rename is durable once the directory is; the file is already in
+    // place, so a failure here is not a failed save.
+    #[cfg(unix)]
+    if let Some(directory) = path.parent()
+        && let Ok(directory) = fs::File::open(directory)
+    {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 /// Writes `text` to the new file `temporary`, which gets the mode and, when
@@ -490,12 +505,17 @@ fn write_like(temporary: &Path, like: &Path, text: &str) -> io::Result<()> {
         let _ = unix_fs::fchown(&file, Some(metadata.uid()), Some(metadata.gid()));
         file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
     }
-    file.write_all(text.as_bytes())
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
 fn write_like(temporary: &Path, _like: &Path, text: &str) -> io::Result<()> {
-    fs::write(temporary, text)
+    use std::io::Write;
+
+    let mut file = fs::File::create(temporary)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 /// Value as a string when there is one entry, as an array otherwise.
@@ -701,6 +721,49 @@ forward = "@api"
         let new = dir.path().join("new.toml");
         write_atomically(&new, "a = 1").unwrap();
         assert_eq!(mode(&new), 0o600, "a new file is private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_symlink_writes_its_target() {
+        use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let target = real.join("rxh.toml");
+        fs::write(&target, BASE).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let main = dir.path().join("rxh.toml");
+        unix_fs::symlink("real/rxh.toml", &main).unwrap();
+        let check = |when: &str| {
+            assert!(
+                fs::symlink_metadata(&main).unwrap().is_symlink(),
+                "still a link {when}"
+            );
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o640, "{when}");
+            let names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .chain(fs::read_dir(&real).unwrap())
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 3, "no temporary file left {when}: {names:?}");
+        };
+
+        let mut file = ConfigFile::open(&main).unwrap();
+        file.add_backend("api", "127.0.0.1:8081", 1).unwrap();
+        save_all(&[&file], &main).unwrap();
+        check("after a save");
+        let saved = fs::read_to_string(&target).unwrap();
+        assert!(saved.contains("8081"), "{saved}");
+
+        let mut file = ConfigFile::open(&main).unwrap();
+        file.set_text("[upstream.api]\npolicy = \"nope\"\n")
+            .unwrap();
+        save_all(&[&file], &main).unwrap_err();
+        check("after a rejected save");
+        assert_eq!(fs::read_to_string(&target).unwrap(), saved);
     }
 
     #[cfg(unix)]

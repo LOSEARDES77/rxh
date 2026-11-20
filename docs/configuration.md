@@ -740,10 +740,13 @@ What a save does, in order:
 2. Only the table of the entity is edited; the rest of the file keeps its
    text, and inside the table the keys that did not change keep their
    comments and layout.
-3. The file is written atomically (a temporary file next to it, then a
-   rename), and the whole configuration is loaded from the main file as
+3. The file is written atomically (a temporary file next to it, synced to
+   disk, then a rename), and the whole configuration is loaded from the main
+   file as
    `rxh validate` does. If it is not valid the file is put back and the
-   answer is `400` with the reason.
+   answer is `400` with the reason. A configuration file that is a symbolic
+   link stays one: the file it points to is replaced, with the temporary
+   file next to that file.
 4. The daemon reloads. If the reload is refused (a port in use, a
    certificate that does not load), the file is put back and the answer is
    `400` with the reason.

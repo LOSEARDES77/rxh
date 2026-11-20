@@ -533,6 +533,12 @@ Changed.
 
 ### Fixed
 
+- The commands that edit the configuration files and the saves of the web
+  UI sync the new text to disk before it takes the name of the file, so a
+  power loss right after a save cannot leave an empty configuration file.
+  A configuration file that is a symbolic link stays a link and the file
+  it points to is the one rewritten; the link used to be replaced by a
+  regular file, leaving the real file with the old text.
 - A configuration file that cannot be written (a read-only directory, for
   instance) is reported as such by the commands that edit the files and by
   the saves of the web UI: "the configuration file /etc/rxh/rxh.toml cannot
