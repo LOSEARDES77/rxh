@@ -64,6 +64,8 @@ test("totals_rows_and_expiring_certificates", async () => {
   expect(value("In flight")).toBe("3");
   expect(value("Healthy backends")).toBe("1/2");
   expect(screen.getByText("Server web").parentElement?.textContent).toContain("10.0%");
+  // Two samples give one rate point: too few for a trend.
+  expect(screen.getByText("Pool api").parentElement?.lastElementChild?.textContent?.trim()).toBe("—");
   expect(screen.getByText(/example\.org on 127\.0\.0\.1:443/).textContent).toContain("12 d left");
 });
 

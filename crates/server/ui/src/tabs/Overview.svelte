@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { api } from "../lib/api";
   import Chart from "../lib/Chart.svelte";
+  import Sparkline from "../lib/Sparkline.svelte";
   import { last, quantile, rate, window, type History, type Point, type Sample } from "../lib/stats";
 
   type Certificate = { listen: string; subject: string; names: string[]; days_left: number };
@@ -66,6 +67,8 @@
   type Row = {
     name: string;
     perSecond: number | null;
+    /** Requests (or connections) per second over the range. */
+    trend: Point[];
     errors: number | null;
     latency: number | null;
     inFlight?: number;
@@ -94,6 +97,7 @@
       return {
         name,
         perSecond: mean(requests),
+        trend: requests,
         errors: share(errors, requests),
         latency: latency === null ? null : latency * 1000,
         inFlight: pool.active,
@@ -114,6 +118,7 @@
       return {
         name,
         perSecond: mean(served),
+        trend: served,
         errors: share(errors, served),
         latency: p95 === null ? null : p95 * 1000,
       };
@@ -203,6 +208,7 @@
       <th scope="col">Latency</th>
       <th scope="col">In flight</th>
       <th scope="col">Healthy</th>
+      <th scope="col">Trend</th>
     </tr>
   </thead>
   <tbody>
@@ -214,6 +220,7 @@
         <td>{fixed(row.latency, 1, " ms")}</td>
         <td>{row.inFlight}</td>
         <td>{row.healthy}</td>
+        <td><Sparkline points={row.trend} /></td>
       </tr>
     {/each}
     {#each serverRows as row (row.name)}
@@ -224,10 +231,11 @@
         <td>{fixed(row.latency, 1, " ms")}</td>
         <td>—</td>
         <td>—</td>
+        <td><Sparkline points={row.trend} /></td>
       </tr>
     {:else}
       {#if !poolRows.length}
-        <tr><td colspan="6">No pool or server has counters yet.</td></tr>
+        <tr><td colspan="7">No pool or server has counters yet.</td></tr>
       {/if}
     {/each}
   </tbody>
