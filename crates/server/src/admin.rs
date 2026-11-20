@@ -265,6 +265,7 @@ async fn bind_unix(path: &Path) -> io::Result<Listener> {
 
 /// Serves the admin API until the task is dropped.
 pub(crate) async fn serve(listener: Listener, state: Arc<AdminState>) {
+    crate::history::global().start(&state);
     loop {
         match &listener {
             Listener::Tcp(listener) => {
@@ -347,6 +348,14 @@ async fn handle(
             );
             response
         }
+        (&Method::GET, ["stats", "history"]) => json_response(
+            StatusCode::OK,
+            &json!({
+                "interval_seconds": crate::history::INTERVAL.as_secs(),
+                "buckets": crate::metrics::BUCKETS,
+                "samples": crate::history::global().samples(),
+            }),
+        ),
         (&Method::GET, ["dashboard"]) if is_dashboard_page => dashboard(),
         (&Method::GET, ["dashboard"]) => dashboard_redirect(),
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
@@ -519,7 +528,8 @@ async fn patch(
     control(state, |reply| Control::Apply(change, reply), "patched").await
 }
 
-fn registry(state: &AdminState) -> Arc<Registry> {
+/// The registry running now.
+pub(crate) fn registry(state: &AdminState) -> Arc<Registry> {
     Arc::clone(
         &state
             .current

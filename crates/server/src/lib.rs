@@ -22,6 +22,7 @@ mod files;
 #[doc(hidden)]
 pub mod fuzzing;
 mod health;
+mod history;
 mod hooks;
 mod http;
 mod http3;
