@@ -593,7 +593,9 @@ Five tabs:
   the page keeps working with the new process, whose history starts empty.
   After Stop the page says the daemon was stopped and asks nothing more.
 - Without a configuration file (the quick commands) nothing can be saved:
-  every tab reads "No configuration file: read only".
+  the tabs that edit (Hosts, Pools, Certificates and Settings) read "No
+  configuration file: read only". The Overview tab changes nothing and
+  shows no notice.
 - Light or dark follows the browser (`prefers-color-scheme`). Every control
   has a label and works from the keyboard: the arrow keys move between the
   tabs, `Tab` between the controls. Focus is not moved into an editor when
@@ -798,26 +800,26 @@ File permissions:
   add`, `rxh pool add`, `rxh service add`, ...): a file that `rxh` creates
   as root is readable by root only, and a daemon running as another user
   cannot read it until it is given (`chown`, or `chmod 640` with its group).
-- To save, the user of the daemon must be able to write each configuration
-  file and the directory it is in (for the temporary file and the rename).
-  Without it the save answers `500` with the error of the system and
+- A save is a new file next to the configuration file, then a rename over
+  it. So the user of the daemon must be able to write the directory of each
+  configuration file (the directory of the file a symbolic link points to)
+  and to read the file; the file itself does not need to be writable.
+  Without that the save answers `500`, "the configuration file ... cannot
+  be written, nothing was changed", with the error of the system, and
   nothing changes.
-- The packages and the unit do not grant that today. The `.deb`, `.rpm` and
-  AUR packages install `/etc/rxh/rxh.toml` with mode `0644`, owned by root,
-  and [`dist/rxh.service`](../dist/rxh.service) runs the daemon as a
-  dynamic user (`DynamicUser=yes`) with `ConfigurationDirectory=rxh` and
+- The packaged service cannot save, from the page or from the admin API, as
+  it is shipped. The `.deb`, `.rpm` and AUR packages install
+  `/etc/rxh/rxh.toml` with mode `0644`, owned by root, and
+  [`dist/rxh.service`](../dist/rxh.service) runs the daemon as a dynamic
+  user (`DynamicUser=yes`) with `ConfigurationDirectory=rxh` and
   `ProtectSystem=strict`: the daemon reads its configuration and cannot
-  write it, so the page of a packaged service shows everything and saves
-  nothing. To let it save, run it as a fixed user that owns the directory,
-  for instance with a drop-in (`systemctl edit rxh`) and
-  `chown -R rxh: /etc/rxh`. This drop-in was not tested with the packages:
-
-  ```ini
-  [Service]
-  DynamicUser=no
-  User=rxh
-  ReadWritePaths=/etc/rxh
-  ```
+  write the directory, so the page shows everything and every save answers
+  `500`. A setup that saves needs a fixed user for the service that owns
+  the configuration directory, and a unit that lets it write there. The
+  packages do not provide that yet: they create no such user, and no
+  recipe for it has been tested. A daemon started by hand, or by a unit of
+  your own, as a user that owns the directory of its configuration file
+  saves without anything else.
 
 ### Changing the configuration through the API
 
