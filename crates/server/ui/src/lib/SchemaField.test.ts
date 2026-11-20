@@ -134,7 +134,8 @@ test("an_enum_keeps_a_value_the_schema_does_not_list", async () => {
 });
 
 test("a_choice_switches_between_its_alternatives", async () => {
-  const field = draw(server.tls, undefined, "tls");
+  // Under another path than `tls` the key has no control of its own.
+  const field = draw(server.tls, undefined, "field");
   const written = screen.getByLabelText("Written as") as HTMLSelectElement;
   expect(written.value).toBe("-1");
   await fireEvent.change(written, { target: { value: "0" } });
@@ -148,7 +149,7 @@ test("a_choice_switches_between_its_alternatives", async () => {
 });
 
 test("a_choice_opens_on_the_alternative_of_its_value", () => {
-  draw(server.forward, [{ pool: "v1", weight: 90 }], "forward");
+  draw(server.forward, [{ pool: "v1", weight: 90 }], "field");
   expect((screen.getByLabelText("Written as") as HTMLSelectElement).value).toBe("2");
   expect((screen.getByLabelText("pool") as HTMLInputElement).value).toBe("v1");
 });
@@ -220,4 +221,32 @@ test("removing_a_list_item_redraws_the_ones_after_it_from_their_values", async (
   // The first item is now the table, not the text it was.
   expect((screen.getByLabelText("Written as") as HTMLSelectElement).value).toBe("1");
   expect((screen.getByLabelText("address") as HTMLInputElement).value).toBe("127.0.0.1:2");
+});
+
+test("a_value_that_is_not_the_constant_of_its_alternative_is_edited_as_json", () => {
+  const field = draw(server.tls, "{env.TLS}", "field");
+  expect(screen.queryByLabelText("Written as")).toBeNull();
+  expect((screen.getByLabelText("field (JSON)") as HTMLTextAreaElement).value).toBe('"{env.TLS}"');
+  expect(field.value()).toBe("{env.TLS}");
+});
+
+test("a_text_with_newlines_is_edited_in_a_textarea", async () => {
+  const field = draw({ type: "string" }, "line one\nline two", "body");
+  const box = screen.getByLabelText("body");
+  expect(box.tagName).toBe("TEXTAREA");
+  expect((box as HTMLTextAreaElement).value).toBe("line one\nline two");
+  await type(box, "line one\nline 2");
+  expect(field.value()).toBe("line one\nline 2");
+});
+
+test("the_keys_with_a_control_of_their_own_are_not_drawn_as_a_choice", () => {
+  draw(server.tls, "auto", "tls");
+  expect(screen.queryByLabelText("Written as")).toBeNull();
+  expect((screen.getByRole("radio", { name: "Automatic" }) as HTMLInputElement).checked).toBe(true);
+});
+
+test("the_tls_table_of_a_pool_keeps_the_generic_control", () => {
+  draw(pool.tls, { server_name: "db.internal" }, "tls");
+  expect(screen.queryByRole("radio")).toBeNull();
+  expect((screen.getByLabelText("server_name") as HTMLInputElement).value).toBe("db.internal");
 });

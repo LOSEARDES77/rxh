@@ -43,3 +43,119 @@ input {
 code {
   font-family: ui-monospace, monospace;
 }
+
+/* Shared by the tabs and the hand made form controls. */
+.button {
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+  cursor: default;
+}
+
+.button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.choices,
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 1rem;
+  margin: 0.4rem 0;
+}
+
+.toolbar {
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+}
+
+.toolbar select {
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--background);
+  color: inherit;
+  font: inherit;
+}
+
+.notice,
+.failure {
+  margin: 0 0 1rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.failure {
+  border-color: var(--danger);
+  background: none;
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+
+.badge {
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.bad {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.scroll {
+  overflow-x: auto;
+}
+
+table.list {
+  border-collapse: collapse;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+table.list th,
+table.list td {
+  padding: 0.4rem 1rem 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+table.list thead th {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: normal;
+  white-space: nowrap;
+}
+
+table.list .number {
+  text-align: right;
+}
+
+table.list .actions {
+  padding-right: 0;
+  white-space: nowrap;
+}
+
+table.list .actions .button + .button {
+  margin-left: 0.35rem;
+}

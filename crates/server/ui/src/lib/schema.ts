@@ -28,6 +28,13 @@ export type Entity = {
   toml: string;
 };
 
+/** The answer of `GET config/files`. */
+export type Files = {
+  editable: boolean;
+  files: { index: number; path: string; revision: string }[];
+  entities: Entity[];
+};
+
 export type Control =
   | { kind: "text" }
   | { kind: "number"; integer: boolean }
@@ -264,14 +271,29 @@ export function textValue(schema: Schema, node: Node, text: string): unknown {
 /** Drops unset keys and list items: the API refuses `null`. */
 export function prune(value: unknown): unknown {
   if (Array.isArray(value)) {
-    return value.filter((item) => item !== undefined && item !== null).map(prune);
+    const kept = value.map(prune).filter((item) => item !== undefined && item !== null);
+    // Rows added to a list and left blank do not make it `[]`: the key stays unset.
+    return value.length > 0 && kept.length === 0 ? undefined : kept;
   }
   if (isTable(value)) {
     const kept: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      if (item !== undefined && item !== null) kept[key] = prune(item);
+    for (const [key, raw] of Object.entries(value)) {
+      const item = prune(raw);
+      if (item !== undefined && item !== null) kept[key] = item;
     }
     return kept;
   }
   return value;
+}
+
+/** The name of the definition a key refers to, through `null` alternatives and `allOf`. */
+export function definition(node: Node): string | undefined {
+  const parts = [node, ...(node.anyOf ?? []), ...(node.allOf ?? [])];
+  return parts.find((part) => part.$ref)?.$ref?.replace("#/definitions/", "");
+}
+
+/** The alternatives of a key written in several shapes, without `null`. */
+export function alternatives(schema: Schema, node: Node): Node[] {
+  const shape = control(schema, node);
+  return shape.kind === "choice" ? shape.options.map((option) => option.node) : [];
 }

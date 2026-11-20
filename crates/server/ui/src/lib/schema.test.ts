@@ -182,6 +182,11 @@ test("blank_and_prune", () => {
     b: [1, { d: "x" }],
     e: "***",
   });
+  // Rows added to a list and left blank do not make it `[]`; a stored `[]` stays.
+  expect(prune({ hosts: [undefined, undefined], kept: [], nested: { list: [undefined] } })).toEqual({
+    kept: [],
+    nested: {},
+  });
 });
 
 test("every_key_of_a_server_and_of_a_pool_is_in_exactly_one_group", () => {

@@ -1,9 +1,14 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { untrack, type Component } from "svelte";
+  import Forward from "./controls/Forward.svelte";
+  import Redirect from "./controls/Redirect.svelte";
+  import Serve from "./controls/Serve.svelte";
+  import Tls from "./controls/Tls.svelte";
   import SchemaField from "./SchemaField.svelte";
   import {
     blank,
     control,
+    definition,
     isTable,
     pickChoice,
     resolve,
@@ -50,12 +55,50 @@
       case "table":
       case "map":
         return !isTable(held);
+      case "choice": {
+        // A placeholder where only a constant goes (`tls = "{env.TLS}"`) is not that constant.
+        const options = shape.options.map((option) => option.node);
+        const fixed = constant(options[pickChoice(schema, options, held)]);
+        return fixed !== undefined && held !== fixed;
+      }
       default:
         return false;
     }
   }
 
+  type Custom = Component<
+    { schema: Schema; node: Node; value: unknown; label: string; path: string },
+    Record<string, never>,
+    "value"
+  >;
+  /** The keys drawn by a control of their own, with the definition it is made for. */
+  const CONTROLS: Record<string, [string, Custom]> = {
+    forward: ["Forward", Forward],
+    tls: ["Tls", Tls],
+    serve: ["FileServer", Serve],
+    redirect: ["Redirect", Redirect],
+  };
+  // The definition is checked too: `tls` of a pool is another table.
+  const Custom = untrack(() => {
+    const [name, component] = CONTROLS[path.split(".").pop() ?? ""] ?? [];
+    return name !== undefined && name === definition(node) ? component : undefined;
+  });
+
+  // The keys with a control of their own are described on their definition.
+  const described = $derived(
+    Custom && resolve(schema, { $ref: `#/definitions/${definition(node)}` }).description,
+  );
+
+  /** The value of an alternative that is one constant (`"auto"`). */
+  function constant(option: Node): string | undefined {
+    const optionShape = control(schema, option);
+    return optionShape.kind === "enum" && optionShape.options.length === 1
+      ? optionShape.options[0]
+      : undefined;
+  }
+
   // Decided once: the control must not change under the cursor while typing.
+  const multiline = untrack(() => typeof value === "string" && value.includes("\n"));
   const asJson = untrack(() => foreign(control(schema, node), value));
   const shape: Control = $derived(asJson ? { kind: "json" } : control(schema, node));
 
@@ -72,7 +115,7 @@
 
   /** The first paragraph of the description, then the rest: examples are code. */
   const paragraphs = $derived(
-    (help ?? "")
+    (help ?? described ?? "")
       .split("\n\n")
       .filter((text) => text.trim() !== "")
       .map((text) =>
@@ -81,7 +124,7 @@
           : { code: false, text: text.replace(/\n/g, " ") },
       ),
   );
-  const described = $derived(paragraphs.length > 0 ? `${id}-help` : undefined);
+  const helpId = $derived(paragraphs.length > 0 ? `${id}-help` : undefined);
 
   function table(): Record<string, unknown> {
     return isTable(value) ? value : {};
@@ -126,11 +169,6 @@
     value = Object.keys(copy).length > 0 ? copy : undefined;
   }
 
-  function constant(option: Node): boolean {
-    const optionShape = control(schema, option);
-    return optionShape.kind === "enum" && optionShape.options.length === 1;
-  }
-
   // The alternative in use. Kept apart from the value: a text alternative
   // that is still empty holds no value to tell it from the others.
   let picked = $state(
@@ -138,7 +176,7 @@
       if (shape.kind !== "choice") return -1;
       const options = shape.options.map((option) => option.node);
       if (value !== undefined) return pickChoice(schema, options, value);
-      return constant(options[0]) ? -1 : 0;
+      return constant(options[0]) === undefined ? 0 : -1;
     }),
   );
 
@@ -169,7 +207,7 @@
 {#snippet hint()}
   {#if paragraphs.length > 0}
     <div class="help">
-      <p id={described}>{paragraphs[0].text}</p>
+      <p id={helpId}>{paragraphs[0].text}</p>
       {#if paragraphs.length > 1}
         <details>
           <summary>More about {label}</summary>
@@ -182,7 +220,27 @@
   {/if}
 {/snippet}
 
-{#if shape.kind === "text"}
+{#if Custom}
+  <fieldset>
+    <legend>{label}</legend>
+    {@render hint()}
+    <Custom {schema} {node} {label} {path} bind:value />
+  </fieldset>
+{:else if shape.kind === "text" && multiline}
+  <div class="field">
+    <label for={id}>{label}</label>
+    <textarea
+      {id}
+      name={path}
+      rows="4"
+      spellcheck="false"
+      value={String(value ?? "")}
+      aria-describedby={helpId}
+      oninput={(event) => (value = textValue(schema, node, event.currentTarget.value))}
+    ></textarea>
+    {@render hint()}
+  </div>
+{:else if shape.kind === "text"}
   <div class="field">
     <label for={id}>{label}</label>
     <input
@@ -193,7 +251,7 @@
       spellcheck="false"
       value={String(value ?? "")}
       {placeholder}
-      aria-describedby={described}
+      aria-describedby={helpId}
       oninput={(event) => (value = textValue(schema, node, event.currentTarget.value))}
     />
     {@render hint()}
@@ -208,7 +266,7 @@
       step={shape.integer ? 1 : "any"}
       value={String(value ?? "")}
       {placeholder}
-      aria-describedby={described}
+      aria-describedby={helpId}
       oninput={(event) => {
         const text = event.currentTarget.value;
         value = text === "" ? undefined : Number(text);
@@ -224,7 +282,7 @@
       {id}
       name={path}
       value={value === undefined ? "" : value ? "yes" : "no"}
-      aria-describedby={described}
+      aria-describedby={helpId}
       onchange={(event) => {
         const answer = event.currentTarget.value;
         value = answer === "" ? undefined : answer === "yes";
@@ -243,7 +301,7 @@
       {id}
       name={path}
       value={String(value ?? "")}
-      aria-describedby={described}
+      aria-describedby={helpId}
       onchange={(event) => (value = event.currentTarget.value || undefined)}
     >
       <option value="">{unset}</option>
@@ -291,7 +349,7 @@
 {:else if shape.kind === "table"}
   {#if value === undefined && !required}
     <div class="field">
-      <button type="button" aria-describedby={described} onclick={() => (value = {})}>
+      <button type="button" aria-describedby={helpId} onclick={() => (value = {})}>
         Add {label}
       </button>
       {@render hint()}
@@ -378,7 +436,7 @@
         {/each}
       </select>
     </div>
-    {#if picked >= 0 && !constant(shape.options[picked].node)}
+    {#if picked >= 0 && constant(shape.options[picked].node) === undefined}
       {#key picked}
         <SchemaField {schema} node={shape.options[picked].node} {label} {path} required bind:value />
       {/key}
@@ -394,7 +452,7 @@
       spellcheck="false"
       value={json}
       aria-invalid={jsonError !== ""}
-      aria-describedby={described}
+      aria-describedby={helpId}
       oninput={(event) => parseJson(event.currentTarget.value)}
     ></textarea>
     {#if jsonError}<p class="error" role="alert">{jsonError}</p>{/if}

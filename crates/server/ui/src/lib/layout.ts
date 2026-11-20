@@ -62,10 +62,15 @@ export const layout: Record<
         keys: ["retry_budget", "retry_match", "try_duration", "try_interval", "hedge_delay"],
       },
       {
+        title: "Load balancing",
+        keys: ["choose", "hash_type", "hash_balance_factor", "secret", "dynamic"],
+      },
+      {
         title: "Connections",
         keys: [
           "tls",
           "h2c",
+          "grpc_web",
           "keepalive",
           "keepalive_idle_conns_per_host",
           "max_connections",
@@ -85,12 +90,6 @@ export const layout: Record<
           "flush_interval",
           "request_buffers",
           "response_buffers",
-          "choose",
-          "hash_type",
-          "hash_balance_factor",
-          "secret",
-          "dynamic",
-          "grpc_web",
         ],
       },
     ],

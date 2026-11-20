@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import rxhSchema from "../../../../../docs/rxh.schema.json";
@@ -269,5 +269,89 @@ test("the_groups_of_a_server_follow_the_layout", () => {
     "Performance",
     "Timeouts and limits",
     "Everything else (1 set)",
+  ]);
+});
+
+test("an_untouched_save_sends_back_what_was_loaded", async () => {
+  const fetch = serve(200, { saved: true });
+  const value = {
+    name: "web",
+    listen: "127.0.0.1:8080",
+    host: "example.org",
+    forward: "@api",
+    tls: "{env.TLS}",
+    max_connections: "{env.MAX}",
+    basic_auth: { users: { admin: "***" } },
+    match: [{ path: "/files", serve: "/var/www" }, { path: "/old", redirect: { to: "/new", status: 301 } }],
+  };
+  const loaded = JSON.stringify(value);
+  const { onsaved } = open({ kind: "server", key: "0:0", file: 0, value, toml: "" });
+  await save();
+  await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
+  expect(JSON.stringify(sent(fetch).body.value)).toBe(loaded);
+});
+
+test("a_list_whose_added_rows_are_left_blank_is_not_saved", async () => {
+  const fetch = serve(200, { saved: true });
+  const { onsaved } = open({ kind: "server", key: "0:0", file: 0, value: { listen: ":80", ip_allow: [] }, toml: "" });
+  await fireEvent.click(screen.getByRole("button", { name: "Add host" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Add host" }));
+  await save();
+  await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
+  // No `host = []`; the `[]` the file holds stays.
+  expect(sent(fetch).body.value).toEqual({ listen: ":80", ip_allow: [] });
+});
+
+test("only_the_section_top_cannot_be_deleted", () => {
+  open({ ...API, key: "top" });
+  expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+  cleanup();
+  open({ kind: "section", key: "top", file: 0, value: {}, toml: "" });
+  expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+});
+
+test("reading_again_closes_the_editor_of_a_server_that_moved", async () => {
+  const web = { kind: "server", key: "0:0", file: 0, value: { name: "web", listen: ":80" }, toml: "" } as const;
+  const files = {
+    editable: true,
+    files: [{ index: 0, path: "rxh.toml", revision: "r2", text: "" }],
+    entities: [{ ...web, value: { name: "other", listen: ":80" } }],
+  };
+  serve(409, { error: "the file changed since it was read" }, files);
+  const onreread = vi.fn();
+  render(EntityEditor, { schema, entity: web, revision: "r1", onsaved: vi.fn(), oncancel: vi.fn(), onreread });
+  expect(screen.getByRole("heading", { name: "Server web" })).toBeTruthy();
+  await save();
+  await fireEvent.click(await screen.findByRole("button", { name: "Read again" }));
+  await vi.waitFor(() => expect(onreread).toHaveBeenCalledTimes(1));
+  expect(onreread.mock.calls[0][0]).toContain("open the host again");
+});
+
+test("the_groups_of_a_pool_follow_the_layout", () => {
+  const { container } = open();
+  const groups = [...container.querySelectorAll("details.group")].map((group) => [
+    group.querySelector("summary")?.textContent?.trim(),
+    [...group.querySelectorAll(":scope > * > label, :scope > * > legend, :scope > * > button")].map((element) =>
+      element.textContent?.trim().replace(/^Add /, ""),
+    ),
+  ]);
+  expect(groups.map(([title]) => title)).toEqual([
+    "Health",
+    "Retries",
+    "Load balancing (1 set)",
+    "Connections",
+    "Timeouts and buffers",
+    "Everything else (1 set)",
+  ]);
+  expect(groups[2][1]).toEqual(["choose", "hash_type", "hash_balance_factor", "secret", "dynamic"]);
+  expect(groups[3][1]).toContain("grpc_web");
+  expect(groups[4][1]).toEqual([
+    "dial_timeout",
+    "read_timeout",
+    "write_timeout",
+    "response_header_timeout",
+    "flush_interval",
+    "request_buffers",
+    "response_buffers",
   ]);
 });

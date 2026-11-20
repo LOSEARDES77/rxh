@@ -3,9 +3,16 @@
   import { ApiError, api } from "./api";
   import { arrange } from "./layout";
   import SchemaField from "./SchemaField.svelte";
-  import { control, entitySchema, prune, resolve, type Entity, type Kind, type Schema } from "./schema";
-
-  type Files = { files: { index: number; revision: string }[]; entities: Entity[] };
+  import {
+    control,
+    entitySchema,
+    prune,
+    resolve,
+    type Entity,
+    type Files,
+    type Kind,
+    type Schema,
+  } from "./schema";
 
   let {
     schema,
@@ -16,12 +23,16 @@
     revision,
     onsaved,
     oncancel,
+    // After "Read again": the list is out of date too. With a message, the
+    // entity is no longer the one being edited and the editor must be closed.
+    onreread = undefined,
   }: {
     schema: Schema;
     entity: Entity | { kind: Kind; file: number; key?: string };
     revision: string;
     onsaved: () => void;
     oncancel: () => void;
+    onreread?: (moved?: string) => void;
   } = $props();
 
   const id = $props.id();
@@ -46,8 +57,14 @@
   let busy = $state(false);
 
   const noun = { server: "server", upstream: "pool", section: "section" }[kind];
+  // The key of a server is its position, which says nothing to a person.
+  const shown = untrack(() =>
+    kind === "server" && "value" in entity
+      ? String(entity.value.name ?? [entity.value.listen ?? key].flat().join(", "))
+      : key,
+  );
   const title =
-    key === undefined ? `New ${noun}` : `${noun.charAt(0).toUpperCase()}${noun.slice(1)} ${key}`;
+    key === undefined ? `New ${noun}` : `${noun.charAt(0).toUpperCase()}${noun.slice(1)} ${shown}`;
 
   const shape = $derived(control(schema, entitySchema(schema, kind, key ?? name)));
   const fields = $derived(shape.kind === "table" ? shape.fields : {});
@@ -129,17 +146,28 @@
   }
 
   function remove() {
-    if (key === undefined || !confirm(`Delete ${noun} ${key} from the configuration?`)) return;
+    if (key === undefined || !confirm(`Delete ${noun} ${shown} from the configuration?`)) return;
     const query = `revision=${encodeURIComponent(stored.revision)}`;
     return send(() =>
       api(`config/entities/${kind}/${encodeURIComponent(key)}?${query}`, { method: "DELETE" }),
     );
   }
 
+  function identity(value: Record<string, unknown>): string {
+    return JSON.stringify(value.name ?? value.listen);
+  }
+
   async function readAgain() {
     try {
       const files = await api<Files>("config/files");
       const found = files.entities.find((other) => other.kind === kind && other.key === key);
+      // The key of a server is its position: after a server was added or
+      // removed above it, the same key is another host.
+      if (kind === "server" && (!found || identity(found.value) !== identity(stored.value))) {
+        onreread?.("The file changed and this host is no longer where it was: open the host again.");
+        return;
+      }
+      onreread?.();
       if (!found) {
         failure = { status: 404, message: `The ${noun} is no longer in the configuration.` };
         return;
@@ -246,7 +274,7 @@
   <div class="actions">
     <button type="button" class="primary" disabled={busy} onclick={save}>Save and reload</button>
     <button type="button" disabled={busy} onclick={cancel}>Cancel</button>
-    {#if key !== undefined && key !== "top"}
+    {#if key !== undefined && !(kind === "section" && key === "top")}
       <button type="button" class="danger" disabled={busy} onclick={remove}>Delete</button>
     {/if}
   </div>
