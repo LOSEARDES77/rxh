@@ -2368,6 +2368,12 @@
           "type": "boolean",
           "default": true
         },
+        "http3": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "https_redirect": {
           "type": [
             "boolean",
