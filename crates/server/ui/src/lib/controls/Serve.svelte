@@ -8,4 +8,4 @@
   }: { schema: Schema; node: Node; value: unknown; label: string; path: string } = $props();
 </script>
 
-<Options {...rest} main="root" text="directory" bind:value />
+<Options {...rest} main="root" text="Directory" bind:value />

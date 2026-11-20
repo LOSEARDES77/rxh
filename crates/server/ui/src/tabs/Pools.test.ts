@@ -75,10 +75,17 @@ test("drain_calls_the_state_route_and_reads_the_pools_again", async () => {
 });
 
 test("a_refused_state_change_is_reported", async () => {
-  serve({ pools: POOLS, "config/files": FILES }, { status: 404, body: { error: "no backend 10.0.0.5:80" } });
+  const fetch = serve({ pools: POOLS, "config/files": FILES }, { status: 404, body: { error: "no backend 10.0.0.5:80" } });
   render(Pools);
   await fireEvent.click(await screen.findByRole("button", { name: "Maintenance 10.0.0.5:80 until restart" }));
   expect((await screen.findByRole("alert")).textContent).toContain("no backend 10.0.0.5:80");
+  // The reads that follow work: they must not take the refusal away.
+  const reads = () => fetch.mock.calls.filter(([url]) => url === "pools").length;
+  const before = reads();
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.waitFor(() => expect(reads()).toBeGreaterThan(before));
+  await new Promise((done) => setTimeout(done, 20));
+  expect(screen.getByRole("alert").textContent).toContain("no backend 10.0.0.5:80");
 });
 
 test("without_a_configuration_file_nothing_can_be_edited", async () => {
@@ -95,7 +102,7 @@ test("edit_opens_the_editor_and_a_save_reads_everything_again", async () => {
   render(Pools);
   await fireEvent.click(await screen.findByRole("button", { name: "Edit api" }));
   expect(screen.getByRole("heading", { name: "Pool api" })).toBeTruthy();
-  await fireEvent.change(screen.getByLabelText("policy"), { target: { value: "ip_hash" } });
+  await fireEvent.change(screen.getByLabelText("Policy"), { target: { value: "ip_hash" } });
   await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
   await screen.findByRole("button", { name: "Edit api" });
   expect(writes(fetch)).toEqual([

@@ -27,7 +27,10 @@
   let files: Files | undefined = $state.raw();
   let schema: Schema | undefined = $state.raw();
   let pools: Pool[] = $state.raw([]);
+  // Of the last read; a later read that works clears it.
   let failure = $state("");
+  // Of the last change asked for: it stays until the next one.
+  let refused = $state("");
   let editing: Entity | { kind: "upstream"; file: number } | undefined = $state.raw();
   let file = $state(0);
 
@@ -74,14 +77,17 @@
     });
   }
 
-  function setState(pool: string, address: string, state: string) {
-    return attempt(async () => {
+  async function setState(pool: string, address: string, state: string) {
+    refused = "";
+    try {
       await api(`pools/${encodeURIComponent(pool)}/upstreams/state`, {
         method: "PUT",
         body: { address, state },
       });
-      pools = await api<Pool[]>("pools");
-    });
+    } catch (err) {
+      refused = err instanceof Error ? err.message : String(err);
+    }
+    refresh();
   }
 
   function close() {
@@ -98,6 +104,9 @@
 
 {#if failure}
   <p class="failure" role="alert">{failure}</p>
+{/if}
+{#if refused}
+  <p class="failure" role="alert">{refused}</p>
 {/if}
 
 {#if editing && schema}

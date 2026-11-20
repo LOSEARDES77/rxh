@@ -1,5 +1,6 @@
 <script lang="ts">
   import SchemaField from "../SchemaField.svelte";
+  import { lower } from "../layout";
   import { alternatives, control, isTable, type Node, type Schema } from "../schema";
 
   // A key written as one text, or as a table whose key `main` holds that text.
@@ -30,7 +31,7 @@
   {@const held = value}
   <SchemaField {schema} node={table} label="{label} options" {path} required bind:value />
   <button type="button" class="button" onclick={() => (value = held[main])}>
-    Only the {text} (drops the other {label} options)
+    Only the {lower(text)} (drops the other {lower(label)} options)
   </button>
 {:else if value === undefined || typeof value === "string"}
   {@const held = value}
@@ -40,7 +41,7 @@
     class="button"
     onclick={() => (value = held === undefined ? {} : { [main]: held })}
   >
-    More {label} options
+    More {lower(label)} options
   </button>
 {:else}
   <SchemaField {schema} node={{}} label={text} {path} bind:value />

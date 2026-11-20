@@ -12,14 +12,14 @@ test("text_and_table_are_left_as_they_were", () => {
 
 test("the_text_is_the_value_until_more_options_are_asked_for", async () => {
   const value = draw("serve", undefined);
-  await type("directory", "/var/www");
+  await type("Directory", "/var/www");
   expect(value()).toBe("/var/www");
   await click("button", "More serve options");
   expect(value()).toEqual({ root: "/var/www" });
-  expect((screen.getByLabelText("root") as HTMLInputElement).value).toBe("/var/www");
-  expect(screen.getByLabelText("browse")).toBeTruthy();
+  expect((screen.getByLabelText("Root") as HTMLInputElement).value).toBe("/var/www");
+  expect(screen.getByLabelText("Browse")).toBeTruthy();
   await click("button", "Only the directory (drops the other serve options)");
   expect(value()).toBe("/var/www");
-  await type("directory", "");
+  await type("Directory", "");
   expect(value()).toBeUndefined();
 });

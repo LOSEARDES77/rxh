@@ -40,7 +40,7 @@
   {/each}
 </div>
 {#if mode === "files"}
-  <SchemaField {schema} node={files} label="certificate files" {path} required bind:value />
+  <SchemaField {schema} node={files} label="Certificate files" {path} required bind:value />
 {:else if mode === "written"}
   <SchemaField
     {schema}

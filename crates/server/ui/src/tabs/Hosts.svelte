@@ -10,7 +10,10 @@
   let files: Files | undefined = $state.raw();
   let schema: Schema | undefined = $state.raw();
   let servers: Live[] = $state.raw([]);
+  // Of the last read; a later read that works clears it.
   let failure = $state("");
+  // Of the last change asked for: it stays until the next one.
+  let refused = $state("");
   let notice = $state("");
   let editing: Entity | { kind: "server"; file: number } | undefined = $state.raw();
   let file = $state(0);
@@ -19,10 +22,20 @@
   const hosts = $derived(
     entities
       .filter((entity) => entity.kind === "server")
-      .map((entity) => ({ entity, value: entity.value, live: liveOf(entity.value) })),
+      .map((entity) => ({
+        entity,
+        value: entity.value,
+        listeners: listenersOf(entity.value),
+        open: isOpen(entity.value),
+      })),
   );
-  // Listeners no file describes: a provider or a `PATCH` made them.
-  const runtime = $derived(servers.filter((server) => !hosts.some((host) => host.live === server)));
+  // Listeners no server of the files accounts for.
+  const others = $derived(
+    servers.filter((server) => !hosts.some((host) => host.listeners.includes(server))),
+  );
+  // While a server of the files cannot be told from its listen address, a
+  // listener without a name may be its own: it is not called "runtime".
+  const unsure = $derived(hosts.some((host) => host.open && host.listeners.length === 0));
 
   // The `forward` control of the editor offers the pools of the files.
   setContext("pools", () =>
@@ -33,14 +46,30 @@
     return [value ?? []].flat().map(String);
   }
 
-  /** The listener of a server: the one on its address, or the one that carries its name. */
-  function liveOf(value: Record<string, unknown>): Live | undefined {
+  function named(value: Record<string, unknown>): string | undefined {
+    return typeof value.name === "string" && !value.name.includes("{") ? value.name : undefined;
+  }
+
+  /**
+   * The listeners of a server, one per socket: those that carry its name,
+   * and for a server without a name those on its listen addresses.
+   */
+  function listenersOf(value: Record<string, unknown>): Live[] {
+    const name = named(value);
     const listens = list(value.listen);
-    return servers.find(
-      (server) =>
-        listens.includes(server.listen) ||
-        (typeof value.name === "string" && server.name?.split(", ").includes(value.name)),
-    );
+    const byName = servers.filter((server) => name && server.name?.split(", ").includes(name));
+    return byName.length > 0 ? byName : servers.filter((server) => listens.includes(server.listen));
+  }
+
+  /** No name, and a listen address the file does not spell out: port 0 or a placeholder. */
+  function isOpen(value: Record<string, unknown>): boolean {
+    const vague = list(value.listen).some((listen) => listen.endsWith(":0") || listen.includes("{"));
+    return vague && named(value) === undefined;
+  }
+
+  function stateOf(host: { listeners: Live[]; open: boolean }): string {
+    const states = [...new Set(host.listeners.map((listener) => listener.state))];
+    return states.join(", ") || (host.open ? "unknown" : "not running");
   }
 
   function title(value: Record<string, unknown>): string {
@@ -90,6 +119,7 @@
 
   function open(next: typeof editing) {
     notice = "";
+    refused = "";
     editing = next;
   }
 
@@ -104,17 +134,18 @@
     const path = fileOf(entity.file)?.path;
     if (!confirm(`Delete host ${title(entity.value)} from ${path}?`)) return;
     notice = "";
+    refused = "";
     // The revision is that of the list on screen: if the file changed since,
     // the key may be another host and the delete is refused.
     const revision = encodeURIComponent(fileOf(entity.file)?.revision ?? "");
-    await attempt(() =>
-      api(`config/entities/server/${encodeURIComponent(entity.key)}?revision=${revision}`, {
+    try {
+      await api(`config/entities/server/${encodeURIComponent(entity.key)}?revision=${revision}`, {
         method: "DELETE",
-      }),
-    );
-    const refused = failure;
-    await load();
-    failure = refused;
+      });
+    } catch (err) {
+      refused = err instanceof Error ? err.message : String(err);
+    }
+    load();
     refresh();
   }
 
@@ -131,6 +162,9 @@
 
 {#if failure}
   <p class="failure" role="alert">{failure}</p>
+{/if}
+{#if refused}
+  <p class="failure" role="alert">{refused}</p>
 {/if}
 {#if notice}
   <p class="notice" role="status">{notice}</p>
@@ -178,11 +212,13 @@
           <th scope="col">TLS</th>
           <th scope="col">State</th>
           <th scope="col">Source</th>
-          <th scope="col"><span class="hidden">Actions</span></th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
         </tr>
       </thead>
       <tbody>
-        {#each hosts as { entity, value, live } (entity.key)}
+        {#each hosts as host (host.entity.key)}
+          {@const { entity, value } = host}
+          {@const text = stateOf(host)}
           <tr>
             <th scope="row">{value.name ?? "—"}</th>
             <td>{list(value.host).join(", ") || "any"}</td>
@@ -190,7 +226,14 @@
             <td>{value.protocol ?? "http"}</td>
             <td>{target(value)}</td>
             <td>{tls(value.tls)}</td>
-            <td class={["state", { bad: live?.state !== "listening" }]}>{live?.state ?? "not running"}</td>
+            <td
+              class={["state", { bad: text !== "listening" }]}
+              title={text === "unknown"
+                ? "The listen address of the file is a placeholder or port 0: its listener cannot be told apart"
+                : undefined}
+            >
+              {text}
+            </td>
             {@render source(fileOf(entity.file)?.path ?? "")}
             <td class="actions">
               <button
@@ -212,7 +255,7 @@
             </td>
           </tr>
         {/each}
-        {#each runtime as server (server.listen)}
+        {#each others as server (server.listen)}
           <tr>
             <th scope="row">{server.name ?? "—"}</th>
             <td>—</td>
@@ -222,14 +265,23 @@
             <td>—</td>
             <td class={["state", { bad: server.state !== "listening" }]}>{server.state}</td>
             <td>
-              <span class="badge" title="Not in a configuration file: made by a provider or a PATCH">
-                runtime
-              </span>
+              {#if unsure && server.name === null}
+                <span
+                  class="badge"
+                  title="May be a server of the files whose listen address is a placeholder or port 0"
+                >
+                  not matched
+                </span>
+              {:else}
+                <span class="badge" title="Not in a configuration file: made by a provider or a PATCH">
+                  runtime
+                </span>
+              {/if}
             </td>
             <td></td>
           </tr>
         {/each}
-        {#if files && hosts.length + runtime.length === 0}
+        {#if files && hosts.length + others.length === 0}
           <tr><td colspan="9" class="muted">No host.</td></tr>
         {/if}
       </tbody>
@@ -245,10 +297,5 @@
 
   .actions {
     text-align: right;
-  }
-
-  .hidden {
-    position: absolute;
-    clip-path: inset(50%);
   }
 </style>

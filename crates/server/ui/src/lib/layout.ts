@@ -1,4 +1,4 @@
-import type { Kind } from "./schema";
+import { definition, type Kind, type Node, type Schema } from "./schema";
 
 /** Where the keys of a server and of a pool are drawn: the common ones first, the rest by topic. */
 export const layout: Record<
@@ -120,4 +120,51 @@ export function arrange(
       .map((group) => ({ ...group, keys: group.keys.filter((key) => keys.includes(key)) }))
       .filter((group) => group.keys.length > 0),
   };
+}
+
+const ACRONYMS = /^(tls|ip|https?\d?|uri|url|cors|udp|tcp|dns|ca|grpc|h2c|acme|id)$/;
+
+/** The label of a key: `hash_balance_factor` reads "Hash balance factor". */
+export function human(key: string): string {
+  const words = key.split("_").map((word) => (ACRONYMS.test(word) ? word.toUpperCase() : word));
+  return words.join(" ").replace(/^[a-z]/, (letter) => letter.toUpperCase());
+}
+
+/** The label of one item of the list labelled `label`, where the singular is not the label. */
+const ITEMS: Record<string, string> = {
+  Backends: "Backend",
+  Listen: "Listen address",
+  Host: "Host name",
+  Addresses: "Address",
+};
+
+export function itemLabel(label: string): string {
+  return ITEMS[label] ?? label;
+}
+
+/** `label` inside a sentence ("Add health"); an acronym keeps its capitals. */
+export function lower(label: string): string {
+  return /^[A-Z][a-z]/.test(label) ? label.charAt(0).toLowerCase() + label.slice(1) : label;
+}
+
+/** Help of the keys the schema describes only by their shape, or in words of the code. */
+const HELP: Record<string, string> = {
+  host: "Host names this server answers to, like example.com or *.example.com. Empty: any.",
+  listen: "Addresses to listen on, like 0.0.0.0:443. Port 0 picks a free port.",
+  forward: "Where requests go: a pool, one address, or several.",
+  serve: "Directory whose files are served.",
+  redirect: "Address the client is sent to, like https://example.com{uri}.",
+  tls: "Off: plain connections. Automatic: certificates from ACME for the host names.",
+};
+
+/**
+ * The help of `key`: its own description, else the text kept here, else the
+ * description of its definition. That of a `OneOrMany_*` definition only
+ * describes the shape and is never shown.
+ */
+export function helpOf(schema: Schema, key: string, node: Node): string | undefined {
+  if (node.description) return node.description;
+  if (HELP[key]) return HELP[key];
+  const name = definition(node);
+  return name?.startsWith("OneOrMany_") ? undefined : name && schema.definitions?.[name]?.description;
 }

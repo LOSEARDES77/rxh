@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import rxhSchema from "../../../../../docs/rxh.schema.json";
@@ -72,8 +72,8 @@ afterEach(() => {
 test("save_sends_the_whole_table_and_the_revision", async () => {
   const fetch = serve(200, { saved: true });
   const { onsaved } = open();
-  await fireEvent.change(field("policy"), { target: { value: "ip_hash" } });
-  await type(field("backends 1"), "127.0.0.1:9090");
+  await fireEvent.change(field("Policy"), { target: { value: "ip_hash" } });
+  await type(field("Backend 1"), "127.0.0.1:9090");
   await save();
   await vi.waitFor(() => expect(onsaved).toHaveBeenCalledTimes(1));
   expect(fetch).toHaveBeenCalledTimes(1);
@@ -104,11 +104,11 @@ test("the_key_is_percent_encoded", async () => {
 test("a_400_shows_the_message_and_keeps_the_typed_value", async () => {
   serve(400, { error: "upstream api: no backends\nthe file was left as it was" });
   const { onsaved } = open();
-  await type(field("key"), "x-user");
+  await type(field("Key"), "x-user");
   await save();
   const alert = await screen.findByRole("alert");
   expect(alert.textContent).toContain("upstream api: no backends\nthe file was left as it was");
-  expect(field("key").value).toBe("x-user");
+  expect(field("Key").value).toBe("x-user");
   expect(onsaved).not.toHaveBeenCalled();
   expect(screen.queryByRole("button", { name: "Read again" })).toBeNull();
 });
@@ -121,13 +121,13 @@ test("a_409_offers_to_read_again_and_the_next_save_uses_the_new_revision", async
   };
   const fetch = serve(409, { error: "the file changed since it was read" }, files);
   open();
-  await type(field("backends 1"), "typed:1");
+  await type(field("Backend 1"), "typed:1");
   await save();
   expect((await screen.findByRole("alert")).textContent).toContain("the file changed");
-  expect(field("backends 1").value).toBe("typed:1");
+  expect(field("Backend 1").value).toBe("typed:1");
 
   await fireEvent.click(screen.getByRole("button", { name: "Read again" }));
-  await vi.waitFor(() => expect(field("backends 1").value).toBe("10.0.0.1:80"));
+  await vi.waitFor(() => expect(field("Backend 1").value).toBe("10.0.0.1:80"));
   expect(screen.queryByRole("alert")).toBeNull();
   await save();
   await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
@@ -137,11 +137,11 @@ test("a_409_offers_to_read_again_and_the_next_save_uses_the_new_revision", async
 test("a_401_keeps_the_editor_and_the_typed_value_behind_the_token_dialog", async () => {
   serve(401, { error: "missing or wrong token" });
   const { onsaved, oncancel } = open();
-  await type(field("key"), "x-user");
+  await type(field("Key"), "x-user");
   await save();
   await screen.findByRole("alert");
   expect(get(needsToken)).toBe(true);
-  expect(field("key").value).toBe("x-user");
+  expect(field("Key").value).toBe("x-user");
   expect(onsaved).not.toHaveBeenCalled();
   expect(oncancel).not.toHaveBeenCalled();
 });
@@ -163,12 +163,12 @@ test("the_toml_view_sends_the_text", async () => {
 test("switching_views_with_unsaved_edits_asks_before_discarding_them", async () => {
   open();
   expect(screen.getByRole("radiogroup")).toBeTruthy();
-  await type(field("key"), "x-user");
+  await type(field("Key"), "x-user");
 
   confirm.mockReturnValue(false);
   await fireEvent.click(screen.getByRole("radio", { name: "TOML" }));
   expect(confirm).toHaveBeenCalledTimes(1);
-  expect(field("key").value).toBe("x-user");
+  expect(field("Key").value).toBe("x-user");
   expect(screen.queryByLabelText("TOML of the table")).toBeNull();
 
   confirm.mockReturnValue(true);
@@ -176,7 +176,7 @@ test("switching_views_with_unsaved_edits_asks_before_discarding_them", async () 
   expect(screen.getByLabelText("TOML of the table")).toBeTruthy();
   await fireEvent.click(screen.getByRole("radio", { name: "Form" }));
   // The edit was discarded, not converted.
-  expect(field("key").value).toBe("");
+  expect(field("Key").value).toBe("");
 });
 
 test("delete_asks_for_confirmation", async () => {
@@ -203,7 +203,7 @@ test("cancel_asks_only_when_something_was_typed", async () => {
   expect(confirm).not.toHaveBeenCalled();
   expect(oncancel).toHaveBeenCalledTimes(1);
 
-  await type(field("key"), "x-user");
+  await type(field("Key"), "x-user");
   confirm.mockReturnValue(false);
   await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(oncancel).toHaveBeenCalledTimes(1);
@@ -214,8 +214,8 @@ test("a_new_pool_is_posted_with_its_name_and_file", async () => {
   const { onsaved } = open({ kind: "upstream", file: 1 });
   expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   await type(field("Name"), "web");
-  await fireEvent.click(screen.getByRole("button", { name: "Add backends" }));
-  await type(field("backends 1"), "127.0.0.1:8080");
+  await fireEvent.click(screen.getByRole("button", { name: "Add backend" }));
+  await type(field("Backend 1"), "127.0.0.1:8080");
   await save();
   await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
   expect(sent(fetch)).toEqual({
@@ -227,8 +227,9 @@ test("a_new_pool_is_posted_with_its_name_and_file", async () => {
 
 test("a_new_server_has_no_name_to_give", async () => {
   const fetch = serve(201, { key: "0:3" });
-  const { onsaved } = open({ kind: "server", file: 0 });
-  expect(screen.queryByLabelText("Name")).toBeNull();
+  const { container, onsaved } = open({ kind: "server", file: 0 });
+  // "Name" is the `name` key of the server, not a key to give the table.
+  expect(container.querySelector(".name")).toBeNull();
   await save();
   await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
   expect(sent(fetch).body).toEqual({ value: {}, file: 0 });
@@ -243,14 +244,23 @@ test("every_key_is_reachable_and_every_control_has_a_label", () => {
   ] as const) {
     const value = kind === "server" ? { listen: ":443", tls: "auto", old_alias: true } : {};
     const { container } = open({ kind, key, file: 0, value, toml: "" });
-    const names = [...container.querySelectorAll("label, legend, button")].map((element) =>
-      element.textContent?.trim().replace(/^Add /, ""),
-    );
+    const labels = [...container.querySelectorAll("label, legend")].map((element) => element.textContent?.trim());
+    // Each field shows the key of the file beside its label.
+    const names = [...container.querySelectorAll(".help code")].map((element) => element.textContent);
     const shape = control(schema, entitySchema(schema, kind, key));
     const keys = shape.kind === "table" ? Object.keys(shape.fields) : [];
     expect(keys.length).toBeGreaterThan(3);
-    expect(keys.filter((name) => !names.includes(name))).toEqual([]);
-    if (kind === "server") expect(names).toContain("old_alias (JSON)");
+    // The three actions of a server are one choice: the ones not chosen are a radio away.
+    const folded = kind === "server" ? ["forward", "redirect", "serve"] : [];
+    expect(keys.filter((name) => !names.includes(name))).toEqual(folded);
+    if (kind === "server") {
+      for (const name of ["Forward to", "Serve files", "Redirect", "None"]) {
+        expect(within(container).getByRole("radio", { name })).toBeTruthy();
+      }
+      expect(labels).toContain("old_alias (JSON)");
+      expect(labels).toContain("Listen address 1");
+      expect(labels).not.toContain("listen");
+    }
 
     const controls = container.querySelectorAll<HTMLInputElement>("input, select, textarea");
     expect(controls.length).toBeGreaterThan(3);
@@ -294,8 +304,8 @@ test("an_untouched_save_sends_back_what_was_loaded", async () => {
 test("a_list_whose_added_rows_are_left_blank_is_not_saved", async () => {
   const fetch = serve(200, { saved: true });
   const { onsaved } = open({ kind: "server", key: "0:0", file: 0, value: { listen: ":80", ip_allow: [] }, toml: "" });
-  await fireEvent.click(screen.getByRole("button", { name: "Add host" }));
-  await fireEvent.click(screen.getByRole("button", { name: "Add host" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Add host name" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Add host name" }));
   await save();
   await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
   // No `host = []`; the `[]` the file holds stays.
@@ -331,9 +341,7 @@ test("the_groups_of_a_pool_follow_the_layout", () => {
   const { container } = open();
   const groups = [...container.querySelectorAll("details.group")].map((group) => [
     group.querySelector("summary")?.textContent?.trim(),
-    [...group.querySelectorAll(":scope > * > label, :scope > * > legend, :scope > * > button")].map((element) =>
-      element.textContent?.trim().replace(/^Add /, ""),
-    ),
+    [...group.querySelectorAll(":scope > * > .help > p > code")].map((element) => element.textContent),
   ]);
   expect(groups.map(([title]) => title)).toEqual([
     "Health",
@@ -354,4 +362,62 @@ test("the_groups_of_a_pool_follow_the_layout", () => {
     "request_buffers",
     "response_buffers",
   ]);
+});
+
+const SERVER = { kind: "server", key: "0:0", file: 0, toml: "" } as const;
+
+test("a_server_has_one_action_and_picking_another_removes_the_first", async () => {
+  const fetch = serve(200, { saved: true });
+  const { onsaved } = open({ ...SERVER, value: { listen: ":80", forward: "@api" } });
+  expect((screen.getByRole("radio", { name: "Forward to" }) as HTMLInputElement).checked).toBe(true);
+  expect(screen.getByRole("group", { name: "Forward" })).toBeTruthy();
+  expect(screen.queryByRole("group", { name: "Serve" })).toBeNull();
+  expect(screen.queryByRole("group", { name: "Redirect" })).toBeNull();
+
+  await fireEvent.click(screen.getByRole("radio", { name: "Serve files" }));
+  expect(screen.queryByRole("group", { name: "Forward" })).toBeNull();
+  await type(field("Directory"), "/var/www");
+  await save();
+  await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
+  expect(sent(fetch).body.value).toEqual({ listen: ":80", serve: "/var/www" });
+});
+
+/** A radio of the Action choice; the routes of the server have radios of their own. */
+function action(name: string): HTMLInputElement {
+  return within(screen.getByRole("radiogroup", { name: "Action" })).getByRole("radio", { name });
+}
+
+test("a_server_without_action_says_its_routes_decide", async () => {
+  const fetch = serve(200, { saved: true });
+  const { onsaved } = open({ ...SERVER, value: { listen: ":80", match: [{ path: "/a", serve: "." }] } });
+  expect((action("None") as HTMLInputElement).checked).toBe(true);
+  expect(screen.getByText(/under Routes/)).toBeTruthy();
+  await fireEvent.click(action("Redirect"));
+  await type(screen.getAllByLabelText("Target")[0], "/new");
+  await fireEvent.click(action("None"));
+  await save();
+  await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
+  expect(sent(fetch).body.value).toEqual({ listen: ":80", match: [{ path: "/a", serve: "." }] });
+});
+
+test("a_server_holding_several_actions_loses_none_of_them", async () => {
+  const fetch = serve(200, { saved: true });
+  const value = { listen: ":80", forward: "@api", serve: "/var/www" };
+  const { onsaved } = open({ ...SERVER, value });
+  expect(screen.queryByRole("radio", { name: "Forward to" })).toBeNull();
+  expect(screen.getByRole("group", { name: "Forward" })).toBeTruthy();
+  expect(screen.getByRole("group", { name: "Serve" })).toBeTruthy();
+  expect(screen.queryByRole("group", { name: "Redirect" })).toBeNull();
+  await fireEvent.click(screen.getByRole("button", { name: "Add redirect" }));
+  expect(screen.getByRole("group", { name: "Redirect" })).toBeTruthy();
+  await save();
+  await vi.waitFor(() => expect(onsaved).toHaveBeenCalled());
+  expect(JSON.stringify(sent(fetch).body.value)).toBe(JSON.stringify(value));
+});
+
+test("host_and_listen_have_help_of_their_own", () => {
+  const { container } = open({ ...SERVER, value: { listen: ":80" } });
+  expect(container.textContent).not.toContain("one_or_many");
+  expect(container.textContent).toContain("Addresses to listen on");
+  expect(container.textContent).toContain("Host names this server answers to");
 });

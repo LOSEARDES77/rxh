@@ -9,7 +9,16 @@
     value = $bindable(),
     label,
     path,
-  }: { schema: Schema; node: Node; value: unknown; label: string; path: string } = $props();
+    // The server forwards: there is no "None" to pick.
+    required = false,
+  }: {
+    schema: Schema;
+    node: Node;
+    value: unknown;
+    label: string;
+    path: string;
+    required?: boolean;
+  } = $props();
 
   type Mode = "none" | "pool" | "address" | "several" | "advanced";
   const MODES: { key: Mode; text: string }[] = [
@@ -19,6 +28,7 @@
     { key: "several", text: "Several addresses" },
     { key: "advanced", text: "Advanced" },
   ];
+  const modes = untrack(() => (required ? MODES.slice(1) : MODES));
 
   const id = $props.id();
   // The pools of the configuration, given by the tab that draws the editor.
@@ -30,7 +40,7 @@
   const table = others.find((option) => control(schema, option).kind === "table") ?? {};
 
   function modeOf(held: unknown): Mode {
-    if (held === undefined) return "none";
+    if (held === undefined) return required ? "pool" : "none";
     if (typeof held === "string") return held.startsWith("@") ? "pool" : "address";
     const texts = Array.isArray(held) && held.every((item) => typeof item === "string");
     return texts ? "several" : "advanced";
@@ -53,7 +63,7 @@
 </script>
 
 <div class="choices" role="radiogroup" aria-label={label}>
-  {#each MODES as choice (choice.key)}
+  {#each modes as choice (choice.key)}
     <label>
       <input
         type="radio"
@@ -67,18 +77,18 @@
 </div>
 {#key mode}
   {#if mode === "pool"}
-    <SchemaField {schema} node={{ enum: names }} label="pool" {path} bind:value />
+    <SchemaField {schema} node={{ enum: names }} label="Pool" {path} bind:value />
   {:else if mode === "address"}
-    <SchemaField {schema} node={{ type: "string" }} label="address" {path} bind:value />
+    <SchemaField {schema} node={{ type: "string" }} label="Address" {path} bind:value />
   {:else if mode === "several"}
     <SchemaField
       {schema}
       node={{ type: "array", items: { type: "string" } }}
-      label="addresses"
+      label="Addresses"
       {path}
       bind:value
     />
   {:else if mode === "advanced"}
-    <SchemaField {schema} node={advanced} label="{label} settings" {path} required bind:value />
+    <SchemaField {schema} node={advanced} label="Inline pool" {path} required bind:value />
   {/if}
 {/key}

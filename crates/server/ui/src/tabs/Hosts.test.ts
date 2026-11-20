@@ -100,6 +100,13 @@ test("a_refused_delete_is_reported_and_the_list_is_read_again", async () => {
   await fireEvent.click(await screen.findByRole("button", { name: "Delete web" }));
   expect((await screen.findByRole("alert")).textContent).toContain("the file changed");
   expect(fetch.mock.calls.filter(([url]) => url === "config/files").length).toBe(2);
+  // The reads that follow work: they must not take the refusal away.
+  const reads = () => fetch.mock.calls.filter(([url]) => url === "status").length;
+  const before = reads();
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.waitFor(() => expect(reads()).toBeGreaterThan(before));
+  await new Promise((done) => setTimeout(done, 20));
+  expect(screen.getByRole("alert").textContent).toContain("the file changed");
 });
 
 test("the_editor_offers_the_pools_of_the_file_as_targets", async () => {
@@ -107,7 +114,7 @@ test("the_editor_offers_the_pools_of_the_file_as_targets", async () => {
   render(Hosts);
   await fireEvent.click(await screen.findByRole("button", { name: "Edit web" }));
   expect(screen.getByRole("heading", { name: "Server web" })).toBeTruthy();
-  const pool: HTMLSelectElement = screen.getByLabelText("pool");
+  const pool: HTMLSelectElement = screen.getByLabelText("Pool", { selector: "select" });
   expect([...pool.options].map((option) => option.value)).toContain("@api");
   await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(screen.getByRole("button", { name: "New host" })).toBeTruthy();
@@ -135,4 +142,50 @@ test("after_a_conflict_reading_again_keeps_the_editor_only_on_the_same_host", as
   expect(screen.queryByRole("heading", { name: "Server web" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   expect(await screen.findByRole("button", { name: "Edit 127.0.0.1:8443, 127.0.0.1:8444" })).toBeTruthy();
+});
+
+function live(listen: string, name: string | null = null, state = "listening") {
+  return { listen, protocol: "http", name, state };
+}
+
+test("a_server_with_two_listen_addresses_owns_both_listeners", async () => {
+  const two = { ...FILES_SERVER, value: { listen: ["127.0.0.1:8443", "127.0.0.1:8444"], serve: "." } };
+  serve({
+    status: { servers: [live("127.0.0.1:8443"), live("127.0.0.1:8444", null, "starting")] },
+    "config/files": files([two]),
+  });
+  render(Hosts);
+  await screen.findByRole("button", { name: "Edit 127.0.0.1:8443, 127.0.0.1:8444" });
+  await vi.waitFor(() => expect(row("127.0.0.1:8443, 127.0.0.1:8444")).toContain("listening, starting"));
+  expect(screen.queryByText("runtime")).toBeNull();
+  expect(screen.getAllByRole("row")).toHaveLength(2);
+});
+
+test("a_named_server_owns_the_listeners_that_carry_its_name", async () => {
+  // Port 0 and a placeholder: the addresses of the file match nothing.
+  const named = { ...WEB, value: { name: "web", listen: ["127.0.0.1:0", "{env.LISTEN}"], forward: "@api" } };
+  serve({
+    status: { servers: [live("127.0.0.1:40001", "web"), live("127.0.0.1:40002", "web, other"), live("127.0.0.1:9", "docker")] },
+    "config/files": files([named]),
+  });
+  render(Hosts);
+  await screen.findByRole("button", { name: "Edit web" });
+  await vi.waitFor(() => expect(row("127.0.0.1:0, {env.LISTEN}")).toContain("listening"));
+  expect(screen.getAllByRole("row")).toHaveLength(3);
+  expect(row("docker")).toContain("runtime");
+});
+
+test("an_unnamed_server_on_port_0_is_unknown_and_its_listener_is_not_called_runtime", async () => {
+  const vague = { ...FILES_SERVER, value: { listen: "127.0.0.1:0", serve: "." } };
+  serve({
+    status: { servers: [live("127.0.0.1:40001"), live("127.0.0.1:9", "docker")] },
+    "config/files": files([vague]),
+  });
+  render(Hosts);
+  await screen.findByRole("button", { name: "Edit 127.0.0.1:0" });
+  await vi.waitFor(() => expect(row("127.0.0.1:40001")).toContain("not matched"));
+  expect(row("127.0.0.1:0")).toContain("unknown");
+  expect(row("127.0.0.1:40001")).not.toContain("runtime");
+  // A listener with a name no server of the files has is a runtime one for sure.
+  expect(row("docker")).toContain("runtime");
 });

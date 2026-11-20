@@ -1,14 +1,11 @@
 <script lang="ts">
-  import { untrack, type Component } from "svelte";
-  import Forward from "./controls/Forward.svelte";
-  import Redirect from "./controls/Redirect.svelte";
-  import Serve from "./controls/Serve.svelte";
-  import Tls from "./controls/Tls.svelte";
+  import { untrack } from "svelte";
+  import { custom } from "./controls";
+  import { helpOf, human, itemLabel, lower } from "./layout";
   import SchemaField from "./SchemaField.svelte";
   import {
     blank,
     control,
-    definition,
     isTable,
     pickChoice,
     resolve,
@@ -24,6 +21,8 @@
     value = $bindable(),
     label,
     help = undefined,
+    // The key as the file writes it, shown beside a label made for people.
+    name = undefined,
     path,
     // The value cannot be unset (an item of a list, an entry of a map): a
     // table is drawn without its "Add" and "Remove" buttons.
@@ -34,6 +33,7 @@
     value: unknown;
     label: string;
     help?: string;
+    name?: string;
     path: string;
     required?: boolean;
   } = $props();
@@ -66,28 +66,7 @@
     }
   }
 
-  type Custom = Component<
-    { schema: Schema; node: Node; value: unknown; label: string; path: string },
-    Record<string, never>,
-    "value"
-  >;
-  /** The keys drawn by a control of their own, with the definition it is made for. */
-  const CONTROLS: Record<string, [string, Custom]> = {
-    forward: ["Forward", Forward],
-    tls: ["Tls", Tls],
-    serve: ["FileServer", Serve],
-    redirect: ["Redirect", Redirect],
-  };
-  // The definition is checked too: `tls` of a pool is another table.
-  const Custom = untrack(() => {
-    const [name, component] = CONTROLS[path.split(".").pop() ?? ""] ?? [];
-    return name !== undefined && name === definition(node) ? component : undefined;
-  });
-
-  // The keys with a control of their own are described on their definition.
-  const described = $derived(
-    Custom && resolve(schema, { $ref: `#/definitions/${definition(node)}` }).description,
-  );
+  const Custom = untrack(() => custom(path, node));
 
   /** The value of an alternative that is one constant (`"auto"`). */
   function constant(option: Node): string | undefined {
@@ -115,16 +94,17 @@
 
   /** The first paragraph of the description, then the rest: examples are code. */
   const paragraphs = $derived(
-    (help ?? described ?? "")
+    (help ?? "")
       .split("\n\n")
       .filter((text) => text.trim() !== "")
       .map((text) =>
         text.startsWith("```")
           ? { code: true, text: text.replace(/^```\w*\n|\n?```$/g, "") }
-          : { code: false, text: text.replace(/\n/g, " ") },
+          : { code: false, text: text.replace(/\n/g, " ").replace(/`/g, "") },
       ),
   );
-  const helpId = $derived(paragraphs.length > 0 ? `${id}-help` : undefined);
+  const helpId = $derived(paragraphs.length > 0 || name ? `${id}-help` : undefined);
+  const one = $derived(itemLabel(label));
 
   function table(): Record<string, unknown> {
     return isTable(value) ? value : {};
@@ -205,12 +185,15 @@
 </script>
 
 {#snippet hint()}
-  {#if paragraphs.length > 0}
+  {#if helpId}
     <div class="help">
-      <p id={helpId}>{paragraphs[0].text}</p>
+      <p id={helpId}>
+        {#if name}<code>{name}</code>{/if}
+        {paragraphs[0]?.text}
+      </p>
       {#if paragraphs.length > 1}
         <details>
-          <summary>More about {label}</summary>
+          <summary>More about {lower(label)}</summary>
           {#each paragraphs.slice(1) as part}
             {#if part.code}<pre>{part.text}</pre>{:else}<p>{part.text}</p>{/if}
           {/each}
@@ -224,7 +207,7 @@
   <fieldset>
     <legend>{label}</legend>
     {@render hint()}
-    <Custom {schema} {node} {label} {path} bind:value />
+    <Custom {schema} {node} {label} {path} {required} bind:value />
   </fieldset>
 {:else if shape.kind === "text" && multiline}
   <div class="field">
@@ -325,14 +308,14 @@
         <SchemaField
           {schema}
           node={shape.item}
-          label="{label} {index + 1}"
+          label="{one} {index + 1}"
           path="{path}.{index}"
           required
           bind:value={() => item, (next) => setItem(index, next)}
         />
         <button
           type="button"
-          aria-label="Remove {label} {index + 1}"
+          aria-label="Remove {lower(one)} {index + 1}"
           onclick={() => removeItem(index)}
         >
           Remove
@@ -343,14 +326,14 @@
       type="button"
       onclick={() => (value = [...items(), blank(schema, shape.item)])}
     >
-      Add {label}
+      Add {lower(one)}
     </button>
   </fieldset>
 {:else if shape.kind === "table"}
   {#if value === undefined && !required}
     <div class="field">
       <button type="button" aria-describedby={helpId} onclick={() => (value = {})}>
-        Add {label}
+        Add {lower(label)}
       </button>
       {@render hint()}
     </div>
@@ -362,8 +345,9 @@
         <SchemaField
           {schema}
           node={field}
-          label={key}
-          help={resolve(schema, field).description}
+          label={human(key)}
+          name={key}
+          help={helpOf(schema, key, field)}
           path="{path}.{key}"
           bind:value={() => table()[key], (next) => setKey(key, next)}
         />
@@ -379,7 +363,7 @@
         />
       {/each}
       {#if !required}
-        <button type="button" onclick={() => (value = undefined)}>Remove {label}</button>
+        <button type="button" onclick={() => (value = undefined)}>Remove {lower(label)}</button>
       {/if}
     </fieldset>
   {/if}
@@ -475,8 +459,15 @@
 
   label,
   legend {
-    font-family: ui-monospace, monospace;
     overflow-wrap: anywhere;
+  }
+
+  .help code {
+    margin-right: 0.35rem;
+    padding: 0 0.3rem;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 0.8rem;
   }
 
   input,

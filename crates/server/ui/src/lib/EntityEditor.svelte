@@ -1,13 +1,13 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { ApiError, api } from "./api";
-  import { arrange } from "./layout";
+  import Action, { ACTIONS } from "./controls/Action.svelte";
+  import { arrange, helpOf, human } from "./layout";
   import SchemaField from "./SchemaField.svelte";
   import {
     control,
     entitySchema,
     prune,
-    resolve,
     type Entity,
     type Files,
     type Kind,
@@ -195,14 +195,20 @@
 </script>
 
 {#snippet draw(fieldKey: string)}
-  <SchemaField
-    {schema}
-    node={fields[fieldKey] ?? {}}
-    label={fieldKey}
-    help={fields[fieldKey] && resolve(schema, fields[fieldKey]).description}
-    path={fieldKey}
-    bind:value={() => draft[fieldKey], (next) => setKey(fieldKey, next)}
-  />
+  {#if kind === "server" && ACTIONS.includes(fieldKey)}
+    <!-- A server does one of the three: they are drawn together, once. -->
+    {#if fieldKey === ACTIONS[0]}<Action {schema} {fields} bind:value={draft} />{/if}
+  {:else}
+    <SchemaField
+      {schema}
+      node={fields[fieldKey] ?? {}}
+      label={fieldKey in fields ? human(fieldKey) : fieldKey}
+      name={fieldKey in fields ? fieldKey : undefined}
+      help={fields[fieldKey] && helpOf(schema, fieldKey, fields[fieldKey])}
+      path={fieldKey}
+      bind:value={() => draft[fieldKey], (next) => setKey(fieldKey, next)}
+    />
+  {/if}
 {/snippet}
 
 <section class="editor" aria-labelledby="{id}-title">

@@ -9,8 +9,8 @@ test("the_three_radios_are_absent_auto_and_a_table", async () => {
   expect(value()).toBe("auto");
   await click("radio", "Certificate files");
   expect(value()).toEqual({});
-  await type("cert", "/etc/cert.pem");
-  await type("key", "/etc/key.pem");
+  await type("Cert", "/etc/cert.pem");
+  await type("Key", "/etc/key.pem");
   expect(value()).toEqual({ cert: "/etc/cert.pem", key: "/etc/key.pem" });
   await click("radio", "Off");
   expect(value()).toBeUndefined();
@@ -32,7 +32,7 @@ test("every_shape_is_shown_under_its_radio_and_left_as_it_was", () => {
 
 test("a_placeholder_is_shown_as_written_and_can_be_changed", async () => {
   const value = draw("tls", "{env.TLS}");
-  expect((screen.getByLabelText("tls as written") as HTMLInputElement).value).toBe("{env.TLS}");
-  await type("tls as written", "{env.MODE}");
+  expect((screen.getByLabelText("TLS as written") as HTMLInputElement).value).toBe("{env.TLS}");
+  await type("TLS as written", "{env.MODE}");
   expect(value()).toBe("{env.MODE}");
 });

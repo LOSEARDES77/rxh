@@ -47,12 +47,12 @@ test("clearing_an_optional_field_removes_the_key", async () => {
   };
   const field = draw(node, { name: "web", port: 8080 }, "table");
   expect(screen.getByRole("group", { name: "table" })).toBeTruthy();
-  await type(screen.getByLabelText("name"), "");
+  await type(screen.getByLabelText("Name"), "");
   expect(field.value()).toEqual({ port: 8080 });
   expect(Object.keys(field.value() as object)).toEqual(["port"]);
-  await type(screen.getByLabelText("port"), "");
+  await type(screen.getByLabelText("Port"), "");
   expect(field.value()).toEqual({});
-  await type(screen.getByLabelText("port"), "9090");
+  await type(screen.getByLabelText("Port"), "9090");
   expect(field.value()).toEqual({ port: 9090 });
 });
 
@@ -91,7 +91,7 @@ test("text_of_the_configuration_is_never_markup", () => {
   const value = { name: attack, policy: attack, users: { [attack]: attack }, hosts: [attack], other: attack };
   const { container } = draw(node, value, attack, attack);
   expect(container.querySelector("img")).toBeNull();
-  expect((screen.getByLabelText("name") as HTMLInputElement).value).toBe(attack);
+  expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe(attack);
   expect(container.textContent).toContain(attack);
 });
 
@@ -142,7 +142,7 @@ test("a_choice_switches_between_its_alternatives", async () => {
   expect(field.value()).toBe("auto");
   await fireEvent.change(written, { target: { value: "1" } });
   expect(field.value()).toEqual({});
-  await type(screen.getByLabelText("cert"), "/etc/cert.pem");
+  await type(screen.getByLabelText("Cert"), "/etc/cert.pem");
   expect(field.value()).toEqual({ cert: "/etc/cert.pem" });
   await fireEvent.change(written, { target: { value: "-1" } });
   expect(field.value()).toBeUndefined();
@@ -151,7 +151,7 @@ test("a_choice_switches_between_its_alternatives", async () => {
 test("a_choice_opens_on_the_alternative_of_its_value", () => {
   draw(server.forward, [{ pool: "v1", weight: 90 }], "field");
   expect((screen.getByLabelText("Written as") as HTMLSelectElement).value).toBe("2");
-  expect((screen.getByLabelText("pool") as HTMLInputElement).value).toBe("v1");
+  expect((screen.getByLabelText("Pool") as HTMLInputElement).value).toBe("v1");
 });
 
 test("an_optional_table_is_added_and_removed", async () => {
@@ -160,7 +160,7 @@ test("an_optional_table_is_added_and_removed", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Add health" }));
   // An empty table is a value: `[upstream.api.health]` turns the checks on.
   expect(field.value()).toEqual({});
-  await type(screen.getByLabelText("interval"), "10s");
+  await type(screen.getByLabelText("Interval"), "10s");
   expect(field.value()).toEqual({ interval: "10s" });
   await fireEvent.click(screen.getByRole("button", { name: "Remove health" }));
   expect(field.value()).toBeUndefined();
@@ -169,7 +169,7 @@ test("an_optional_table_is_added_and_removed", async () => {
 test("a_table_shows_and_keeps_the_keys_the_schema_does_not_know", async () => {
   const field = draw(pool.health, { uri: "/up", health_uri: "/old" }, "health");
   expect((screen.getByLabelText("health_uri (JSON)") as HTMLTextAreaElement).value).toBe('"/old"');
-  await type(screen.getByLabelText("uri"), "/ready");
+  await type(screen.getByLabelText("URI"), "/ready");
   expect(field.value()).toEqual({ uri: "/ready", health_uri: "/old" });
 });
 
@@ -215,12 +215,12 @@ test("help_is_tied_to_its_input", () => {
 });
 
 test("removing_a_list_item_redraws_the_ones_after_it_from_their_values", async () => {
-  const field = draw(pool.backends, ["127.0.0.1:1", { address: "127.0.0.1:2", weight: 3 }], "backends");
-  await fireEvent.click(screen.getByRole("button", { name: "Remove backends 1" }));
+  const field = draw(pool.backends, ["127.0.0.1:1", { address: "127.0.0.1:2", weight: 3 }], "field");
+  await fireEvent.click(screen.getByRole("button", { name: "Remove field 1" }));
   expect(field.value()).toEqual([{ address: "127.0.0.1:2", weight: 3 }]);
   // The first item is now the table, not the text it was.
   expect((screen.getByLabelText("Written as") as HTMLSelectElement).value).toBe("1");
-  expect((screen.getByLabelText("address") as HTMLInputElement).value).toBe("127.0.0.1:2");
+  expect((screen.getByLabelText("Address") as HTMLInputElement).value).toBe("127.0.0.1:2");
 });
 
 test("a_value_that_is_not_the_constant_of_its_alternative_is_edited_as_json", () => {
@@ -248,5 +248,27 @@ test("the_keys_with_a_control_of_their_own_are_not_drawn_as_a_choice", () => {
 test("the_tls_table_of_a_pool_keeps_the_generic_control", () => {
   draw(pool.tls, { server_name: "db.internal" }, "tls");
   expect(screen.queryByRole("radio")).toBeNull();
-  expect((screen.getByLabelText("server_name") as HTMLInputElement).value).toBe("db.internal");
+  expect((screen.getByLabelText("Server name") as HTMLInputElement).value).toBe("db.internal");
+});
+
+test("the_fields_of_a_table_are_labelled_for_people_and_show_their_key", () => {
+  const { container } = draw(pool.health, { interval: "10s" }, "health");
+  const input = screen.getByLabelText("Interval");
+  const help = document.getElementById(input.getAttribute("aria-describedby") ?? "");
+  expect(help?.querySelector("code")?.textContent).toBe("interval");
+  expect([...container.querySelectorAll("label")].map((label) => label.textContent)).not.toContain("interval");
+});
+
+test("list_items_are_named_in_the_singular_where_it_is_known", async () => {
+  draw(server.listen, ":443", "Listen");
+  expect((screen.getByLabelText("Listen address 1") as HTMLInputElement).value).toBe(":443");
+  expect(screen.getByRole("button", { name: "Add listen address" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Remove listen address 1" })).toBeTruthy();
+});
+
+test("help_is_shown_without_markdown_backticks", () => {
+  draw({ type: "string" }, undefined, "name", "Sent as `Host`, like `example.org`.");
+  const input = screen.getByLabelText("name");
+  const help = document.getElementById(input.getAttribute("aria-describedby") ?? "");
+  expect(help?.textContent?.trim()).toBe("Sent as Host, like example.org.");
 });
