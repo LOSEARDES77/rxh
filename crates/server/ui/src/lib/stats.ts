@@ -127,3 +127,14 @@ export function window(samples: Sample[], seconds: 300 | 900 | 3600): Sample[] {
   const from = samples[samples.length - 1].time - seconds;
   return samples.filter((sample) => sample.time >= from);
 }
+
+/**
+ * `history` followed by the samples of `update` that are newer than its own,
+ * cut to the last hour: what the daemon itself keeps.
+ */
+export function append(history: History | undefined, update: History): History {
+  const kept = history?.samples ?? [];
+  const newest = kept.length ? kept[kept.length - 1].time : -Infinity;
+  const samples = [...kept, ...update.samples.filter((sample) => sample.time > newest)];
+  return { ...update, samples: window(samples, 3600) };
+}

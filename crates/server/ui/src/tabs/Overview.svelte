@@ -3,7 +3,7 @@
   import { api } from "../lib/api";
   import Chart from "../lib/Chart.svelte";
   import Sparkline from "../lib/Sparkline.svelte";
-  import { last, quantile, rate, window, type History, type Point, type Sample } from "../lib/stats";
+  import { append, last, quantile, rate, window, type History, type Point, type Sample } from "../lib/stats";
 
   type Certificate = { listen: string; subject: string; names: string[]; days_left: number };
   type Range = 300 | 900 | 3600;
@@ -137,10 +137,14 @@
 
   async function refresh() {
     try {
-      [history, certificates] = await Promise.all([
-        api<History>("stats/history"),
+      // Everything on the first load, then only what is newer than the page has.
+      const since = history?.samples.at(-1)?.time;
+      const [update, served] = await Promise.all([
+        api<History>(since === undefined ? "stats/history" : `stats/history?since=${since}`),
         api<Certificate[]>("certificates"),
       ]);
+      history = append(history, update);
+      certificates = served;
       failure = "";
     } catch (err) {
       failure = err instanceof Error ? err.message : String(err);

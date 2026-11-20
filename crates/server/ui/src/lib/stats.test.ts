@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { last, quantile, rate, window, type Sample, type ServerCounters } from "./stats";
+import { append, last, quantile, rate, window, type History, type Sample, type ServerCounters } from "./stats";
 
 const BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
 
@@ -120,4 +120,26 @@ test("window_cuts_by_time", () => {
 
 test("last_is_the_newest_value", () => {
   expect(last([{ time: 1, value: 3 }, { time: 2, value: 4 }])).toBe(4);
+});
+
+function history(times: number[]): History {
+  return { interval_seconds: 5, buckets: BUCKETS, samples: times.map((time) => sample(time)) };
+}
+
+function times(history: History): number[] {
+  return history.samples.map((s) => s.time);
+}
+
+test("append_adds_the_newer_samples_after_the_ones_kept", () => {
+  expect(times(append(undefined, history([0, 5])))).toEqual([0, 5]);
+  expect(times(append(history([0, 5]), history([10, 15])))).toEqual([0, 5, 10, 15]);
+  expect(times(append(history([0, 5]), history([])))).toEqual([0, 5]);
+  // Two answers to the same question, or a daemon asked without `since`.
+  expect(times(append(history([0, 5, 10]), history([5, 10, 15])))).toEqual([0, 5, 10, 15]);
+});
+
+test("append_keeps_one_hour", () => {
+  const kept = history([0, 5, 10, 3595]);
+  expect(times(append(kept, history([3600, 3605])))).toEqual([5, 10, 3595, 3600, 3605]);
+  expect(times(append(kept, history([9000])))).toEqual([9000]);
 });

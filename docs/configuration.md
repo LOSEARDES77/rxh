@@ -623,6 +623,9 @@ restart and on a binary upgrade. It is always on when the admin API is.
 
 ```sh
 curl -s localhost:2019/stats/history | jq '.samples | length'
+# Only the samples taken after a time (unix seconds): what the page asks
+# every 5 seconds, with the time of the newest sample it has.
+curl -s "localhost:2019/stats/history?since=$(($(date +%s) - 60))" | jq '.samples | length'
 ```
 
 `GET /stats/history` answers `200` with `interval_seconds` (5), `buckets`
@@ -632,7 +635,10 @@ the responses by class `1xx` to `5xx`; `duration_count`, `duration_sum`,
 `duration_buckets`; `connections` of layer 4) and `pools` (per pool:
 `requests`, `failures`, `responses`, `server_errors`, `response_seconds`,
 and the gauges `active`, `healthy`, `backends`). Counters are cumulative:
-the page draws the difference between two samples.
+the page draws the difference between two samples. With `?since=<unix
+seconds>` only the samples with a later `time` are sent (`interval_seconds`
+and `buckets` are always there); a `since` that is not a whole number is
+`400`. The answer is JSON on one line.
 
 - Latency percentiles are interpolated inside the histogram buckets, whose
   bounds are 5, 10, 25, 50, 100, 250 and 500 ms, 1, 2.5, 5 and 10 s. Requests
@@ -669,7 +675,7 @@ the token like every other route, and answer `{"error": "..."}` on failure.
 | Method | Path | Body | Success | Failure |
 |---|---|---|---|---|
 | `GET` | `/schema` | | `200`: the JSON schema `rxh schema` prints | |
-| `GET` | `/stats/history` | | `200`, see [Statistics history](#statistics-history) | |
+| `GET` | `/stats/history[?since=...]` | | `200`, see [Statistics history](#statistics-history) | `400` `since` is not a number |
 | `GET` | `/config/files` | | `200`: `editable`, `files`, `entities` | `500` a file cannot be read or parsed (the answer gives the file, line and column, not its text) |
 | `PUT` | `/config/files/{index}` | `{"text", "revision"}` | `200` `{"saved": true}` | `400` not valid TOML, not a valid configuration, reload refused; `404` no such file; `409` |
 | `POST` | `/config/entities/{kind}` | `{"value"}` or `{"toml"}`, `"key"` (name of a pool or section), `"file"` (index, default 0) | `201` `{"key": "..."}` | `400` both or neither of `value` and `toml`, name missing or taken, not valid; `404` unknown kind or file; `409` |

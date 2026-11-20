@@ -354,14 +354,30 @@ async fn handle(
             );
             response
         }
-        (&Method::GET, ["stats", "history"]) => json_response(
-            StatusCode::OK,
-            &json!({
-                "interval_seconds": crate::history::INTERVAL.as_secs(),
-                "buckets": crate::metrics::BUCKETS,
-                "samples": crate::history::global().samples(),
-            }),
-        ),
+        (&Method::GET, ["stats", "history"]) => {
+            // `since=<unix seconds>`: only the samples taken after it.
+            let since: Option<Result<u64, _>> = request.uri().query().and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("since="))
+                    .map(str::parse)
+            });
+            match since.transpose() {
+                // Polled every few seconds by the page: no indentation.
+                Ok(since) => json_bytes(
+                    StatusCode::OK,
+                    serde_json::to_vec(&json!({
+                        "interval_seconds": crate::history::INTERVAL.as_secs(),
+                        "buckets": crate::metrics::BUCKETS,
+                        "samples": crate::history::global().samples(since),
+                    })),
+                ),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "since must be a unix time in seconds",
+                ),
+            }
+        }
         (&Method::GET, ["dashboard"]) if is_dashboard_page => {
             dashboard(UI_INDEX, "text/html; charset=utf-8")
         }
@@ -798,7 +814,11 @@ pub(crate) async fn read_body(
 }
 
 pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec_pretty(value).unwrap_or_else(|err| {
+    json_bytes(status, serde_json::to_vec_pretty(value))
+}
+
+fn json_bytes(status: StatusCode, body: serde_json::Result<Vec<u8>>) -> Response<Full<Bytes>> {
+    let body = body.unwrap_or_else(|err| {
         format!("{{\"error\":\"serialization failed: {err}\"}}").into_bytes()
     });
     let mut response = Response::new(Full::new(Bytes::from(body)));

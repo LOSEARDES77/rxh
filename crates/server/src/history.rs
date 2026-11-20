@@ -73,9 +73,15 @@ impl History {
         samples.push_back(sample);
     }
 
-    /// Copy of the samples, oldest first.
-    pub(crate) fn samples(&self) -> Vec<Sample> {
-        lock(&self.samples).iter().cloned().collect()
+    /// Copy of the samples taken after the unix time `since` (all of them
+    /// without it), oldest first.
+    pub(crate) fn samples(&self, since: Option<u64>) -> Vec<Sample> {
+        let samples = lock(&self.samples);
+        samples
+            .iter()
+            .filter(|sample| since.is_none_or(|since| sample.time > since))
+            .cloned()
+            .collect()
     }
 
     /// Samples the pools of `state` from now on. The first call takes a
@@ -173,10 +179,18 @@ mod tests {
         for time in 0..725 {
             history.push(empty_sample(time));
         }
-        let samples = history.samples();
+        let samples = history.samples(None);
         assert_eq!(samples.len(), 720);
         assert_eq!(samples[0].time, 5);
         assert_eq!(samples[719].time, 724);
+
+        let times = |since: u64| -> Vec<u64> {
+            let samples = history.samples(Some(since));
+            samples.iter().map(|sample| sample.time).collect()
+        };
+        assert_eq!(times(721), [722, 723, 724]);
+        assert_eq!(times(724), [] as [u64; 0]);
+        assert_eq!(times(0).len(), 720);
     }
 
     #[test]
@@ -219,7 +233,7 @@ mod tests {
         let history: &'static History = Box::leak(Box::default());
         history.start(&state);
         history.start(&state);
-        assert_eq!(history.samples().len(), 1);
+        assert_eq!(history.samples(None).len(), 1);
     }
 
     #[test]
@@ -230,7 +244,7 @@ mod tests {
         *lock(&history.source) = Arc::downgrade(&state);
         drop(state);
         history.tick();
-        let samples = history.samples();
+        let samples = history.samples(None);
         assert_eq!(samples.len(), 1);
         assert!(samples[0].pools.is_empty());
         assert_eq!(samples[0].servers["history-dead-source"].status[1], 1);

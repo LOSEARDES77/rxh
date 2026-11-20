@@ -38,12 +38,22 @@ const HISTORY: History = {
   samples: [sample(1000, 0, 0, 0), sample(1005, 45, 5, 3)],
 };
 
-function serve() {
-  const fetch = vi.fn(async (url: string) =>
-    Response.json(url === "stats/history" ? HISTORY : [{ listen: "127.0.0.1:443", subject: "CN=a", names: ["example.org"], days_left: 12 }]),
-  );
+/** `later` is what the daemon has sampled after the first answer. */
+function serve(later: Sample[] = []) {
+  const fetch = vi.fn(async (url: string) => {
+    if (url === "stats/history") return Response.json(HISTORY);
+    if (url.startsWith("stats/history?since=")) {
+      const since = Number(url.split("=")[1]);
+      return Response.json({ ...HISTORY, samples: later.filter((s) => s.time > since) });
+    }
+    return Response.json([{ listen: "127.0.0.1:443", subject: "CN=a", names: ["example.org"], days_left: 12 }]);
+  });
   vi.stubGlobal("fetch", fetch);
   return fetch;
+}
+
+function asked(fetch: ReturnType<typeof serve>): string[] {
+  return fetch.mock.calls.map(([url]) => url).filter((url) => url.startsWith("stats/"));
 }
 
 afterEach(() => {
@@ -85,4 +95,35 @@ test("no_requests_while_the_tab_is_hidden", async () => {
   expect(fetch).toHaveBeenCalledTimes(4);
   await vi.advanceTimersByTimeAsync(5_000);
   expect(fetch).toHaveBeenCalledTimes(6);
+});
+
+test("later_polls_ask_for_the_new_samples_and_append_them", async () => {
+  vi.useFakeTimers();
+  const later = [sample(1010, 145, 5, 3)];
+  const fetch = serve(later);
+  render(Overview);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(asked(fetch)).toEqual(["stats/history"]);
+  expect(value("Requests per second")).toBe("10.0");
+
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(asked(fetch)).toEqual(["stats/history", "stats/history?since=1005"]);
+  // 100 more requests in 5 seconds, counted from the sample the page kept.
+  expect(value("Requests per second")).toBe("20.0");
+  // Three samples give two rate points: a trend is drawn.
+  expect(screen.getByText("Pool api").parentElement?.querySelector("svg")).toBeTruthy();
+
+  // Nothing new: what the page has stays.
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(asked(fetch)[2]).toBe("stats/history?since=1010");
+  expect(value("Requests per second")).toBe("20.0");
+
+  // More than an hour later the old samples are gone.
+  later.push(sample(1010 + 7200, 145, 5, 3), sample(1015 + 7200, 195, 5, 3));
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(asked(fetch)[3]).toBe("stats/history?since=1010");
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(asked(fetch)[4]).toBe(`stats/history?since=${1015 + 7200}`);
+  expect(value("Requests per second")).toBe("10.0");
+  expect(screen.getByText("Pool api").parentElement?.querySelector("svg")).toBeNull();
 });

@@ -56,6 +56,47 @@ async fn history_grows_and_counts_requests() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    // `since` leaves out what the page already has.
+    let (_, all) = get(admin, "/stats/history").await;
+    let times = |history: &Value| -> Vec<u64> {
+        let samples = history["samples"].as_array().expect("samples");
+        samples
+            .iter()
+            .map(|sample| sample["time"].as_u64().expect("time"))
+            .collect()
+    };
+    let all_times = times(&all);
+    assert!(all_times.len() >= 2, "{all_times:?}");
+    let (first, newest) = (all_times[0], all_times[all_times.len() - 1]);
+    let (status, later) = get(admin, &format!("/stats/history?since={first}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(later["interval_seconds"], 5);
+    assert_eq!(later["buckets"], all["buckets"]);
+    let later_times = times(&later);
+    assert!(later_times.len() < all_times.len(), "{later_times:?}");
+    assert!(later_times.contains(&newest), "{later_times:?}");
+    assert!(later_times.iter().all(|time| *time > first));
+    let (status, none) = get(admin, &format!("/stats/history?since={}", newest + 60)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(none["samples"], serde_json::json!([]));
+    assert_eq!(none["buckets"], all["buckets"]);
+
+    for since in ["soon", "", "-1", "1.5"] {
+        let uri = format!("/stats/history?since={since}");
+        let (status, json) = get(admin, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(
+            json["error"], "since must be a unix time in seconds",
+            "{uri}"
+        );
+    }
+
+    // The page asks every 5 seconds: no indentation.
+    let (status, _, body) = util::get(admin, "/stats/history").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains(&b'\n'), "one line");
+    assert!(!body.windows(2).any(|pair| pair == b": "), "no padding");
+
     daemon.abort();
 }
 

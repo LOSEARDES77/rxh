@@ -55,7 +55,8 @@ Changed.
   and ask for it before reading any data. `/dashboard/` redirects to
   `/dashboard`. No certificate upload and no accounts.
 - Admin routes behind the page: `GET /schema`, `GET /stats/history` (one
-  sample every 5 seconds, 720 kept, in memory), `GET /config/files`,
+  sample every 5 seconds, 720 kept, in memory; `?since=<unix seconds>`
+  sends only the newer ones, which is what the page polls), `GET /config/files`,
   `PUT /config/files/{index}`, `POST /config/entities/{kind}`, and `PUT`
   and `DELETE /config/entities/{kind}/{key}`. Secrets are shown as `***`
   and a `***` sent back keeps the stored value.
