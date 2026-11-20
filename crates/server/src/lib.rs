@@ -14,6 +14,11 @@ mod dns01;
 mod docker;
 mod dynamic;
 pub mod edit;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the admin routes of the next tasks")
+)]
+mod entity;
 mod error;
 mod files;
 #[cfg(feature = "fuzzing")]
