@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { stopped } from "../lib/api";
+import { setToken, stopped } from "../lib/api";
 import Settings from "./Settings.svelte";
 import { serve, writes } from "./serve";
 
@@ -275,4 +275,14 @@ test("reload_keeps_the_typed_text_and_moves_the_untouched_files", async () => {
   expect(first.value).toBe("typed");
   // Its file did not change: nothing to warn about.
   expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("the_files_are_read_again_once_a_token_is_given", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "token" }, { status: 401 })));
+  render(Settings);
+  await screen.findByRole("alert");
+  serve({ "config/files": FILES });
+  setToken("0123456789abcdef");
+  expect(await screen.findByRole("button", { name: "Edit Access log" })).toBeTruthy();
+  sessionStorage.clear();
 });

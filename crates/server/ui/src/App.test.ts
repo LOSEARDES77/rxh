@@ -33,7 +33,16 @@ test("the_token_dialog_stays_open_until_a_token_is_given", async () => {
 
 test("once_stopped_the_page_says_so_and_stops_asking", async () => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
-  const fetch = vi.fn(async () => Response.json({ version: "1", uptime_seconds: 1, config_path: null }));
+  // The overview tab reads the history too: an answer of another shape throws in it.
+  const fetch = vi.fn(async (url: string) =>
+    Response.json(
+      url === "stats/history"
+        ? { interval_seconds: 5, buckets: [], samples: [] }
+        : url === "certificates"
+          ? []
+          : { version: "1", uptime_seconds: 1, config_path: null },
+    ),
+  );
   vi.stubGlobal("fetch", fetch);
   const { getByRole, queryByRole } = render(App);
   await waitFor(() => expect(fetch).toHaveBeenCalled());

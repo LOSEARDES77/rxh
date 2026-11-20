@@ -24,10 +24,21 @@ export const needsToken: Readable<boolean> = readonly(tokenWanted);
  */
 export const stopped = writable(false);
 
+const tokensGiven = writable(0);
+
 /** Keeps the token for this browser tab and sends it from now on. */
 export function setToken(token: string): void {
   sessionStorage.setItem(TOKEN_KEY, token);
   tokenWanted.set(false);
+  tokensGiven.update((count) => count + 1);
+}
+
+/**
+ * Calls `load` now, and again each time a token is given: what a tab reads
+ * once was refused without it. Returns what stops it, for `onMount`.
+ */
+export function loadWithToken(load: () => void): () => void {
+  return tokensGiven.subscribe(() => load());
 }
 
 /**

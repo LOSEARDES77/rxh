@@ -80,6 +80,8 @@ code {
 }
 
 .toolbar select {
+  /* A long path must not make the page wider than a phone. */
+  max-width: 100%;
   padding: 0.3rem 0.45rem;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -123,6 +125,8 @@ code {
 }
 
 .scroll {
+  /* Holds the visually hidden headings of its table: placed against the page, they widen it. */
+  position: relative;
   overflow-x: auto;
 }
 

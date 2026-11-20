@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ApiError, api, stopped } from "../lib/api";
+  import { ApiError, api, loadWithToken, stopped } from "../lib/api";
   import EntityEditor from "../lib/EntityEditor.svelte";
   import type { Entity, Files, Schema } from "../lib/schema";
 
@@ -165,9 +165,7 @@
     load();
   }
 
-  onMount(() => {
-    load();
-  });
+  onMount(() => loadWithToken(load));
 </script>
 
 {#if failure}
@@ -349,6 +347,9 @@
 
   .file {
     display: grid;
+    /* Not wider than the page, however long the path above the text is. */
+    grid-template-columns: minmax(0, 1fr);
+    overflow-wrap: anywhere;
     gap: 0.3rem;
     margin-bottom: 1rem;
   }

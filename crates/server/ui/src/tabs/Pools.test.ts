@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
+import { setToken } from "../lib/api";
 import Pools from "./Pools.svelte";
 import { serve, writes } from "./serve";
 
@@ -126,4 +127,16 @@ test("a_new_pool_goes_to_the_chosen_file", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
   await vi.waitFor(() => expect(writes(fetch)).toHaveLength(1));
   expect(writes(fetch)[0]).toEqual({ url: "config/entities/upstream", method: "POST", body: { value: {}, key: "web", file: 1 } });
+});
+
+test("the_files_are_read_again_once_a_token_is_given", async () => {
+  // The first reads are made without the token and refused.
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "token" }, { status: 401 })));
+  render(Pools);
+  await screen.findAllByRole("alert");
+  serve({ pools: POOLS, "config/files": FILES });
+  setToken("0123456789abcdef");
+  // Without the files the pool would read "runtime", with no way to edit it.
+  expect(await screen.findByRole("button", { name: "Edit api" })).toBeTruthy();
+  sessionStorage.clear();
 });

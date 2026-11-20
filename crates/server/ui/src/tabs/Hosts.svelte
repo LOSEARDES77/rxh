@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, setContext } from "svelte";
-  import { api } from "../lib/api";
+  import { api, loadWithToken } from "../lib/api";
   import EntityEditor from "../lib/EntityEditor.svelte";
   import { poll } from "../lib/poll";
   import { isTable, type Entity, type Files, type Schema } from "../lib/schema";
@@ -150,8 +150,12 @@
   }
 
   onMount(() => {
-    load();
-    return poll(refresh);
+    const forget = loadWithToken(load);
+    const stop = poll(refresh);
+    return () => {
+      forget();
+      stop();
+    };
   });
 </script>
 
