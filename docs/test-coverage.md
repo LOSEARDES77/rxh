@@ -236,8 +236,8 @@ written against an older snapshot: their line numbers and percentages are stale,
 - [x] `signal()` PID validation unit tests and `start`/`stop` e2e (gap 1).
 - [ ] Health-check fault-injection backend and tests (gap 5).
 - [x] Proxy retry, h2c and 502 paths (gap 6; stale-connection retry left).
-- [ ] File server traversal and MIME tests (gap 7).
-- [ ] PROXY protocol header byte tests and UDP failure/idle tests (gap 8).
+- [ ] File server traversal and MIME tests (gap 7; traversal done in `server/tests/files.rs`, `content_type` table left).
+- [ ] PROXY protocol header byte tests and UDP failure/idle tests (gap 8; header bytes done in `proxy_protocol.rs`, UDP failure and idle left).
 - [x] CLI rendering and admin-client e2e tests (gap 2).
 - [ ] Config validation/edit edge cases (gap 9).
 - [ ] Small modules: error, duration, cache, net, master, registry (gap 10).
