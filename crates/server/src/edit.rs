@@ -11,30 +11,44 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Val
 
 /// New pool definition.
 #[derive(Debug, Default)]
-pub(crate) struct PoolSpec {
-    pub(crate) policy: String,
-    pub(crate) backends: Vec<String>,
-    pub(crate) key: Option<String>,
-    pub(crate) retries: Option<u32>,
-    pub(crate) health_uri: Option<String>,
-    pub(crate) health_interval: Option<String>,
-    pub(crate) fail_duration: Option<String>,
+pub struct PoolSpec {
+    /// Load balancing policy, as written in `policy`.
+    pub policy: String,
+    /// Backend addresses.
+    pub backends: Vec<String>,
+    /// Hash key of the policies that take one.
+    pub key: Option<String>,
+    /// Attempts on other backends after a failure.
+    pub retries: Option<u32>,
+    /// URI of the active health check.
+    pub health_uri: Option<String>,
+    /// Interval of the active health check, as a duration.
+    pub health_interval: Option<String>,
+    /// How long passive health checks keep a failed backend out.
+    pub fail_duration: Option<String>,
 }
 
 /// New service definition.
 #[derive(Debug, Default)]
-pub(crate) struct ServiceSpec {
-    pub(crate) listen: Vec<SocketAddr>,
-    pub(crate) protocol: &'static str,
-    pub(crate) to: Vec<String>,
-    pub(crate) serve: Option<String>,
-    pub(crate) name: Option<String>,
-    pub(crate) uri: Option<String>,
-    pub(crate) host: Vec<String>,
+pub struct ServiceSpec {
+    /// Listen addresses.
+    pub listen: Vec<SocketAddr>,
+    /// `http`, `tcp` or `udp`; `http` is left implicit.
+    pub protocol: &'static str,
+    /// Forward targets: addresses or `@pool`.
+    pub to: Vec<String>,
+    /// Directory served as static files instead of forwarding.
+    pub serve: Option<String>,
+    /// Name of the service.
+    pub name: Option<String>,
+    /// Path the service matches.
+    pub uri: Option<String>,
+    /// Host names the service matches.
+    pub host: Vec<String>,
 }
 
 /// A configuration file loaded for editing.
-pub(crate) struct ConfigFile {
+pub struct ConfigFile {
     path: PathBuf,
     document: DocumentMut,
     /// Text on disk when opened, `None` if the file did not exist.
@@ -43,7 +57,7 @@ pub(crate) struct ConfigFile {
 
 impl ConfigFile {
     /// Loads `path`. A missing file starts as an empty document.
-    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, String> {
         let original = match fs::read_to_string(path) {
             Ok(text) => Some(text),
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
@@ -71,12 +85,41 @@ impl ConfigFile {
     }
 
     /// Path of the file.
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// The edited document as TOML text.
+    pub fn text(&self) -> String {
+        self.document.to_string()
+    }
+
+    /// Text on disk when the file was opened, `None` if it did not exist.
+    pub fn original(&self) -> Option<&str> {
+        self.original.as_deref()
+    }
+
+    /// The edited document.
+    pub fn document(&self) -> &DocumentMut {
+        &self.document
+    }
+
+    /// The edited document, for changes the methods of this type do not cover.
+    pub fn document_mut(&mut self) -> &mut DocumentMut {
+        &mut self.document
+    }
+
+    /// Replaces the whole document with `text`. On a parse error the document
+    /// is left unchanged and the error names the file.
+    pub fn set_text(&mut self, text: &str) -> Result<(), String> {
+        self.document = text
+            .parse()
+            .map_err(|err| format!("{}: {err}", self.path.display()))?;
+        Ok(())
+    }
+
     /// True if `[upstream.NAME]` is defined in this file.
-    pub(crate) fn defines_pool(&self, name: &str) -> bool {
+    pub fn defines_pool(&self, name: &str) -> bool {
         self.document
             .get("upstream")
             .and_then(|upstreams| upstreams.get(name))
@@ -84,7 +127,7 @@ impl ConfigFile {
     }
 
     /// Entries of the top level `include` list.
-    pub(crate) fn includes(&self) -> Vec<String> {
+    pub fn includes(&self) -> Vec<String> {
         self.document
             .get("include")
             .and_then(Item::as_array)
@@ -98,7 +141,7 @@ impl ConfigFile {
     }
 
     /// Appends `path` to the top level `include` list unless it is there.
-    pub(crate) fn add_include(&mut self, path: &str) -> Result<(), String> {
+    pub fn add_include(&mut self, path: &str) -> Result<(), String> {
         let include = self
             .document
             .entry("include")
@@ -125,12 +168,7 @@ impl ConfigFile {
     }
 
     /// Appends a backend to `[upstream.POOL].backends`.
-    pub(crate) fn add_backend(
-        &mut self,
-        pool: &str,
-        address: &str,
-        weight: u32,
-    ) -> Result<(), String> {
+    pub fn add_backend(&mut self, pool: &str, address: &str, weight: u32) -> Result<(), String> {
         let table = self.pool_mut(pool)?;
         let key = if table.contains_key("to") {
             "to"
@@ -162,7 +200,7 @@ impl ConfigFile {
     }
 
     /// Removes a backend from `[upstream.POOL].backends`.
-    pub(crate) fn remove_backend(&mut self, pool: &str, address: &str) -> Result<(), String> {
+    pub fn remove_backend(&mut self, pool: &str, address: &str) -> Result<(), String> {
         let table = self.pool_mut(pool)?;
         for key in ["backends", "to"] {
             if let Some(backends) = table.get_mut(key).and_then(Item::as_array_mut) {
@@ -177,7 +215,7 @@ impl ConfigFile {
     }
 
     /// Adds an `[upstream.NAME]` table.
-    pub(crate) fn add_pool(&mut self, name: &str, spec: &PoolSpec) -> Result<(), String> {
+    pub fn add_pool(&mut self, name: &str, spec: &PoolSpec) -> Result<(), String> {
         spec.policy.parse::<Policy>()?;
 
         let upstreams = self
@@ -227,7 +265,7 @@ impl ConfigFile {
     }
 
     /// Deletes an `[upstream.NAME]` table.
-    pub(crate) fn remove_pool(&mut self, name: &str) -> Result<(), String> {
+    pub fn remove_pool(&mut self, name: &str) -> Result<(), String> {
         let upstreams = self
             .document
             .get_mut("upstream")
@@ -240,7 +278,7 @@ impl ConfigFile {
     }
 
     /// Appends a `[[server]]`.
-    pub(crate) fn add_service(&mut self, spec: &ServiceSpec) -> Result<(), String> {
+    pub fn add_service(&mut self, spec: &ServiceSpec) -> Result<(), String> {
         let mut server = Table::new();
 
         if let Some(name) = &spec.name {
@@ -285,7 +323,7 @@ impl ConfigFile {
     }
 
     /// Removes services whose name or one of whose listen addresses matches.
-    pub(crate) fn remove_service(&mut self, service: &str) -> Result<usize, String> {
+    pub fn remove_service(&mut self, service: &str) -> Result<usize, String> {
         let servers = self
             .document
             .get_mut("server")
@@ -305,7 +343,7 @@ impl ConfigFile {
 /// Writes the edited `files`, then loads the whole configuration starting at
 /// `main` (includes merged) to validate it. If that fails every file goes
 /// back to what it was and the error is returned.
-pub(crate) fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
+pub fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
     // Topmost directory each new file needs, removed again on rollback.
     let created_directories: Vec<PathBuf> = files
         .iter()
@@ -327,26 +365,15 @@ pub(crate) fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, Str
         .try_for_each(|file| write_atomically(&file.path, &file.document.to_string()));
     let outcome = written
         .map_err(|err| err.to_string())
-        .and_then(|()| rxh_server::load_config(main).map_err(|err| err.to_string()));
+        .and_then(|()| crate::load_config(main).map_err(|err| err.to_string()));
     let err = match outcome {
         Ok(config) => return Ok(config),
         Err(err) => err,
     };
 
-    let mut failures = Vec::new();
-    for file in files {
-        let restored = match &file.original {
-            Some(text) => write_atomically(&file.path, text),
-            None => match fs::remove_file(&file.path) {
-                Err(err) if err.kind() != io::ErrorKind::NotFound => {
-                    Err(format!("{}: {err}", file.path.display()))
-                }
-                _ => Ok(()),
-            },
-        };
-        if let Err(err) = restored {
-            failures.push(err);
-        }
+    let mut failures: Vec<String> = Vec::new();
+    if let Err(err) = restore(files) {
+        failures.push(err);
     }
     for directory in created_directories {
         if let Err(err) = fs::remove_dir_all(&directory)
@@ -364,6 +391,32 @@ pub(crate) fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, Str
         ));
     }
     Err(message)
+}
+
+/// Writes every file back to the text it had when opened, and removes the
+/// files that did not exist then. Tries every file even after a failure; the
+/// error lists each file that could not be restored.
+pub fn restore(files: &[&ConfigFile]) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
+    for file in files {
+        let restored = match &file.original {
+            Some(text) => write_atomically(&file.path, text),
+            None => match fs::remove_file(&file.path) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                    Err(format!("{}: {err}", file.path.display()))
+                }
+                _ => Ok(()),
+            },
+        };
+        if let Err(err) = restored {
+            failures.push(err);
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
@@ -522,6 +575,27 @@ forward = "@api"
         .unwrap();
         let text = file.document.to_string();
         Config::from_toml(&text).unwrap_or_else(|err| panic!("{err}\n{text}"));
+    }
+
+    #[test]
+    fn restore_puts_back_the_text_and_removes_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.toml");
+        fs::write(&existing, "a = 1").unwrap();
+        let mut file = ConfigFile::open(&existing).unwrap();
+        file.set_text("a = 2").unwrap();
+        assert!(file.set_text("a = ").unwrap_err().contains("a.toml"));
+        assert_eq!(file.original(), Some("a = 1"));
+        fs::write(&existing, file.text()).unwrap();
+
+        let missing = dir.path().join("new.toml");
+        let new = ConfigFile::open(&missing).unwrap();
+        assert_eq!(new.original(), None);
+        fs::write(&missing, "b = 1").unwrap();
+
+        restore(&[&file, &new]).unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "a = 1");
+        assert!(!missing.exists());
     }
 
     #[test]

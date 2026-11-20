@@ -7,6 +7,7 @@ use std::time::Duration;
 use rxh_core::config::{Action, Admin, Forward, Policy};
 use rxh_core::deprecation;
 use rxh_core::pool::BackendState;
+use rxh_server::edit::{self, ConfigFile, PoolSpec, ServiceSpec};
 use serde_json::{Value, json};
 
 use crate::cli::{
@@ -14,7 +15,6 @@ use crate::cli::{
     UpstreamCommand,
 };
 use crate::client::{AdminClient, ClientError};
-use crate::edit::{self, ConfigFile, PoolSpec, ServiceSpec};
 use crate::process::{self, DaemonSignal};
 
 /// Default configuration file.

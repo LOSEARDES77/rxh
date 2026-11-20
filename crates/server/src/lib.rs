@@ -13,6 +13,7 @@ mod daemon;
 mod dns01;
 mod docker;
 mod dynamic;
+pub mod edit;
 mod error;
 mod files;
 #[cfg(feature = "fuzzing")]
