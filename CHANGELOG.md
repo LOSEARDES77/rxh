@@ -532,6 +532,12 @@ Changed.
 
 ### Fixed
 
+- A configuration file that cannot be written (a read-only directory, for
+  instance) is reported as such by the commands that edit the files and by
+  the saves of the web UI: "the configuration file /etc/rxh/rxh.toml cannot
+  be written, nothing was changed: ...". The message used to start with
+  "the change would break the configuration" and to end with "rollback
+  failed, check these files by hand", although nothing had been written.
 - An HTTP/3 request carrying `Connection: upgrade` and `Upgrade` no longer
   asks the backend for the upgrade: the fields are dropped, as HTTP/3 has
   no upgrades.

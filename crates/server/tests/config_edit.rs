@@ -992,10 +992,17 @@ async fn a_read_only_directory_fails_cleanly() {
     let (status, json) = proxy.put("/config/entities/upstream/api", &body).await;
     set_mode(0o755);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json:#}");
-    assert!(
-        json["error"].as_str().expect("error").contains("rxh.toml"),
-        "{json:#}"
+    // Nothing was written: the answer says which file and why, and does not
+    // speak of a broken configuration or of a rollback.
+    let error = json["error"].as_str().expect("error");
+    let expected = format!(
+        "the configuration file {} cannot be written, nothing was changed: ",
+        proxy.config_path.display()
     );
+    assert!(error.starts_with(&expected), "{error}");
+    assert!(error.contains("Permission denied"), "{error}");
+    assert!(!error.contains("would break"), "{error}");
+    assert!(!error.contains("rollback failed"), "{error}");
     let names: Vec<String> = fs::read_dir(directory)
         .expect("directory")
         .map(|entry| {

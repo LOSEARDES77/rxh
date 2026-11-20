@@ -353,7 +353,8 @@ pub enum SaveError {
 
 /// Writes the edited `files`, then loads the whole configuration starting at
 /// `main` (includes merged) to validate it. If that fails every file goes
-/// back to what it was and the error is returned.
+/// back to what it was and the error is returned. A file that cannot be
+/// written stops the save before validation; the error names it.
 pub fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
     try_save_all(files, main).map_err(|err| match err {
         SaveError::Invalid(message) | SaveError::Io(message) => message,
@@ -379,19 +380,32 @@ pub fn try_save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, SaveEr
         })
         .collect();
 
-    let written = files
-        .iter()
-        .try_for_each(|file| write_atomically(&file.path, &file.document.to_string()));
-    let (err, is_written) = match written {
-        Ok(()) => match crate::load_config(main) {
+    // Files before this index were replaced and are the ones to put back.
+    let mut written: usize = 0;
+    let mut unwritable: Option<String> = None;
+    for file in files {
+        if let Err(err) = write_atomically(&file.path, &file.document.to_string()) {
+            unwritable = Some(format!(
+                "the configuration file {} cannot be written, nothing was changed: {err}",
+                file.path.display()
+            ));
+            break;
+        }
+        written += 1;
+    }
+    let (mut message, is_invalid) = match unwritable {
+        Some(message) => (message, false),
+        None => match crate::load_config(main) {
             Ok(config) => return Ok(config),
-            Err(err) => (err.to_string(), true),
+            Err(err) => (
+                format!("the change would break the configuration: {err}"),
+                true,
+            ),
         },
-        Err(err) => (err, false),
     };
 
     let mut failures: Vec<String> = Vec::new();
-    if let Err(err) = restore(files) {
+    if let Err(err) = restore(&files[..written]) {
         failures.push(err);
     }
     for directory in created_directories {
@@ -402,14 +416,13 @@ pub fn try_save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, SaveEr
         }
     }
 
-    let mut message = format!("the change would break the configuration: {err}");
     if !failures.is_empty() {
         message.push_str(&format!(
             "\nrollback failed, check these files by hand: {}",
             failures.join("; ")
         ));
     }
-    Err(if is_written && failures.is_empty() {
+    Err(if is_invalid && failures.is_empty() {
         SaveError::Invalid(message)
     } else {
         SaveError::Io(message)
@@ -688,6 +701,44 @@ forward = "@api"
         let new = dir.path().join("new.toml");
         write_atomically(&new, "a = 1").unwrap();
         assert_eq!(mode(&new), 0o600, "a new file is private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_written_is_named_and_the_others_are_put_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("rxh.toml");
+        let main_text = format!("include = [\"locked/*.toml\"]\n{BASE}");
+        fs::write(&main, &main_text).unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let extra = locked.join("extra.toml");
+        fs::write(&extra, "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(locked.join("probe"), "").is_ok() {
+            // Root writes anywhere: nothing to check.
+            return;
+        }
+
+        let mut first = ConfigFile::open(&main).unwrap();
+        first.add_backend("api", "127.0.0.1:8081", 1).unwrap();
+        let mut second = ConfigFile::open(&extra).unwrap();
+        second.set_text("[upstream.other]\n").unwrap();
+        let err = save_all(&[&first, &second], &main).unwrap_err();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let expected = format!(
+            "the configuration file {} cannot be written, nothing was changed: ",
+            extra.display()
+        );
+        assert!(err.starts_with(&expected), "{err}");
+        assert!(err.contains("Permission denied"), "{err}");
+        assert!(!err.contains("would break"), "{err}");
+        assert!(!err.contains("rollback failed"), "{err}");
+        assert_eq!(fs::read_to_string(&main).unwrap(), main_text);
+        assert_eq!(fs::read_to_string(&extra).unwrap(), "");
     }
 
     #[test]
