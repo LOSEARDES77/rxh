@@ -2121,13 +2121,14 @@ started under, then RXH closes the connection. The next request of the
 client opens a new connection, served by the new configuration. No request
 is cut by a reload.
 
-On `rxh stop`, connections drain the same way within `grace_period`. A
-drained connection is closed at most 3 seconds after its last response.
+On `rxh stop`, connections drain the same way as on a reload: a GOAWAY, and
+the requests in flight finish within `grace_period`. A drained connection
+is closed at most 3 seconds after its last response.
 
-`rxh upgrade` hands the UDP sockets to the new process like the TCP ones.
-QUIC connections open in the old process do not survive the handover: HTTP/3
-requests in flight at that moment fail, and the old process closes the
-connection. Clients open a new connection to the new process.
+`rxh upgrade` does not hand the UDP sockets over: the new process binds the
+UDP port itself (`SO_REUSEPORT`), and the old process closes its QUIC
+connections at once, without a GOAWAY drain. HTTP/3 requests in flight
+fail; clients open a new connection to the new process.
 
 ### `match` entries (HTTP routes)
 

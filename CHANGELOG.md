@@ -413,8 +413,9 @@ Changed.
   on, `true` makes a UDP port that cannot be bound a start error, `false`
   turns it off. Open the UDP port in the firewall. Not over HTTP/3:
   WebSockets and other upgrades, 0-RTT, HTTP/3 to backends. Reloads keep the
-  UDP socket and drain open connections with a GOAWAY. `rxh upgrade` hands
-  the UDP sockets over; HTTP/3 requests in flight then fail. See [HTTP/3](docs/configuration.md#http3).
+  UDP socket and drain open connections with a GOAWAY. `rxh upgrade` closes
+  QUIC connections at once and the new process binds the UDP port itself;
+  HTTP/3 requests in flight fail. See [HTTP/3](docs/configuration.md#http3).
 
 ### Deprecated
 
