@@ -38,6 +38,11 @@ mod ocsp;
 mod per_core;
 mod proxy_protocol;
 mod registry;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the admin routes of the next tasks")
+)]
+mod secret;
 mod server;
 #[cfg(target_os = "linux")]
 mod splice;
