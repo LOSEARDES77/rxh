@@ -449,8 +449,40 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    fs::write(&temporary, text).map_err(|err| format!("{}: {err}", temporary.display()))?;
+    write_like(&temporary, path, text).map_err(|err| format!("{}: {err}", temporary.display()))?;
     fs::rename(&temporary, path).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Writes `text` to the new file `temporary`, which gets the mode and, when
+/// the process may give it, the owner of `like`. Without `like` only the
+/// owner can read it: a configuration file can hold secrets. The file is
+/// private before anything is written to it.
+#[cfg(unix)]
+fn write_like(temporary: &Path, like: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{self as unix_fs, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    // One left by a process that died would keep its own mode.
+    match fs::remove_file(temporary) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        _ => {}
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(temporary)?;
+    if let Ok(metadata) = fs::metadata(like) {
+        // Only root can give a file away; the mode is what protects it.
+        let _ = unix_fs::fchown(&file, Some(metadata.uid()), Some(metadata.gid()));
+        file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
+    }
+    file.write_all(text.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_like(temporary: &Path, _like: &Path, text: &str) -> io::Result<()> {
+    fs::write(temporary, text)
 }
 
 /// Value as a string when there is one entry, as an array otherwise.
@@ -619,6 +651,43 @@ forward = "@api"
         restore(&[&file, &new]).unwrap();
         assert_eq!(fs::read_to_string(&existing).unwrap(), "a = 1");
         assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_the_mode_of_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("rxh.toml");
+        fs::write(&main, BASE).unwrap();
+        // A temporary file left behind, readable by everybody.
+        fs::write(dir.path().join("rxh.toml.tmp"), "stale").unwrap();
+
+        for wanted in [0o600, 0o640] {
+            fs::set_permissions(&main, fs::Permissions::from_mode(wanted)).unwrap();
+
+            let mut file = ConfigFile::open(&main).unwrap();
+            file.add_backend("api", "127.0.0.1:8081", 1).unwrap();
+            save_all(&[&file], &main).unwrap();
+            assert_eq!(mode(&main), wanted, "after a save");
+            assert!(fs::read_to_string(&main).unwrap().contains("8081"));
+
+            let before = fs::read_to_string(&main).unwrap();
+            let mut file = ConfigFile::open(&main).unwrap();
+            file.set_text("[upstream.api]\npolicy = \"nope\"\n")
+                .unwrap();
+            save_all(&[&file], &main).unwrap_err();
+            assert_eq!(mode(&main), wanted, "after a rejected save");
+            assert_eq!(fs::read_to_string(&main).unwrap(), before);
+            file.remove_backend("api", "127.0.0.1:8081").unwrap_err();
+            fs::write(&main, BASE).unwrap();
+        }
+
+        let new = dir.path().join("new.toml");
+        write_atomically(&new, "a = 1").unwrap();
+        assert_eq!(mode(&new), 0o600, "a new file is private");
     }
 
     #[test]

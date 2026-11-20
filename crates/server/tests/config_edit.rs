@@ -1037,3 +1037,74 @@ async fn a_quoted_pool_name_is_edited() {
     assert!(text.contains(&pool), "{text}");
     proxy.serves("new").await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_keeps_the_file_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let old = util::backend("old").await;
+    let new = util::backend("new").await;
+    let proxy = Proxy::with_pool(old).await;
+    fs::set_permissions(&proxy.config_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+    let mode = || {
+        let metadata = fs::metadata(&proxy.config_path).expect("metadata");
+        metadata.permissions().mode() & 0o7777
+    };
+
+    let body = json!({
+        "value": { "backends": [new.to_string()], "policy": "nope" },
+        "revision": proxy.revision(0).await,
+    });
+    let (status, json) = proxy.put("/config/entities/upstream/api", &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json:#}");
+    assert_eq!(mode(), 0o600, "after a rejected save");
+
+    let body = json!({
+        "value": { "backends": [new.to_string()] },
+        "revision": proxy.revision(0).await,
+    });
+    let (status, json) = proxy.put("/config/entities/upstream/api", &body).await;
+    assert_eq!(status, StatusCode::OK, "{json:#}");
+    assert!(proxy.text().contains(&new.to_string()));
+    assert_eq!(mode(), 0o600, "after a save");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_put_refuses_masks_in_servers_that_look_alike() {
+    let old = util::backend("old").await;
+    // Two servers on one address, told apart by their host only.
+    let server = |listen: SocketAddr, host: &str| {
+        format!(
+            "[[server]]\nlisten = \"{listen}\"\nhost = \"{host}.test\"\nforward = {{ backends = \
+             [\"{old}\"], policy = \"cookie\", secret = \"secret-of-server-{host}\" }}\n"
+        )
+    };
+    let proxy = Proxy::start(
+        |admin, listen| {
+            format!(
+                "[admin]\nlisten = \"{admin}\"\n\n{}\n{}",
+                server(listen, "a"),
+                server(listen, "b")
+            )
+        },
+        None,
+    )
+    .await;
+    let original = proxy.text();
+
+    let files = proxy.files().await;
+    let masked = files["files"][0]["text"].as_str().expect("text");
+    let (head, servers) = masked.split_once("[[server]]").expect("servers");
+    let (first, second) = servers.split_once("[[server]]").expect("two servers");
+    let swapped = format!("{head}[[server]]{second}\n[[server]]{first}");
+    for text in [swapped.as_str(), masked] {
+        let body = json!({ "text": text, "revision": files["files"][0]["revision"] });
+        let (status, json) = proxy.put("/config/files/0", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json:#}");
+        let error = json["error"].as_str().expect("error");
+        assert!(error.contains("type its secret again"), "{error}");
+        assert!(!error.contains("secret-of-server"), "{error}");
+        assert_eq!(proxy.text(), original);
+    }
+}

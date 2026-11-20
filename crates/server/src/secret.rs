@@ -64,9 +64,12 @@ pub(crate) fn restore(edited: &mut DocumentMut, stored: &DocumentMut) -> Result<
 /// [`restore`] for a file the client sent back whole. The servers of a file
 /// have no key but their position, so a [`MASK`] in a server is restored only
 /// when that server is still the stored one at its position: same `name`, or
-/// same `listen` without a name. The secret of a server that moved must be
-/// typed again, it is not taken from the server that was there.
+/// same `listen` without a name, and no other server of either document with
+/// that name or address. The secret of a server that moved, or that cannot
+/// be told from another, must be typed again.
 pub(crate) fn restore_file(edited: &mut DocumentMut, stored: &DocumentMut) -> Result<(), String> {
+    let edited_servers: Vec<Option<String>> = identities(edited);
+    let stored_servers: Vec<Option<String>> = identities(stored);
     for steps in secrets(edited.as_item(), |text| text == MASK) {
         let [Step::Key(key), Step::Index(index), ..] = steps.as_slice() else {
             continue;
@@ -74,25 +77,46 @@ pub(crate) fn restore_file(edited: &mut DocumentMut, stored: &DocumentMut) -> Re
         if key != "server" {
             continue;
         }
-        let server = &steps[..2];
-        if identity(get(edited.as_item(), server)) != identity(get(stored.as_item(), server)) {
+        let identity: Option<&Option<String>> = edited_servers.get(*index);
+        if identity != stored_servers.get(*index) {
             return Err(format!(
                 "server {index} is not the server stored at that position, type its secret again \
                  instead of {MASK}"
+            ));
+        }
+        let is_unique = |servers: &[Option<String>]| {
+            servers
+                .iter()
+                .filter(|other| Some(*other) == identity)
+                .count()
+                == 1
+        };
+        if !is_unique(&edited_servers) || !is_unique(&stored_servers) {
+            return Err(format!(
+                "server {index} has the name or the address of another server, type its secret \
+                 again instead of {MASK}"
             ));
         }
     }
     restore(edited, stored)
 }
 
-/// What tells a server from the others: its `name`, else its `listen` as written.
-fn identity(server: Option<&Item>) -> Option<String> {
-    let server = server?;
-    let value: &Value = server
-        .get("name")
-        .or_else(|| server.get("listen"))?
-        .as_value()?;
-    Some(value.to_string().trim().to_owned())
+/// What tells each server of `document` from the others: its `name`, else
+/// its `listen` as written.
+fn identities(document: &DocumentMut) -> Vec<Option<String>> {
+    let Some(servers) = document.get("server") else {
+        return Vec::new();
+    };
+    children(servers)
+        .into_iter()
+        .map(|(_, server)| {
+            let value: &Value = server
+                .get("name")
+                .or_else(|| server.get("listen"))?
+                .as_value()?;
+            Some(value.to_string().trim().to_owned())
+        })
+        .collect()
 }
 
 /// One key of a table or one index of an array.
@@ -348,6 +372,26 @@ secret = "cookie-hmac"
         let mut kept: DocumentMut = parse(&unnamed("127.0.0.1:80", MASK));
         restore_file(&mut kept, &stored).unwrap();
         assert!(kept.to_string().contains("secret-of-80"));
+
+        // Two servers on one address cannot be told apart, in place or swapped.
+        let twins: String = unnamed("127.0.0.1:80", "secret-of-first")
+            + &unnamed("127.0.0.1:80", "secret-of-second");
+        let stored_twins: DocumentMut = parse(&twins);
+        let mut masked_twins: DocumentMut = masked(&twins);
+        let err: String = restore_file(&mut masked_twins, &stored_twins).unwrap_err();
+        assert!(err.contains("of another server"), "{err}");
+        assert!(
+            !masked_twins.to_string().contains("secret-of"),
+            "nothing restored"
+        );
+        // One in the edited file only is enough to refuse.
+        let mut doubled: DocumentMut =
+            parse(&(unnamed("127.0.0.1:80", MASK) + &unnamed("127.0.0.1:80", "typed")));
+        assert!(restore_file(&mut doubled, &stored).is_err());
+        // Typed secrets need no stored server.
+        let mut typed_twins: DocumentMut =
+            parse(&(unnamed("127.0.0.1:80", "x") + &unnamed("127.0.0.1:80", "y")));
+        restore_file(&mut typed_twins, &stored_twins).unwrap();
 
         // A new secret typed in a server that moved is fine.
         let mut typed: DocumentMut = parse(&unnamed("127.0.0.1:81", "typed-again"));
