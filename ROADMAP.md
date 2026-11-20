@@ -179,7 +179,7 @@ A release people can run without reading the source.
       every later change and `rxh validate` warnings for deprecated keys.
 - [x] `rxh fmt` and a JSON schema for the TOML file, for editor
       completion (`rxh schema`, `docs/rxh.schema.json`).
-- [ ] `rxh adapt` to convert a Caddyfile or a simple `nginx.conf` into RXH
+- [x] `rxh adapt` to convert a Caddyfile or a simple `nginx.conf` into RXH
       TOML.
 - [ ] Documentation site with a guide per use case (load balancer, TLS
       gateway, Docker, layer 4).

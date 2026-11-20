@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- `rxh adapt FILE [--adapter caddyfile|nginx]` prints the RXH TOML of a
+  Caddyfile or a simple nginx configuration: sites, reverse proxies with
+  their load balancing and health checks, file servers, redirects, headers,
+  basic auth, TLS files, `upstream` pools and `stream` servers. What has no
+  equivalent is listed on standard error and as comments at the top of the
+  output; the result is checked with RXH's own parser.
 - `rxh fmt [--check] [FILE...]` rewrites configuration files in one layout
   (no indentation, one space around `=`, a blank line before each table,
   one newline at the end) keeping every comment; `--check` fails when a

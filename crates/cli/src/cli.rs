@@ -104,6 +104,20 @@ pub(crate) enum Command {
         check: bool,
     },
 
+    /// Convert a Caddyfile or an nginx configuration into RXH TOML, printed
+    /// on standard output. What has no RXH equivalent is left out, listed
+    /// on standard error and as comments at the top of the output.
+    Adapt {
+        /// File to convert.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Format of FILE. By default from its name (`Caddyfile`, `*.conf`,
+        /// `nginx*`), else nginx when a line ends with `;`.
+        #[arg(long, value_enum)]
+        adapter: Option<Adapter>,
+    },
+
     /// Print the JSON schema of the configuration file, for completion and
     /// validation in editors (`#:schema` in Taplo, Even Better TOML).
     Schema,
@@ -342,6 +356,13 @@ pub(crate) enum PoolCommand {
         /// Pool name.
         name: String,
     },
+}
+
+/// Format of a file for `rxh adapt`.
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub(crate) enum Adapter {
+    Caddyfile,
+    Nginx,
 }
 
 /// Protocol of a new service.

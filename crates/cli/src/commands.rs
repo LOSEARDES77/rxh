@@ -52,6 +52,7 @@ pub(crate) async fn execute(cli: &Cli, command: Command) -> Result<(), String> {
         | Command::ReverseProxy { .. }
         | Command::HashPassword
         | Command::Fmt { .. }
+        | Command::Adapt { .. }
         | Command::Schema
         | Command::Completions { .. }
         | Command::Man { .. } => unreachable!("handled in main"),

@@ -202,6 +202,75 @@ rxh completions fish > /usr/share/fish/vendor_completions.d/rxh.fish
 rxh man --dir /usr/share/man/man1
 ```
 
+## Converting a Caddyfile or an nginx configuration
+
+`rxh adapt FILE` prints the RXH configuration of a Caddyfile or an nginx
+configuration on standard output. The format comes from the file name
+(`Caddyfile`, `*.caddyfile`; `nginx*`, `*.conf`), else from the content (nginx
+when a line ends with `;`); `--adapter caddyfile|nginx` forces it. What has
+no RXH equivalent is left out and listed, with its line, on standard error
+and as `# Not converted:` comments at the top of the output. The command
+fails when the file cannot be parsed, when nothing could be converted, or
+when RXH rejects the result (still printed, to fix by hand).
+
+```sh
+rxh adapt /etc/caddy/Caddyfile > rxh.toml
+rxh adapt --adapter nginx /etc/nginx/sites-available/app > rxh.toml
+rxh validate -c rxh.toml
+```
+
+Caddyfile: global `email`, `acme_ca`, `admin`, `http_port`, `https_port`,
+`auto_https off|disable_redirects` and `grace_period`; site addresses (one
+server per listen address, `tls = "auto"` for host names like Caddy's
+automatic HTTPS); `reverse_proxy` with load balancing, retries, active and
+passive health checks, `header_up`/`header_down` and the `http` transport's
+timeouts and TLS; `file_server`, `root`, `redir`, `handle`, `handle_path`,
+`route`, `encode`, `header`, `basic_auth`, `tls` with certificate files,
+`{$VAR}` as `{env.VAR}`, and named matchers on `path`, `method`, `host`,
+`header`, `query`, `remote_ip` and `client_ip`. Routes are ordered as Caddy
+orders its directives. Snippets, `import`, `php_fastcgi`, `rewrite`,
+`try_files` and other directives are reported.
+
+nginx: `http` and `stream` servers (or bare `server` blocks of a
+`sites-available` file), `upstream` blocks with weights, `max_fails`,
+`fail_timeout`, `least_conn`, `ip_hash`, `random`, `hash` and `keepalive`;
+`listen`, `server_name`, `ssl_certificate`, exact and prefix `location`s
+with `proxy_pass`, `root`, `alias`, `index`, `autoindex`, `return` of a
+redirect, `add_header`, `proxy_set_header`, `gzip` and
+`client_max_body_size`, ordered as nginx picks them. `$host`,
+`$request_uri`, `$uri`, `$args` and `$server_name` become placeholders.
+Regex and named locations, other variables, `include`, a URI in
+`proxy_pass` and `return` of a body are reported.
+
+Caddy's `header` and nginx's `add_header` become `response.headers` on
+proxied routes only: RXH's response header rules do not apply to served
+files and redirects, so those routes get a warning instead.
+
+```nginx
+upstream app { server 10.0.0.1:8080 weight=3; server 10.0.0.2:8080; }
+server {
+    listen 80;
+    server_name example.com;
+    location / { proxy_pass http://app; }
+}
+```
+
+becomes
+
+```toml
+# Converted from nginx.conf by rxh adapt.
+
+[upstream.app]
+backends = [{ address = "10.0.0.1:8080", weight = 3 }, "10.0.0.2:8080"]
+
+[[server]]
+listen = "0.0.0.0:80"
+host = "example.com"
+
+[[server.match]]
+forward = "@app"
+```
+
 ## Formatting and editor completion
 
 `rxh fmt [FILE...]` rewrites configuration files (the configuration file
