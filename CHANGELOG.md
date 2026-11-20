@@ -501,6 +501,9 @@ Changed.
 
 ### Fixed
 
+- An HTTP/3 request carrying `Connection: upgrade` and `Upgrade` no longer
+  asks the backend for the upgrade: the fields are dropped, as HTTP/3 has
+  no upgrades.
 - Reloading a configuration with a UDP server could fail with "Address
   already in use" and keep the old configuration: the stopped listener
   reported its shutdown while its sessions still held the socket. The

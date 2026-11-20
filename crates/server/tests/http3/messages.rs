@@ -427,3 +427,31 @@ async fn not_modified_has_no_body() {
     assert_eq!(response.headers["etag"], "\"v1\"");
     assert!(response.body.is_empty(), "304 answered {:?}", response.body);
 }
+
+// HTTP/3 has no upgrades (RFC 9114, section 4.2): the backend must not be
+// asked for one the proxy cannot carry out.
+#[tokio::test(flavor = "multi_thread")]
+async fn forwards_an_http3_request_as_http11() {
+    let (backend, mut requests) = util::interceptor().await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+    let client = proxy.connect("localhost").await;
+
+    for fields in [
+        &[("upgrade", "websocket")][..],
+        &[("connection", "upgrade"), ("upgrade", "websocket")][..],
+    ] {
+        client
+            .send_raw(&headers_frame("GET", "/", fields))
+            .await
+            .unwrap();
+
+        let head = requests.recv().await.unwrap();
+        assert_eq!(head.version, hyper::Version::HTTP_11);
+        for name in ["upgrade", "connection"] {
+            assert!(
+                !head.headers.contains_key(name),
+                "{name} reached the backend"
+            );
+        }
+    }
+}

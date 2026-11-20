@@ -77,6 +77,11 @@ pub(crate) async fn forward(
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut request));
 
     let (mut parts, incoming) = request.into_parts();
+    // An upgrade the proxy will not carry out (HTTP/2, HTTP/3) must not be
+    // asked of the backend.
+    if !upgrade {
+        parts.headers.remove(header::UPGRADE);
+    }
     let forwarding = Forwarding {
         peer: connection.peer,
         peer_ip: &connection.peer_ip,
