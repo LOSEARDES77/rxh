@@ -5,9 +5,11 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use h3::error::Code;
+use http::HeaderValue;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{IdleTimeout, TransportConfig, VarInt};
 use tokio::sync::{Semaphore, watch};
@@ -45,6 +47,13 @@ pub(crate) struct Listener {
     pub(super) phase: watch::Sender<Phase>,
     /// Connections accepted and not closed yet.
     open: watch::Sender<usize>,
+    /// Whether the server asked for HTTP/3 with `http3 = true`: not being
+    /// able to bind the UDP port is then an error.
+    requires_http3: bool,
+    /// Whether an endpoint serves this listener now.
+    active: AtomicBool,
+    /// `Alt-Svc` value that announces this listener.
+    alt_svc: HeaderValue,
 }
 
 impl fmt::Debug for Listener {
@@ -59,12 +68,16 @@ impl Listener {
     /// Listener on `address`, the address of the TCP listener whose
     /// `context` and `max_connections` connection `permits` it shares, with
     /// the certificates and client verifier of its TLS acceptor `tls`.
+    /// `requires_http3` is [`rxh_core::config::Server::requires_http3`] of
+    /// the first server on the listener. It starts inactive: see
+    /// [`Listener::alt_svc`].
     pub(crate) fn new(
         address: SocketAddr,
         tls: &TlsAcceptor,
         context: Arc<ConnectionContext>,
         permits: Arc<Semaphore>,
         max_connections: usize,
+        requires_http3: bool,
     ) -> io::Result<Self> {
         let crypto =
             QuicServerConfig::with_initial(tls::quic_config(tls.config()), initial_suite()?)
@@ -86,7 +99,32 @@ impl Listener {
             max_connections,
             phase: watch::Sender::new(Phase::Serving),
             open: watch::Sender::new(0),
+            requires_http3,
+            active: AtomicBool::new(false),
+            alt_svc: HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", address.port()))
+                .expect("a port in an Alt-Svc value is a valid header value"),
         })
+    }
+
+    /// Whether the server asked for HTTP/3 explicitly, so failing to bind
+    /// its UDP port is an error.
+    pub(super) fn requires_http3(&self) -> bool {
+        self.requires_http3
+    }
+
+    /// Records whether an endpoint serves this listener.
+    pub(super) fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    /// The `Alt-Svc` value for responses over HTTP/1.1 and HTTP/2, or
+    /// `None` while no endpoint serves this listener: advertising HTTP/3
+    /// that nothing answers would only make clients wait.
+    #[must_use]
+    pub(crate) fn alt_svc(&self) -> Option<HeaderValue> {
+        self.active
+            .load(Ordering::Acquire)
+            .then(|| self.alt_svc.clone())
     }
 
     /// Connections accepted and not closed yet.

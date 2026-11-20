@@ -12,7 +12,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use hyper::header::HeaderValue;
@@ -123,17 +123,21 @@ pub(crate) struct ConnectionContext {
     /// `max_connections_per_ip` and the open connections of each client.
     pub(crate) per_ip: Option<(usize, Mutex<HashMap<IpAddr, usize>>)>,
     match_timeout: Duration,
+    /// The HTTP/3 listener of the same server, to ask for `Alt-Svc`.
+    http3: OnceLock<Weak<http3::Listener>>,
 }
 
 impl ConnectionContext {
     /// Service of one client connection from `peer` to `local`, or `None`
     /// if the server is not an HTTP one. `client_subject` is the subject of
-    /// the certificate the client presented.
+    /// the certificate the client presented. `alt_svc` is set for TCP
+    /// connections: see [`ConnectionContext::alt_svc`].
     pub(crate) fn http_service(
         &self,
         peer: SocketAddr,
         local: SocketAddr,
         client_subject: Option<HeaderValue>,
+        alt_svc: Option<HeaderValue>,
     ) -> Option<Service> {
         let Handler::Http { routes, tracer, .. } = &self.handler else {
             return None;
@@ -148,7 +152,14 @@ impl ConnectionContext {
             activity: Arc::new(Activity::default()),
             logger: Arc::clone(&self.log.logger),
             tracer: tracer.clone(),
+            alt_svc,
         })
+    }
+
+    /// The `Alt-Svc` value for a new HTTP/1.1 or HTTP/2 connection, if an
+    /// HTTP/3 endpoint serves this server now.
+    pub(crate) fn alt_svc(&self) -> Option<HeaderValue> {
+        self.http3.get()?.upgrade()?.alt_svc()
     }
 }
 
@@ -416,17 +427,24 @@ impl Server {
                         .max_connections_per_ip
                         .map(|max| (max, Mutex::default())),
                     match_timeout: server.match_timeout,
+                    http3: OnceLock::new(),
                 };
                 let context = Arc::new(context);
                 let http3 = match &context.tls {
                     Some(acceptor) if server.serves_http3() => {
-                        Some(Arc::new(http3::Listener::new(
+                        let listener = Arc::new(http3::Listener::new(
                             address,
                             acceptor,
                             Arc::clone(&context),
                             Arc::clone(&permits),
                             max_connections,
-                        )?))
+                            server.requires_http3(),
+                        )?);
+                        context
+                            .http3
+                            .set(Arc::downgrade(&listener))
+                            .expect("the context is new");
+                        Some(listener)
                     }
                     _ => None,
                 };
@@ -902,7 +920,7 @@ async fn serve<S>(
         }
         Handler::Http { http2, .. } => {
             let service = context
-                .http_service(peer, local, client_subject)
+                .http_service(peer, local, client_subject, context.alt_svc())
                 .expect("an HTTP handler has a service");
             let activity = Arc::clone(&service.activity);
             let stamp = Stamp::new();

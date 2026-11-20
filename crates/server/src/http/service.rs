@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::header::{HeaderName, HeaderValue};
+use hyper::header::{ALT_SVC, HeaderName, HeaderValue};
 use hyper::http::uri::Authority;
 use hyper::{HeaderMap, Method, Request, StatusCode, Uri};
 use rxh_core::config::{
@@ -411,6 +411,9 @@ pub(crate) struct Service {
     pub(crate) logger: Arc<Logger>,
     /// Set when the `[tracing]` table is.
     pub(crate) tracer: Option<Arc<Tracer>>,
+    /// `Alt-Svc` value to add to responses that have none: set on HTTP/1.1
+    /// and HTTP/2 connections of a server that also serves HTTP/3.
+    pub(crate) alt_svc: Option<HeaderValue>,
 }
 
 /// Response extension set by the proxy for JSON access lines: the backend
@@ -439,7 +442,11 @@ impl Service {
         self.activity.in_flight.fetch_add(1, Ordering::Release);
         let in_flight = InFlight(Arc::clone(&self.activity));
 
-        let response = self.handle(request).await;
+        let alt_svc = self.alt_svc.clone();
+        let mut response = self.handle(request).await;
+        if let Some(alt_svc) = alt_svc {
+            response.headers_mut().entry(ALT_SVC).or_insert(alt_svc);
+        }
         response.map(|body| Guarded::new(body, in_flight).boxed())
     }
 

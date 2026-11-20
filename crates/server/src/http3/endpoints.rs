@@ -61,12 +61,27 @@ impl Endpoints {
 
         let mut bound = Vec::new();
         for listener in listeners {
-            if !endpoints.contains_key(&listener.address) {
-                let (endpoint, socket) = bind(listener).map_err(|err| {
+            if endpoints.contains_key(&listener.address) {
+                continue;
+            }
+            match bind(listener) {
+                Ok((endpoint, socket)) => bound.push((listener, endpoint, socket)),
+                Err(err) if listener.requires_http3() => {
                     let address = listener.address;
-                    io::Error::new(err.kind(), format!("HTTP/3 on {address} (UDP): {err}"))
-                })?;
-                bound.push((listener, endpoint, socket));
+                    return Err(io::Error::new(
+                        err.kind(),
+                        format!("HTTP/3 on {address} (UDP): {err}"),
+                    )
+                    .into());
+                }
+                Err(err) => {
+                    let log_name = &listener.context.log.log_name;
+                    eprintln!(
+                        "{log_name} => HTTP/3 disabled: cannot bind UDP {}: {err}",
+                        listener.address
+                    );
+                    listener.set_active(false);
+                }
             }
         }
 
@@ -77,6 +92,7 @@ impl Endpoints {
                 continue;
             }
             entry.retired = true;
+            entry.listener.borrow().set_active(false);
             entry.endpoint.set_server_config(None);
             tokio::task::spawn(remove_when_idle(
                 Arc::downgrade(&self.endpoints),
@@ -91,10 +107,16 @@ impl Endpoints {
                 entry
                     .endpoint
                     .set_server_config(Some(listener.config.clone()));
-                entry.listener.send_replace(Arc::clone(listener));
+                // Before the new one is set: it may be the same listener.
+                entry
+                    .listener
+                    .send_replace(Arc::clone(listener))
+                    .set_active(false);
+                listener.set_active(true);
             }
         }
         for (listener, endpoint, socket) in bound {
+            listener.set_active(true);
             let (sender, receiver) = watch::channel(Arc::clone(listener));
             tokio::task::spawn(accept(endpoint.clone(), receiver));
             let entry = Entry {
@@ -135,6 +157,7 @@ impl Endpoints {
                 if !overlaps(address) {
                     return true;
                 }
+                entry.listener.borrow().set_active(false);
                 entry.endpoint.close(listener::no_error(), b"");
                 released.push((*address, Weak::clone(&entry.socket)));
                 false
@@ -168,6 +191,7 @@ impl Endpoints {
             .lock()
             .expect("nothing panics while holding the endpoints");
         for (_, entry) in endpoints.drain() {
+            entry.listener.borrow().set_active(false);
             entry.endpoint.close(listener::no_error(), b"");
         }
     }

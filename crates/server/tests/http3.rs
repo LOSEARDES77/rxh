@@ -48,6 +48,67 @@ struct Site {
     dir: PathBuf,
 }
 
+/// A [`Site`] on `listen` with a new certificate in `dir`, and that
+/// certificate as PEM.
+fn site_in(dir: &Path, listen: SocketAddr) -> (Site, String) {
+    let certificate = rcgen::generate_simple_self_signed(NAMES.map(String::from).to_vec()).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, certificate.cert.pem()).unwrap();
+    std::fs::write(&key, certificate.signing_key.serialize_pem()).unwrap();
+    let site = Site {
+        listen,
+        tls: format!("{{ cert = {cert:?}, key = {key:?} }}"),
+        dir: dir.to_owned(),
+    };
+    (site, certificate.cert.pem())
+}
+
+/// `GET /` over HTTPS on TCP to `address`, with HTTP/2 if `h2` and
+/// HTTP/1.1 otherwise. Returns the status and the header fields.
+async fn https_exchange(address: SocketAddr, root: &str, h2: bool) -> (StatusCode, HeaderMap) {
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(root.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let mut tls = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![if h2 {
+        b"h2".to_vec()
+    } else {
+        b"http/1.1".to_vec()
+    }];
+    let stream = TcpStream::connect(address).await.unwrap();
+    let name = ServerName::try_from("localhost").unwrap();
+    let stream = TlsConnector::from(Arc::new(tls))
+        .connect(name, stream)
+        .await
+        .unwrap();
+    let request = Request::get("https://localhost/")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let response = if h2 {
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::task::spawn(connection);
+        sender.send_request(request).await.unwrap()
+    } else {
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::task::spawn(connection);
+        let request = Request::get("/")
+            .header(HOST, "localhost")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        sender.send_request(request).await.unwrap()
+    };
+    (response.status(), response.headers().clone())
+}
+
 /// A daemon serving a test configuration.
 struct Proxy {
     address: SocketAddr,
@@ -70,17 +131,7 @@ impl Proxy {
     /// [`Proxy::start`] with the servers on `listen`.
     async fn start_on(listen: SocketAddr, config: impl FnOnce(&Site) -> String) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let certificate =
-            rcgen::generate_simple_self_signed(NAMES.map(String::from).to_vec()).unwrap();
-        let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
-        std::fs::write(&cert, certificate.cert.pem()).unwrap();
-        std::fs::write(&key, certificate.signing_key.serialize_pem()).unwrap();
-        let site = Site {
-            listen,
-            tls: format!("{{ cert = {cert:?}, key = {key:?} }}"),
-            dir: dir.path().to_owned(),
-        };
+        let (site, root) = site_in(dir.path(), listen);
 
         let admin = free_address();
         let path = dir.path().join("rxh.toml");
@@ -90,7 +141,7 @@ impl Proxy {
 
         Self {
             address: site.listen,
-            root: certificate.cert.pem(),
+            root,
             site,
             admin,
             path,
@@ -1200,4 +1251,199 @@ async fn reload_off_then_on_reuses_the_socket() {
     let response = request.await.unwrap().unwrap();
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.body, "slow");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alt_svc_is_advertised_over_http1_and_http2() {
+    let backend = util::backend("advertised").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+    let expected = format!("h3=\":{}\"; ma=86400", proxy.address.port());
+
+    for h2 in [false, true] {
+        let (status, headers) = https_exchange(proxy.address, &proxy.root, h2).await;
+        assert_eq!(status, StatusCode::OK);
+        let values: Vec<_> = headers.get_all("alt-svc").iter().collect();
+        assert_eq!(values, [expected.as_str()], "h2 = {h2}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alt_svc_is_absent_over_http3() {
+    let backend = util::backend("quiet").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+
+    let response = proxy.get("/").await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(!response.headers.contains_key("alt-svc"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alt_svc_is_absent_with_http3_false() {
+    let backend = util::backend("tcp only").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "http3 = false")).await;
+
+    let (status, headers) = https_exchange(proxy.address, &proxy.root, false).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("alt-svc"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backend_alt_svc_is_kept() {
+    let backend = util::backend_with(|_| async {
+        Response::builder()
+            .header("alt-svc", "clear")
+            .body(Full::new(Bytes::from("own")))
+            .unwrap()
+    })
+    .await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+
+    for h2 in [false, true] {
+        let (_, headers) = https_exchange(proxy.address, &proxy.root, h2).await;
+        let values: Vec<_> = headers.get_all("alt-svc").iter().collect();
+        assert_eq!(values, ["clear"], "h2 = {h2}");
+    }
+}
+
+/// Starts a daemon whose UDP port is held by `taken`, with `extra` keys on
+/// its one HTTPS server. Returns what a TCP client saw, if the daemon
+/// started, and the daemon's result.
+async fn start_with_udp_port_taken(
+    extra: &str,
+) -> (
+    Option<(StatusCode, HeaderMap)>,
+    Result<(), rxh_server::Error>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let listen = free_address();
+    let (site, root) = site_in(dir.path(), listen);
+    let _taken = UdpSocket::bind(listen).unwrap();
+    let backend = util::backend("up").await;
+    let admin = free_address();
+    let path = dir.path().join("rxh.toml");
+    write_config(&path, admin, &forwarding(&site, backend, extra));
+    let mut daemon = tokio::task::spawn(Daemon::new(&path).run());
+
+    let started = tokio::time::timeout(Duration::from_secs(5), async {
+        util::eventually(async || daemon.is_finished() || TcpStream::connect(admin).await.is_ok())
+            .await
+    })
+    .await;
+    started.expect("the daemon starts or fails within 5 s");
+    if daemon.is_finished() {
+        return (None, daemon.await.unwrap());
+    }
+    let seen = https_exchange(listen, &root, false).await;
+    let stop = Request::post("/stop")
+        .header(HOST, admin.to_string())
+        .body(Empty::new())
+        .unwrap();
+    assert_eq!(util::send(admin, stop).await.0, StatusCode::OK);
+    let stopped = tokio::time::timeout(Duration::from_secs(5), &mut daemon).await;
+    (Some(seen), stopped.expect("the daemon stops").unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_port_taken_fails_the_start_with_http3_true() {
+    let (seen, result) = start_with_udp_port_taken("http3 = true").await;
+
+    assert!(seen.is_none(), "the daemon started");
+    let err = result.expect_err("the start fails");
+    assert!(err.to_string().contains("HTTP/3"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_port_taken_only_warns_when_unset() {
+    let (seen, result) = start_with_udp_port_taken("").await;
+
+    result.expect("the daemon runs and stops");
+    let (status, headers) = seen.expect("the daemon started");
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("alt-svc"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_does_not_wait_forever_for_a_pinging_client() {
+    let (backend, mut arrivals) = slow_backend("pinged", Duration::from_millis(300)).await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+    // Pings more often than the server's quiet window: the server keeps
+    // acknowledging them.
+    let mut client = Http3Client::connect_keep_alive(
+        proxy.address,
+        "localhost",
+        &proxy.root,
+        Duration::from_millis(20),
+    )
+    .await
+    .expect("QUIC handshake");
+
+    // The stop comes while the request is in flight, so the connection
+    // waits for its response to be acknowledged before it closes.
+    let request = tokio::task::spawn(async move {
+        let response = client.send(get_request()).await;
+        (client, response)
+    });
+    arrival(&mut arrivals).await;
+    assert_eq!(proxy.admin_post("/stop").await, StatusCode::OK);
+    let (client, response) = request.await.unwrap();
+    assert_eq!(response.unwrap().status, StatusCode::OK);
+
+    let stopped = tokio::time::timeout(Duration::from_secs(6), proxy.daemon).await;
+    stopped
+        .expect("the daemon stops within 6 s")
+        .unwrap()
+        .unwrap();
+    drop(client);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alt_svc_follows_reloads() {
+    let backend = util::backend("reloaded").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+    let advertised = async || {
+        let (_, headers) = https_exchange(proxy.address, &proxy.root, false).await;
+        headers.contains_key("alt-svc")
+    };
+    assert!(advertised().await, "advertised at the start");
+
+    // The new generation takes over the endpoint of the old one.
+    proxy.reload(|site| forwarding(site, backend, "")).await;
+    assert!(advertised().await, "not advertised after a plain reload");
+
+    proxy
+        .reload(|site| forwarding(site, backend, "http3 = false"))
+        .await;
+    assert!(!advertised().await, "advertised with http3 = false");
+
+    proxy.reload(|site| forwarding(site, backend, "")).await;
+    assert!(advertised().await, "not advertised once HTTP/3 is back");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alt_svc_stays_after_a_failed_reload() {
+    let backend = util::backend("kept").await;
+    let echo = util::udp_echo("e:").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+
+    // As in `failed_reload_keeps_http3`: the UDP port is released, then
+    // the start fails.
+    let status = proxy
+        .try_reload(|site| {
+            let missing = site.dir.join("missing.pem");
+            format!(
+                "[[server]]\nlisten = \"{}\"\nprotocol = \"udp\"\nforward = \"{echo}\"\n\n\
+                 [[server]]\nlisten = \"{}\"\nforward = \"{backend}\"\n\
+                 tls = {{ cert = {missing:?}, key = {missing:?} }}\n",
+                site.listen,
+                free_address()
+            )
+        })
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, headers) = https_exchange(proxy.address, &proxy.root, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.contains_key("alt-svc"));
 }

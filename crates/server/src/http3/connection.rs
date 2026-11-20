@@ -110,7 +110,7 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
         .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
         .and_then(|chain| tls::client_subject(&chain));
     let service = context
-        .http_service(peer, listener.address, client_subject)
+        .http_service(peer, listener.address, client_subject, None)
         .expect("HTTP/3 listeners belong to HTTP servers");
 
     // h3 buffers a whole HEADERS frame before it decodes it and checks its
@@ -226,6 +226,9 @@ fn needs_retry(available: usize, max: usize, validated: bool, may_retry: bool) -
     !validated && may_retry && available * 2 < max
 }
 
+/// Longest wait in [`settled`], however busy the connection is.
+const SETTLE_CAP: Duration = Duration::from_secs(3);
+
 /// Resolves once the client closed the connection, or once its last
 /// responses are acknowledged: closing earlier would drop the stream data
 /// in flight.
@@ -235,6 +238,8 @@ async fn settled(quic: &quinn::Connection) {
     // connection open after GOAWAY. So the data counts as acknowledged once
     // the connection sends nothing for two probe timeouts: unacknowledged
     // data is sent again within one. Wait on `stopped()` once h3 exposes it.
+    // A client that sends PINGs more often than that window keeps the server
+    // sending ACKs, so the wait is also capped at `SETTLE_CAP`.
     let quiet = async {
         loop {
             let sent = quic.stats().udp_tx.datagrams;
@@ -245,11 +250,14 @@ async fn settled(quic: &quinn::Connection) {
             }
         }
     };
-    tokio::select! {
-        // Also on the idle timeout.
-        _ = quic.closed() => {}
-        () = quiet => {}
-    }
+    let settled = async {
+        tokio::select! {
+            // Also on the idle timeout.
+            _ = quic.closed() => {}
+            () = quiet => {}
+        }
+    };
+    let _ = tokio::time::timeout(SETTLE_CAP, settled).await;
 }
 
 /// Sending half of a request stream. Dropped before its response ended,

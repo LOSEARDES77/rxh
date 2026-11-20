@@ -3,6 +3,7 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use h3::client::{RequestStream, SendRequest};
@@ -88,14 +89,32 @@ impl Http3Client {
         root_pem: &str,
         identity: Option<(&str, &str)>,
     ) -> io::Result<Self> {
-        let (endpoint, connection) = quic_connect(
-            address,
-            server_name,
-            root_pem,
-            identity,
-            TransportConfig::default(),
-        )
-        .await?;
+        let transport = TransportConfig::default();
+        Self::connect_with(address, server_name, root_pem, identity, transport).await
+    }
+
+    /// [`Http3Client::connect`] without a client certificate, sending a
+    /// PING every `keep_alive` while idle.
+    pub async fn connect_keep_alive(
+        address: SocketAddr,
+        server_name: &str,
+        root_pem: &str,
+        keep_alive: Duration,
+    ) -> io::Result<Self> {
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(keep_alive));
+        Self::connect_with(address, server_name, root_pem, None, transport).await
+    }
+
+    async fn connect_with(
+        address: SocketAddr,
+        server_name: &str,
+        root_pem: &str,
+        identity: Option<(&str, &str)>,
+        transport: TransportConfig,
+    ) -> io::Result<Self> {
+        let (endpoint, connection) =
+            quic_connect(address, server_name, root_pem, identity, transport).await?;
         let (mut driver, sender) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
             .await
             .map_err(io::Error::other)?;
