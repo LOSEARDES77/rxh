@@ -121,10 +121,18 @@ fn check_server(path: &str, server: &Table, warnings: &mut Vec<Warning>) {
         check_pool(&format!("{path}.forward"), pool, warnings);
     }
     if let Some(Value::Array(patterns)) = server.get("match") {
-        for (index, pattern) in patterns.iter().enumerate() {
-            if let Some(Value::Table(pool)) = pattern.get("forward") {
-                check_pool(&format!("{path}.match[{index}].forward"), pool, warnings);
-            }
+        check_patterns(&format!("{path}.match"), patterns, warnings);
+    }
+}
+
+/// Entries of a `match` or `subroute` list; TCP subroutes nest.
+fn check_patterns(path: &str, patterns: &[Value], warnings: &mut Vec<Warning>) {
+    for (index, pattern) in patterns.iter().enumerate() {
+        if let Some(Value::Table(pool)) = pattern.get("forward") {
+            check_pool(&format!("{path}[{index}].forward"), pool, warnings);
+        }
+        if let Some(Value::Array(subroute)) = pattern.get("subroute") {
+            check_patterns(&format!("{path}[{index}].subroute"), subroute, warnings);
         }
     }
 }
@@ -132,16 +140,35 @@ fn check_server(path: &str, server: &Table, warnings: &mut Vec<Warning>) {
 fn check_pool(path: &str, pool: &Table, warnings: &mut Vec<Warning>) {
     check_keys(path, pool, Scope::Pool, warnings);
     for key in POLICY_KEYS {
-        let Some(Value::String(policy)) = pool.get(key) else {
-            continue;
-        };
-        for deprecated in DEPRECATED {
-            if deprecated.scope == Scope::Policy && deprecated.old == policy {
-                warnings.push(Warning {
-                    path: path.to_owned(),
-                    deprecated: *deprecated,
-                });
+        if let Some(Value::String(policy)) = pool.get(key) {
+            check_policy(path, policy, warnings);
+        }
+    }
+    check_fallback(&format!("{path}.fallback"), pool.get("fallback"), warnings);
+}
+
+/// A `fallback`: a policy name, or a table with a `policy` and maybe
+/// another `fallback`.
+fn check_fallback(path: &str, fallback: Option<&Value>, warnings: &mut Vec<Warning>) {
+    match fallback {
+        Some(Value::String(policy)) => check_policy(path, policy, warnings),
+        Some(Value::Table(table)) => {
+            if let Some(Value::String(policy)) = table.get("policy") {
+                check_policy(path, policy, warnings);
             }
+            check_fallback(&format!("{path}.fallback"), table.get("fallback"), warnings);
+        }
+        _ => {}
+    }
+}
+
+fn check_policy(path: &str, policy: &str, warnings: &mut Vec<Warning>) {
+    for deprecated in DEPRECATED {
+        if deprecated.scope == Scope::Policy && deprecated.old == policy {
+            warnings.push(Warning {
+                path: path.to_owned(),
+                deprecated: *deprecated,
+            });
         }
     }
 }
@@ -230,6 +257,59 @@ forward = "@connections"
 "#;
         Config::from_toml(text).expect("valid");
         assert_eq!(messages(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn finds_policies_in_nested_fallbacks() {
+        let text = r#"
+[upstream.web]
+policy = "header"
+key = "x-user"
+fallback = { policy = "wrr", fallback = { policy = "query", key = "q", fallback = "WRR" } }
+backends = ["127.0.0.1:8001"]
+
+[upstream.api]
+policy = "ip_hash"
+fallback = "wrr"
+backends = ["127.0.0.1:8002"]
+"#;
+        Config::from_toml(text).expect("deprecated fallback policies keep working");
+        assert_eq!(
+            messages(text),
+            [
+                "upstream.api.fallback: policy `wrr` is deprecated since 0.3.0, \
+                 use `weighted_round_robin`",
+                "upstream.web.fallback: policy `wrr` is deprecated since 0.3.0, \
+                 use `weighted_round_robin`",
+                "upstream.web.fallback.fallback.fallback: policy `WRR` is deprecated since \
+                 0.3.0, use `weighted_round_robin`",
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_pools_in_nested_tcp_subroutes() {
+        let text = r#"
+[[server]]
+protocol = "tcp"
+listen = "127.0.0.1:8080"
+match = [{ remote_ip = ["127.0.0.0/8"], subroute = [
+    { regexp = "^a", forward = { algorithm = "wrr", backends = ["127.0.0.1:8001"] } },
+    { subroute = [{ forward = { policy = "WRR", backends = ["127.0.0.1:8002"] } }] },
+] }]
+"#;
+        Config::from_toml(text).expect("deprecated keys in subroutes keep working");
+        assert_eq!(
+            messages(text),
+            [
+                "server[0].match[0].subroute[0].forward: key `algorithm` is deprecated since \
+                 0.3.0, use `policy`",
+                "server[0].match[0].subroute[0].forward: policy `wrr` is deprecated since \
+                 0.3.0, use `weighted_round_robin`",
+                "server[0].match[0].subroute[1].subroute[0].forward: policy `WRR` is \
+                 deprecated since 0.3.0, use `weighted_round_robin`",
+            ]
+        );
     }
 
     #[test]

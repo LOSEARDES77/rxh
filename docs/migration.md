@@ -34,7 +34,10 @@ it does.
 
    The path after the file name is the table: `upstream.NAME`,
    `server[N]` (counted from 0 in that file), `server[N].forward` for an
-   inline pool and `server[N].match[M].forward` for the pool of a route.
+   inline pool, `server[N].match[M].forward` for the pool of a route,
+   `...subroute[K].forward` for a pool inside a TCP subroute (nested
+   subroutes repeat the segment), and `....fallback` (repeated for each
+   nested level) for a pool's fallback policy.
 3. Rename what the warnings list, using the table below, and run
    `rxh validate` again until it prints no warning. `rxh fmt` keeps your
    comments if you want to tidy the file afterwards.
@@ -50,7 +53,7 @@ checked. `rxh adapt` never writes them.
 |---|---|---|---|
 | `connections` | `[[server]]` | `max_connections` | 0.3.0 |
 | `algorithm` | pool (`[upstream.NAME]`, inline `forward`) | `policy` | 0.3.0 |
-| `policy = "WRR"`, `policy = "wrr"` | pool | `policy = "weighted_round_robin"` | 0.3.0 |
+| `policy = "WRR"`, `policy = "wrr"` | pool, and its `fallback` at any depth | `policy = "weighted_round_robin"` | 0.3.0 |
 
 ```toml
 # Before
