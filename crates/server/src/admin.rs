@@ -7,6 +7,8 @@
 //! |----------|-------------------------------|-------------------------------------|
 //! | `GET`    | `/status`                     | Version, listeners and pools        |
 //! | `GET`    | `/config`                     | Running configuration (JSON)        |
+//! | `GET`    | `/config/files`               | Files on disk as entities, masked   |
+//! | `GET`    | `/schema`                     | JSON schema of the configuration    |
 //! | `GET`    | `/pools`, `/pools/{name}`     | Pool members and health             |
 //! | `GET`    | `/reverse_proxy/upstreams`    | Caddy compatible upstream list      |
 //! | `POST`   | `/pools/{name}/upstreams`     | Add `{"address", "weight"}`         |
@@ -66,6 +68,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::change::{self, Change, Section};
+use crate::config_api;
 use crate::files;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
@@ -338,6 +341,8 @@ async fn handle(
         (&Method::GET, ["dashboard"]) if is_dashboard_page => dashboard(),
         (&Method::GET, ["dashboard"]) => dashboard_redirect(),
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
+        (&Method::GET, ["config", "files"]) => config_api::files(&state).await,
+        (&Method::GET, ["schema"]) => config_api::schema(),
         (&Method::GET, ["pools"]) => {
             let registry = registry(&state);
             let pools: Vec<_> = registry.groups().map(|group| group.pool.status()).collect();
@@ -718,7 +723,7 @@ async fn read_body(
     Ok(body.to_bytes())
 }
 
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
+pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
     let body = serde_json::to_vec_pretty(value).unwrap_or_else(|err| {
         format!("{{\"error\":\"serialization failed: {err}\"}}").into_bytes()
     });
@@ -756,7 +761,7 @@ fn dashboard_redirect() -> Response<Full<Bytes>> {
     response
 }
 
-fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+pub(crate) fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     json_response(status, &json!({ "error": message }))
 }
 

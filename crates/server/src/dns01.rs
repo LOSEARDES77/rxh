@@ -217,7 +217,8 @@ async fn cloudflare_publish(dns: &AcmeDns, name: &str, value: &str) -> Result<Re
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` in lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

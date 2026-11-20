@@ -43,6 +43,10 @@ pub(crate) fn mask(document: &mut DocumentMut) {
 ///
 /// Returns a message naming the path when `edited` has [`MASK`] where
 /// `stored` has no secret.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the write routes of Task 5")
+)]
 pub(crate) fn restore(edited: &mut DocumentMut, stored: &DocumentMut) -> Result<(), String> {
     let masked: Vec<Vec<Step>> = secrets(edited.as_item(), |text| text == MASK);
     for steps in masked {

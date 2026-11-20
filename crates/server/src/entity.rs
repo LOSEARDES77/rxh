@@ -23,6 +23,10 @@ pub(crate) enum Kind {
 
 impl Kind {
     /// The kind named by a path segment of the admin API.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the write routes of Task 5")
+    )]
     pub(crate) fn from_segment(segment: &str) -> Option<Self> {
         match segment {
             "server" => Some(Self::Server),
@@ -47,6 +51,10 @@ pub(crate) struct Entity {
 }
 
 /// Content of a new entity.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the write routes of Task 5")
+)]
 pub(crate) enum Body<'a> {
     Value(&'a Map<String, Json>),
     Toml(&'a str),
@@ -140,6 +148,10 @@ pub(crate) fn list(file_index: usize, document: &DocumentMut) -> Vec<Entity> {
 /// given is left as written, comment included; a key missing from `value` is
 /// removed; objects merge into tables by the same rule; arrays are replaced.
 /// On an error the document is unchanged.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the write routes of Task 5")
+)]
 pub(crate) fn replace_value(
     document: &mut DocumentMut,
     kind: Kind,
@@ -162,6 +174,10 @@ pub(crate) fn replace_value(
 /// Replaces the entity with `toml`, the body of its table: its keys, then its
 /// sub-tables under the headers they have in the file. The rest of the file
 /// keeps its text. On an error the document is unchanged.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the write routes of Task 5")
+)]
 pub(crate) fn replace_toml(
     document: &mut DocumentMut,
     kind: Kind,
@@ -191,6 +207,10 @@ pub(crate) fn replace_toml(
 /// Adds an entity and returns its key: the name given for a pool or a
 /// section, the position for a server (`key` is not used). On an error the
 /// document is unchanged.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the write routes of Task 5")
+)]
 pub(crate) fn create(
     document: &mut DocumentMut,
     kind: Kind,
@@ -265,6 +285,10 @@ pub(crate) fn create(
 
 /// Deletes an entity. The positions of the servers after a removed one shift
 /// down by one.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the write routes of Task 5")
+)]
 pub(crate) fn remove(document: &mut DocumentMut, kind: Kind, key: &str) -> Result<(), String> {
     match kind {
         Kind::Server => {

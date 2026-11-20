@@ -9,15 +9,12 @@ mod acme;
 mod admin;
 mod catalog;
 mod change;
+mod config_api;
 mod daemon;
 mod dns01;
 mod docker;
 mod dynamic;
 pub mod edit;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the admin routes of the next tasks")
-)]
 mod entity;
 mod error;
 mod files;
@@ -38,10 +35,6 @@ mod ocsp;
 mod per_core;
 mod proxy_protocol;
 mod registry;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the admin routes of the next tasks")
-)]
 mod secret;
 mod server;
 #[cfg(target_os = "linux")]
