@@ -182,7 +182,7 @@ A release people can run without reading the source.
       completion (`rxh schema`, `docs/rxh.schema.json`).
 - [x] `rxh adapt` to convert a Caddyfile or a simple `nginx.conf` into RXH
       TOML.
-- [ ] Documentation site with a guide per use case (load balancer, TLS
+- [x] Documentation site with a guide per use case (load balancer, TLS
       gateway, Docker, layer 4).
 - [x] Hot binary upgrade: a new process takes over the listening sockets
       (`rxh upgrade`, `SIGUSR2`, `POST /upgrade`; Linux).

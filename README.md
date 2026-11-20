@@ -222,6 +222,12 @@ More configurations: [`examples/`](examples), including
 and [TCP/UDP balancing](examples/tcp-udp.toml). The full reference is in
 [docs/configuration.md](docs/configuration.md).
 
+Step by step guides, one per use case, are on the
+[documentation site](docs/README.md): an
+[HTTP load balancer](docs/guides/load-balancer.md), a
+[TLS gateway](docs/guides/tls-gateway.md), [Docker](docs/guides/docker.md)
+and [layer 4 (TCP and UDP)](docs/guides/layer4.md).
+
 ## CLI
 
 | Command | What it does |

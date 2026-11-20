@@ -9,6 +9,12 @@ Changed.
 
 ### Added
 
+- Documentation site (mdBook, `mdbook build docs`) with a guide per use
+  case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
+  next to the configuration reference. The `Docs` workflow builds it on
+  every pull request and publishes it to GitHub Pages from `master`. The
+  tests validate every configuration of the guides and check the links
+  between pages.
 - Hot binary upgrade on Linux: `rxh upgrade`, `SIGUSR2` or `POST /upgrade`
   make the daemon start its own command line again, which runs the binary
   now on disk, and hand it every listening socket (TCP, UDP, admin). The new

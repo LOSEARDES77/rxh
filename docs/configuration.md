@@ -4,7 +4,8 @@ RXH reads one TOML file (`rxh.toml` by default, `-c` or `RXH_CONFIG` to
 change it). `rxh validate` checks a file without starting anything and
 warns about deprecated keys (see [Configuration migration](migration.md)),
 and [`examples/full.toml`](../examples/full.toml) shows every option at
-once.
+once. Step by step guides per use case are listed on the
+[documentation home](README.md).
 
 Durations are strings like `250ms`, `5s`, `1m30s` or `2h` (units `ns`, `us`,
 `ms`, `s`, `m`, `h`, `d`), or plain integers meaning seconds. Unknown keys
