@@ -1,29 +1,11 @@
-//! HTTP/3: a QUIC endpoint next to the TCP listener of every `http` server
-//! with TLS.
-//!
-//! A [`Listener`] is what one generation serves on one address: routes,
-//! limits, log and QUIC TLS settings, shared with its TCP listener. The
-//! daemon owns the [`Endpoints`], one UDP socket per address, and they
-//! outlive generations: two sockets on one port would split the packets of
-//! every connection between them. Installing a generation hands the new
-//! connections of each endpoint to its new listener; open connections keep
-//! the listener they were accepted under.
-//!
-//! ```text
-//!   Endpoints (daemon)        Listener (generation)
-//!   :443/udp ---- new connections ----> routes, limits, log, TLS
-//!       \
-//!        connection ---> one task per request stream ---> Service
-//! ```
+//! One QUIC connection: limits, handshake, requests, drain.
 
-use std::collections::HashMap;
-use std::fmt;
 use std::future;
 use std::io;
-use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use h3::error::{Code, ConnectionError, StreamError};
@@ -32,21 +14,16 @@ use http::header::{self, HeaderName};
 use http::{HeaderMap, Request, Response, Version};
 use http_body_util::BodyExt;
 use hyper::body::{Frame, SizeHint};
-use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{Endpoint, EndpointConfig, Incoming, TokioRuntime};
-use socket2::{Domain, Socket, Type};
-use tokio::sync::{mpsc, oneshot, watch};
+use quinn::{ConnectionError as QuicError, Incoming};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::quic::Suite;
-use tokio_rustls::rustls::{CipherSuite, ServerConfig};
+use tokio_rustls::rustls::pki_types::CertificateDer;
 
-use crate::error::Error;
+use super::listener::{self, Listener, Phase};
 use crate::http::body::{self, Body, BodyError};
 use crate::http::response::BoxResponse;
 use crate::http::service::Service;
-use crate::server::{self, ConnectionContext};
-use crate::systemd;
+use crate::server::{self, PerIpSlot};
 use crate::tls;
 
 /// Connection-specific fields, which HTTP/3 forbids (RFC 9114, section
@@ -59,171 +36,73 @@ const CONNECTION_FIELDS: [HeaderName; 5] = [
     header::UPGRADE,
 ];
 
+/// Least time a connection that answered its last request stays open, so
+/// the client can acknowledge the responses, unless it closes first.
+const LINGER: Duration = Duration::from_millis(100);
+
 /// Request stream of an HTTP/3 connection, or one of its halves.
 type Stream<S> = RequestStream<S, Bytes>;
 
-/// What one generation serves over HTTP/3 on one address.
-pub(crate) struct Listener {
-    address: SocketAddr,
-    /// QUIC and TLS settings of new connections.
-    config: quinn::ServerConfig,
-    /// Routes, limits and log, shared with the TCP listener.
-    context: Arc<ConnectionContext>,
-}
-
-impl fmt::Debug for Listener {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Listener")
-            .field("address", &self.address)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Listener {
-    /// Listener on `address`, the address of the TCP listener whose
-    /// `context` it serves, with the certificates and client verifier of
-    /// its TLS acceptor `tls`.
-    pub(crate) fn new(
-        address: SocketAddr,
-        tls: &TlsAcceptor,
-        context: Arc<ConnectionContext>,
-    ) -> io::Result<Self> {
-        let crypto =
-            QuicServerConfig::with_initial(tls::quic_config(tls.config()), initial_suite()?)
-                .map_err(io::Error::other)?;
-        Ok(Self {
-            address,
-            config: quinn::ServerConfig::with_crypto(Arc::new(crypto)),
-            context,
-        })
-    }
-}
-
-/// Suite that protects QUIC Initial packets. It is always AES-128-GCM (RFC
-/// 9001, section 5.2), even when `tls_options` leave that suite out of the
-/// handshake.
-fn initial_suite() -> io::Result<Suite> {
-    let provider = Arc::clone(ServerConfig::builder().crypto_provider());
-    provider
-        .cipher_suites
-        .iter()
-        .filter_map(|suite| suite.tls13())
-        .find(|suite| suite.common.suite == CipherSuite::TLS13_AES_128_GCM_SHA256)
-        .and_then(|suite| suite.quic_suite())
-        .ok_or_else(|| io::Error::other("the TLS provider has no AES-128-GCM suite for QUIC"))
-}
-
-/// QUIC endpoints of the daemon, by listen address. They outlive
-/// generations.
-#[derive(Default)]
-pub(crate) struct Endpoints {
-    endpoints: Mutex<HashMap<SocketAddr, Entry>>,
-}
-
-/// One endpoint and the listener it hands new connections to.
-struct Entry {
-    endpoint: Endpoint,
-    listener: watch::Sender<Arc<Listener>>,
-}
-
-impl Endpoints {
-    /// Makes `listeners` the ones new connections are served by, binding
-    /// the addresses that have no endpoint yet. Every new address is bound
-    /// before anything changes, so on error the endpoints serve what they
-    /// served before. Endpoints `listeners` has no address for keep their
-    /// listener.
-    pub(crate) fn install(&self, listeners: &[Arc<Listener>]) -> Result<(), Error> {
-        let mut endpoints = self
-            .endpoints
-            .lock()
-            .expect("nothing panics while holding the endpoints");
-
-        let mut bound = Vec::new();
-        for listener in listeners {
-            if !endpoints.contains_key(&listener.address) {
-                let endpoint = bind(listener).map_err(|err| {
-                    let address = listener.address;
-                    io::Error::new(err.kind(), format!("HTTP/3 on {address} (UDP): {err}"))
-                })?;
-                bound.push((listener, endpoint));
-            }
-        }
-
-        for listener in listeners {
-            if let Some(entry) = endpoints.get(&listener.address) {
-                entry
-                    .endpoint
-                    .set_server_config(Some(listener.config.clone()));
-                entry.listener.send_replace(Arc::clone(listener));
-            }
-        }
-        for (listener, endpoint) in bound {
-            let (sender, receiver) = watch::channel(Arc::clone(listener));
-            tokio::task::spawn(accept(endpoint.clone(), receiver));
-            let entry = Entry {
-                endpoint,
-                listener: sender,
-            };
-            endpoints.insert(listener.address, entry);
-        }
-        Ok(())
-    }
-}
-
-/// QUIC endpoint on the address of `listener`, over the UDP socket systemd
-/// passed for it or a new one. Runs on the calling runtime.
-fn bind(listener: &Listener) -> io::Result<Endpoint> {
-    let address = listener.address;
-    let socket = match systemd::udp_socket(address)? {
-        Some(socket) => socket,
-        None => {
-            let socket = Socket::new(Domain::for_address(address), Type::DGRAM, None)?;
-            // Lets the next process of a hot binary upgrade bind the port
-            // while this one still serves it.
-            #[cfg(unix)]
-            socket.set_reuse_port(true)?;
-            if address.is_ipv6() {
-                socket.set_only_v6(true)?;
-            }
-            socket.bind(&address.into())?;
-            socket.into()
-        }
-    };
-    socket.set_nonblocking(true)?;
-    Endpoint::new(
-        EndpointConfig::default(),
-        Some(listener.config.clone()),
-        socket,
-        Arc::new(TokioRuntime),
-    )
-}
-
-/// Accepts the connections of `endpoint`, each one served by the listener
-/// current when it arrives.
-async fn accept(endpoint: Endpoint, listener: watch::Receiver<Arc<Listener>>) {
-    while let Some(incoming) = endpoint.accept().await {
-        let listener = Arc::clone(&listener.borrow());
-        tokio::task::spawn(serve_connection(incoming, listener));
-    }
-}
-
-/// Serves the requests of one QUIC connection until it closes.
-async fn serve_connection(incoming: Incoming, listener: Arc<Listener>) {
-    let log_name = &listener.context.log.log_name;
+/// Serves the requests of one QUIC connection until it closes, under the
+/// limits of `listener`. A connection over a limit is refused, not queued:
+/// the client falls back to TCP.
+pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>) {
+    let context = &listener.context;
     let peer = incoming.remote_address();
-    let connection = match incoming.await {
-        Ok(connection) => connection,
-        Err(err) => {
-            eprintln!("{log_name} => QUIC handshake with {peer} failed: {err}");
+    // Refused without a log line: a client over its limit could flood it.
+    if *listener.phase.borrow() != Phase::Serving {
+        incoming.refuse();
+        return;
+    }
+    let Ok(_permit) = Arc::clone(&listener.permits).try_acquire_owned() else {
+        incoming.refuse();
+        return;
+    };
+    let _slot = match &context.per_ip {
+        Some((max, counts)) => match PerIpSlot::acquire(*max, counts, peer.ip()) {
+            Some(slot) => Some(slot),
+            None => {
+                incoming.refuse();
+                return;
+            }
+        },
+        None => None,
+    };
+    let _open = listener.count_open();
+    let mut phase = listener.phase.subscribe();
+
+    let log_name = &context.log.log_name;
+    let deadline = context
+        .read_header_timeout
+        .unwrap_or(server::DEFAULT_HANDSHAKE_TIMEOUT);
+    let handshake = tokio::select! {
+        handshake = tokio::time::timeout(deadline, incoming) => handshake,
+        _ = phase.wait_for(|phase| *phase == Phase::Closed) => return,
+    };
+    let quic = match handshake {
+        Ok(Ok(connection)) => connection,
+        // The endpoint was closed: the daemon stops.
+        Ok(Err(QuicError::LocallyClosed)) => return,
+        Ok(Err(err)) => {
+            eprintln!("{log_name} => TLS handshake with {peer} failed: {err}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("{log_name} => TLS handshake with {peer} timed out");
             return;
         }
     };
+    let client_subject = quic
+        .peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .and_then(|chain| tls::client_subject(&chain));
+
     // h3 buffers a whole HEADERS frame before it decodes it and checks this
-    // limit, so that buffering is bounded only by time, which Task 4's
-    // `read_header_timeout` covers.
+    // limit, so that buffering is bounded only by time: the first request
+    // head by `read_header_timeout` below, the others by `idle_timeout`.
     let mut connection = match h3::server::builder()
         .max_field_section_size(u64::from(server::MAX_HEADER_LIST_SIZE))
-        .build(h3_quinn::Connection::new(connection))
+        .build(h3_quinn::Connection::new(quic.clone()))
         .await
     {
         Ok(connection) => connection,
@@ -232,32 +111,98 @@ async fn serve_connection(incoming: Incoming, listener: Arc<Listener>) {
             return;
         }
     };
-    let service = listener
-        .context
-        .http_service(peer, listener.address, None)
+    let service = context
+        .http_service(peer, listener.address, client_subject)
         .expect("HTTP/3 listeners belong to HTTP servers");
 
-    // Dropped, and so aborted, when the connection is lost: no response
-    // can reach the client any more.
+    let activity = Arc::clone(&service.activity);
+    let first_request = context
+        .read_header_timeout
+        .unwrap_or(server::DEFAULT_READ_HEADER_TIMEOUT);
+    let first_head = tokio::time::timeout(first_request, activity.first_request());
+    let mut first_head = std::pin::pin!(first_head);
+    let mut waiting_for_head = true;
+    let mut sent_goaway = false;
+    let mut received_goaway = false;
+    // Dropped, and so aborted, when the connection ends: no response can
+    // reach the client any more.
     let mut requests = JoinSet::new();
-    loop {
-        while requests.try_join_next().is_some() {}
-        match connection.accept().await {
-            Ok(Some(resolver)) => {
-                requests.spawn(serve_request(resolver, service.clone()));
-            }
-            // The client sent GOAWAY: answer what it already asked for.
-            Ok(None) => break,
-            Err(err) => {
-                // Closes and timeouts from the client side are routine.
-                if matches!(err, ConnectionError::Local { .. }) && !err.is_h3_no_error() {
-                    eprintln!("{log_name} => HTTP/3 connection from {peer}: {err}");
+    // True once every request was answered, false to close at once.
+    let answered = loop {
+        let current = *phase.borrow_and_update();
+        match current {
+            Phase::Serving => {}
+            Phase::Draining => {
+                if !sent_goaway {
+                    sent_goaway = true;
+                    // An error means the connection is gone: the loop ends below.
+                    let _ = connection.shutdown(0).await;
                 }
-                return;
             }
+            Phase::Closed => break false,
+        }
+        if (sent_goaway || received_goaway) && requests.is_empty() {
+            break true;
+        }
+        tokio::select! {
+            // Still polled after this side's GOAWAY: h3 rejects the streams
+            // that come after it.
+            accepted = connection.accept(), if !received_goaway => match accepted {
+                Ok(Some(resolver)) => {
+                    requests.spawn(serve_request(resolver, service.clone()));
+                }
+                // The client sent GOAWAY: answer what it already asked for.
+                Ok(None) => received_goaway = true,
+                Err(err) => {
+                    // Closes and timeouts from the client side are routine.
+                    if matches!(err, ConnectionError::Local { .. }) && !err.is_h3_no_error() {
+                        eprintln!("{log_name} => HTTP/3 connection from {peer}: {err}");
+                    }
+                    return;
+                }
+            },
+            Some(_) = requests.join_next() => {}
+            head = &mut first_head, if waiting_for_head => {
+                if head.is_err() {
+                    break false;
+                }
+                waiting_for_head = false;
+            }
+            // The sender lives in `listener`: this cannot fail.
+            _ = phase.changed() => {}
+        }
+    };
+    drop(requests);
+    if answered {
+        // ponytail: closing drops the stream data the client did not
+        // acknowledge yet, and h3 0.0.8 hides the `SendStream::stopped()`
+        // that reports the acknowledgement: the last responses get a few
+        // round trips to arrive instead. Wait on `stopped()` once h3 exposes
+        // it.
+        let linger = LINGER + 4 * quic.rtt();
+        tokio::select! {
+            _ = quic.closed() => return,
+            _ = phase.wait_for(|phase| *phase == Phase::Closed) => {}
+            () = tokio::time::sleep(linger) => {}
         }
     }
-    while requests.join_next().await.is_some() {}
+    quic.close(listener::no_error(), b"");
+}
+
+/// Sending half of a request stream. Dropped before its response ended,
+/// by a panic or an error, it resets the stream with `H3_INTERNAL_ERROR`:
+/// quinn would end it cleanly and a cut response would look whole.
+struct ResponseStream {
+    stream: Stream<h3_quinn::SendStream<Bytes>>,
+    finished: bool,
+}
+
+impl Drop for ResponseStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.stream.stop_stream(Code::H3_INTERNAL_ERROR);
+        }
+    }
 }
 
 /// Answers the request of one stream with `service`.
@@ -266,7 +211,11 @@ async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, s
     let Ok((request, stream)) = resolver.resolve_request().await else {
         return;
     };
-    let (mut send, receive) = stream.split();
+    let (send, receive) = stream.split();
+    let send = ResponseStream {
+        stream: send,
+        finished: false,
+    };
     let (mut parts, ()) = request.into_parts();
     parts.version = Version::HTTP_3;
     let (reset_sender, reset) = oneshot::channel();
@@ -285,7 +234,7 @@ async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, s
         Ok(()) = reset => return,
     };
     // An error means the client reset the stream: it wants no answer.
-    let _ = send_response(&mut send, response).await;
+    let _ = send_response(send, response).await;
 }
 
 /// Reads a request body from its stream: data frames, then trailers.
@@ -327,14 +276,19 @@ impl BodyReader {
     }
 }
 
-/// Length a request declares in a single valid `Content-Length`.
+/// Length a request declares in a single `Content-Length` of ASCII digits
+/// only: Rust's integer parser would also take a leading `+`.
 fn declared_length(headers: &HeaderMap) -> Option<u64> {
     let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
     let value = values.next()?;
     if values.next().is_some() {
         return None;
     }
-    value.to_str().ok()?.parse().ok()
+    let value = value.to_str().ok()?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn body_error(err: StreamError) -> BodyError {
@@ -364,6 +318,9 @@ async fn request_body(
         Poll::Pending => None,
     };
 
+    // A `GET` without `Content-Length` whose end of stream comes after
+    // this peek goes upstream chunked: `is_end_stream` can only report an
+    // end that already happened when the proxy sends the head.
     let (sender, receiver) = mpsc::channel(1);
     tokio::task::spawn(read_body(reader, first, sender, reset));
     let received = Received {
@@ -399,7 +356,10 @@ async fn read_body(
         match next {
             None => return,
             Some(Ok(frame)) => {
-                // An error means the body was dropped: keep watching.
+                // A reset is not seen while this waits for room in the
+                // channel, which only happens while the proxy holds the body
+                // without reading it. An error means the body was dropped:
+                // keep watching.
                 let _ = sender.send(Ok(frame)).await;
             }
             Some(Err(err)) => {
@@ -452,13 +412,11 @@ impl hyper::body::Body for Received {
     }
 }
 
-/// Sends `response` on `stream`: head, data, trailers, end. A body that
-/// fails resets the stream with `H3_INTERNAL_ERROR`, so the client cannot
-/// take a cut body for a whole one.
-async fn send_response(
-    stream: &mut Stream<h3_quinn::SendStream<Bytes>>,
-    response: BoxResponse,
-) -> Result<(), StreamError> {
+/// Sends `response` on `send`: head, data, trailers, end. A body that fails
+/// leaves the response unfinished, so the stream is reset and the client
+/// cannot take a cut body for a whole one.
+async fn send_response(mut send: ResponseStream, response: BoxResponse) -> Result<(), StreamError> {
+    let stream = &mut send.stream;
     let (mut parts, mut body) = response.into_parts();
     for name in &CONNECTION_FIELDS {
         parts.headers.remove(name);
@@ -468,7 +426,6 @@ async fn send_response(
         .await?;
     while let Some(frame) = body.frame().await {
         let Ok(frame) = frame else {
-            stream.stop_stream(Code::H3_INTERNAL_ERROR);
             return Ok(());
         };
         match frame.into_data() {
@@ -480,5 +437,25 @@ async fn send_response(
             }
         }
     }
-    stream.finish().await
+    let finished = stream.finish().await;
+    // Resetting now could discard what was sent and not yet acknowledged.
+    send.finished = true;
+    finished
+}
+
+#[cfg(test)]
+mod tests {
+    use http::HeaderValue;
+
+    use super::*;
+
+    #[test]
+    fn content_length_with_a_plus_sign_is_not_trusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("+5"));
+        assert_eq!(declared_length(&headers), None);
+
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        assert_eq!(declared_length(&headers), Some(5));
+    }
 }

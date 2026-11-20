@@ -44,12 +44,12 @@ use crate::udp::{self, UdpSettings};
 use crate::upgrade::{self, Lease};
 
 /// Deadline for the TLS handshake when `read_header_timeout` is unset.
-const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Deadline for the first request head of an HTTP connection when
 /// `read_header_timeout` is unset. Hyper applies the same default to later
 /// HTTP/1 request heads.
-const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Largest request header section accepted over HTTP/2 and HTTP/3, in bytes:
 /// hyper's HTTP/2 default. HTTP/1 has hyper's own read buffer limit.
@@ -110,8 +110,8 @@ pub(crate) struct ConnectionContext {
     handler: Handler,
     tls: Option<TlsAcceptor>,
     pub(crate) log: ListenerLog,
-    read_header_timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
+    pub(crate) read_header_timeout: Option<Duration>,
+    pub(crate) idle_timeout: Option<Duration>,
     /// Read a PROXY header first, from peers in `trusted_proxies` (any peer
     /// if empty).
     proxy_protocol_in: bool,
@@ -121,7 +121,7 @@ pub(crate) struct ConnectionContext {
     ip_allow: Vec<IpNet>,
     ip_deny: Vec<IpNet>,
     /// `max_connections_per_ip` and the open connections of each client.
-    per_ip: Option<(usize, Mutex<HashMap<IpAddr, usize>>)>,
+    pub(crate) per_ip: Option<(usize, Mutex<HashMap<IpAddr, usize>>)>,
     match_timeout: Duration,
 }
 
@@ -153,14 +153,18 @@ impl ConnectionContext {
 }
 
 /// One connection counted against `max_connections_per_ip`, until dropped.
-struct PerIpSlot<'a> {
+pub(crate) struct PerIpSlot<'a> {
     counts: &'a Mutex<HashMap<IpAddr, usize>>,
     ip: IpAddr,
 }
 
 impl<'a> PerIpSlot<'a> {
     /// Counts one more connection of `ip`, or `None` if it already has `max`.
-    fn acquire(max: usize, counts: &'a Mutex<HashMap<IpAddr, usize>>, ip: IpAddr) -> Option<Self> {
+    pub(crate) fn acquire(
+        max: usize,
+        counts: &'a Mutex<HashMap<IpAddr, usize>>,
+        ip: IpAddr,
+    ) -> Option<Self> {
         let ip = ip.to_canonical();
         let mut map = counts
             .lock()
@@ -291,6 +295,8 @@ impl Server {
         let label: Arc<str> = name.clone().unwrap_or_else(|| address.to_string()).into();
         let logger = Arc::new(Logger::new(&config.log)?);
 
+        let max_connections = server.max_connections.max(1);
+        let permits = Arc::new(Semaphore::new(max_connections));
         let mut cert_resolver = None;
         let closing = watch::Sender::new(false);
         let (socket, context, http3) = match socket {
@@ -413,16 +419,20 @@ impl Server {
                 };
                 let context = Arc::new(context);
                 let http3 = match &context.tls {
-                    Some(acceptor) if server.serves_http3() => Some(Arc::new(
-                        http3::Listener::new(address, acceptor, Arc::clone(&context))?,
-                    )),
+                    Some(acceptor) if server.serves_http3() => {
+                        Some(Arc::new(http3::Listener::new(
+                            address,
+                            acceptor,
+                            Arc::clone(&context),
+                            Arc::clone(&permits),
+                        )?))
+                    }
                     _ => None,
                 };
                 (Socket::Tcp(listener), Some(context), http3)
             }
         };
 
-        let max_connections = server.max_connections.max(1);
         Ok(Self {
             state: watch::channel(State::Starting).0,
             socket,
@@ -432,7 +442,7 @@ impl Server {
             name,
             log_name,
             max_connections,
-            permits: Arc::new(Semaphore::new(max_connections)),
+            permits,
             grace_period: config.grace_period,
             context,
             cert_resolver,
@@ -555,6 +565,7 @@ impl Server {
             ocsp_stapling,
             announce,
             closing,
+            http3,
             shutdown,
             ..
         } = self;
@@ -595,8 +606,11 @@ impl Server {
                 closing.send_replace(true);
                 while connections.try_join_next().is_some() {}
 
-                let pending = connections.len();
-                if pending > 0 {
+                let tcp = async {
+                    let pending = connections.len();
+                    if pending == 0 {
+                        return;
+                    }
                     println!("{log_name} => Can't shutdown yet, {pending} pending connections");
                     state.send_replace(State::ShuttingDown(ShutdownState::PendingConnections(
                         pending,
@@ -620,7 +634,13 @@ impl Server {
                         connections.abort_all();
                         drain(&mut connections).await;
                     }
-                }
+                };
+                let quic = async {
+                    if let Some(http3) = &http3 {
+                        http3.drain(grace_period).await;
+                    }
+                };
+                tokio::join!(tcp, quic);
 
                 state.send_replace(State::ShuttingDown(ShutdownState::Done));
                 if announce {
@@ -795,7 +815,7 @@ async fn handle_connection(
                 if connection.alpn_protocol() == Some(acme::TLS_ALPN_PROTOCOL) {
                     return;
                 }
-                let client_subject = tls::client_subject(connection);
+                let client_subject = connection.peer_certificates().and_then(tls::client_subject);
                 let handshake = Detected {
                     tls: true,
                     sni: connection.server_name().map(str::to_owned),

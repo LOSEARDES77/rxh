@@ -148,6 +148,19 @@ impl Generation {
         if let Some(previous) = previous {
             registry.inherit(previous);
         }
+        // A `udp` server taking over the port of a QUIC endpoint must be
+        // able to bind it.
+        endpoints.release(&effective).await;
+        // The last step that can fail, before the listeners serve: a
+        // generation that does not start leaves the QUIC endpoints to the
+        // running one.
+        let install = |servers: &[ServerInfo]| {
+            let listeners: Vec<Arc<http3::Listener>> = servers
+                .iter()
+                .filter_map(|server| server.http3.clone())
+                .collect();
+            endpoints.install(&listeners)
+        };
         let (stop, stopped) = oneshot::channel::<()>();
         let (servers, acme, task) = match effective.runtime {
             Runtime::Shared => {
@@ -156,20 +169,18 @@ impl Generation {
                         let _ = stopped.await;
                     });
                 let acme = acme::Manager::new(&effective, &master, base);
-                (master.servers(), acme, tokio::task::spawn(master.run()))
+                let servers = master.servers();
+                install(&servers)?;
+                (servers, acme, tokio::task::spawn(master.run()))
             }
             Runtime::PerCore => {
+                // Its listeners already serve; on error, dropping `stop`
+                // stops them.
                 let started = per_core::start(effective, &registry, base, stopped).await?;
+                install(&started.servers)?;
                 (started.servers, started.acme, started.task)
             }
         };
-        // The last step that can fail: a generation that does not start
-        // leaves the QUIC endpoints to the running one.
-        let listeners: Vec<Arc<http3::Listener>> = servers
-            .iter()
-            .filter_map(|server| server.http3.clone())
-            .collect();
-        endpoints.install(&listeners)?;
         // Health checks, the admin API and ACME stay on the calling runtime.
         let mut health_checks = registry.start_background_tasks();
         if let Some(acme) = acme {
@@ -480,6 +491,9 @@ impl Daemon {
                             // to the new process alone while this one
                             // drains. Requests in flight still get answers.
                             drop(admin_listener);
+                            // The UDP sockets are not handed over: requests
+                            // in flight over HTTP/3 fail and clients retry.
+                            endpoints.close();
                             return generation.stop().await;
                         }
                         Err(message) => {
@@ -538,7 +552,9 @@ impl Daemon {
 
         println!("Main => Shutting down");
         systemd::notify("STOPPING=1");
-        generation.stop().await
+        let stopped = generation.stop().await;
+        endpoints.close();
+        stopped
     }
 
     /// Directory relative `[acme]` paths are resolved against: the one of

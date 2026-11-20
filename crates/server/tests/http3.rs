@@ -6,26 +6,35 @@
 mod util;
 
 use std::convert::Infallible;
+use std::mem;
 use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{Empty, Full};
 use hyper::body::{Frame, Incoming};
+use hyper::header::HOST;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rcgen::{CertificateParams, DnType, KeyPair};
 use rxh_server::Daemon;
 use rxh_test_util::{Fault, FlakyBackend, Http3Client, free_address};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 /// Names the test certificate is valid for.
 const NAMES: [&str; 3] = ["localhost", "a.localhost", "b.localhost"];
@@ -45,6 +54,10 @@ struct Proxy {
     address: SocketAddr,
     /// Certificate of the servers, which the clients trust.
     root: String,
+    site: Site,
+    admin: SocketAddr,
+    path: PathBuf,
+    daemon: JoinHandle<Result<(), rxh_server::Error>>,
     _dir: TempDir,
 }
 
@@ -52,6 +65,11 @@ impl Proxy {
     /// Starts a daemon with the configuration `config` returns, plus an
     /// `[admin]` table, and waits until it serves.
     async fn start(config: impl FnOnce(&Site) -> String) -> Self {
+        Self::start_on(free_address(), config).await
+    }
+
+    /// [`Proxy::start`] with the servers on `listen`.
+    async fn start_on(listen: SocketAddr, config: impl FnOnce(&Site) -> String) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let certificate =
             rcgen::generate_simple_self_signed(NAMES.map(String::from).to_vec()).unwrap();
@@ -60,23 +78,42 @@ impl Proxy {
         std::fs::write(&cert, certificate.cert.pem()).unwrap();
         std::fs::write(&key, certificate.signing_key.serialize_pem()).unwrap();
         let site = Site {
-            listen: free_address(),
+            listen,
             tls: format!("{{ cert = {cert:?}, key = {key:?} }}"),
             dir: dir.path().to_owned(),
         };
 
         let admin = free_address();
-        let text = format!("{}\n[admin]\nlisten = \"{admin}\"\n", config(&site));
         let path = dir.path().join("rxh.toml");
-        std::fs::write(&path, text).unwrap();
-        tokio::task::spawn(Daemon::new(&path).run());
+        write_config(&path, admin, &config(&site));
+        let daemon = tokio::task::spawn(Daemon::new(&path).run());
         util::eventually(async || TcpStream::connect(admin).await.is_ok()).await;
 
         Self {
             address: site.listen,
             root: certificate.cert.pem(),
+            site,
+            admin,
+            path,
+            daemon,
             _dir: dir,
         }
+    }
+
+    /// Status of `POST {uri}` on the admin API.
+    async fn admin_post(&self, uri: &str) -> StatusCode {
+        let request = Request::post(uri)
+            .header(HOST, self.admin.to_string())
+            .body(Empty::new())
+            .unwrap();
+        util::send(self.admin, request).await.0
+    }
+
+    /// Rewrites the configuration file with what `config` returns and
+    /// reloads it, which must succeed.
+    async fn reload(&self, config: impl FnOnce(&Site) -> String) {
+        write_config(&self.path, self.admin, &config(&self.site));
+        assert_eq!(self.admin_post("/reload").await, StatusCode::OK);
     }
 
     /// A new QUIC connection for `name`.
@@ -86,6 +123,11 @@ impl Proxy {
             .expect("QUIC handshake")
     }
 
+    /// A new QUIC connection for `localhost`, or the handshake error.
+    async fn try_connect(&self) -> std::io::Result<Http3Client> {
+        Http3Client::connect(self.address, "localhost", &self.root, None).await
+    }
+
     /// `GET https://localhost{path}` on a new connection.
     async fn get(&self, path: &str) -> rxh_test_util::Http3Response {
         let request = Request::get(format!("https://localhost{path}"))
@@ -93,6 +135,19 @@ impl Proxy {
             .unwrap();
         self.connect("localhost").await.send(request).await.unwrap()
     }
+}
+
+/// `GET https://localhost/`.
+fn get_request() -> Request<Bytes> {
+    Request::get("https://localhost/")
+        .body(Bytes::new())
+        .unwrap()
+}
+
+/// Writes `config` and an `[admin]` table on `admin` to `path`.
+fn write_config(path: &Path, admin: SocketAddr, config: &str) {
+    let text = format!("{config}\n[admin]\nlisten = \"{admin}\"\n");
+    std::fs::write(path, text).unwrap();
 }
 
 /// A single `http` server forwarding to `backend`, with `extra` keys.
@@ -386,11 +441,23 @@ async fn client_reset_frees_the_connection_slot() {
         .body(())
         .unwrap();
     client.send_and_reset(request, b"ten bytes!").await.unwrap();
+    assert!(
+        proxy.try_connect().await.is_err(),
+        "the first client holds the only slot"
+    );
     drop(client);
 
-    let response = tokio::time::timeout(Duration::from_secs(2), proxy.get("/"))
-        .await
-        .expect("a second client is served within 2 s");
+    let mut second = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(client) = proxy.try_connect().await {
+                return client;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a second client gets the slot within 2 s");
+    let response = second.send(get_request()).await.unwrap();
     assert_eq!(response.status, StatusCode::OK);
 }
 
@@ -650,4 +717,378 @@ async fn get_declaring_no_body_is_retried_before_its_stream_ends() {
         assert_eq!(status.unwrap().unwrap(), StatusCode::OK);
     }
     assert!(flaky.connections() >= 1, "the closing backend was tried");
+}
+
+/// Backend answering `body` `delay` after each request, and reporting each
+/// request when it arrives.
+async fn slow_backend(body: &'static str, delay: Duration) -> (SocketAddr, mpsc::Receiver<()>) {
+    let (arrived, arrivals) = mpsc::channel(8);
+    let address = util::backend_with(move |_| {
+        let arrived = arrived.clone();
+        async move {
+            let _ = arrived.send(()).await;
+            tokio::time::sleep(delay).await;
+            Response::new(Full::new(Bytes::from(body)))
+        }
+    })
+    .await;
+    (address, arrivals)
+}
+
+/// Waits for the next request `arrivals` reports.
+async fn arrival(arrivals: &mut mpsc::Receiver<()>) {
+    tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+        .await
+        .expect("the backend gets the request within 5 s")
+        .expect("the backend runs");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_timeout_closes_the_connection() {
+    let backend = util::backend("idle").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "idle_timeout = \"300ms\"")).await;
+    let client = proxy.connect("localhost").await;
+
+    tokio::time::timeout(Duration::from_secs(2), client.closed())
+        .await
+        .expect("an idle connection is closed within 2 s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_without_a_request_is_closed() {
+    let backend = util::backend("late").await;
+    let proxy =
+        Proxy::start(|site| forwarding(site, backend, "read_header_timeout = \"300ms\"")).await;
+    let client = proxy.connect("localhost").await;
+
+    tokio::time::timeout(Duration::from_secs(2), client.closed())
+        .await
+        .expect("a connection without a request is closed within 2 s");
+}
+
+/// Sends `GET /` over HTTPS on TCP to `proxy` and returns the task that
+/// waits for the answer.
+async fn https_get(proxy: &Proxy) -> JoinHandle<hyper::Result<Response<Incoming>>> {
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(proxy.root.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let tls = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let stream = TcpStream::connect(proxy.address).await.unwrap();
+    let name = ServerName::try_from("localhost").unwrap();
+    let stream = TlsConnector::from(Arc::new(tls))
+        .connect(name, stream)
+        .await
+        .unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::task::spawn(connection);
+    let request = Request::get("/")
+        .header(HOST, "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    tokio::task::spawn(async move { sender.send_request(request).await })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_connections_is_shared_with_tcp() {
+    let (backend, mut arrivals) = slow_backend("slow", Duration::from_secs(3600)).await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "max_connections = 1")).await;
+
+    let tcp = https_get(&proxy).await;
+    arrival(&mut arrivals).await;
+
+    let refused = proxy.try_connect().await;
+    assert!(refused.is_err(), "a QUIC connection over max_connections");
+    tcp.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_connections_per_ip_counts_quic() {
+    let backend = util::backend("per ip").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "max_connections_per_ip = 1")).await;
+
+    let first = proxy.connect("localhost").await;
+    assert!(
+        proxy.try_connect().await.is_err(),
+        "a second connection from the same address"
+    );
+    drop(first);
+
+    let mut second = None;
+    util::eventually(async || {
+        second = proxy.try_connect().await.ok();
+        second.is_some()
+    })
+    .await;
+    let response = second.unwrap().send(get_request()).await.unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+}
+
+// A guard: `ip_deny` is checked per request, as for HTTP/1 and HTTP/2.
+#[tokio::test(flavor = "multi_thread")]
+async fn ip_deny_answers_403() {
+    let backend = util::backend("denied").await;
+    let proxy =
+        Proxy::start(|site| forwarding(site, backend, "ip_deny = [\"127.0.0.1/32\"]")).await;
+
+    assert_eq!(proxy.get("/").await.status, StatusCode::FORBIDDEN);
+}
+
+/// Writes a certificate authority to `dir` and returns its path, with the
+/// chain and key PEM of a client certificate it signed for
+/// `CN=alice, O=Example`.
+fn client_certificate(dir: &Path) -> (PathBuf, String, String) {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "clients");
+    let ca = params.self_signed(&ca_key).unwrap();
+    let path = dir.join("clients.pem");
+    std::fs::write(&path, ca.pem()).unwrap();
+    let issuer = rcgen::Issuer::new(params, ca_key);
+
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.distinguished_name.push(DnType::CommonName, "alice");
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "Example");
+    let cert = params.signed_by(&key, &issuer).unwrap();
+    (path, cert.pem(), key.serialize_pem())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mandatory_client_auth_refuses_clients_without_a_certificate() {
+    let (backend, requests) = util::echo_backend().await;
+    let proxy = Proxy::start(|site| {
+        let (ca, _, _) = client_certificate(&site.dir);
+        forwarding(site, backend, &format!("client_auth = {{ ca = {ca:?} }}"))
+    })
+    .await;
+
+    let refused = match proxy.try_connect().await {
+        Ok(mut client) => client.send(get_request()).await.err(),
+        Err(err) => Some(err),
+    };
+
+    assert!(
+        refused.is_some(),
+        "a client without a certificate was served"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_subject_reaches_the_backend() {
+    let (backend, mut requests) = util::interceptor().await;
+    let mut identity = None;
+    let proxy = Proxy::start(|site| {
+        let (ca, chain, key) = client_certificate(&site.dir);
+        identity = Some((chain, key));
+        let client_auth = format!("client_auth = {{ ca = {ca:?}, header = \"X-Client-Subject\" }}");
+        forwarding(site, backend, &client_auth)
+    })
+    .await;
+    let (chain, key) = identity.unwrap();
+
+    let mut client = Http3Client::connect(
+        proxy.address,
+        "localhost",
+        &proxy.root,
+        Some((&chain, &key)),
+    )
+    .await
+    .unwrap();
+    let response = client
+        .send(
+            Request::get("https://localhost/")
+                .header("x-client-subject", "CN=forged")
+                .body(Bytes::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, StatusCode::OK);
+    let seen = requests.recv().await.unwrap();
+    let subjects: Vec<_> = seen.headers.get_all("x-client-subject").iter().collect();
+    assert_eq!(subjects, ["CN=alice, O=Example"]);
+}
+
+// A guard: the QUIC TLS configuration shares the certificate resolver of
+// the TCP listener.
+#[tokio::test(flavor = "multi_thread")]
+async fn certificate_reload_reaches_quic() {
+    let backend = util::backend("renewed").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+
+    let renewed = rcgen::generate_simple_self_signed(NAMES.map(String::from).to_vec()).unwrap();
+    std::fs::write(proxy.site.dir.join("cert.pem"), renewed.cert.pem()).unwrap();
+    std::fs::write(
+        proxy.site.dir.join("key.pem"),
+        renewed.signing_key.serialize_pem(),
+    )
+    .unwrap();
+    assert_eq!(
+        proxy.admin_post("/certificates/reload").await,
+        StatusCode::OK
+    );
+
+    let root = renewed.cert.pem();
+    let mut client = Http3Client::connect(proxy.address, "localhost", &root, None)
+        .await
+        .expect("the renewed certificate is served over QUIC");
+    let response = client.send(get_request()).await.unwrap();
+    assert_eq!(response.body, "renewed");
+}
+
+// A guard: the UDP socket of an IPv6 listener is IPv6 only.
+#[tokio::test(flavor = "multi_thread")]
+async fn ipv6_listener() {
+    let backend = util::backend("six").await;
+    // Kept bound without listening, so no other test takes the port.
+    let socket = TcpSocket::new_v6().unwrap();
+    socket.set_reuseaddr(true).unwrap();
+    socket.bind("[::1]:0".parse().unwrap()).unwrap();
+    let listen = socket.local_addr().unwrap();
+    mem::forget(socket);
+    let proxy = Proxy::start_on(listen, |site| forwarding(site, backend, "")).await;
+
+    let response = proxy.get("/").await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, "six");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_lets_a_request_in_flight_finish() {
+    let (backend, mut arrivals) = slow_backend("finished", Duration::from_millis(500)).await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+    let mut client = proxy.connect("localhost").await;
+
+    let request = tokio::task::spawn(async move {
+        let response = client.send(get_request()).await;
+        (client, response)
+    });
+    arrival(&mut arrivals).await;
+    assert_eq!(proxy.admin_post("/stop").await, StatusCode::OK);
+
+    let (client, response) = request.await.unwrap();
+    let response = response.unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, "finished");
+    tokio::time::timeout(Duration::from_secs(2), client.closed())
+        .await
+        .expect("the stopped daemon closes the connection within 2 s");
+    let stopped = tokio::time::timeout(Duration::from_secs(2), proxy.daemon).await;
+    stopped.expect("the daemon stops").unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grace_period_cuts_long_requests() {
+    let (backend, mut arrivals) = slow_backend("never", Duration::from_secs(3600)).await;
+    let proxy = Proxy::start(|site| {
+        format!(
+            "grace_period = \"200ms\"\n{}",
+            forwarding(site, backend, "")
+        )
+    })
+    .await;
+    let mut client = proxy.connect("localhost").await;
+
+    let request = tokio::task::spawn(async move { client.send(get_request()).await });
+    arrival(&mut arrivals).await;
+    assert_eq!(proxy.admin_post("/stop").await, StatusCode::OK);
+
+    let stopped = tokio::time::timeout(Duration::from_secs(3), proxy.daemon).await;
+    stopped
+        .expect("the daemon stops within 3 s")
+        .unwrap()
+        .unwrap();
+    let cut = tokio::time::timeout(Duration::from_secs(3), request).await;
+    let cut = cut.expect("the request ends within 3 s").unwrap();
+    assert!(cut.is_err(), "a cut request ended normally: {cut:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_keeps_the_connection_and_the_request() {
+    let (a, mut arrivals) = slow_backend("a", Duration::from_millis(500)).await;
+    let b = util::backend("b").await;
+    let proxy = Proxy::start(|site| forwarding(site, a, "")).await;
+    let mut client = proxy.connect("localhost").await;
+
+    let request = tokio::task::spawn(async move {
+        let response = client.send(get_request()).await;
+        (client, response)
+    });
+    arrival(&mut arrivals).await;
+    proxy.reload(|site| forwarding(site, b, "")).await;
+
+    let (mut client, response) = request.await.unwrap();
+    let response = response.unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, "a");
+    // The previous generation drains its connections: GOAWAY, then close.
+    let refused = client.send(get_request()).await;
+    assert!(refused.is_err(), "a draining connection took a request");
+    assert_eq!(proxy.get("/").await.body, "b");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_turning_http3_off_closes_the_socket() {
+    let backend = util::backend("off").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+    assert!(
+        UdpSocket::bind(proxy.address).is_err(),
+        "HTTP/3 holds the UDP port"
+    );
+
+    proxy
+        .reload(|site| forwarding(site, backend, "http3 = false"))
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while UdpSocket::bind(proxy.address).is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the UDP port is free within 2 s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_to_a_udp_server_on_the_port_works() {
+    let (backend, mut arrivals) = slow_backend("never", Duration::from_secs(3600)).await;
+    let echo = util::udp_echo("e:").await;
+    let proxy = Proxy::start(|site| forwarding(site, backend, "")).await;
+    // Without a grace period, a reload that has to stop the running
+    // configuration before it starts the new one waits for this request.
+    let tcp = https_get(&proxy).await;
+    arrival(&mut arrivals).await;
+
+    let reload = proxy.reload(|site| {
+        format!(
+            "[[server]]\nlisten = \"{}\"\nprotocol = \"udp\"\nforward = \"{echo}\"\n",
+            site.listen
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(2), reload)
+        .await
+        .expect("the reload completes within 2 s");
+
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.send_to(b"ping", proxy.address).await.unwrap();
+    let mut buffer = [0; 64];
+    let (read, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await
+        .expect("an answer within 2 s")
+        .unwrap();
+    assert_eq!(&buffer[..read], b"e:ping");
+    tcp.abort();
 }
