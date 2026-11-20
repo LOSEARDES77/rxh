@@ -9,6 +9,10 @@
 //! | `GET`    | `/config`                     | Running configuration (JSON)        |
 //! | `GET`    | `/config/files`               | Files on disk as entities, masked   |
 //! | `GET`    | `/schema`                     | JSON schema of the configuration    |
+//! | `PUT`    | `/config/files/{index}`       | Save the text of one file           |
+//! | `POST`   | `/config/entities/{kind}`     | Save a new pool, server or section  |
+//! | `PUT`    | `/config/entities/{kind}/{key}` | Save one pool, server or section  |
+//! | `DELETE` | `/config/entities/{kind}/{key}` | Delete it from its file           |
 //! | `GET`    | `/pools`, `/pools/{name}`     | Pool members and health             |
 //! | `GET`    | `/reverse_proxy/upstreams`    | Caddy compatible upstream list      |
 //! | `POST`   | `/pools/{name}/upstreams`     | Add `{"address", "weight"}`         |
@@ -26,7 +30,9 @@
 //! `/load` takes a whole configuration and the `PATCH` routes a JSON merge
 //! patch (RFC 7396), as JSON or TOML. Both validate and swap like a reload,
 //! and neither writes the configuration file: the next reload or restart
-//! goes back to it. `/load` without a body reloads the file. A server is
+//! goes back to it. The `/config/files` and `/config/entities` routes write
+//! the file, then reload it; a change that is not valid or does not reload
+//! leaves the file as it was. `/load` without a body reloads the file. A server is
 //! addressed by `name`, else by its index.
 //!
 //! With `[admin] token` every request must carry `Authorization: Bearer
@@ -87,7 +93,7 @@ const DASHBOARD_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; 
 const MAX_BODY: usize = 64 * 1024;
 
 /// Limit for the bodies that carry configuration.
-const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
 
 /// Requests from the admin API to the daemon loop.
 #[derive(Debug)]
@@ -134,6 +140,9 @@ pub(crate) struct AdminState {
     pub(crate) token: Option<String>,
     pub(crate) current: RwLock<Current>,
     pub(crate) control: mpsc::Sender<Control>,
+    /// Held while a configuration file is saved and reloaded, so two saves
+    /// do not write over each other.
+    pub(crate) saving: tokio::sync::Mutex<()>,
 }
 
 #[derive(Deserialize)]
@@ -343,6 +352,19 @@ async fn handle(
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
         (&Method::GET, ["config", "files"]) => config_api::files(&state).await,
         (&Method::GET, ["schema"]) => config_api::schema(),
+        (&Method::PUT, ["config", "files", index]) => {
+            config_api::put_file(&state, index, request).await
+        }
+        (&Method::POST, ["config", "entities", kind]) => {
+            config_api::create(&state, kind, request).await
+        }
+        (&Method::PUT, ["config", "entities", kind, key]) => {
+            config_api::replace(&state, kind, key, request).await
+        }
+        (&Method::DELETE, ["config", "entities", kind, key]) => {
+            let query = request.uri().query();
+            config_api::remove(&state, kind, key, query).await
+        }
         (&Method::GET, ["pools"]) => {
             let registry = registry(&state);
             let pools: Vec<_> = registry.groups().map(|group| group.pool.status()).collect();
@@ -438,14 +460,32 @@ async fn control(
     request: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Control,
     done: &str,
 ) -> Response<Full<Bytes>> {
+    match self::request(state, request).await {
+        Ok(()) => json_response(StatusCode::OK, &json!({ done: true })),
+        Err((status, message)) => error(status, &message),
+    }
+}
+
+/// Sends a request to the daemon loop and waits for its outcome: `400` with
+/// the reason it was rejected, `503` when the daemon is stopping.
+pub(crate) async fn request(
+    state: &AdminState,
+    request: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Control,
+) -> Result<(), (StatusCode, String)> {
+    let stopping = || {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            String::from("daemon is shutting down"),
+        )
+    };
     let (reply, outcome) = oneshot::channel();
     if state.control.send(request(reply)).await.is_err() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down");
+        return Err(stopping());
     }
     match outcome.await {
-        Ok(Ok(())) => json_response(StatusCode::OK, &json!({ done: true })),
-        Ok(Err(message)) => error(StatusCode::BAD_REQUEST, &message),
-        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down"),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err((StatusCode::BAD_REQUEST, message)),
+        Err(_) => Err(stopping()),
     }
 }
 
@@ -707,7 +747,7 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
     })
 }
 
-async fn read_body(
+pub(crate) async fn read_body(
     request: Request<Incoming>,
     limit: usize,
 ) -> Result<Bytes, Box<Response<Full<Bytes>>>> {

@@ -43,10 +43,6 @@ pub(crate) fn mask(document: &mut DocumentMut) {
 ///
 /// Returns a message naming the path when `edited` has [`MASK`] where
 /// `stored` has no secret.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the write routes of Task 5")
-)]
 pub(crate) fn restore(edited: &mut DocumentMut, stored: &DocumentMut) -> Result<(), String> {
     let masked: Vec<Vec<Step>> = secrets(edited.as_item(), |text| text == MASK);
     for steps in masked {
@@ -63,6 +59,40 @@ pub(crate) fn restore(edited: &mut DocumentMut, stored: &DocumentMut) -> Result<
         }
     }
     Ok(())
+}
+
+/// [`restore`] for a file the client sent back whole. The servers of a file
+/// have no key but their position, so a [`MASK`] in a server is restored only
+/// when that server is still the stored one at its position: same `name`, or
+/// same `listen` without a name. The secret of a server that moved must be
+/// typed again, it is not taken from the server that was there.
+pub(crate) fn restore_file(edited: &mut DocumentMut, stored: &DocumentMut) -> Result<(), String> {
+    for steps in secrets(edited.as_item(), |text| text == MASK) {
+        let [Step::Key(key), Step::Index(index), ..] = steps.as_slice() else {
+            continue;
+        };
+        if key != "server" {
+            continue;
+        }
+        let server = &steps[..2];
+        if identity(get(edited.as_item(), server)) != identity(get(stored.as_item(), server)) {
+            return Err(format!(
+                "server {index} is not the server stored at that position, type its secret again \
+                 instead of {MASK}"
+            ));
+        }
+    }
+    restore(edited, stored)
+}
+
+/// What tells a server from the others: its `name`, else its `listen` as written.
+fn identity(server: Option<&Item>) -> Option<String> {
+    let server = server?;
+    let value: &Value = server
+        .get("name")
+        .or_else(|| server.get("listen"))?
+        .as_value()?;
+    Some(value.to_string().trim().to_owned())
 }
 
 /// One key of a table or one index of an array.
@@ -280,6 +310,48 @@ secret = "cookie-hmac"
             restore(&mut edited, &stored),
             Err("server.0.forward.secret is *** but no value is stored".to_owned())
         );
+    }
+
+    #[test]
+    fn a_file_restores_a_server_only_at_its_own_position() {
+        let server = |name: &str, secret: &str| {
+            format!(
+                "[[server]]\nname = \"{name}\"\nlisten = \"127.0.0.1:80\"\nforward = {{ backends = \
+                 [\"127.0.0.1:1\"], policy = \"cookie\", secret = \"{secret}\" }}\n"
+            )
+        };
+        let text: String = server("a", "secret-of-a") + &server("b", "secret-of-b");
+        let stored: DocumentMut = parse(&text);
+
+        let mut same_order: DocumentMut = masked(&text);
+        restore_file(&mut same_order, &stored).unwrap();
+        assert_eq!(same_order.to_string(), text);
+
+        let mut swapped: DocumentMut = parse(&(server("b", MASK) + &server("a", MASK)));
+        let err: String = restore_file(&mut swapped, &stored).unwrap_err();
+        assert!(err.contains("server 0"), "{err}");
+        assert!(
+            !swapped.to_string().contains("secret-of"),
+            "nothing restored"
+        );
+
+        // Without names the listen address tells them apart.
+        let unnamed = |listen: &str, secret: &str| {
+            format!(
+                "[[server]]\nlisten = \"{listen}\"\nforward = {{ backends = [\"127.0.0.1:1\"], \
+                 secret = \"{secret}\" }}\n"
+            )
+        };
+        let stored: DocumentMut = parse(&unnamed("127.0.0.1:80", "secret-of-80"));
+        let mut moved: DocumentMut = parse(&unnamed("127.0.0.1:81", MASK));
+        assert!(restore_file(&mut moved, &stored).is_err());
+        let mut kept: DocumentMut = parse(&unnamed("127.0.0.1:80", MASK));
+        restore_file(&mut kept, &stored).unwrap();
+        assert!(kept.to_string().contains("secret-of-80"));
+
+        // A new secret typed in a server that moved is fine.
+        let mut typed: DocumentMut = parse(&unnamed("127.0.0.1:81", "typed-again"));
+        restore_file(&mut typed, &stored).unwrap();
     }
 
     #[test]

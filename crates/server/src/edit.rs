@@ -340,10 +340,29 @@ impl ConfigFile {
     }
 }
 
+/// Why [`try_save_all`] did not save.
+#[derive(Debug)]
+#[must_use]
+pub enum SaveError {
+    /// The configuration would not be valid with the change. Every file is
+    /// as it was.
+    Invalid(String),
+    /// A file could not be written, or could not be put back.
+    Io(String),
+}
+
 /// Writes the edited `files`, then loads the whole configuration starting at
 /// `main` (includes merged) to validate it. If that fails every file goes
 /// back to what it was and the error is returned.
 pub fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
+    try_save_all(files, main).map_err(|err| match err {
+        SaveError::Invalid(message) | SaveError::Io(message) => message,
+    })
+}
+
+/// [`save_all`] with an error that tells an invalid configuration from a
+/// file system failure.
+pub fn try_save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, SaveError> {
     // Topmost directory each new file needs, removed again on rollback.
     let created_directories: Vec<PathBuf> = files
         .iter()
@@ -363,12 +382,12 @@ pub fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
     let written = files
         .iter()
         .try_for_each(|file| write_atomically(&file.path, &file.document.to_string()));
-    let outcome = written
-        .map_err(|err| err.to_string())
-        .and_then(|()| crate::load_config(main).map_err(|err| err.to_string()));
-    let err = match outcome {
-        Ok(config) => return Ok(config),
-        Err(err) => err,
+    let (err, is_written) = match written {
+        Ok(()) => match crate::load_config(main) {
+            Ok(config) => return Ok(config),
+            Err(err) => (err.to_string(), true),
+        },
+        Err(err) => (err, false),
     };
 
     let mut failures: Vec<String> = Vec::new();
@@ -390,7 +409,11 @@ pub fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
             failures.join("; ")
         ));
     }
-    Err(message)
+    Err(if is_written && failures.is_empty() {
+        SaveError::Invalid(message)
+    } else {
+        SaveError::Io(message)
+    })
 }
 
 /// Writes every file back to the text it had when opened, and removes the
