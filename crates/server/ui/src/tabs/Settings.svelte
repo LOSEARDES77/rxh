@@ -41,6 +41,9 @@
   let editing: Entity | { kind: "section"; file: number; key: string } | undefined = $state.raw();
   // The text typed in each file, by index.
   let drafts: Record<number, string> = $state({});
+  // The text and revision of the disk each draft was read from: a save is
+  // made over that revision, so a change made since is refused, never lost.
+  let bases: Record<number, { text: string; revision: string }> = $state({});
   // What a file held when it was read again after a conflict, by index.
   let holds: Record<number, string> = $state({});
   let refusals: Record<number, { status: number; message: string }> = $state({});
@@ -63,16 +66,38 @@
     return err instanceof Error ? err.message : String(err);
   }
 
-  async function load() {
+  /**
+   * Reads the files. A draft nobody changed follows the disk, as does the
+   * file just `saved`; a changed draft is kept on its old revision, except
+   * for the file `accepted` ("Read again"), whose draft moves to the new one.
+   */
+  async function load(saved?: number, accepted?: number) {
     try {
       [files, schema] = await Promise.all([api<Files>("config/files"), schema ?? api<Schema>("schema")]);
-      drafts = Object.fromEntries(files.files.map((file) => [file.index, file.text]));
-      holds = {};
-      refusals = {};
+      for (const file of files.files) {
+        const base = bases[file.index];
+        const disk = { text: file.text, revision: file.revision };
+        if (!base || file.index === saved || drafts[file.index] === base.text) {
+          drafts[file.index] = file.text;
+          bases[file.index] = disk;
+          delete holds[file.index];
+          delete refusals[file.index];
+        } else if (file.index === accepted) {
+          bases[file.index] = disk;
+          holds[file.index] = file.text;
+          delete refusals[file.index];
+        }
+      }
       failure = "";
     } catch (err) {
       failure = message(err);
     }
+  }
+
+  // A typed draft whose file changed on disk since it was read.
+  function stale(index: number): boolean {
+    const base = bases[index];
+    return !!base && drafts[index] !== base.text && base.revision !== fileOf(index)?.revision;
   }
 
   async function saveFile(index: number) {
@@ -81,10 +106,10 @@
     try {
       await api(`config/files/${index}`, {
         method: "PUT",
-        body: { text: drafts[index], revision: fileOf(index)?.revision ?? "" },
+        body: { text: drafts[index], revision: bases[index]?.revision ?? "" },
       });
       notice = `${fileOf(index)?.path} saved and reloaded.`;
-      await load();
+      await load(index);
     } catch (err) {
       // The text stays as typed.
       refusals[index] = { status: err instanceof ApiError ? err.status : 0, message: message(err) };
@@ -92,19 +117,8 @@
   }
 
   // The typed text stays; the next save is made over what the file holds now.
-  async function readAgain(index: number) {
-    try {
-      const next = await api<Files>("config/files");
-      for (const file of next.files) {
-        // A file nobody typed in follows the disk.
-        if (drafts[file.index] === fileOf(file.index)?.text) drafts[file.index] = file.text;
-      }
-      holds[index] = next.files.find((file) => file.index === index)?.text ?? "";
-      files = next;
-      delete refusals[index];
-    } catch (err) {
-      refusals[index] = { status: 0, message: message(err) };
-    }
+  function readAgain(index: number) {
+    return load(undefined, index);
   }
 
   async function control(path: string, done: string) {
@@ -179,7 +193,7 @@
       revision={fileOf(editing.file)?.revision ?? ""}
       onsaved={close}
       oncancel={() => (editing = undefined)}
-      onreread={load}
+      onreread={() => load()}
     />
   {/key}
 {:else}
@@ -246,6 +260,13 @@
           <label for="file-{file.index}"><code>{file.path}</code></label>
           <textarea id="file-{file.index}" rows="16" spellcheck="false" bind:value={drafts[file.index]}
           ></textarea>
+          {#if !refusal && stale(file.index)}
+            <div class="failure" role="alert">
+              <p>The file changed on disk after this text was typed: saving it now is refused.</p>
+              <p>Reading again keeps what is typed here and shows what the file holds now.</p>
+              <button type="button" class="button" onclick={() => readAgain(file.index)}>Read again</button>
+            </div>
+          {/if}
           {#if refusal}
             <div class="failure" role="alert">
               <p>{refusal.message}</p>
@@ -334,10 +355,13 @@
 
   .file .failure {
     margin: 0;
+    /* Only the message keeps its line breaks, not the markup around it. */
+    white-space: normal;
   }
 
   .file .failure p {
     margin: 0 0 0.25rem;
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 

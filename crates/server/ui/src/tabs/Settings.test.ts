@@ -205,3 +205,74 @@ test("a_refused_upgrade_is_reported", async () => {
   expect(writes(fetch)).toEqual([{ url: "upgrade", method: "POST", body: undefined }]);
   expect(get(stopped)).toBe(false);
 });
+
+function disk(first: { text: string; revision: string }, second = { text: "", revision: "r2" }) {
+  return {
+    ...FILES,
+    files: [
+      { ...FILES.files[0], ...first },
+      { ...FILES.files[1], ...second },
+    ],
+  };
+}
+
+test("saving_one_file_keeps_the_text_typed_in_another", async () => {
+  const answers: Record<string, unknown> = { "config/files": FILES };
+  serve(answers);
+  render(Settings);
+  const first: HTMLTextAreaElement = await screen.findByLabelText("/etc/rxh/rxh.toml");
+  const second: HTMLTextAreaElement = screen.getByLabelText("/etc/rxh/conf.d/extra.toml");
+  await fireEvent.input(second, { target: { value: "typed in extra" } });
+  await fireEvent.input(first, { target: { value: "saved text" } });
+  // The disk as the daemon writes it back: the file just saved takes it.
+  answers["config/files"] = disk({ text: "saved text\n", revision: "r3" });
+  await fireEvent.click(screen.getByRole("button", { name: "Save and reload /etc/rxh/rxh.toml" }));
+  await vi.waitFor(() => expect(first.value).toBe("saved text\n"));
+  expect(second.value).toBe("typed in extra");
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("a_section_save_keeps_the_typed_text_and_its_save_is_made_over_the_old_revision", async () => {
+  const answers: Record<string, unknown> = { "config/files": FILES };
+  const write = { status: 200, body: {} as unknown };
+  const fetch = serve(answers, write);
+  render(Settings);
+  await fireEvent.input(await screen.findByLabelText("/etc/rxh/rxh.toml"), { target: { value: "typed" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Edit Access log" }));
+  answers["config/files"] = disk({ text: "# main\n[log]\nformat = \"text\"\n", revision: "r5" });
+  await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
+  const text: HTMLTextAreaElement = await screen.findByLabelText("/etc/rxh/rxh.toml");
+  expect(text.value).toBe("typed");
+  // The page says the disk moved under the draft, before any save is tried.
+  expect((await screen.findByRole("alert")).textContent).toContain("changed on disk");
+  Object.assign(write, { status: 409, body: { error: "the file changed since it was read" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Save and reload /etc/rxh/rxh.toml" }));
+  await vi.waitFor(() => expect(writes(fetch)).toHaveLength(2));
+  // Over the revision the text was typed on: the daemon refuses it with 409.
+  expect(writes(fetch)[1].body).toEqual({ text: "typed", revision: "r1" });
+  await screen.findByText("the file changed since it was read");
+  Object.assign(write, { status: 200, body: {} });
+  await fireEvent.click(screen.getByRole("button", { name: "Read again" }));
+  const now: HTMLTextAreaElement = await screen.findByLabelText("What /etc/rxh/rxh.toml holds now");
+  expect(now.value).toContain("format = \"text\"");
+  expect(text.value).toBe("typed");
+  expect(screen.queryByRole("alert")).toBeNull();
+  await fireEvent.click(screen.getByRole("button", { name: "Save and reload /etc/rxh/rxh.toml" }));
+  await vi.waitFor(() => expect(writes(fetch)).toHaveLength(3));
+  expect(writes(fetch)[2].body).toEqual({ text: "typed", revision: "r5" });
+});
+
+test("reload_keeps_the_typed_text_and_moves_the_untouched_files", async () => {
+  const answers: Record<string, unknown> = { "config/files": FILES };
+  serve(answers, { status: 200, body: { reloaded: true } });
+  render(Settings);
+  const first: HTMLTextAreaElement = await screen.findByLabelText("/etc/rxh/rxh.toml");
+  const second: HTMLTextAreaElement = screen.getByLabelText("/etc/rxh/conf.d/extra.toml");
+  await fireEvent.input(first, { target: { value: "typed" } });
+  answers["config/files"] = disk({ text: MAIN, revision: "r1" }, { text: "changed by hand", revision: "r7" });
+  await fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+  await vi.waitFor(() => expect(second.value).toBe("changed by hand"));
+  expect(first.value).toBe("typed");
+  // Its file did not change: nothing to warn about.
+  expect(screen.queryByRole("alert")).toBeNull();
+});
