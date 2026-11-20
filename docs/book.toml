@@ -1,0 +1,17 @@
+# Documentation site, built with mdBook: `mdbook build docs` writes it to
+# target/book, `mdbook serve docs` serves it with live reload.
+[book]
+title = "RXH documentation"
+description = "Reverse proxy and load balancer for HTTP, TCP and UDP"
+language = "en"
+# The Markdown files stay where they are, readable on GitHub as well.
+src = "."
+
+[build]
+build-dir = "../target/book"
+# A page listed in SUMMARY.md that does not exist is an error, not an empty page.
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/LOSEARDES77/rxh"
+edit-url-template = "https://github.com/LOSEARDES77/rxh/edit/master/docs/{path}"
