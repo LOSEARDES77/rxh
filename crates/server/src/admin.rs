@@ -95,6 +95,10 @@ pub(crate) enum Control {
     /// Run a changed configuration and report the outcome.
     Apply(Change, oneshot::Sender<Result<(), String>>),
 
+    /// Start the binary on disk, hand it the listening sockets and report
+    /// whether it took over.
+    Upgrade(oneshot::Sender<Result<(), String>>),
+
     /// Shut down gracefully.
     Stop,
 }
@@ -163,6 +167,15 @@ pub(crate) enum Listener {
 }
 
 impl Listener {
+    /// Registers the socket for a hot binary upgrade.
+    pub(crate) fn lease(&self) -> io::Result<crate::upgrade::Lease> {
+        match self {
+            Self::Tcp(listener) => crate::upgrade::lease(listener),
+            #[cfg(unix)]
+            Self::Unix(listener, _) => crate::upgrade::lease(listener),
+        }
+    }
+
     /// Binds `listen`, replacing the socket file a dead daemon left behind.
     pub(crate) async fn bind(listen: &AdminListen) -> io::Result<Self> {
         match listen {
@@ -187,7 +200,10 @@ impl Listener {
 #[cfg(unix)]
 impl Drop for Listener {
     fn drop(&mut self) {
-        if let Self::Unix(_, Some(path)) = self {
+        // After a hot binary upgrade the file belongs to the new process.
+        if let Self::Unix(_, Some(path)) = self
+            && !crate::upgrade::handed_over()
+        {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -396,6 +412,7 @@ async fn handle(
         }
         (&Method::GET, ["certificates"]) => json_response(StatusCode::OK, &certificates(&state)),
         (&Method::POST, ["certificates", "reload"]) => reload_certificates(&state),
+        (&Method::POST, ["upgrade"]) => control(&state, Control::Upgrade, "upgraded").await,
         (&Method::POST, ["stop"]) => {
             let _ = state.control.send(Control::Stop).await;
             json_response(StatusCode::OK, &json!({ "stopping": true }))

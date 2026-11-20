@@ -132,7 +132,9 @@ written against an older snapshot: their line numbers and percentages are stale,
    child process). `cli/tests/daemon.rs::start_reload_and_stop_through_the_pid_file` runs `rxh start`
    with the admin API disabled and nested PID/log paths, then `rxh reload` and `rxh stop` through the
    PID file, and checks the log file; `start_refuses_a_busy_admin_address` and a broken configuration
-   cover the foreground failures.
+   cover the foreground failures. `upgrade_hands_the_listening_sockets_to_a_new_process` and
+   `upgrade_of_a_background_daemon_keeps_its_pid_file_and_admin_socket` run `rxh upgrade` and
+   `SIGUSR2` against real daemons under load (Linux).
    Left: `process.rs` 26 (`create_dir_all` failure) and `main.rs` 38-41, 65-94 (`reverse-proxy` and
    `file-server` startup errors, runtime build failures).
 2. **CLI command output and error paths: done.** `status` table (version line, server row, health

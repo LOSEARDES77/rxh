@@ -60,6 +60,7 @@ pub(crate) async fn execute(cli: &Cli, command: Command) -> Result<(), String> {
         Command::Config(ConfigCommand::Show { json }) => config_show(cli, &client, json).await,
         Command::Stop => stop(cli, &client).await,
         Command::Reload => reload(cli, &client).await,
+        Command::Upgrade => upgrade(cli, &client).await,
         Command::Status { json } => status(&client, json).await,
         Command::Top { interval, count } => crate::top::run(&client, interval, count).await,
         Command::Validate => validate(&config_path(cli)),
@@ -122,6 +123,49 @@ async fn reload(cli: &Cli, client: &AdminClient) -> Result<(), String> {
             "reload rejected, the running configuration is unchanged: {err}"
         )),
     }
+}
+
+/// Asks the daemon to hand its sockets to a new process and waits until
+/// that process answers on the admin API.
+async fn upgrade(cli: &Cli, client: &AdminClient) -> Result<(), String> {
+    let old = match client.get("/status").await {
+        Ok(status) => status["pid"].clone(),
+        Err(ClientError::Unreachable(_)) => {
+            let pid = process::signal(&cli.pid_file, DaemonSignal::Upgrade).map_err(|err| {
+                format!(
+                    "no daemon on {} and no usable PID file: {err}",
+                    client.address()
+                )
+            })?;
+            println!("Sent SIGUSR2 to {pid}");
+            return Ok(());
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    // The old process stops as soon as the new one is ready, which can cut
+    // its answer short: only an error it reports is a failure.
+    if let Err(ClientError::Api { message, .. }) = client.post("/upgrade", None).await {
+        return Err(format!(
+            "upgrade failed, the running daemon is unchanged: {message}"
+        ));
+    }
+    // Both processes answer on the admin address until the old one stops.
+    for _ in 0..300 {
+        if let Ok(status) = client.get("/status").await
+            && status["pid"] != old
+        {
+            println!(
+                "rxh upgraded: process {} (version {}) took over from {old}",
+                status["pid"],
+                status["version"].as_str().unwrap_or("?")
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!(
+        "the new process did not take over, {old} keeps serving: see its log"
+    ))
 }
 
 async fn status(client: &AdminClient, raw: bool) -> Result<(), String> {

@@ -12,6 +12,7 @@ use std::path::Path;
 pub(crate) enum DaemonSignal {
     Terminate,
     Reload,
+    Upgrade,
 }
 
 /// Forks into the background, writing the PID file and redirecting output to
@@ -110,6 +111,35 @@ pub(crate) fn daemonize(pid_file: &Path, log_file: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Makes the PID file name this process once the daemon it replaces (hot
+/// binary upgrade) exits. That daemon holds the lock until then, so the wait
+/// runs on a thread; from then on this process holds it.
+#[cfg(unix)]
+pub(crate) fn take_over_pid_file(pid_file: &Path) -> io::Result<()> {
+    use std::io::Write;
+    use std::{process, thread};
+
+    let mut pid = OpenOptions::new().write(true).open(pid_file)?;
+    thread::spawn(move || {
+        let written = pid
+            .lock()
+            .and_then(|()| pid.set_len(0))
+            .and_then(|()| writeln!(pid, "{}", process::id()));
+        if let Err(err) = written {
+            eprintln!("Main => Cannot take over the PID file: {err}");
+        }
+        // Locked for as long as the descriptor stays open.
+        std::mem::forget(pid);
+    });
+    Ok(())
+}
+
+/// Hot binary upgrades are Linux only.
+#[cfg(not(unix))]
+pub(crate) fn take_over_pid_file(_pid_file: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Forks the process: `Some(child)` in the parent, `None` in the child.
 #[cfg(unix)]
 fn fork() -> io::Result<Option<libc::pid_t>> {
@@ -150,6 +180,7 @@ pub(crate) fn signal(pid_file: &Path, signal: DaemonSignal) -> io::Result<i32> {
     let raw = match signal {
         DaemonSignal::Terminate => libc::SIGTERM,
         DaemonSignal::Reload => libc::SIGHUP,
+        DaemonSignal::Upgrade => libc::SIGUSR2,
     };
 
     // SAFETY: kill(2) takes plain integers and has no memory safety
@@ -222,6 +253,7 @@ mod tests {
         for (daemon_signal, expected) in [
             (DaemonSignal::Terminate, libc::SIGTERM),
             (DaemonSignal::Reload, libc::SIGHUP),
+            (DaemonSignal::Upgrade, libc::SIGUSR2),
         ] {
             let mut command = Command::new("sleep");
             command.arg("30");

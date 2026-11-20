@@ -81,6 +81,8 @@ pool web (least_conn)
   directory or proxy to backends right away, without a configuration file.
 - **Zero downtime reloads** (`SO_REUSEPORT`). An invalid configuration is
   rejected and the running one keeps serving.
+- **Hot binary upgrades** on Linux: `rxh upgrade` starts the new binary and
+  hands it the listening sockets, without refusing a connection.
 - **Admin API** on `127.0.0.1:2019` (JSON), with Caddy compatible
   `/reverse_proxy/upstreams`.
 - **HTTP done right**: keep-alive pools to backends, h2/h2c, WebSocket
@@ -204,7 +206,7 @@ rxh reverse-proxy --from 127.0.0.1:8080 --to 127.0.0.1:3001 127.0.0.1:3002 --pol
 
 | Command | Does |
 |---|---|
-| `rxh run`, `start`, `stop`, `reload`, `status`, `validate` | Daemon lifecycle |
+| `rxh run`, `start`, `stop`, `reload`, `upgrade`, `status`, `validate` | Daemon lifecycle |
 | `rxh upstream add\|rm\|list` | Backends of a pool, live and saved |
 | `rxh pool add\|rm\|list [--file PATH]` | Pools (`--file` writes to an included file) |
 | `rxh service add\|rm\|list [--file PATH]` | Listeners |
@@ -226,6 +228,7 @@ and [TCP/UDP balancing](examples/tcp-udp.toml). The full reference is in
 |---|---|
 | `rxh run` | Run in the foreground (default command). |
 | `rxh start` / `stop` / `reload` | Daemon control through the admin API, with PID file and signal fallbacks. |
+| `rxh upgrade` | Replace the daemon with the binary now on disk; the new process takes over the listening sockets (Linux). |
 | `rxh status [--json]` | Listeners, pools, health and request counters. |
 | `rxh top [-i 1s] [-n N]` | Live requests per second, errors, latency and health per pool, from `/metrics`. |
 | `rxh validate` | Check a configuration file. |
@@ -267,6 +270,7 @@ reachable address.
 | `POST` | `/load` | Run the configuration in the body (TOML or JSON), without writing the file |
 | `PATCH` | `/config/upstream/{name}` | Merge the body into one pool |
 | `PATCH` | `/config/server/{name or index}` | Merge the body into one server |
+| `POST` | `/upgrade` | Hand the listening sockets to a new process running the binary on disk (Linux) |
 | `POST` | `/stop` | Graceful shutdown |
 
 ```bash

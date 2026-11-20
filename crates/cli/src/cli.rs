@@ -65,6 +65,10 @@ pub(crate) enum Command {
     /// Reload the configuration file without dropping connections.
     Reload,
 
+    /// Replace the running daemon with the binary now on disk without
+    /// closing the listening sockets (Linux).
+    Upgrade,
+
     /// Show listeners, pools and backend health.
     Status {
         /// Print the raw JSON from the admin API.

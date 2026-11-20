@@ -184,7 +184,8 @@ A release people can run without reading the source.
       TOML.
 - [ ] Documentation site with a guide per use case (load balancer, TLS
       gateway, Docker, layer 4).
-- [ ] Hot binary upgrade: a new process takes over the listening sockets.
+- [x] Hot binary upgrade: a new process takes over the listening sockets
+      (`rxh upgrade`, `SIGUSR2`, `POST /upgrade`; Linux).
 - [x] Security policy (`SECURITY.md`), `cargo audit` and `cargo deny` in CI
       (`.github/workflows/audit.yml`, policy in `deny.toml`).
 - [ ] External review of the TLS and admin surface.

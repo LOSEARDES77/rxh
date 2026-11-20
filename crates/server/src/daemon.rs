@@ -31,6 +31,7 @@ use crate::master::{Master, ServerInfo};
 use crate::per_core;
 use crate::registry::Registry;
 use crate::systemd;
+use crate::upgrade::{self, Lease};
 
 fn read_file(path: &Path) -> Result<String, Error> {
     Ok(std::fs::read_to_string(path)
@@ -203,6 +204,9 @@ enum Event {
     Reload,
     /// `watch = true` noticed an edit; the watcher already took it in.
     Watch,
+    /// Hot binary upgrade, from `SIGUSR2` or from the admin API, which gets
+    /// the outcome.
+    Upgrade(Option<oneshot::Sender<Result<(), String>>>),
     Stop,
 }
 
@@ -290,7 +294,8 @@ impl Daemon {
     }
 
     /// Runs until `SIGTERM`, `SIGINT` or `POST /stop`. `SIGHUP` and
-    /// `POST /reload` reload the configuration file.
+    /// `POST /reload` reload the configuration file; `SIGUSR2` and
+    /// `POST /upgrade` hand the listening sockets to a new process.
     pub async fn run(self) -> Result<(), Error> {
         // Taken before loading, so an edit made while starting is noticed.
         let mut watcher = self.config_path().map(Watcher::new);
@@ -316,7 +321,7 @@ impl Daemon {
             control,
         });
 
-        let _admin = if admin_settings.enabled {
+        let admin_listener: Option<(AbortOnDrop, Lease)> = if admin_settings.enabled {
             let listener = admin::Listener::bind(&admin_settings.listen).await.map_err(|err| {
                 io::Error::new(
                     err.kind(),
@@ -332,16 +337,20 @@ impl Daemon {
                     println!("Admin => API listening on unix socket {}", path.display());
                 }
             }
-            Some(AbortOnDrop(tokio::task::spawn(admin::serve(
-                listener,
-                Arc::clone(&admin_state),
-            ))))
+            let lease = listener.lease()?;
+            let task = admin::serve(listener, Arc::clone(&admin_state));
+            Some((AbortOnDrop(tokio::task::spawn(task)), lease))
         } else {
             None
         };
 
         systemd::warn_unused();
         systemd::notify("READY=1\nSTATUS=Running");
+        upgrade::ready();
+        // Outcome of the hot binary upgrade in progress.
+        let mut upgrading: Option<JoinHandle<Result<(), String>>> = None;
+        let mut successor: u32 = 0;
+        let mut upgrade_reply: Option<oneshot::Sender<Result<(), String>>> = None;
 
         let (docker_updates, mut containers) = mpsc::channel::<(Provider, Vec<Container>)>(1);
         // Settings being followed and the task that follows them.
@@ -401,6 +410,7 @@ impl Daemon {
                 }
                 Some(control) = controls.recv() => match control {
                     Control::Stop => Event::Stop,
+                    Control::Upgrade(reply) => Event::Upgrade(Some(reply)),
                     Control::Reload(reply) => {
                         if let Some(watcher) = &mut watcher {
                             watcher.loading();
@@ -431,6 +441,32 @@ impl Daemon {
                     println!("Main => Configuration file changed");
                     Event::Watch
                 }
+                outcome = async { upgrading.as_mut().expect("guarded by the condition").await },
+                    if upgrading.is_some() =>
+                {
+                    upgrading = None;
+                    let outcome = outcome.map_err(|err| err.to_string()).flatten();
+                    if let Some(reply) = upgrade_reply.take() {
+                        let _ = reply.send(outcome.clone());
+                    }
+                    match outcome {
+                        Ok(()) => {
+                            println!("Main => Process {successor} took over the listening sockets");
+                            // systemd follows the new process from here on,
+                            // so this one must not report that it stops.
+                            systemd::notify(&format!("MAINPID={successor}"));
+                            // The admin socket is shared too: requests go
+                            // to the new process alone while this one
+                            // drains. Requests in flight still get answers.
+                            drop(admin_listener);
+                            return generation.stop().await;
+                        }
+                        Err(message) => {
+                            eprintln!("Main => Upgrade failed, this process keeps serving: {message}");
+                        }
+                    }
+                    continue;
+                }
                 result = &mut generation.task => {
                     return match result {
                         Ok(Ok(())) => Ok(()),
@@ -442,6 +478,28 @@ impl Daemon {
 
             match event {
                 Event::Stop => break,
+                Event::Upgrade(reply) => {
+                    let started = if upgrading.is_some() {
+                        Err(String::from("an upgrade is already in progress"))
+                    } else {
+                        upgrade::spawn()
+                            .map_err(|err| format!("cannot start the new process: {err}"))
+                    };
+                    match started {
+                        Ok((pid, wait)) => {
+                            println!("Main => Upgrading: starting process {pid}");
+                            successor = pid;
+                            upgrading = Some(tokio::task::spawn_blocking(wait));
+                            upgrade_reply = reply;
+                        }
+                        Err(message) => {
+                            eprintln!("Main => {message}");
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(message));
+                            }
+                        }
+                    }
+                }
                 Event::Reload | Event::Watch => {
                     if let (Event::Reload, Some(watcher)) = (&event, &mut watcher) {
                         watcher.loading();
@@ -634,6 +692,7 @@ impl Drop for AbortOnDrop {
 struct Signals {
     terminate: tokio::signal::unix::Signal,
     hangup: tokio::signal::unix::Signal,
+    upgrade: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -643,6 +702,7 @@ impl Signals {
         Ok(Self {
             terminate: signal(SignalKind::terminate())?,
             hangup: signal(SignalKind::hangup())?,
+            upgrade: signal(SignalKind::user_defined2())?,
         })
     }
 
@@ -651,6 +711,7 @@ impl Signals {
             _ = tokio::signal::ctrl_c() => Event::Stop,
             _ = self.terminate.recv() => Event::Stop,
             _ = self.hangup.recv() => Event::Reload,
+            _ = self.upgrade.recv() => Event::Upgrade(None),
         }
     }
 }

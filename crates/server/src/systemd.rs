@@ -6,9 +6,14 @@
 //! configured address equals the local address of an inherited socket of the
 //! same type uses a duplicate of that socket instead of binding its own. Every
 //! generation (reload) takes a new duplicate, so the socket outlives them all.
+//!
+//! The sockets of a hot binary upgrade ([`crate::upgrade`]) are matched the
+//! same way, before the ones of systemd.
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{notify, reloading, tcp_listener, udp_socket, unix_listener, warn_unused};
+pub(crate) use linux::{
+    Address, address, notify, reloading, tcp_listener, udp_socket, unix_listener, warn_unused,
+};
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) use other::{notify, reloading, tcp_listener, udp_socket, warn_unused};
@@ -31,8 +36,9 @@ mod linux {
     /// First descriptor systemd passes, `SD_LISTEN_FDS_START`.
     const LISTEN_FDS_START: i32 = 3;
 
+    /// Kind and local address of a listening socket.
     #[derive(Debug, PartialEq)]
-    enum Address {
+    pub(crate) enum Address {
         Stream(SocketAddr),
         Datagram(SocketAddr),
         Unix(PathBuf),
@@ -96,7 +102,7 @@ mod linux {
         sockets
     }
 
-    fn address(fd: &OwnedFd) -> io::Result<Address> {
+    pub(crate) fn address(fd: &OwnedFd) -> io::Result<Address> {
         let mut kind: libc::c_int = 0;
         let mut length = size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: `kind` and `length` are valid for writes and `length` is
@@ -135,8 +141,13 @@ mod linux {
         }
     }
 
-    /// Duplicate of the inherited socket at `wanted`, if there is one.
+    /// The socket a previous process handed over for `wanted` (see
+    /// [`crate::upgrade`]), else a duplicate of the inherited socket at
+    /// `wanted`, if there is one.
     fn take(wanted: &Address) -> io::Result<Option<OwnedFd>> {
+        if let Some(fd) = crate::upgrade::take(wanted) {
+            return Ok(Some(fd));
+        }
         let Some(socket) = inherited().iter().find(|socket| socket.address == *wanted) else {
             return Ok(None);
         };

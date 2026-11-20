@@ -61,7 +61,7 @@ fn bash_complete(words: &str) -> Vec<String> {
 #[test]
 fn bash_completes_subcommands_and_flags() {
     let commands = bash_complete("rxh up");
-    assert_eq!(commands, ["upstream"]);
+    assert_eq!(commands, ["upgrade", "upstream"]);
 
     let pool_commands = bash_complete("rxh pool r");
     assert_eq!(pool_commands, ["remove", "rm"]);

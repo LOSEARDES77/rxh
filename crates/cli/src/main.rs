@@ -90,7 +90,10 @@ fn file_server(listen: SocketAddr, root: &Path, browse: bool, encode: bool) -> R
     let config = quick::file_server(listen, &root, browse, encode)?;
     // Fail with a clear message now if the address is taken; the daemon
     // binds it again right after.
-    TcpListener::bind(listen).map_err(|err| format!("cannot listen on {listen}: {err}"))?;
+    // Not during a hot binary upgrade: the daemon being replaced holds it.
+    if !rxh_server::is_upgrade() {
+        TcpListener::bind(listen).map_err(|err| format!("cannot listen on {listen}: {err}"))?;
+    }
     println!("Serving {} on http://{listen}", root.display());
     run_config(config)
 }
@@ -225,6 +228,13 @@ fn run_config(config: Config) -> Result<(), String> {
 fn start(cli: &Cli, log_file: Option<PathBuf>) -> Result<(), String> {
     let path = commands::config_path(cli);
     let config = rxh_server::load_config(&path).map_err(|err| err.to_string())?;
+
+    // Started by the daemon it replaces: already in the background, with
+    // its output on the same log, and the admin address is busy on purpose.
+    if rxh_server::is_upgrade() {
+        process::take_over_pid_file(&cli.pid_file).map_err(|err| err.to_string())?;
+        return run(cli);
+    }
 
     // Fail in the foreground, where the user can see it, if another daemon
     // already owns the admin address.
