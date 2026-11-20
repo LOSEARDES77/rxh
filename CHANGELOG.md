@@ -407,6 +407,14 @@ Changed.
   sides (no TLS termination, no upstream TLS, `host:port` backends) are
   relayed with `splice(2)`, so the bytes stay in the kernel. Other
   connections and other systems keep the buffered copy. No configuration.
+- HTTP/3 (QUIC): every `http` server with `tls` answers HTTP/3 on the UDP
+  port of its `listen` addresses, and adds `Alt-Svc: h3=":<port>"; ma=86400`
+  to responses over HTTP/1.1 and HTTP/2. New server key `http3`: unset is
+  on, `true` makes a UDP port that cannot be bound a start error, `false`
+  turns it off. Open the UDP port in the firewall. Not over HTTP/3:
+  WebSockets and other upgrades, 0-RTT, HTTP/3 to backends. Reloads keep the
+  UDP socket and drain open connections with a GOAWAY. `rxh upgrade` hands
+  the UDP sockets over; HTTP/3 requests in flight then fail. See [HTTP/3](docs/configuration.md#http3).
 
 ### Deprecated
 

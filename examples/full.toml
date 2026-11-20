@@ -182,6 +182,7 @@ name = "shop"
 listen = "0.0.0.0:443"
 host = ["shop.example.com", "www.shop.example.com"]
 tls = "auto"
+http3 = true              # HTTP/3 on UDP 443 too; a taken port fails the start (unset: on, `false`: off)
 forward = "@api"
 
 # A second HTTPS site on the same address, with certificate files. Servers on

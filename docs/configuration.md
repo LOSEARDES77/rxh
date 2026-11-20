@@ -1735,19 +1735,20 @@ socket, except that `http` servers listing the same address share one socket
 | `host` | | Host name(s) this server answers to. In the single pattern form it is the `host` matcher; with `match` it is the default of every entry without its own `host`. Not allowed on `udp` servers. |
 | `path`, `method`, `header`, `query`, `remote_ip` | | Request matchers for the single pattern form, same as in `match` entries. |
 | `match` | | List of patterns instead of `forward`/`serve`/`redirect`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
-| `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog. The old `connections` is deprecated, see [migration](migration.md). |
+| `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog; a QUIC connection over the limit is refused, see [HTTP/3](#http3). The old `connections` is deprecated, see [migration](migration.md). |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
 | `client_auth` | | `{ mode, ca, header }`: ask clients for a certificate in the TLS handshake, see [Client certificates (mTLS)](#client-certificates-mtls) (servers with `tls` only). |
 | `tls_options` | | `{ min_version, cipher_suites, curves, ocsp_stapling }`: what the TLS handshake accepts, and OCSP stapling, see [TLS options](#tls-options) (servers with `tls` only). |
 | `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |
 | `http2` | `true` | Accept HTTP/2 (h2 over TLS, h2c in cleartext). |
+| `http3` | unset | Serve HTTP/3 on the UDP port of each `listen` address, see [HTTP/3](#http3). Unset means on for `http` servers with `tls`. `true` makes a UDP port that cannot be bound a start error. `false` turns HTTP/3 off. |
 | `trusted_proxies` | `[]` | CIDR ranges (or `"private_ranges"`) allowed to set `X-Forwarded-*` and the client IP. With `proxy_protocol_in`, also the only peers allowed to send a PROXY header (any peer when empty). |
 | `ip_allow`, `ip_deny` | `[]` | CIDR ranges or addresses of the clients this server accepts and rejects, on every protocol, see [IP allow and deny lists](#ip-allow-and-deny-lists). |
 | `rate_limit` | | `{ rate, per, burst, key }`: requests each client may send, see [Rate limits](#rate-limits) (http only). |
 | `basic_auth` | | `{ users, realm }`: ask for a user name and password, see [Basic auth](#basic-auth) (http only). |
 | `forward_auth` | | `{ url, copy_headers, timeout }`: let an external service (Authelia, Authentik, oauth2-proxy) decide, see [Forward auth](#forward-auth) (http only). |
 | `error_pages` | | `{ "404" = "404.html", "5xx" = "50x.html" }`: files replacing the body of the errors rxh answers itself, see [Error pages](#error-pages) (http only). |
-| `max_connections_per_ip` | | Concurrent connections of one client IP; more are closed on accept, see [Connections per client](#connections-per-client) (http and tcp). |
+| `max_connections_per_ip` | | Concurrent connections of one client IP; more are closed on accept, see [Connections per client](#connections-per-client) (http and tcp). QUIC connections count too. |
 | `proxy_protocol` | | `"v1"` or `"v2"`: send a PROXY protocol header with the client address on every new connection to a backend, see [PROXY protocol output](#proxy-protocol-output) (http and tcp). |
 | `proxy_protocol_in` | `false` | Require a PROXY protocol header (v1 or v2) at the start of every connection and use its source address as the client address, see [PROXY protocol input](#proxy-protocol-input) (http and tcp). Set `trusted_proxies` too: with it empty any directly connecting client can spoof its address. |
 | `match_timeout` | `"3s"` | Time a client has to send the PROXY header (`proxy_protocol_in`) and, on `tcp` servers with layer 4 matchers, the first bytes the matchers look at. |
@@ -2060,6 +2061,73 @@ stopped naming one in 2025).
 - rxh does not verify the signature of the answer: the clients do.
 - `ocsp_stapling = false` stops the requests, for hosts that cannot reach
   the responder.
+
+### HTTP/3
+
+An `http` server with `tls` answers HTTP/3 (QUIC) on the UDP port of each of
+its `listen` addresses, next to HTTP/1.1 and HTTP/2 on the TCP port. Nothing
+else is needed: `http3` is unset by default, which means on.
+
+```toml
+[[server]]
+name = "app"
+listen = "0.0.0.0:443"
+tls = { cert = "/etc/rxh/app.pem", key = "/etc/rxh/app.key" }
+forward = "127.0.0.1:3000"
+http3 = false                   # unset: on; true: a taken UDP port fails the start
+```
+
+- Open the UDP port in the firewall, next to the TCP port.
+- `http3` unset: HTTP/3 is on for `http` servers with `tls`. A UDP port that
+  cannot be bound gives a warning in the log, and the server runs without
+  HTTP/3 and without `Alt-Svc`. With `http3 = true` the same error fails the
+  start. `http3 = false` turns HTTP/3 off.
+- `http3 = true` is a validation error on a server that cannot serve it: not
+  an `http` server, no `tls`, `proxy_protocol_in` set, or
+  `tls_options.cipher_suites` without a TLS 1.3 suite (QUIC needs TLS 1.3).
+  With `http3` unset, such a server runs without HTTP/3.
+- On servers that share one listen address, the first server decides.
+- RXH adds `Alt-Svc: h3=":<port>"; ma=86400` to responses over HTTP/1.1 and
+  HTTP/2 that have none, so clients try HTTP/3 next time. The port is the
+  one RXH listens on: behind a port mapping, it is not the public one. The
+  header is not sent while HTTP/3 is off.
+- `tls`, `client_auth`, `tls_options`, routes, matchers, limits and the
+  access log work as for HTTP/1.1 and HTTP/2.
+- `max_connections` and `max_connections_per_ip` count QUIC and TCP
+  connections together. A QUIC connection over the limit is refused: it
+  does not wait.
+- When fewer than half of the `max_connections` slots are free, a new QUIC
+  client must first prove its address (a QUIC Retry, one more round trip),
+  so spoofed packets cannot take the slots.
+- The request header section is limited to 16 KiB, as for HTTP/2.
+- A request without `Content-Length` whose end arrives after RXH started to
+  forward it goes to the backend with `Transfer-Encoding: chunked`.
+- With `runtime = "per_core"`, QUIC runs on the main runtime.
+- Not available over HTTP/3: WebSockets and other upgrades (clients use
+  HTTP/1.1 or HTTP/2 for them), 0-RTT, and HTTP/3 to backends (RXH talks
+  HTTP/1.1 or HTTP/2 to them).
+
+When a client cancels a request, RXH cancels the backend request, with one
+exception. A client that cancels after it sent the whole request (a `GET`,
+for example) and before the response starts is not noticed: the backend
+request runs to its end. A cancel while the request body is still being
+sent, or once the response is being written, is noticed. This is a limit of
+the `h3` crate (0.0.8).
+
+On a reload, the UDP socket and its QUIC endpoint stay: nothing is rebound,
+and no packet is lost between two sockets. A connection open at the reload
+gets a GOAWAY. Its requests in flight finish with the configuration they
+started under, then RXH closes the connection. The next request of the
+client opens a new connection, served by the new configuration. No request
+is cut by a reload.
+
+On `rxh stop`, connections drain the same way within `grace_period`. A
+drained connection is closed at most 3 seconds after its last response.
+
+`rxh upgrade` hands the UDP sockets to the new process like the TCP ones.
+QUIC connections open in the old process do not survive the handover: HTTP/3
+requests in flight at that moment fail, and the old process closes the
+connection. Clients open a new connection to the new process.
 
 ### `match` entries (HTTP routes)
 

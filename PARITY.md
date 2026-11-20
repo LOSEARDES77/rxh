@@ -97,7 +97,7 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | Caddy | RXH | Status | Notes |
 |---|---|---|---|
 | HTTP/1.1 and HTTP/2 clients | same, `http2 = true` | ✅ | h2 over TLS through ALPN, h2c in cleartext. |
-| HTTP/3 | | ❌ | |
+| HTTP/3 | `http3` (on by default for `http` servers with `tls`) | 🟡 | QUIC and HTTP/3 on the UDP port of each `listen` address, `Alt-Svc: h3=":<port>"; ma=86400` over HTTP/1.1 and HTTP/2, same routes, limits, client certificates and log as TCP. Gaps: no 0-RTT, no HTTP/3 to backends, no WebSockets over HTTP/3, no `Alt-Svc` override (Caddy has `protocols` and `alt_svc` options). A client that cancels a request after sending it whole (a `GET`) and before the response starts is not noticed: the backend request runs to its end. A request without `Content-Length` whose end arrives after forwarding started goes upstream with `Transfer-Encoding: chunked`. Header section limited to 16 KiB, as for HTTP/2. Reloads keep the UDP socket; open connections get a GOAWAY, finish their requests and close. |
 | WebSockets and other upgrades | same | ✅ | |
 | Hop-by-hop headers removed | same | ✅ | Including headers listed in `Connection`. `TE: trailers` kept. |
 | `X-Forwarded-For/Proto/Host` | same | ✅ | Client values kept only from `trusted_proxies`. |
@@ -190,10 +190,8 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 
 ## Next steps
 
-The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). Ordered by value
-for a load balancer:
-
-1. HTTP/3.
+The full plan, by milestone, is in [ROADMAP.md](ROADMAP.md). The only ❌ row
+left is `transport fastcgi`.
 
 ## Roadmap beyond Caddy
 
