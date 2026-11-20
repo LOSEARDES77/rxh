@@ -1,5 +1,6 @@
 //! `rxh` binary: runs the proxy daemon and manages it from the command line.
 
+mod adapt;
 mod cli;
 mod client;
 mod commands;
@@ -9,6 +10,7 @@ mod process;
 mod quick;
 mod top;
 
+use std::env;
 use std::fs;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -17,8 +19,9 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 use rxh_core::config::{AdminListen, BasicAuth, Config};
+use rxh_core::placeholder::{self, Lookup};
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Adapter, Cli, Command};
 
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
@@ -45,6 +48,7 @@ fn main() -> ExitCode {
             })
         }
         Some(Command::Fmt { files, check }) => format_files(&cli, files, check),
+        Some(Command::Adapt { file, adapter }) => adapt_file(&file, adapter),
         Some(Command::Schema) => schema(),
         Some(Command::HashPassword) => hash_password(),
         Some(Command::Completions { shell }) => completions(shell),
@@ -119,6 +123,34 @@ fn format_files(cli: &Cli, mut files: Vec<PathBuf>, check: bool) -> Result<(), S
         return Err(format!("{unformatted} file(s) not formatted"));
     }
     Ok(())
+}
+
+/// `rxh adapt`: prints the RXH configuration of a Caddyfile or nginx file.
+fn adapt_file(path: &Path, adapter: Option<Adapter>) -> Result<(), String> {
+    let text: String =
+        fs::read_to_string(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let adapter: Adapter = adapter.unwrap_or_else(|| adapt::detect(path, &text));
+    let adapted = adapt::adapt(&text, adapter, &path.display().to_string())
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    print!("{}", adapted.toml);
+    for warning in &adapted.warnings {
+        eprintln!("rxh: not converted: {warning}");
+    }
+    if adapted.is_empty {
+        return Err(String::from("nothing could be converted"));
+    }
+    // `{env.NAME}` placeholders from Caddy's `{$NAME}` are checked with the
+    // current environment; without the variables the check is left to `rxh validate`.
+    let expanded = placeholder::expand(&adapted.toml, |lookup| match lookup {
+        Lookup::Env(name) => env::var(name).map_err(|err| err.to_string()),
+        Lookup::File(path) => Err(format!("{path} is not read here")),
+    });
+    let Ok(expanded) = expanded else {
+        return Ok(());
+    };
+    Config::from_toml(&expanded)
+        .map(|_| ())
+        .map_err(|err| format!("the converted configuration needs changes by hand: {err}"))
 }
 
 fn schema() -> Result<(), String> {
