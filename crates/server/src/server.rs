@@ -12,7 +12,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use hyper::header::HeaderValue;
@@ -29,6 +29,7 @@ use crate::acme;
 use crate::error::Error;
 use crate::http::headers;
 use crate::http::service::{Activity, Route, Service, Site};
+use crate::http3;
 use crate::l4match::{self, Detected, L4Matcher, Rewind};
 use crate::log::{ListenerLog, Logger};
 use crate::ocsp;
@@ -43,12 +44,16 @@ use crate::udp::{self, UdpSettings};
 use crate::upgrade::{self, Lease};
 
 /// Deadline for the TLS handshake when `read_header_timeout` is unset.
-const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Deadline for the first request head of an HTTP connection when
 /// `read_header_timeout` is unset. Hyper applies the same default to later
 /// HTTP/1 request heads.
-const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest request header section accepted over HTTP/2 and HTTP/3, in bytes:
+/// hyper's HTTP/2 default. HTTP/1 has hyper's own read buffer limit.
+pub(crate) const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
 /// Current state of a [`Server`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -99,13 +104,14 @@ enum Socket {
     Udp(Arc<UdpSocket>, UdpSettings),
 }
 
-/// Shared by every connection task of one server.
-struct ConnectionContext {
+/// Shared by every connection task of one server, and by its HTTP/3
+/// listener.
+pub(crate) struct ConnectionContext {
     handler: Handler,
     tls: Option<TlsAcceptor>,
-    log: ListenerLog,
-    read_header_timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
+    pub(crate) log: ListenerLog,
+    pub(crate) read_header_timeout: Option<Duration>,
+    pub(crate) idle_timeout: Option<Duration>,
     /// Read a PROXY header first, from peers in `trusted_proxies` (any peer
     /// if empty).
     proxy_protocol_in: bool,
@@ -115,19 +121,61 @@ struct ConnectionContext {
     ip_allow: Vec<IpNet>,
     ip_deny: Vec<IpNet>,
     /// `max_connections_per_ip` and the open connections of each client.
-    per_ip: Option<(usize, Mutex<HashMap<IpAddr, usize>>)>,
+    pub(crate) per_ip: Option<(usize, Mutex<HashMap<IpAddr, usize>>)>,
     match_timeout: Duration,
+    /// The HTTP/3 listener of the same server, to ask for `Alt-Svc`.
+    http3: OnceLock<Weak<http3::Listener>>,
+}
+
+impl ConnectionContext {
+    /// Service of one client connection from `peer` to `local`, or `None`
+    /// if the server is not an HTTP one. `client_subject` is the subject of
+    /// the certificate the client presented. `alt_svc` is set for TCP
+    /// connections: see [`ConnectionContext::alt_svc`].
+    pub(crate) fn http_service(
+        &self,
+        peer: SocketAddr,
+        local: SocketAddr,
+        client_subject: Option<HeaderValue>,
+        alt_svc: Option<HeaderValue>,
+    ) -> Option<Service> {
+        let Handler::Http { routes, tracer, .. } = &self.handler else {
+            return None;
+        };
+        Some(Service {
+            routes: Arc::clone(routes),
+            log_name: Arc::clone(&self.log.log_name),
+            peer,
+            peer_ip: headers::peer_ip_value(peer),
+            client_subject,
+            local,
+            activity: Arc::new(Activity::default()),
+            logger: Arc::clone(&self.log.logger),
+            tracer: tracer.clone(),
+            alt_svc,
+        })
+    }
+
+    /// The `Alt-Svc` value for a new HTTP/1.1 or HTTP/2 connection, if an
+    /// HTTP/3 endpoint serves this server now.
+    pub(crate) fn alt_svc(&self) -> Option<HeaderValue> {
+        self.http3.get()?.upgrade()?.alt_svc()
+    }
 }
 
 /// One connection counted against `max_connections_per_ip`, until dropped.
-struct PerIpSlot<'a> {
+pub(crate) struct PerIpSlot<'a> {
     counts: &'a Mutex<HashMap<IpAddr, usize>>,
     ip: IpAddr,
 }
 
 impl<'a> PerIpSlot<'a> {
     /// Counts one more connection of `ip`, or `None` if it already has `max`.
-    fn acquire(max: usize, counts: &'a Mutex<HashMap<IpAddr, usize>>, ip: IpAddr) -> Option<Self> {
+    pub(crate) fn acquire(
+        max: usize,
+        counts: &'a Mutex<HashMap<IpAddr, usize>>,
+        ip: IpAddr,
+    ) -> Option<Self> {
         let ip = ip.to_canonical();
         let mut map = counts
             .lock()
@@ -195,6 +243,9 @@ pub struct Server {
     announce: bool,
     /// Raised on shutdown, for `stream_close_delay`.
     closing: watch::Sender<bool>,
+    /// What this listener serves over HTTP/3, for the daemon's QUIC
+    /// endpoints.
+    http3: Option<Arc<http3::Listener>>,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
@@ -255,9 +306,11 @@ impl Server {
         let label: Arc<str> = name.clone().unwrap_or_else(|| address.to_string()).into();
         let logger = Arc::new(Logger::new(&config.log)?);
 
+        let max_connections = server.max_connections.max(1);
+        let permits = Arc::new(Semaphore::new(max_connections));
         let mut cert_resolver = None;
         let closing = watch::Sender::new(false);
-        let (socket, context) = match socket {
+        let (socket, context, http3) = match socket {
             SocketKind::Udp(socket) => {
                 let settings = UdpSettings {
                     group: {
@@ -275,7 +328,7 @@ impl Server {
                     server: Arc::clone(&label),
                     logger: Arc::clone(&logger),
                 };
-                (Socket::Udp(socket, settings), None)
+                (Socket::Udp(socket, settings), None, None)
             }
             SocketKind::Tcp(listener) => {
                 let handler = match server.protocol {
@@ -374,12 +427,34 @@ impl Server {
                         .max_connections_per_ip
                         .map(|max| (max, Mutex::default())),
                     match_timeout: server.match_timeout,
+                    http3: OnceLock::new(),
                 };
-                (Socket::Tcp(listener), Some(Arc::new(context)))
+                let context = Arc::new(context);
+                // A `udp` server on the same port turns HTTP/3 off there.
+                let http3 = match &context.tls {
+                    Some(acceptor)
+                        if server.serves_http3() && !config.udp_listens_on(requested) =>
+                    {
+                        let listener = Arc::new(http3::Listener::new(
+                            address,
+                            acceptor,
+                            Arc::clone(&context),
+                            Arc::clone(&permits),
+                            max_connections,
+                            server.requires_http3(),
+                        )?);
+                        context
+                            .http3
+                            .set(Arc::downgrade(&listener))
+                            .expect("the context is new");
+                        Some(listener)
+                    }
+                    _ => None,
+                };
+                (Socket::Tcp(listener), Some(context), http3)
             }
         };
 
-        let max_connections = server.max_connections.max(1);
         Ok(Self {
             state: watch::channel(State::Starting).0,
             socket,
@@ -389,7 +464,7 @@ impl Server {
             name,
             log_name,
             max_connections,
-            permits: Arc::new(Semaphore::new(max_connections)),
+            permits,
             grace_period: config.grace_period,
             context,
             cert_resolver,
@@ -399,6 +474,7 @@ impl Server {
                 .is_none_or(|options| options.ocsp_stapling),
             announce: true,
             closing,
+            http3,
             shutdown: Box::pin(std::future::pending()),
         })
     }
@@ -443,6 +519,7 @@ impl Server {
             ocsp_stapling: false,
             announce: false,
             closing: replica.closing,
+            http3: None,
             shutdown: Box::pin(std::future::pending()),
         })
     }
@@ -482,6 +559,12 @@ impl Server {
         self.cert_resolver.as_ref()
     }
 
+    /// What this listener serves over HTTP/3, if it does. Replicas have
+    /// none: the daemon keeps one QUIC endpoint per address.
+    pub(crate) fn http3(&self) -> Option<&Arc<http3::Listener>> {
+        self.http3.as_ref()
+    }
+
     /// Receives [`State`] updates.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<State> {
@@ -504,6 +587,7 @@ impl Server {
             ocsp_stapling,
             announce,
             closing,
+            http3,
             shutdown,
             ..
         } = self;
@@ -544,14 +628,17 @@ impl Server {
                 closing.send_replace(true);
                 while connections.try_join_next().is_some() {}
 
-                let pending = connections.len();
+                let quic_pending = http3.as_ref().map_or(0, |http3| http3.open_connections());
+                let pending = connections.len() + quic_pending;
                 if pending > 0 {
                     println!("{log_name} => Can't shutdown yet, {pending} pending connections");
                     state.send_replace(State::ShuttingDown(ShutdownState::PendingConnections(
                         pending,
                     )));
-                    stop.send_replace(true);
+                }
+                stop.send_replace(true);
 
+                let tcp = async {
                     let drained = match grace_period {
                         Some(grace) => tokio::time::timeout(grace, drain(&mut connections))
                             .await
@@ -569,7 +656,13 @@ impl Server {
                         connections.abort_all();
                         drain(&mut connections).await;
                     }
-                }
+                };
+                let quic = async {
+                    if let Some(http3) = &http3 {
+                        http3.drain(grace_period).await;
+                    }
+                };
+                tokio::join!(tcp, quic);
 
                 state.send_replace(State::ShuttingDown(ShutdownState::Done));
                 if announce {
@@ -744,7 +837,7 @@ async fn handle_connection(
                 if connection.alpn_protocol() == Some(acme::TLS_ALPN_PROTOCOL) {
                     return;
                 }
-                let client_subject = tls::client_subject(connection);
+                let client_subject = connection.peer_certificates().and_then(tls::client_subject);
                 let handshake = Detected {
                     tls: true,
                     sni: connection.server_name().map(str::to_owned),
@@ -828,23 +921,11 @@ async fn serve<S>(
             )
             .await;
         }
-        Handler::Http {
-            routes,
-            http2,
-            tracer,
-        } => {
-            let activity = Arc::new(Activity::default());
-            let service = Service {
-                routes: Arc::clone(routes),
-                log_name: Arc::clone(&context.log.log_name),
-                peer,
-                peer_ip: headers::peer_ip_value(peer),
-                client_subject,
-                local,
-                activity: Arc::clone(&activity),
-                logger: Arc::clone(&context.log.logger),
-                tracer: tracer.clone(),
-            };
+        Handler::Http { http2, .. } => {
+            let service = context
+                .http_service(peer, local, client_subject, context.alt_svc())
+                .expect("an HTTP handler has a service");
+            let activity = Arc::clone(&service.activity);
             let stamp = Stamp::new();
             let io = TokioIo::new(Watched::new(stream, Arc::clone(&stamp)));
             let idle = context.idle_timeout.map(|idle| (idle, stamp));
@@ -859,6 +940,7 @@ async fn serve<S>(
                 if let Some(timeout) = context.read_header_timeout {
                     http1.header_read_timeout(timeout);
                 }
+                builder.http2().max_header_list_size(MAX_HEADER_LIST_SIZE);
                 drive_http(
                     builder.serve_connection_with_upgrades(io, service),
                     stop,

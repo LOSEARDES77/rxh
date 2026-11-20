@@ -124,6 +124,13 @@ A client asking for a name that matches no server gets the first certificate
 loaded and a `404`. See
 [Virtual hosts on a shared address](../configuration.md#virtual-hosts-on-a-shared-address).
 
+## HTTP/3
+
+A server with `tls` also answers HTTP/3 on the same port number over UDP, and
+tells HTTP/1.1 and HTTP/2 clients with an `Alt-Svc` header. Open UDP 443 in the
+firewall, next to TCP 443. `http3 = false` turns it off. See
+[HTTP/3](../configuration.md#http3).
+
 ## Hardening
 
 TLS 1.2 and 1.3 with the default suites are safe today. A stricter policy, a

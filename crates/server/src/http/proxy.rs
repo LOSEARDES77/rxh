@@ -25,7 +25,7 @@ use rxh_core::config::RetryMatch;
 use rxh_core::pool::{RequestGuard, RetryPermit, SelectContext, Selection, Upstream};
 use tokio::sync::watch;
 
-use crate::http::body::{self, BodyError, Guarded};
+use crate::http::body::{self, Body, BodyError, Guarded};
 use crate::http::cache::{self, Cache};
 use crate::http::grpc_web;
 use crate::http::headers::{self, Forwarding};
@@ -43,7 +43,7 @@ const MAX_STALE_RETRIES: usize = 3;
 
 /// Proxies `request` to a backend of `group`.
 pub(crate) async fn forward(
-    mut request: Request<Incoming>,
+    mut request: Request<Body>,
     route: &Route,
     group: &Group,
     connection: &Service,
@@ -56,7 +56,7 @@ pub(crate) async fn forward(
     );
     let h2c = group.transport.is_h2c();
     let upgrade = !h2c
-        && request.version() != Version::HTTP_2
+        && !matches!(request.version(), Version::HTTP_2 | Version::HTTP_3)
         && headers::requested_upgrade(request.headers()).is_some();
 
     let cache_key = route
@@ -143,8 +143,8 @@ pub(crate) async fn forward(
         (Some(limit), Some(too_large)) => {
             let too_large = Arc::clone(too_large);
             Limited::new(incoming, limit)
-                .map_err(move |err| match err.downcast::<hyper::Error>() {
-                    Ok(err) => BodyError::Hyper(*err),
+                .map_err(move |err| match err.downcast::<BodyError>() {
+                    Ok(err) => *err,
                     Err(_) => {
                         too_large.store(true, Ordering::Release);
                         BodyError::TooLarge
@@ -152,7 +152,7 @@ pub(crate) async fn forward(
                 })
                 .boxed()
         }
-        _ => body::incoming(incoming),
+        _ => incoming,
     };
     if let Some(encoding) = web {
         outgoing = grpc_web::request_body(outgoing, encoding);

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::header::{HeaderName, HeaderValue};
+use hyper::header::{ALT_SVC, HeaderName, HeaderValue};
 use hyper::http::uri::Authority;
 use hyper::{HeaderMap, Method, Request, StatusCode, Uri};
 use rxh_core::config::{
@@ -29,7 +29,7 @@ use crate::acme;
 use crate::error::Error;
 use crate::files::Files;
 use crate::http::auth::{BasicAuth, ForwardAuth};
-use crate::http::body::Guarded;
+use crate::http::body::{self, Body, Guarded};
 use crate::http::cache::Cache;
 use crate::http::cors::Cors;
 use crate::http::encode;
@@ -411,6 +411,9 @@ pub(crate) struct Service {
     pub(crate) logger: Arc<Logger>,
     /// Set when the `[tracing]` table is.
     pub(crate) tracer: Option<Arc<Tracer>>,
+    /// `Alt-Svc` value to add to responses that have none: set on HTTP/1.1
+    /// and HTTP/2 connections of a server that also serves HTTP/3.
+    pub(crate) alt_svc: Option<HeaderValue>,
 }
 
 /// Response extension set by the proxy for JSON access lines: the backend
@@ -424,21 +427,29 @@ impl hyper::service::Service<Request<Incoming>> for Service {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, request: Request<Incoming>) -> Self::Future {
+        let service = self.clone();
+        Box::pin(async move { Ok(service.respond(request.map(body::incoming)).await) })
+    }
+}
+
+impl Service {
+    /// Answers a request from any HTTP version: counts it as activity and
+    /// keeps the connection counted as in flight until the response body ends.
+    pub(crate) async fn respond(self, request: Request<Body>) -> BoxResponse {
         self.activity.requests.fetch_add(1, Ordering::Release);
         self.activity.notify.notify_waiters();
 
         self.activity.in_flight.fetch_add(1, Ordering::Release);
         let in_flight = InFlight(Arc::clone(&self.activity));
 
-        let service = self.clone();
-        Box::pin(async move {
-            let response = service.handle(request).await;
-            Ok(response.map(|body| Guarded::new(body, in_flight).boxed()))
-        })
+        let alt_svc = self.alt_svc.clone();
+        let mut response = self.handle(request).await;
+        if let Some(alt_svc) = alt_svc {
+            response.headers_mut().entry(ALT_SVC).or_insert(alt_svc);
+        }
+        response.map(|body| Guarded::new(body, in_flight).boxed())
     }
-}
 
-impl Service {
     /// Checks a request against the `basic_auth` and the `forward_auth` of
     /// `route`, or of its site for the one the route does not set. Returns
     /// the answer for a request that may not go on.
@@ -475,7 +486,7 @@ impl Service {
         forward_auth.check(headers, request_headers).await
     }
 
-    async fn handle(self, mut request: Request<Incoming>) -> BoxResponse {
+    async fn handle(self, mut request: Request<Body>) -> BoxResponse {
         if let Some(response) = acme::challenge_response(request.method(), request.uri().path()) {
             return response;
         }

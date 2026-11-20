@@ -27,6 +27,7 @@ use rxh_core::config::{Config, Protocol};
 use tokio::sync::{broadcast, watch};
 
 use crate::error::Error;
+use crate::http3;
 use crate::registry::Registry;
 use crate::server::{Replica, Server, State};
 use crate::tls::CertResolver;
@@ -49,6 +50,9 @@ pub struct ServerInfo {
 
     /// Certificates of a listener that terminates TLS.
     pub cert_resolver: Option<Arc<CertResolver>>,
+
+    /// What the listener serves over HTTP/3, if it does.
+    pub(crate) http3: Option<Arc<http3::Listener>>,
 }
 
 /// Owner of all [`Server`]s of one configuration.
@@ -108,6 +112,7 @@ impl Master {
                 name: server.name().map(str::to_owned),
                 state: server.subscribe(),
                 cert_resolver: server.cert_resolver().cloned(),
+                http3: server.http3().cloned(),
             });
             servers.push(server);
         }
@@ -143,6 +148,7 @@ impl Master {
                 name: server.name().map(str::to_owned),
                 state: server.subscribe(),
                 cert_resolver: None,
+                http3: None,
             });
             servers.push(server);
         }

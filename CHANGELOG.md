@@ -407,6 +407,25 @@ Changed.
   sides (no TLS termination, no upstream TLS, `host:port` backends) are
   relayed with `splice(2)`, so the bytes stay in the kernel. Other
   connections and other systems keep the buffered copy. No configuration.
+- HTTP/3 (QUIC): every `http` server with `tls` answers HTTP/3 on the UDP
+  port of its `listen` addresses, and adds `Alt-Svc: h3=":<port>"; ma=86400`
+  to responses over HTTP/1.1 and HTTP/2. New server key `http3`: unset is
+  on, `true` makes a UDP port that cannot be bound a start error, `false`
+  turns it off. Open the UDP port in the firewall. Not over HTTP/3:
+  WebSockets and other upgrades, 0-RTT, HTTP/3 to backends. Reloads keep the
+  UDP socket and drain open connections with a GOAWAY. `rxh upgrade` closes
+  QUIC connections at once and the new process binds the UDP port itself;
+  HTTP/3 requests in flight fail, and with systemd socket activation the new
+  process runs without HTTP/3. A `Content-Length` that is not one valid
+  length is answered `400`, and a body that does not match it resets the
+  stream with `H3_MESSAGE_ERROR` without completing the backend request.
+  Flow control holds at most 1 MiB per request stream and 8 MiB per
+  connection. `idle_timeout` closes connections without requests in flight,
+  as over TCP; RXH sends a QUIC PING every 10 s and drops silent clients
+  after 30 s. With `max_connections_per_ip`, new QUIC clients get a Retry
+  first. Servers sharing a listen address must agree on `http3`, and
+  `http3 = true` on the UDP port of a `udp` server is a validation error.
+  See [HTTP/3](docs/configuration.md#http3).
 
 ### Deprecated
 

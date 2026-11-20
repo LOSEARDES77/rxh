@@ -308,6 +308,17 @@ impl Config {
                          either all or none of the servers on it must set proxy_protocol_in"
                     ));
                 }
+                // One QUIC endpoint per listener: a later server cannot
+                // turn it on or off.
+                if server
+                    .http3
+                    .is_some_and(|http3| http3 != first.serves_http3())
+                {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         http3 must be the same on servers sharing a listen address"
+                    ));
+                }
                 if server.max_connections_per_ip != first.max_connections_per_ip {
                     return invalid(format!(
                         "{label}: listen address {address} is shared with {first_label}, \
@@ -666,6 +677,38 @@ impl Config {
                     .map_err(|err| ConfigError::Invalid(format!("{label}: tls_options: {err}")))?;
             }
 
+            if server.http3 == Some(true) {
+                if server.protocol != Protocol::Http {
+                    return invalid(format!("{label}: http3 is only for http servers"));
+                }
+                if server.tls.is_none() {
+                    return invalid(format!("{label}: http3 needs tls"));
+                }
+                if server.proxy_protocol_in {
+                    return invalid(format!(
+                        "{label}: http3 cannot be used with proxy_protocol_in"
+                    ));
+                }
+                if !server
+                    .tls_options
+                    .as_ref()
+                    .is_none_or(TlsOptions::allows_tls13)
+                {
+                    return invalid(format!(
+                        "{label}: http3 needs TLS 1.3, but cipher_suites has no TLS 1.3 suite"
+                    ));
+                }
+                if let Some(address) = server
+                    .listen
+                    .iter()
+                    .find(|address| self.udp_listens_on(**address))
+                {
+                    return invalid(format!(
+                        "{label}: http3 needs the UDP port of {address}, which a udp server uses"
+                    ));
+                }
+            }
+
             if server.tls == Some(Tls::Auto) {
                 if server.protocol != Protocol::Http {
                     return invalid(format!(
@@ -750,6 +793,24 @@ impl Config {
             CatalogKind::Nomad => self.nomad.as_ref(),
             CatalogKind::Kubernetes => self.kubernetes.as_ref(),
         }
+    }
+
+    /// Whether a `udp` server listens on the UDP port of `address`: the same
+    /// port on the same IP, or on any IP when either side is unspecified
+    /// (`0.0.0.0`, `[::]`). HTTP/3 cannot use that port.
+    #[must_use]
+    pub fn udp_listens_on(&self, address: SocketAddr) -> bool {
+        let mut udp = self
+            .servers
+            .iter()
+            .filter(|server| server.protocol == Protocol::Udp)
+            .flat_map(|server| &server.listen);
+        udp.any(|udp| {
+            udp.port() == address.port()
+                && (udp.ip() == address.ip()
+                    || udp.ip().is_unspecified()
+                    || address.ip().is_unspecified())
+        })
     }
 
     /// Returns this configuration plus one plain `http` server per TLS
@@ -1395,6 +1456,13 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_options: Option<TlsOptions>,
 
+    /// Serves HTTP/3 over QUIC on the UDP port of each listen address and
+    /// announces it with `Alt-Svc`. Unset means on for `http` servers with
+    /// `tls` that allow TLS 1.3 and do not set `proxy_protocol_in`, and off
+    /// otherwise. `true` on a server that cannot serve it is an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http3: Option<bool>,
+
     /// Redirects plain HTTP requests for this TLS server to HTTPS, see
     /// [`Config::with_https_redirects`]. Unset means on with `tls = "auto"`
     /// and off otherwise.
@@ -1496,6 +1564,28 @@ pub struct Server {
 }
 
 impl Server {
+    /// Whether this server answers HTTP/3: `http3` is not `false`, and it is
+    /// an `http` server with `tls`, without `proxy_protocol_in`, whose
+    /// `tls_options` allow TLS 1.3.
+    #[must_use]
+    pub fn serves_http3(&self) -> bool {
+        self.http3 != Some(false)
+            && self.protocol == Protocol::Http
+            && self.tls.is_some()
+            && !self.proxy_protocol_in
+            && self
+                .tls_options
+                .as_ref()
+                .is_none_or(TlsOptions::allows_tls13)
+    }
+
+    /// Whether `http3 = true` asks for HTTP/3, so a listener that cannot
+    /// start it is an error instead of being skipped.
+    #[must_use]
+    pub fn requires_http3(&self) -> bool {
+        self.http3 == Some(true)
+    }
+
     /// Every `match` entry with its position, depth first: `0`, `1`, and
     /// `1.0`, `1.1` for the entries of the `subroute` of entry 1.
     #[must_use]
@@ -1601,6 +1691,7 @@ struct RawServer {
     tls: Option<Tls>,
     client_auth: Option<ClientAuth>,
     tls_options: Option<TlsOptions>,
+    http3: Option<bool>,
     https_redirect: Option<bool>,
     #[serde(default = "default::true_value")]
     http2: bool,
@@ -1732,6 +1823,7 @@ impl TryFrom<RawServer> for Server {
             tls: raw.tls,
             client_auth: raw.client_auth,
             tls_options: raw.tls_options,
+            http3: raw.http3,
             https_redirect: raw.https_redirect,
             http2: raw.http2,
             trusted_proxies,
@@ -3943,6 +4035,16 @@ impl TlsOptions {
 
     /// Key exchange groups of `curves`, by their IANA names.
     pub const CURVES: [&str; 4] = ["X25519MLKEM768", "X25519", "secp256r1", "secp384r1"];
+
+    /// Whether the handshakes can negotiate TLS 1.3: `cipher_suites` is
+    /// empty or has a TLS 1.3 suite.
+    fn allows_tls13(&self) -> bool {
+        self.cipher_suites.is_empty()
+            || self
+                .cipher_suites
+                .iter()
+                .any(|suite| !suite.contains("_WITH_"))
+    }
 
     fn validate(&self) -> Result<(), String> {
         for suite in &self.cipher_suites {
@@ -6346,6 +6448,158 @@ mod tests {
         assert_eq!(decode_base64("+/8=").unwrap(), [0xfb, 0xff]);
         assert_eq!(decode_base64("Z"), None);
         assert_eq!(decode_base64("Zm9v-mFy"), None);
+    }
+
+    fn http3_servers(extra: &str, protocol: &str, tls: bool) -> Result<Config, ConfigError> {
+        let tls = if tls {
+            "tls = { cert = \"c.pem\", key = \"k.pem\" }\n"
+        } else {
+            ""
+        };
+        Config::from_toml(&format!(
+            "[[server]]\nlisten = \"127.0.0.1:443\"\nprotocol = \"{protocol}\"\n\
+             forward = \"a:1\"\n{tls}{extra}\n"
+        ))
+    }
+
+    fn http3_error(extra: &str, protocol: &str, tls: bool) -> String {
+        match http3_servers(extra, protocol, tls) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected an error for {extra}"),
+        }
+    }
+
+    #[test]
+    fn http3_defaults_on_for_tls_http_servers() {
+        let config = http3_servers("", "http", true).unwrap();
+        assert_eq!(config.servers[0].http3, None);
+        assert!(config.servers[0].serves_http3());
+        assert!(!config.servers[0].requires_http3());
+        let config = http3_servers("http3 = true", "http", true).unwrap();
+        assert!(config.servers[0].serves_http3());
+        assert!(config.servers[0].requires_http3());
+    }
+
+    #[test]
+    fn http3_defaults_off_without_tls() {
+        let config = http3_servers("", "http", false).unwrap();
+        assert!(!config.servers[0].serves_http3());
+    }
+
+    #[test]
+    fn http3_false_turns_it_off() {
+        let config = http3_servers("http3 = false", "http", true).unwrap();
+        assert!(!config.servers[0].serves_http3());
+        assert!(!config.servers[0].requires_http3());
+    }
+
+    #[test]
+    fn http3_unset_is_off_with_proxy_protocol_in() {
+        let config = http3_servers("proxy_protocol_in = true", "http", true).unwrap();
+        assert!(!config.servers[0].serves_http3());
+    }
+
+    #[test]
+    fn http3_unset_is_off_when_tls_1_3_is_excluded() {
+        let only_tls12 = "tls_options = { cipher_suites = \
+                          [\"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\"] }";
+        let config = http3_servers(only_tls12, "http", true).unwrap();
+        assert!(!config.servers[0].serves_http3());
+        let err = http3_error(&format!("http3 = true\n{only_tls12}"), "http", true);
+        assert!(err.contains("http3 needs TLS 1.3"), "{err}");
+    }
+
+    #[test]
+    fn http3_true_is_rejected_without_tls() {
+        let err = http3_error("http3 = true", "http", false);
+        assert!(err.contains("http3 needs tls"), "{err}");
+    }
+
+    #[test]
+    fn http3_true_is_rejected_on_tcp_and_udp_servers() {
+        for protocol in ["tcp", "udp"] {
+            let err = http3_error("http3 = true", protocol, false);
+            assert!(err.contains("http3 is only for http servers"), "{err}");
+        }
+    }
+
+    #[test]
+    fn http3_true_is_rejected_with_proxy_protocol_in() {
+        let err = http3_error("http3 = true\nproxy_protocol_in = true", "http", true);
+        assert!(
+            err.contains("http3 cannot be used with proxy_protocol_in"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn http3_must_agree_on_a_shared_listen_address() {
+        let servers = |first: &str, second: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{first}\n\
+                 [[server]]\nlisten = \"127.0.0.1:443\"\nhost = [\"b\"]\n\
+                 forward = \"b:1\"\ntls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{second}\n"
+            ))
+        };
+        for (first, second) in [
+            ("", ""),
+            ("", "http3 = true"),
+            ("http3 = true", ""),
+            ("http3 = false", "http3 = false"),
+            ("http3 = false", ""),
+        ] {
+            assert!(servers(first, second).is_ok(), "{first:?} then {second:?}");
+        }
+        for (first, second) in [
+            ("", "http3 = false"),
+            ("http3 = false", "http3 = true"),
+            ("http3 = true", "http3 = false"),
+        ] {
+            let err = servers(first, second).expect_err("a later server disagrees");
+            assert!(
+                err.to_string()
+                    .contains("http3 must be the same on servers sharing"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn http3_true_is_rejected_on_the_port_of_a_udp_server() {
+        let with_udp = |udp: &str, extra: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{extra}\n\
+                 [[server]]\nlisten = \"{udp}\"\nprotocol = \"udp\"\nforward = \"d:53\"\n"
+            ))
+        };
+        for udp in ["127.0.0.1:443", "0.0.0.0:443"] {
+            let err = with_udp(udp, "http3 = true").expect_err("the UDP port is taken");
+            assert!(
+                err.to_string().contains("http3 needs the UDP port"),
+                "{err}"
+            );
+            // Unset: HTTP/3 is simply off on that address.
+            let config = with_udp(udp, "").unwrap();
+            assert!(config.udp_listens_on(config.servers[0].listen[0]));
+        }
+        for udp in ["127.0.0.1:444", "127.0.0.2:443"] {
+            let config = with_udp(udp, "http3 = true").unwrap();
+            assert!(!config.udp_listens_on(config.servers[0].listen[0]));
+        }
+    }
+
+    #[test]
+    fn http3_survives_a_serialization_round_trip() {
+        let config = http3_servers("http3 = false", "http", true).unwrap();
+        let text = toml::to_string(&config).unwrap();
+        let again = Config::from_toml(&text).unwrap();
+        assert_eq!(again.servers[0].http3, Some(false));
+
+        let config = http3_servers("", "http", true).unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("http3"), "{text}");
     }
 
     #[test]

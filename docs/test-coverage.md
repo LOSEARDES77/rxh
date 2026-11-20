@@ -243,3 +243,4 @@ written against an older snapshot: their line numbers and percentages are stale,
 - [ ] Small modules: error, duration, cache, net, master, registry (gap 10).
 - [x] Decide bench policy (gap 12): excluded from the coverage gate.
 - [ ] TLS error paths and shared-listener failure isolation (gap 11).
+- [x] HTTP/3: `crates/server/tests/http3.rs` (requests, limits, timeouts, client certificates, reload and stop drain). Not in the measured table above.

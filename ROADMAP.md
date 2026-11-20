@@ -21,7 +21,7 @@ not a promise. An item moves to [CHANGELOG.md](CHANGELOG.md) when it ships.
 
 ## Where RXH is today (0.3.0, unreleased)
 
-- HTTP/1.1, HTTP/2, WebSocket, TCP and UDP proxying with one pool model.
+- HTTP/1.1, HTTP/2, HTTP/3, WebSocket, TCP and UDP proxying with one pool model.
 - Every Caddy load balancing policy (with nested `fallback`), retries with
   `retry_match`, active and passive health checks with event hooks and
   webhooks, dynamic upstreams from DNS, TLS and unix socket upstreams,
@@ -120,6 +120,8 @@ goal of this milestone is to close most of that gap and to keep it closed.
 - [x] Security header presets and CORS.
 - [x] Admin API over a unix socket, and optional token authentication for
       remote admin.
+- [x] HTTP/3 over QUIC (`http3`), announced with `Alt-Svc`. No 0-RTT, no
+      HTTP/3 to backends, no WebSockets over HTTP/3.
 
 ## 0.6: discovery and deployment
 
@@ -212,7 +214,6 @@ A release people can run without reading the source.
 
 Large features that wait for a clear need.
 
-- HTTP/3 and QUIC.
 - FastCGI transport.
 - Plugins or WASM middleware.
 - State shared between several RXH instances (rate limits, sticky tables,

@@ -20,8 +20,8 @@ use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifie
 use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{
-    self, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig, ServerConnection,
-    SignatureScheme, SupportedProtocolVersion,
+    self, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig, SignatureScheme,
+    SupportedProtocolVersion,
 };
 
 use crate::acme;
@@ -573,11 +573,12 @@ fn client_verifier(
     builder.build().map_err(io::Error::other)
 }
 
-/// Subject of the certificate the client of `connection` presented, such as
-/// `CN=alice, O=Example`, as a header value. `None` without a certificate,
-/// or if the subject has characters a header cannot carry.
-pub(crate) fn client_subject(connection: &ServerConnection) -> Option<HeaderValue> {
-    let end_entity = connection.peer_certificates()?.first()?;
+/// Subject of the client certificate that starts `chain`, the chain a
+/// client presented over TCP or QUIC, such as `CN=alice, O=Example`, as a
+/// header value. `None` for an empty chain, or if the subject has
+/// characters a header cannot carry.
+pub(crate) fn client_subject(chain: &[CertificateDer<'_>]) -> Option<HeaderValue> {
+    let end_entity = chain.first()?;
     let (_, certificate) = x509_parser::parse_x509_certificate(end_entity).ok()?;
     HeaderValue::from_bytes(certificate.subject().to_string().as_bytes()).ok()
 }
@@ -671,6 +672,16 @@ pub(crate) fn acceptor(
     config.alpn_protocols = alpn_protocols;
 
     Ok(Some((TlsAcceptor::from(Arc::new(config)), resolver)))
+}
+
+/// QUIC flavour of `tcp`, a configuration [`acceptor`] built: the same
+/// provider, client verifier and resolver, ALPN `h3` only and no early data.
+/// Rustls negotiates nothing but TLS 1.3 on QUIC connections.
+pub(crate) fn quic_config(tcp: &ServerConfig) -> Arc<ServerConfig> {
+    let mut config = tcp.clone();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    config.max_early_data_size = 0;
+    Arc::new(config)
 }
 
 #[cfg(test)]
