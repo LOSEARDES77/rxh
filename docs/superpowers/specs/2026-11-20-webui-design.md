@@ -1,6 +1,6 @@
 # Web UI: design
 
-Date: 2026-11-20. Status: waiting for approval.
+Date: 2026-11-20. Status: approved.
 
 ## Intent
 
@@ -47,7 +47,7 @@ Proxy Manager: edit hosts and certificates, access lists".
   `***` into the file.
 - Losing comments or the layout of the configuration file outside the table
   that was edited.
-- `cargo build`, `cargo install` or a package build that needs Node. Node
+- `cargo build`, `cargo install` or a package build that needs Bun or Node. Bun
   is for people who change the page, and for CI.
 - A page that loads anything from another site.
 - Markup built from strings (`innerHTML`): host names, Docker labels and
@@ -102,7 +102,7 @@ the browser only (charts empty on every page load) and over history on disk
 
 **Front end**
 
-1. Svelte 5 with TypeScript and Vite, compiled to static HTML, JavaScript
+1. Svelte 5 with TypeScript and Vite, run with Bun, compiled to static HTML, JavaScript
    and CSS, and the compiled files committed and embedded (chosen, proposed
    by the user). Components for the forms, typed API client, unit tests
    with Vitest. Svelte compiles to plain JavaScript with a small runtime, so
@@ -115,11 +115,11 @@ the browser only (charts empty on every page load) and over history on disk
 
 1. Compiled output committed in the repository; Rust embeds it; CI rebuilds
    it and fails when the committed output differs (chosen). Building RXH
-   never needs Node.
+   never needs Bun or Node.
 2. `build.rs` runs the front end build. Every `cargo build`, `cargo
-   install`, AUR and Homebrew build would need Node and the network.
+   install`, AUR and Homebrew build would need Bun and the network.
    Rejected.
-3. Only CI builds it, nothing committed. A build from source without Node
+3. Only CI builds it, nothing committed. A build from source without Bun
    has no page. Rejected.
 
 ## Design
@@ -232,15 +232,16 @@ again every 5 seconds.
 
 ### Front end
 
-- Source in `crates/server/ui/` (Svelte 5, TypeScript, Vite), with its
-  `package-lock.json`. `npm run build` writes `crates/server/ui/dist/` with
+- Source in `crates/server/ui/` (Svelte 5, TypeScript, Vite, run with Bun), with its
+  `bun.lock`. `bun run build` writes `crates/server/ui/dist/` with
   fixed file names (`index.html`, `app.js`, `app.css`), committed and
   embedded with `include_str!`. Served under `/dashboard/` without the
   token, like the page today: they hold no data.
 - No runtime dependency beyond Svelte. No component library, no chart
   library, no web fonts.
-- CI gets a `ui` job: `npm ci`, type check, `npm test`, `npm run build`,
-  then `git diff --exit-code` on `dist/`, and `npm audit`.
+- CI gets a `ui` job: `bun install --frozen-lockfile`, type check,
+  `bun run test`, `bun run build`, then `git diff --exit-code` on `dist/`,
+  and `bun audit`.
 - Content security policy tightened to `script-src 'self'` and
   `style-src 'self'`; no inline script.
 - All requests go through one function that adds the token, kept in
@@ -292,7 +293,8 @@ certificate upload and accounts are not in it).
 - `revision` check against lost updates.
 - Adding or removing a backend goes through the pool form (saved); only
   drain, maintenance and ready are runtime actions.
-- Svelte 5, TypeScript, Vite and Vitest; compiled output committed.
+- Svelte 5, TypeScript, Vite and Vitest, with Bun as package manager and
+  script runner (the user's choice); compiled output committed.
 - Charts drawn as SVG by a component of the page, no chart library.
 
 ## Left to the builder
