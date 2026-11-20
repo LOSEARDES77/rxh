@@ -9,6 +9,13 @@ Changed.
 
 ### Added
 
+- Hot binary upgrade on Linux: `rxh upgrade`, `SIGUSR2` or `POST /upgrade`
+  make the daemon start its own command line again, which runs the binary
+  now on disk, and hand it every listening socket (TCP, UDP, admin). The new
+  process tells the old one when it serves; the old one then stops accepting
+  and drains its connections, so no connection is refused. A new process
+  that fails to start (broken configuration, bad binary) leaves the old one
+  serving. `rxh start` daemons keep their PID file and log.
 - `rxh validate` warns on standard error about deprecated keys and values,
   in the main file and in included files, naming the table and the
   replacement; the exit status stays 0. `docs/migration.md` sets the

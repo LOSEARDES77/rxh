@@ -41,6 +41,7 @@ mod timeout;
 mod tls;
 mod tracer;
 mod udp;
+mod upgrade;
 mod upstream;
 
 pub use daemon::{Daemon, config_files, load_config};
@@ -51,3 +52,4 @@ pub use registry::{Group, Registry};
 pub use rxh_core::{VERSION, config, pool};
 pub use server::{Replica, Server, ShutdownState, State};
 pub use tls::CertResolver;
+pub use upgrade::is_upgrade;

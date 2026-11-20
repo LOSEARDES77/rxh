@@ -2248,3 +2248,192 @@ fn top_fails_without_a_daemon() {
     let stderr = assert_failure(&rxh(directory.path(), free_address(), &["top", "-n", "1"]));
     assert!(stderr.contains("daemon is not reachable"), "{stderr}");
 }
+
+/// PID the admin API reports.
+#[cfg(target_os = "linux")]
+fn daemon_pid(dir: &Path, admin: &str) -> u32 {
+    let output = Command::new(RXH)
+        .current_dir(dir)
+        .args(["--config", "rxh.toml", "--admin", admin, "status", "--json"])
+        .output()
+        .expect("rxh runs");
+    let status: serde_json::Value =
+        serde_json::from_str(&assert_success(&output)).expect("status is JSON");
+    u32::try_from(status["pid"].as_u64().expect("pid")).expect("pid fits")
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_exit(pid: u32) {
+    for _ in 0..500 {
+        // A zombie (the test is the parent of the first daemon) has exited.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if stat.is_empty() || stat.contains(") Z ") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("process {pid} never exited");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_hands_the_listening_sockets_to_a_new_process() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = backend("backend-1").await;
+    let admin = free_address();
+    let web = free_address();
+    let datagrams = free_address();
+    // A backend that answers when the test says so.
+    let slow = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let slow_upstream = slow.local_addr().expect("address");
+    let slow_web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let config = format!(
+        "[admin]\nlisten = \"{admin}\"\n\
+         [[server]]\nlisten = \"{web}\"\nforward = \"{upstream}\"\n\
+         [[server]]\nlisten = \"{slow_web}\"\nforward = \"{slow_upstream}\"\n\
+         [[server]]\nprotocol = \"udp\"\nlisten = \"{datagrams}\"\nforward = \"127.0.0.1:9\"\n"
+    );
+    std::fs::write(dir.join("rxh.toml"), &config).expect("write");
+    let daemon = start_daemon(dir);
+    wait_for_body(web, "backend-1").await;
+    let first = daemon.0.id();
+    assert_eq!(daemon_pid(dir, &admin.to_string()), first);
+
+    // New connections all the time: none may be refused or reset while the
+    // processes change.
+    let done = Arc::new(AtomicBool::new(false));
+    let served = Arc::new(AtomicUsize::new(0));
+    let load = {
+        let (done, served) = (Arc::clone(&done), Arc::clone(&served));
+        tokio::task::spawn(async move {
+            while !done.load(Ordering::Relaxed) {
+                assert_eq!(
+                    try_get(web).await.as_deref(),
+                    Some("backend-1"),
+                    "request failed during the upgrade"
+                );
+                served.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    // A new process that cannot start leaves the old one serving.
+    std::fs::write(dir.join("rxh.toml"), "[[server]]\nlisten = 1").expect("write");
+    let stderr = assert_failure(&rxh(dir, admin, &["upgrade"]));
+    assert!(
+        stderr.contains("the new process stopped before it was ready"),
+        "{stderr}"
+    );
+    assert_eq!(daemon_pid(dir, &admin.to_string()), first);
+
+    // A request the old process is in the middle of: it must finish there.
+    let pending = tokio::task::spawn(try_get(slow_web));
+    let (mut held, _) = slow.accept().await.expect("request reaches the backend");
+
+    std::fs::write(dir.join("rxh.toml"), &config).expect("write");
+    let upgraded = assert_success(&rxh(dir, admin, &["upgrade"]));
+    assert!(
+        upgraded.contains(&format!("took over from {first}")),
+        "{upgraded}"
+    );
+    // The old process drains, and only the new one answers the admin API.
+    for _ in 0..20 {
+        assert_ne!(daemon_pid(dir, &admin.to_string()), first);
+    }
+    let second = daemon_pid(dir, &admin.to_string());
+    let _guard = Background(Some(second));
+    assert!(is_alive(first), "the old process waits for its request");
+    held.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow")
+        .await
+        .expect("write");
+    assert_eq!(pending.await.expect("joins").as_deref(), Some("slow"));
+    wait_for_exit(first).await;
+
+    // The new process can be upgraded in turn, by signal.
+    let killed = Command::new("kill")
+        .args(["-USR2", &second.to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(killed.success());
+    wait_for_exit(second).await;
+    let third = daemon_pid(dir, &admin.to_string());
+    let _guard = Background(Some(third));
+    assert!(third != first && third != second);
+
+    let before = served.load(Ordering::Relaxed);
+    wait_for_body(web, "backend-1").await;
+    done.store(true, Ordering::Relaxed);
+    load.await.expect("no request failed");
+    assert!(before > 0, "requests were served during the upgrades");
+
+    assert_success(&rxh(dir, admin, &["stop"]));
+    wait_for_exit(third).await;
+    assert!(try_get(web).await.is_none(), "listener closed");
+    // The UDP port, which cannot be bound twice, was handed over and is
+    // free again.
+    std::net::UdpSocket::bind(datagrams).expect("UDP port released");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_of_a_background_daemon_keeps_its_pid_file_and_admin_socket() {
+    let upstream = backend("backend-1").await;
+    let web = free_address();
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let admin = format!("unix/{}/admin.sock", dir.display());
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\n\
+             [[server]]\nlisten = \"{web}\"\nforward = \"{upstream}\"\n"
+        ),
+    )
+    .expect("write");
+    let cli = |args: &[&str]| {
+        Command::new(RXH)
+            .current_dir(dir)
+            .args(["--config", "rxh.toml", "--pid-file", "rxh.pid"])
+            .args(args)
+            .output()
+            .expect("rxh runs")
+    };
+    let pid_file = || -> u32 {
+        std::fs::read_to_string(dir.join("rxh.pid"))
+            .expect("PID file")
+            .trim()
+            .parse()
+            .expect("numeric PID")
+    };
+
+    assert_success(&cli(&["start"]));
+    let first = pid_file();
+    let _guard = Background(Some(first));
+    wait_for_body(web, "backend-1").await;
+
+    assert_success(&cli(&["upgrade"]));
+    wait_for_exit(first).await;
+    let second = daemon_pid(dir, &admin);
+    let _guard = Background(Some(second));
+    assert_ne!(second, first);
+    // The new process waits for the lock of the old one.
+    for _ in 0..250 {
+        if pid_file() == second {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(pid_file(), second);
+    assert_eq!(try_get(web).await.as_deref(), Some("backend-1"));
+    let stderr = assert_failure(&cli(&["start"]));
+    assert!(stderr.contains("is rxh already running?"), "{stderr}");
+
+    assert_success(&cli(&["stop"]));
+    wait_for_exit(second).await;
+}

@@ -40,6 +40,7 @@ use crate::timeout::{Stamp, Watched};
 use crate::tls::{self, CertResolver};
 use crate::tracer::Tracer;
 use crate::udp::{self, UdpSettings};
+use crate::upgrade::{self, Lease};
 
 /// Deadline for the TLS handshake when `read_header_timeout` is unset.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -175,6 +176,8 @@ pub struct Replica {
 pub struct Server {
     state: watch::Sender<State>,
     socket: Socket,
+    /// Hands `socket` to the next process of a hot binary upgrade.
+    lease: Lease,
     address: SocketAddr,
     protocol: Protocol,
     name: Option<String>,
@@ -219,7 +222,7 @@ impl Server {
             .map(|&index| &config.servers[index])
             .collect();
 
-        let (socket, address) = match server.protocol {
+        let (socket, lease, address) = match server.protocol {
             Protocol::Udp => {
                 let socket = match systemd::udp_socket(requested)? {
                     Some(socket) => socket,
@@ -228,12 +231,14 @@ impl Server {
                 socket.set_nonblocking(true)?;
                 let socket = UdpSocket::from_std(socket)?;
                 let address = socket.local_addr()?;
-                (SocketKind::Udp(Arc::new(socket)), address)
+                let lease = upgrade::lease(&socket)?;
+                (SocketKind::Udp(Arc::new(socket)), lease, address)
             }
             Protocol::Http | Protocol::Tcp => {
                 let listener = bind_tcp(requested)?;
                 let address = listener.local_addr()?;
-                (SocketKind::Tcp(listener), address)
+                let lease = upgrade::lease(&listener)?;
+                (SocketKind::Tcp(listener), lease, address)
             }
         };
 
@@ -378,6 +383,7 @@ impl Server {
         Ok(Self {
             state: watch::channel(State::Starting).0,
             socket,
+            lease,
             address,
             protocol: server.protocol,
             name,
@@ -420,9 +426,11 @@ impl Server {
     /// `max_connections`.
     pub fn from_replica(replica: &Replica) -> Result<Self, Error> {
         let replica = replica.clone();
+        let listener = bind_tcp(replica.address)?;
         Ok(Self {
             state: watch::channel(State::Starting).0,
-            socket: Socket::Tcp(bind_tcp(replica.address)?),
+            lease: upgrade::lease(&listener)?,
+            socket: Socket::Tcp(listener),
             address: replica.address,
             protocol: replica.protocol,
             name: replica.name,
@@ -486,6 +494,7 @@ impl Server {
         let Self {
             state,
             socket,
+            lease,
             log_name,
             max_connections,
             permits,
@@ -531,6 +540,7 @@ impl Server {
 
                 // Stop accepting: new clients get "connection refused".
                 drop(listener);
+                drop(lease);
                 closing.send_replace(true);
                 while connections.try_join_next().is_some() {}
 
@@ -576,6 +586,7 @@ impl Server {
         if let Err(err) = udp::serve(socket, settings, shutdown).await {
             eprintln!("{log_name} => UDP socket failed: {err}");
         }
+        drop(lease);
 
         state.send_replace(State::ShuttingDown(ShutdownState::Done));
         println!("{log_name} => Shutdown complete");

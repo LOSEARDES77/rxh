@@ -363,6 +363,51 @@ same files locally, see the comments of [`dist/stage.sh`](../dist/stage.sh),
 [`dist/nfpm.yaml`](../dist/nfpm.yaml), [`dist/pkgbuild.sh`](../dist/pkgbuild.sh)
 and [`dist/homebrew.sh`](../dist/homebrew.sh).
 
+## Upgrading the binary without downtime
+
+On Linux a running daemon can be replaced by a new binary without closing
+its listening sockets. Install the new binary over the old one, then:
+
+```sh
+rxh upgrade                  # or: kill -USR2 "$(cat rxh.pid)", or POST /upgrade
+```
+
+The daemon starts its own command line again (same program name, arguments,
+environment and working directory, so the binary now at that path runs) and
+leaves it a duplicate of every socket it listens on: `http`, `tcp` and `udp`
+servers and the admin API. The new process loads the configuration file,
+its listeners use the sockets whose address equals their `listen`, and it
+tells the old process once everything is up. The old process then stops
+accepting, lets its open connections finish as on `rxh stop` (`grace_period`,
+`stream_close_delay`) and exits. Both processes share the sockets in between,
+so no connection is refused and nothing waiting in a backlog is lost.
+
+- If the new process exits before it is ready (a configuration the new
+  version rejects, a binary that does not start), the old one logs
+  `Upgrade failed, this process keeps serving` and nothing changes;
+  `rxh upgrade` and `POST /upgrade` report the failure (`400`). A new process
+  that hangs before it is ready leaves the old one serving too.
+- `rxh upgrade` waits until the new process answers `GET /status`. Without
+  the admin API it sends `SIGUSR2` to the PID in `--pid-file` and returns.
+- A daemon started with `rxh start` keeps its log file, and its PID file
+  names the new process once the old one has exited.
+- The new process starts from the configuration file, like a restart:
+  changes made through the admin API only, drain and maintenance states,
+  counters, rate limit and sticky session tables are not carried over.
+- A `listen` on port 0 gets a new port. With `runtime = "per_core"` one
+  socket per address is handed over and the new process binds the others;
+  connections queued on the old ones can be reset, as on a reload.
+- With systemd, the old process sends `MAINPID=` so the unit follows the new
+  one. Sockets that came from socket activation are handed over like the
+  others, but systemd already keeps those open across `systemctl restart`,
+  which is the simpler way to upgrade there.
+- The challenge-only ACME listener is not handed over: it is only open
+  while a certificate is being obtained, and the new process retries until
+  the port is free.
+
+Not available on other systems: `rxh upgrade` fails and the daemon keeps
+running.
+
 ## Running under systemd
 
 [`dist/rxh.service`](../dist/rxh.service) runs `rxh run` as a
