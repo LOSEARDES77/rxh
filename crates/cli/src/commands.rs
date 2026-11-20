@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rxh_core::config::{Action, Admin, Forward, Policy};
+use rxh_core::deprecation;
 use rxh_core::pool::BackendState;
 use serde_json::{Value, json};
 
@@ -293,6 +294,14 @@ fn print_pool(pool: &Value) {
 
 fn validate(path: &Path) -> Result<(), String> {
     let config = rxh_server::load_config(path).map_err(|err| err.to_string())?;
+    let files: Vec<PathBuf> = rxh_server::config_files(path).map_err(|err| err.to_string())?;
+    for file in &files {
+        let text: String =
+            std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))?;
+        for warning in deprecation::scan(&text) {
+            eprintln!("warning: {}: {warning}", file.display());
+        }
+    }
     let listeners: usize = config
         .servers
         .iter()

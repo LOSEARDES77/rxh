@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- `rxh validate` warns on standard error about deprecated keys and values,
+  in the main file and in included files, naming the table and the
+  replacement; the exit status stays 0. `docs/migration.md` sets the
+  deprecation policy (old spellings keep working until the next major
+  release), the upgrade steps and the table of deprecated keys.
 - `rxh adapt FILE [--adapter caddyfile|nginx]` prints the RXH TOML of a
   Caddyfile or a simple nginx configuration: sites, reverse proxies with
   their load balancing and health checks, file servers, redirects, headers,
@@ -389,6 +394,12 @@ Changed.
   sides (no TLS termination, no upstream TLS, `host:port` backends) are
   relayed with `splice(2)`, so the bytes stay in the kernel. Other
   connections and other systems keep the buffered copy. No configuration.
+
+### Deprecated
+
+- `connections` on `[[server]]`: use `max_connections`.
+- `algorithm` on pools: use `policy`.
+- The policy values `WRR` and `wrr`: use `weighted_round_robin`.
 
 ### Changed
 

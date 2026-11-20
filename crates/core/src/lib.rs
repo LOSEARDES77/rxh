@@ -8,6 +8,7 @@
 
 pub mod address;
 pub mod config;
+pub mod deprecation;
 pub mod duration;
 pub mod matcher;
 pub mod net;
