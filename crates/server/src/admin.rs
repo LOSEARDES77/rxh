@@ -326,12 +326,10 @@ async fn handle(
             );
             return Ok(response);
         }
-    } else if let AdminListen::Tcp(listen) = state.listen
-        && !is_local_request(&request, listen)
-    {
+    } else if !is_local_request(&request, &state.listen) {
         return Ok(error(
             StatusCode::FORBIDDEN,
-            "admin API only accepts loopback Host and Origin",
+            "admin API only accepts a loopback Host and its own Origin",
         ));
     }
 
@@ -730,33 +728,45 @@ fn has_token<B>(request: &Request<B>, token: &str) -> bool {
         })
 }
 
-/// True if both `Host` and `Origin` (when present) name a loopback host or
-/// the admin address itself.
-fn is_local_request<B>(request: &Request<B>, listen: SocketAddr) -> bool {
-    let allowed = |authority: &str| {
-        let host = match authority.strip_prefix('[') {
+/// True if a request without a token is not one a web page of another origin
+/// can send. `Host` must name a loopback host, or the address of a TCP
+/// listener: a page that reaches the API through DNS rebinding sends its own
+/// name. `Origin`, which browsers add to every request that can change
+/// something, must be that same `Host`: the port counts, so the page of
+/// another web server on this machine is refused. The comparison is with
+/// `Host` and not with the listen address because a tunnel to the API, or to
+/// its unix socket, can be on any local port. A request without `Host` and
+/// `Origin` passes: browsers always send `Host`.
+fn is_local_request<B>(request: &Request<B>, listen: &AdminListen) -> bool {
+    // `None` for a header that is not text: refused.
+    let text = |name: header::HeaderName| -> Option<Option<&str>> {
+        match request.headers().get(name) {
+            Some(value) => value.to_str().ok().map(Some),
+            None => Some(None),
+        }
+    };
+    let (Some(host), Some(origin)) = (text(header::HOST), text(header::ORIGIN)) else {
+        return false;
+    };
+
+    let is_loopback = |authority: &str| {
+        let name = match authority.strip_prefix('[') {
             Some(rest) => rest.split(']').next().unwrap_or_default(),
             None => authority.split(':').next().unwrap_or_default(),
         };
-        matches!(host, "localhost" | "127.0.0.1" | "::1") || host == listen.ip().to_string()
+        name.eq_ignore_ascii_case("localhost")
+            || matches!(name, "127.0.0.1" | "::1")
+            || matches!(listen, AdminListen::Tcp(listen) if name == listen.ip().to_string())
+    };
+    let is_same_origin = |origin: &str| {
+        // `null`, the origin of sandboxed pages and files, has no scheme.
+        origin
+            .split_once("://")
+            .zip(host)
+            .is_some_and(|((_, authority), host)| authority.eq_ignore_ascii_case(host))
     };
 
-    let host_ok = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_none_or(allowed);
-
-    let origin_ok = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .is_none_or(|origin| {
-            let authority = origin.split("://").nth(1).unwrap_or(origin);
-            allowed(authority.trim_end_matches('/'))
-        });
-
-    host_ok && origin_ok
+    host.is_none_or(is_loopback) && origin.is_none_or(is_same_origin)
 }
 
 async fn read_json<T: for<'de> Deserialize<'de>>(
@@ -918,20 +928,76 @@ mod tests {
 
     #[test]
     fn only_loopback_hosts_are_allowed() {
-        let listen: SocketAddr = "127.0.0.1:2019".parse().unwrap();
-        assert!(is_local_request(&request("localhost:2019", None), listen));
-        assert!(is_local_request(
-            &request("127.0.0.1:2019", Some("http://localhost:2019")),
-            listen
-        ));
-        assert!(is_local_request(&request("[::1]:2019", None), listen));
-        assert!(!is_local_request(
-            &request("evil.example:2019", None),
-            listen
-        ));
-        assert!(!is_local_request(
-            &request("localhost:2019", Some("https://evil.example")),
-            listen
-        ));
+        let tcp = AdminListen::Tcp("127.0.0.1:2019".parse().unwrap());
+        let unix = AdminListen::Unix(PathBuf::from("/run/rxh/admin.sock"));
+        for listen in [&tcp, &unix] {
+            let local =
+                |host: &str, origin: Option<&str>| is_local_request(&request(host, origin), listen);
+            for host in [
+                "localhost",
+                "localhost:2019",
+                "LocalHost:2019",
+                "127.0.0.1:2019",
+                "[::1]:2019",
+            ] {
+                assert!(local(host, None), "{host}");
+            }
+            for host in [
+                "evil.example",
+                "evil.example:2019",
+                "127.0.0.1.evil.example",
+                "localhost.evil.example:2019",
+                "",
+            ] {
+                assert!(!local(host, None), "{host}");
+            }
+            assert!(is_local_request(&Request::new(()), listen), "no Host");
+        }
+
+        // The address of a TCP listener is a name of the API, on TCP only.
+        let wide = AdminListen::Tcp("10.0.0.5:2019".parse().unwrap());
+        assert!(is_local_request(&request("10.0.0.5:2019", None), &wide));
+        assert!(!is_local_request(&request("10.0.0.5:2019", None), &tcp));
+        assert!(!is_local_request(&request("10.0.0.5:2019", None), &unix));
+    }
+
+    #[test]
+    fn an_origin_must_be_the_host_of_the_request() {
+        let tcp = AdminListen::Tcp("127.0.0.1:2019".parse().unwrap());
+        let unix = AdminListen::Unix(PathBuf::from("/run/rxh/admin.sock"));
+        for listen in [&tcp, &unix] {
+            let local =
+                |host: &str, origin: &str| is_local_request(&request(host, Some(origin)), listen);
+            assert!(local("localhost:2019", "http://localhost:2019"));
+            assert!(local("127.0.0.1:2019", "http://127.0.0.1:2019"));
+            assert!(local("[::1]:2019", "http://[::1]:2019"));
+            assert!(local("localhost", "http://localhost"));
+            assert!(local("localhost:2019", "HTTP://LOCALHOST:2019"));
+            // A tunnel on a port that is not the one the daemon listens on.
+            assert!(local("localhost:8080", "http://localhost:8080"));
+
+            // Another site, and another web server of this machine.
+            assert!(!local("localhost:2019", "https://evil.example"));
+            assert!(!local("localhost:2019", "http://localhost:3000"));
+            assert!(!local("localhost:2019", "http://localhost"));
+            assert!(!local("localhost", "http://localhost:2019"));
+            assert!(!local("localhost:2019", "http://127.0.0.1:2019"));
+            // The same origin, but not of this machine.
+            assert!(!local("evil.example", "http://evil.example"));
+            // Not an origin.
+            assert!(!local("localhost:2019", "null"));
+            assert!(!local("localhost:2019", ""));
+            assert!(!local("localhost:2019", "localhost:2019"));
+            assert!(!local("localhost:2019", "http://localhost:2019/"));
+            assert!(!local("localhost:2019", "http://user@localhost:2019"));
+
+            // Nothing to compare the origin with.
+            let mut no_host = Request::new(());
+            no_host.headers_mut().insert(
+                header::ORIGIN,
+                header::HeaderValue::from_static("http://localhost:2019"),
+            );
+            assert!(!is_local_request(&no_host, listen));
+        }
     }
 }

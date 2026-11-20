@@ -445,6 +445,16 @@ Changed.
 
 ### Changed
 
+- Without `[admin] token`, the admin API on a unix socket now refuses with
+  `403` a request whose `Host` is not `localhost`, `127.0.0.1` or `::1`, as
+  the TCP listener already did: once the socket is forwarded to a local
+  port (`ssh -L 2019:/run/rxh/admin.sock host`) any web page could reach it
+  and, with the routes that save the configuration, add a server. On both
+  listeners `Origin` must now be the `Host` of the request, port included,
+  so a page served on another local port (`http://localhost:3000`) is
+  refused too. The CLI is not affected; a script that talks to the socket
+  with another name (`curl --unix-socket ... http://rxh/status`) must use
+  `http://localhost/`. With a token nothing changes.
 - `rxh_upstream_failures_total` counts requests and connections that failed
   without a response only. Responses that passive health checks treat as
   failures (`unhealthy_status`, `unhealthy_latency`) are no longer added to

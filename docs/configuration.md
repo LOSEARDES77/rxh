@@ -516,9 +516,23 @@ curl -H "Authorization: Bearer kq3Zp0uX7mV9cR2tLw8yHs4d" http://10.0.0.5:2019/st
 rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 ```
 
-- Without a token, TCP requests must have a loopback `Host` and `Origin`
-  (protection against DNS rebinding). With a token, or on a unix socket, any
-  `Host` is accepted. A token set together with a unix socket is checked too.
+- Without a token, on TCP and on a unix socket alike, a request is refused
+  with `403` unless its `Host` is `localhost`, `127.0.0.1` or `::1` (or the
+  `listen` address of a TCP listener) and its `Origin`, when it has one, is
+  that same `Host`, port included. The first stops a page of another site
+  that reaches the API through DNS rebinding; the second stops a form or a
+  script of any other page, including one served by another web server of
+  the same machine (`http://localhost:3000`). A unix socket is checked too
+  because a browser reaches it once it is forwarded to a local port
+  (`ssh -L`). The CLI and `curl` send no `Origin`, and the dashboard sends
+  its own, whatever the local port of a tunnel. With a token any `Host` and
+  `Origin` are accepted: the token is the check, also on a unix socket.
+
+  ```sh
+  curl --unix-socket /run/rxh/admin.sock http://localhost/status         # 200
+  curl --unix-socket /run/rxh/admin.sock http://rxh/status               # 403: use localhost
+  curl -H 'Origin: http://localhost:3000' http://localhost:2019/status   # 403
+  ```
 - `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are the
   only routes served without the token: the page and its script and style
   hold no data. The page asks for the token and sends it on its requests.

@@ -11,7 +11,7 @@ use hyper::{Method, StatusCode, header};
 use rxh_server::Daemon;
 use rxh_server::config::Config;
 use rxh_test_util::free_address;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use util::admin::{call, call_on, get, send, start};
 
@@ -162,12 +162,118 @@ async fn routes_answer_with_status_codes_and_json() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+const FORBIDDEN: &str = "admin API only accepts a loopback Host and its own Origin";
+
+/// A configuration the editing routes can change: one pool, no server.
+fn editable_config(listen: &str) -> String {
+    format!("[admin]\nlisten = \"{listen}\"\n\n[upstream.api]\nbackends = [\"127.0.0.1:9\"]\n")
+}
+
+/// Without a token, the routes that read and write the configuration refuse
+/// what a page of another origin can send, and still answer the CLI, `curl`
+/// and the dashboard. `request` sends one request to the admin API.
+async fn only_same_origin_loopback_requests_pass(
+    config_path: &Path,
+    request: impl AsyncFn(Method, &str, &str, &[(header::HeaderName, &str)]) -> (StatusCode, Value),
+) {
+    let original = fs::read_to_string(config_path).expect("read");
+    let (status, files) = request(Method::GET, "/config/files", "", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{files}");
+    let revision = files["files"][0]["revision"].as_str().expect("revision");
+
+    // Each write would be saved if it were let through.
+    let listen = free_address().to_string();
+    let server = json!({ "value": { "name": "added", "listen": listen, "forward": "@api" } });
+    let server = server.to_string();
+    let pool = json!({ "value": { "backends": ["127.0.0.1:10"] }, "revision": revision });
+    let pool = pool.to_string();
+    let file = json!({ "text": format!("{original}# Edited.\n"), "revision": revision });
+    let file = file.to_string();
+    let delete = format!("/config/entities/upstream/api?revision={revision}");
+    let routes = [
+        (Method::GET, "/status", ""),
+        (Method::GET, "/config/files", ""),
+        (Method::POST, "/config/entities/server", server.as_str()),
+        (Method::PUT, "/config/entities/upstream/api", pool.as_str()),
+        (Method::DELETE, delete.as_str(), ""),
+        (Method::PUT, "/config/files/0", file.as_str()),
+    ];
+
+    let refused = [
+        // DNS rebinding: the page of another site, under its own name.
+        [(header::HOST, "evil.example")].as_slice(),
+        &[(header::HOST, "127.0.0.1.evil.example:2019")],
+        // A form or a `fetch` of another site.
+        &[(header::ORIGIN, "http://evil.example")],
+        &[(header::ORIGIN, "null")],
+        &[(header::ORIGIN, "localhost:2019")],
+        // A page of another web server of this machine.
+        &[
+            (header::HOST, "localhost:2019"),
+            (header::ORIGIN, "http://localhost:3000"),
+        ],
+        &[
+            (header::HOST, "localhost"),
+            (header::ORIGIN, "http://localhost:3000"),
+        ],
+    ];
+    for (method, uri, body) in &routes {
+        for headers in refused {
+            let (status, json) = request(method.clone(), uri, body, headers).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} {headers:?}");
+            assert_eq!(error_text(&json), FORBIDDEN);
+            assert_eq!(
+                fs::read_to_string(config_path).expect("read"),
+                original,
+                "{method} {uri} {headers:?}"
+            );
+        }
+    }
+
+    let accepted = [
+        // The CLI and `curl` send no `Origin`.
+        [(header::HOST, "localhost")].as_slice(),
+        &[(header::HOST, "[::1]:2019")],
+        // The dashboard through a tunnel on another local port.
+        &[
+            (header::HOST, "localhost:8080"),
+            (header::ORIGIN, "http://localhost:8080"),
+        ],
+        &[
+            (header::HOST, "LOCALHOST:8080"),
+            (header::ORIGIN, "http://localhost:8080"),
+        ],
+    ];
+    for (method, uri, _) in &routes {
+        for headers in accepted {
+            // No body and no revision: a write gets past the check and
+            // fails on its content.
+            let uri = uri.split('?').next().expect("path");
+            let (status, json) = request(method.clone(), uri, "", headers).await;
+            if method == Method::GET {
+                assert_eq!(status, StatusCode::OK, "{uri} {headers:?}: {json}");
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{method} {uri} {headers:?}: {json}"
+                );
+            }
+        }
+    }
+    let tunnel = accepted[2];
+    let (status, json) = request(Method::POST, "/config/entities/server", &server, tunnel).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let saved = fs::read_to_string(config_path).expect("read");
+    assert!(saved.contains("name = \"added\""), "{saved}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_host_or_origin_is_forbidden() {
     let admin = free_address();
     let directory = tempfile::tempdir().expect("temp dir");
     let config_path = directory.path().join("rxh.toml");
-    fs::write(&config_path, format!("[admin]\nlisten = \"{admin}\"\n")).expect("write");
+    fs::write(&config_path, editable_config(&admin.to_string())).expect("write");
     let _daemon = start(&config_path, admin).await;
 
     // Every route, including the ones that change state, is guarded.
@@ -183,14 +289,19 @@ async fn foreign_host_or_origin_is_forbidden() {
         ] {
             let (status, _, json) = call(admin, method.clone(), uri, "", headers).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} {headers:?}");
-            assert_eq!(
-                error_text(&json),
-                "admin API only accepts loopback Host and Origin"
-            );
+            assert_eq!(error_text(&json), FORBIDDEN);
         }
     }
 
-    let local = [(header::ORIGIN, "http://localhost:2019/")];
+    only_same_origin_loopback_requests_pass(&config_path, async |method, uri, body, headers| {
+        let (status, _, json) = call(admin, method, uri, body, headers).await;
+        (status, json)
+    })
+    .await;
+
+    // The page served on the listen address itself is the same origin.
+    let origin = format!("http://{admin}");
+    let local = [(header::ORIGIN, origin.as_str())];
     let (status, _, _) = call(admin, Method::GET, "/status", "", &local).await;
     assert_eq!(status, StatusCode::OK, "the daemon is still running");
 }
@@ -793,10 +904,10 @@ mod unix_socket {
         let (status, json) = call_unix(&socket, Method::GET, "/status", &[]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["admin"], format!("unix/{}", socket.display()));
-        // No `Host` check: web pages cannot open unix sockets.
+        // A web page reaches the socket once it is forwarded to a local port.
         let foreign = [(header::HOST, "proxy.example.com")];
         let (status, _) = call_unix(&socket, Method::GET, "/pools", &foreign).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::FORBIDDEN);
 
         // A second daemon does not steal the socket of a live one.
         let err = Daemon::from_config(config(&socket, ""))
@@ -820,6 +931,28 @@ mod unix_socket {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn foreign_host_or_origin_is_forbidden_on_the_socket_too() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let socket = directory.path().join("admin.sock");
+        let config_path = directory.path().join("rxh.toml");
+        let listen = format!("unix/{}", socket.display());
+        fs::write(&config_path, editable_config(&listen)).expect("write");
+        let _daemon = tokio::task::spawn(Daemon::new(&config_path).run());
+        util::eventually(async || UnixStream::connect(&socket).await.is_ok()).await;
+
+        only_same_origin_loopback_requests_pass(
+            &config_path,
+            async |method, uri, body, headers| {
+                let stream = UnixStream::connect(&socket).await.expect("socket accepts");
+                let (status, _, json) =
+                    call_on(stream, "localhost", method, uri, body, headers).await;
+                (status, json)
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn token_is_checked_on_the_socket_too() {
         let directory = tempfile::tempdir().expect("temp dir");
         let socket = directory.path().join("admin.sock");
@@ -832,6 +965,14 @@ mod unix_socket {
         let bearer = format!("Bearer {TOKEN}");
         let authorized = [(header::AUTHORIZATION, bearer.as_str())];
         let (status, _) = call_unix(&socket, Method::GET, "/status", &authorized).await;
+        assert_eq!(status, StatusCode::OK);
+        // The token is the check: any `Host` and `Origin` pass with it.
+        let remote = [
+            (header::AUTHORIZATION, bearer.as_str()),
+            (header::HOST, "proxy.example.com"),
+            (header::ORIGIN, "https://other.example.com"),
+        ];
+        let (status, _) = call_unix(&socket, Method::GET, "/status", &remote).await;
         assert_eq!(status, StatusCode::OK);
     }
 
