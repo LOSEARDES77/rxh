@@ -4,14 +4,16 @@ use std::future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use h3::error::{Code, ConnectionError, StreamError};
+use h3::quic::StreamId;
 use h3::server::{RequestResolver, RequestStream};
 use http::header::{self, HeaderName};
-use http::{HeaderMap, Request, Response, Version};
+use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Version};
 use http_body_util::BodyExt;
 use hyper::body::{Frame, SizeHint};
 use quinn::{ConnectionError as QuicError, Incoming};
@@ -21,8 +23,8 @@ use tokio_rustls::rustls::pki_types::CertificateDer;
 
 use super::listener::{self, Listener, Phase};
 use crate::http::body::{self, Body, BodyError};
-use crate::http::response::BoxResponse;
-use crate::http::service::Service;
+use crate::http::response::{self, BoxResponse};
+use crate::http::service::{Activity, Service};
 use crate::server::{self, PerIpSlot};
 use crate::tls;
 
@@ -43,6 +45,12 @@ const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 /// Request stream of an HTTP/3 connection, or one of its halves.
 type Stream<S> = RequestStream<S, Bytes>;
 
+/// HTTP/3 side of a QUIC connection.
+type Connection = h3::server::Connection<h3_quinn::Connection, Bytes>;
+
+/// Request stream accepted, its head not read yet.
+type Resolver = RequestResolver<h3_quinn::Connection, Bytes>;
+
 /// Serves the requests of one QUIC connection until it closes, under the
 /// limits of `listener`. A connection over a limit is refused, not queued:
 /// the client falls back to TCP. No wait in here outlives
@@ -60,6 +68,7 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
     if needs_retry(
         available,
         listener.max_connections,
+        context.per_ip.is_some(),
         validated,
         incoming.may_retry(),
     ) {
@@ -145,11 +154,15 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
     };
 
     let mut waiting_for_head = true;
-    let mut sent_goaway = false;
+    // The ID this side's GOAWAY carries, once sent.
+    let mut goaway = None;
     let mut received_goaway = false;
+    let mut accepted = Accepted::default();
     // Dropped, and so aborted, when the connection ends: no response can
     // reach the client any more.
     let mut requests = JoinSet::new();
+    let idle = idle(context.idle_timeout, &activity);
+    let mut idle = std::pin::pin!(idle);
     // True once every request was answered after a GOAWAY, false to close
     // at once.
     let answered = loop {
@@ -157,32 +170,30 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
         match current {
             Phase::Serving => {}
             Phase::Draining => {
-                if !sent_goaway {
-                    // Nothing to finish: closed at once, like an idle
-                    // keep-alive connection over TCP.
-                    if requests.is_empty() {
-                        break false;
-                    }
-                    sent_goaway = true;
+                if goaway.is_none() {
                     tokio::select! {
-                        // An error means the connection is gone: the next
-                        // `accept` says so.
-                        _ = connection.shutdown(0) => {}
+                        id = accepted.send_goaway(&mut connection) => goaway = Some(id),
                         _ = phase.wait_for(|phase| *phase == Phase::Closed) => break false,
                     }
                 }
             }
             Phase::Closed => break false,
         }
-        if (sent_goaway || received_goaway) && requests.is_empty() {
+        if (goaway.is_some() || received_goaway) && requests.is_empty() {
             break true;
         }
         tokio::select! {
             // Still polled after this side's GOAWAY: h3 rejects the streams
-            // that come after it.
-            accepted = connection.accept(), if !received_goaway => match accepted {
+            // above its ID, this loop the one at it.
+            next = connection.accept(), if !received_goaway => match next {
                 Ok(Some(resolver)) => {
-                    requests.spawn(serve_request(resolver, service.clone()));
+                    let id = resolver.frame_stream.id();
+                    if goaway.is_some_and(|goaway| id >= goaway) {
+                        reject(resolver);
+                    } else {
+                        accepted.add(id);
+                        requests.spawn(serve_request(resolver, service.clone()));
+                    }
                 }
                 // The client sent GOAWAY: answer what it already asked for.
                 Ok(None) => received_goaway = true,
@@ -201,6 +212,17 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
                 }
                 waiting_for_head = false;
             }
+            // `idle_timeout` with no request in flight: GOAWAY, so the
+            // client knows nothing it sent was dropped unseen, then close.
+            () = &mut idle => {
+                if goaway.is_none() {
+                    tokio::select! {
+                        _ = accepted.send_goaway(&mut connection) => {}
+                        _ = phase.wait_for(|phase| *phase == Phase::Closed) => break false,
+                    }
+                }
+                break true;
+            }
             // The sender lives in `listener`: this cannot fail.
             _ = phase.changed() => {}
         }
@@ -217,13 +239,88 @@ pub(super) async fn serve_connection(incoming: Incoming, listener: Arc<Listener>
 
 /// Whether an incoming connection must prove its address with a Retry
 /// before it takes one of `max` connection slots, `available` of them
-/// free. Spoofed Initial packets cost no return path, and each one would
-/// hold a slot, shared with TCP, for up to the handshake deadline. The
-/// extra round trip is only paid when slots are scarce.
-fn needs_retry(available: usize, max: usize, validated: bool, may_retry: bool) -> bool {
+/// free, and with `per_ip` one of the slots of its address. Spoofed
+/// Initial packets cost no return path, and each one would hold a slot,
+/// shared with TCP, for up to the handshake deadline: a spoofed address
+/// could lock its owner out. Without `per_ip`, the extra round trip is
+/// only paid when slots are scarce.
+fn needs_retry(
+    available: usize,
+    max: usize,
+    per_ip: bool,
+    validated: bool,
+    may_retry: bool,
+) -> bool {
     // ponytail: fixed at half the slots; make it a setting if someone needs
     // another threshold.
-    !validated && may_retry && available * 2 < max
+    !validated && may_retry && (per_ip || available * 2 < max)
+}
+
+/// Request streams a connection accepted, for the ID of its GOAWAY.
+#[derive(Default)]
+struct Accepted {
+    /// The last one accepted, which h3 counts the GOAWAY ID from.
+    latest: Option<StreamId>,
+    /// The highest one: streams can arrive out of order.
+    highest: Option<StreamId>,
+}
+
+impl Accepted {
+    fn add(&mut self, id: StreamId) {
+        self.latest = Some(id);
+        self.highest = self.highest.max(Some(id));
+    }
+
+    /// Sends GOAWAY with the ID after the highest stream accepted, so the
+    /// client knows that every request it sent before is being answered
+    /// and that the later ones were not processed and can be sent again
+    /// (RFC 9114, section 5.2). Returns that ID. An error means the
+    /// connection is gone, which the next `accept` reports.
+    async fn send_goaway(&self, connection: &mut Connection) -> StreamId {
+        let (Some(latest), Some(highest)) = (self.latest, self.highest) else {
+            // h3 sends the first request stream ID.
+            let _ = connection.shutdown(0).await;
+            return StreamId::try_from(0).expect("0 is a request stream ID");
+        };
+        // h3 sends the ID `steps` request streams after `latest`.
+        let steps = usize::try_from(highest.index() - latest.index() + 1)
+            .expect("stream indexes are small");
+        let _ = connection.shutdown(steps).await;
+        latest + steps
+    }
+}
+
+/// Refuses a request stream that came after this side's GOAWAY: the client
+/// may send it again on a new connection.
+fn reject(resolver: Resolver) {
+    use h3::quic::{RecvStream, SendStream};
+
+    let code = Code::H3_REQUEST_REJECTED.value();
+    let mut stream = resolver.frame_stream.into_inner();
+    stream.stop_sending(code);
+    stream.reset(code);
+}
+
+/// Completes once the connection had no request in flight for `limit`, its
+/// `idle_timeout`, as over TCP. Never without a limit.
+async fn idle(limit: Option<Duration>, activity: &Activity) {
+    let Some(limit) = limit else {
+        return future::pending().await;
+    };
+    // ponytail: checks once per `limit`, so an idle connection closes
+    // between one and two limits after its last response: `Activity` has
+    // no event for the end of a request. Add one if that matters.
+    loop {
+        let requests = activity.requests.load(Ordering::Acquire);
+        let was_idle = activity.in_flight() == 0;
+        tokio::time::sleep(limit).await;
+        if was_idle
+            && activity.in_flight() == 0
+            && activity.requests.load(Ordering::Acquire) == requests
+        {
+            return;
+        }
+    }
 }
 
 /// Longest wait in [`settled`], however busy the connection is.
@@ -277,20 +374,34 @@ impl Drop for ResponseStream {
 }
 
 /// Answers the request of one stream with `service`.
-async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, service: Service) {
+async fn serve_request(resolver: Resolver, service: Service) {
     // A stream reset before its head is complete has nothing to answer.
     let Ok((request, stream)) = resolver.resolve_request().await else {
         return;
     };
     let (send, receive) = stream.split();
-    let send = ResponseStream {
+    let mut send = ResponseStream {
         stream: send,
         finished: false,
     };
     let (mut parts, ()) = request.into_parts();
     parts.version = Version::HTTP_3;
+    // h3 does not check `Content-Length`, and an HTTP/1.1 backend would
+    // read a wrong one as the end of this request inside the next one.
+    let Ok(declared) = content_length(&parts.headers) else {
+        let bad_request = response::plain(StatusCode::BAD_REQUEST, "Bad Request");
+        let _ = send_response(send, bad_request).await;
+        return;
+    };
+    if let Some(length) = declared {
+        // One value, also for repeated ones.
+        parts
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    }
     let (reset_sender, reset) = oneshot::channel();
-    let body = request_body(receive, declared_length(&parts.headers), reset_sender).await;
+    let (malformed_sender, mut malformed) = oneshot::channel();
+    let body = request_body(receive, declared, reset_sender, malformed_sender).await;
     let response = tokio::select! {
         // `respond` first: it counts the request on its first poll.
         biased;
@@ -304,6 +415,13 @@ async fn serve_request(resolver: RequestResolver<h3_quinn::Connection, Bytes>, s
         // an h3 release exposes it.
         Ok(()) = reset => return,
     };
+    // The body did not match its `Content-Length`, so the backend request
+    // failed: the request is malformed (RFC 9114, section 4.1.2).
+    if malformed.try_recv().is_ok() {
+        send.stream.stop_stream(Code::H3_MESSAGE_ERROR);
+        send.finished = true;
+        return;
+    }
     // An error means the client reset the stream: it wants no answer.
     let _ = send_response(send, response).await;
 }
@@ -347,19 +465,31 @@ impl BodyReader {
     }
 }
 
-/// Length a request declares in a single `Content-Length` of ASCII digits
-/// only: Rust's integer parser would also take a leading `+`.
-fn declared_length(headers: &HeaderMap) -> Option<u64> {
-    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
-    let value = values.next()?;
-    if values.next().is_some() {
-        return None;
+/// A `Content-Length` that is not one valid length.
+#[derive(Debug, PartialEq, Eq)]
+struct InvalidLength;
+
+/// Length a request declares in `Content-Length`, `None` without one.
+/// Repeated values, in several fields or in a list, count once as they are
+/// the same (RFC 9110, section 8.6). Only ASCII digits: Rust's integer
+/// parser would also take a leading `+`.
+fn content_length(headers: &HeaderMap) -> Result<Option<u64>, InvalidLength> {
+    let mut length = None;
+    for value in headers.get_all(header::CONTENT_LENGTH) {
+        let value = value.to_str().map_err(|_| InvalidLength)?;
+        for item in value.split(',') {
+            let item = item.trim_matches([' ', '\t']);
+            if item.is_empty() || !item.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(InvalidLength);
+            }
+            let item: u64 = item.parse().map_err(|_| InvalidLength)?;
+            if length.is_some_and(|length| length != item) {
+                return Err(InvalidLength);
+            }
+            length = Some(item);
+        }
     }
-    let value = value.to_str().ok()?;
-    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    value.parse().ok()
+    Ok(length)
 }
 
 fn body_error(err: StreamError) -> BodyError {
@@ -368,14 +498,16 @@ fn body_error(err: StreamError) -> BodyError {
 
 /// Body of the request whose stream `stream` is the receiving half of, and
 /// whose `Content-Length` is `declared`. A request that already ended, as
-/// most `GET`s do, gets an empty body, so it goes upstream without one. Any
-/// other body is read by [`read_body`] and handed over through a channel:
-/// the stream itself is not `Sync`. `reset` is told if the client resets the
-/// stream before it ends.
+/// most `GET`s do, gets an empty body, so it goes upstream without one,
+/// unless it declares a length. Any other body is read by [`read_body`] and
+/// handed over through a channel: the stream itself is not `Sync`. `reset`
+/// is told if the client resets the stream before it ends, `malformed` if
+/// the body does not match `declared`.
 async fn request_body(
     stream: Stream<h3_quinn::RecvStream>,
     declared: Option<u64>,
     reset: oneshot::Sender<()>,
+    malformed: oneshot::Sender<()>,
 ) -> Body {
     let mut reader = BodyReader {
         stream,
@@ -384,7 +516,7 @@ async fn request_body(
     };
     let first = future::poll_fn(|context| Poll::Ready(reader.poll_frame(context))).await;
     let first = match first {
-        Poll::Ready(None) => return body::empty(),
+        Poll::Ready(None) if declared.unwrap_or(0) == 0 => return body::empty(),
         Poll::Ready(next) => Some(next),
         Poll::Pending => None,
     };
@@ -397,6 +529,8 @@ async fn request_body(
     let received = Received {
         frames: receiver,
         remaining: declared,
+        last: None,
+        malformed: Some(malformed),
     };
     received.boxed()
 }
@@ -444,11 +578,44 @@ async fn read_body(
     }
 }
 
-/// Request body fed by the task that reads its stream.
+/// Request body fed by the task that reads its stream. With a declared
+/// length, a body that ends short of it or goes past it fails, which aborts
+/// the backend request and closes its connection.
 struct Received {
     frames: mpsc::Receiver<Result<Frame<Bytes>, BodyError>>,
     /// Bytes the `Content-Length` announces and that did not come yet.
     remaining: Option<u64>,
+    /// The data that completes the declared length, held back until the
+    /// stream ends: data after it would make the request malformed.
+    last: Option<Bytes>,
+    /// Told when the body does not match its declared length.
+    malformed: Option<oneshot::Sender<()>>,
+}
+
+impl Received {
+    /// What follows the end of the data: the data held back, or the end.
+    fn end(&mut self) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        match self.last.take() {
+            Some(last) => Poll::Ready(Some(Ok(Frame::data(last)))),
+            None if self.remaining == Some(0) => Poll::Ready(None),
+            None => self.mismatch("shorter"),
+        }
+    }
+
+    fn mismatch(&mut self, comparison: &str) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        if let Some(malformed) = self.malformed.take() {
+            let _ = malformed.send(());
+        }
+        let message = format!("request body {comparison} than its Content-Length");
+        let err = io::Error::new(io::ErrorKind::InvalidData, message);
+        Poll::Ready(Some(Err(BodyError::Io(err))))
+    }
+
+    /// Declared bytes not handed on yet.
+    fn undelivered(&self) -> Option<u64> {
+        let held = self.last.as_ref().map_or(0, |last| last.len() as u64);
+        self.remaining.map(|remaining| remaining + held)
+    }
 }
 
 impl hyper::body::Body for Received {
@@ -460,25 +627,48 @@ impl hyper::body::Body for Received {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = self.get_mut();
-        let frame = ready!(this.frames.poll_recv(context));
-        if let Some(Ok(frame)) = &frame
-            && let Some(data) = frame.data_ref()
-            && let Some(remaining) = &mut this.remaining
-        {
-            *remaining = remaining.saturating_sub(data.len() as u64);
+        loop {
+            let Some(remaining) = this.remaining else {
+                return this.frames.poll_recv(context);
+            };
+            let data = match ready!(this.frames.poll_recv(context)) {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => data,
+                    // Trailers end the data. They are dropped: the head
+                    // declared the length, not trailers.
+                    Err(_) => return this.end(),
+                },
+                None => return this.end(),
+                Some(Err(err)) => return Poll::Ready(Some(Err(err))),
+            };
+            let length = data.len() as u64;
+            if length == 0 {
+                continue;
+            }
+            if this.last.is_some() || length > remaining {
+                return this.mismatch("longer");
+            }
+            this.remaining = Some(remaining - length);
+            if length == remaining {
+                this.last = Some(data);
+                continue;
+            }
+            return Poll::Ready(Some(Ok(Frame::data(data))));
         }
-        Poll::Ready(frame)
     }
 
-    /// Ended once the declared length came (trailers after it are dropped),
-    /// or once the reader task delivered everything.
+    /// Ended once the declared length was handed on, or once the reader
+    /// task delivered everything.
     fn is_end_stream(&self) -> bool {
-        self.remaining == Some(0) || (self.frames.is_closed() && self.frames.is_empty())
+        match self.undelivered() {
+            Some(undelivered) => undelivered == 0,
+            None => self.frames.is_closed() && self.frames.is_empty(),
+        }
     }
 
     /// Exact when the request declares its length.
     fn size_hint(&self) -> SizeHint {
-        self.remaining
+        self.undelivered()
             .map_or_else(SizeHint::default, SizeHint::with_exact)
     }
 }
@@ -520,25 +710,52 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn content_length_with_a_plus_sign_is_not_trusted() {
+    fn length_of(values: &[&'static str]) -> Result<Option<u64>, InvalidLength> {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("+5"));
-        assert_eq!(declared_length(&headers), None);
+        for value in values {
+            headers.append(header::CONTENT_LENGTH, HeaderValue::from_static(value));
+        }
+        content_length(&headers)
+    }
 
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
-        assert_eq!(declared_length(&headers), Some(5));
+    #[test]
+    fn content_length_values() {
+        assert_eq!(length_of(&[]), Ok(None));
+        assert_eq!(length_of(&["5"]), Ok(Some(5)));
+        assert_eq!(length_of(&["5", "5"]), Ok(Some(5)));
+        assert_eq!(length_of(&["5, 5"]), Ok(Some(5)));
+        for invalid in [
+            &["+5"][..],
+            &["-5"],
+            &[""],
+            &["abc"],
+            &["5, 6"],
+            &["5", "6"],
+            &["5,"],
+            &["99999999999999999999"],
+        ] {
+            assert_eq!(length_of(invalid), Err(InvalidLength), "{invalid:?}");
+        }
     }
 
     #[test]
     fn retry_when_fewer_than_half_the_slots_are_free() {
         // Half or more of 4 slots free: no extra round trip.
-        assert!(!needs_retry(2, 4, false, true));
+        assert!(!needs_retry(2, 4, false, false, true));
         // Fewer than half free.
-        assert!(needs_retry(1, 4, false, true));
-        assert!(needs_retry(0, 4, false, true));
+        assert!(needs_retry(1, 4, false, false, true));
+        assert!(needs_retry(0, 4, false, false, true));
         // A validated address, or a client that already answered a Retry.
-        assert!(!needs_retry(0, 4, true, true));
-        assert!(!needs_retry(0, 4, false, false));
+        assert!(!needs_retry(0, 4, false, true, true));
+        assert!(!needs_retry(0, 4, false, false, false));
+    }
+
+    #[test]
+    fn retry_always_with_max_connections_per_ip() {
+        // Slots to spare, but each unvalidated client would take one of
+        // the slots of the address it claims.
+        assert!(needs_retry(4, 4, true, false, true));
+        assert!(!needs_retry(4, 4, true, true, true));
+        assert!(!needs_retry(4, 4, true, false, false));
     }
 }

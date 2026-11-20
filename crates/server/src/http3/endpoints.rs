@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, TokioRuntime};
-use rxh_core::config::{Config, Protocol};
+use rxh_core::config::Config;
 use socket2::{Domain, Socket, Type};
 use tokio::sync::watch;
 
@@ -135,26 +135,12 @@ impl Endpoints {
     /// closed, so that server can bind them. A server on `0.0.0.0` takes
     /// its port on every address.
     pub(crate) async fn release(&self, config: &Config) {
-        let udp: Vec<SocketAddr> = config
-            .servers
-            .iter()
-            .filter(|server| server.protocol == Protocol::Udp)
-            .flat_map(|server| server.listen.iter().copied())
-            .collect();
-        let overlaps = |address: &SocketAddr| {
-            udp.iter().any(|udp| {
-                udp.port() == address.port()
-                    && (udp.ip() == address.ip()
-                        || udp.ip().is_unspecified()
-                        || address.ip().is_unspecified())
-            })
-        };
         let mut released = Vec::new();
         self.endpoints
             .lock()
             .expect("nothing panics while holding the endpoints")
             .retain(|address, entry| {
-                if !overlaps(address) {
+                if !config.udp_listens_on(*address) {
                     return true;
                 }
                 entry.listener.borrow().set_active(false);
@@ -234,9 +220,8 @@ fn bind(listener: &Listener) -> io::Result<(Endpoint, Weak<dyn AsyncUdpSocket>)>
             // while this one still serves it.
             #[cfg(unix)]
             socket.set_reuse_port(true)?;
-            if address.is_ipv6() {
-                socket.set_only_v6(true)?;
-            }
+            // IPv6 only or not as the OS decides, like the TCP listener on
+            // the address: `[::]` serves IPv4 clients too where TCP does.
             socket.bind(&address.into())?;
             socket.into()
         }

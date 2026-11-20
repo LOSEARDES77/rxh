@@ -308,6 +308,17 @@ impl Config {
                          either all or none of the servers on it must set proxy_protocol_in"
                     ));
                 }
+                // One QUIC endpoint per listener: a later server cannot
+                // turn it on or off.
+                if server
+                    .http3
+                    .is_some_and(|http3| http3 != first.serves_http3())
+                {
+                    return invalid(format!(
+                        "{label}: listen address {address} is shared with {first_label}, \
+                         http3 must be the same on servers sharing a listen address"
+                    ));
+                }
                 if server.max_connections_per_ip != first.max_connections_per_ip {
                     return invalid(format!(
                         "{label}: listen address {address} is shared with {first_label}, \
@@ -687,6 +698,15 @@ impl Config {
                         "{label}: http3 needs TLS 1.3, but cipher_suites has no TLS 1.3 suite"
                     ));
                 }
+                if let Some(address) = server
+                    .listen
+                    .iter()
+                    .find(|address| self.udp_listens_on(**address))
+                {
+                    return invalid(format!(
+                        "{label}: http3 needs the UDP port of {address}, which a udp server uses"
+                    ));
+                }
             }
 
             if server.tls == Some(Tls::Auto) {
@@ -773,6 +793,24 @@ impl Config {
             CatalogKind::Nomad => self.nomad.as_ref(),
             CatalogKind::Kubernetes => self.kubernetes.as_ref(),
         }
+    }
+
+    /// Whether a `udp` server listens on the UDP port of `address`: the same
+    /// port on the same IP, or on any IP when either side is unspecified
+    /// (`0.0.0.0`, `[::]`). HTTP/3 cannot use that port.
+    #[must_use]
+    pub fn udp_listens_on(&self, address: SocketAddr) -> bool {
+        let mut udp = self
+            .servers
+            .iter()
+            .filter(|server| server.protocol == Protocol::Udp)
+            .flat_map(|server| &server.listen);
+        udp.any(|udp| {
+            udp.port() == address.port()
+                && (udp.ip() == address.ip()
+                    || udp.ip().is_unspecified()
+                    || address.ip().is_unspecified())
+        })
     }
 
     /// Returns this configuration plus one plain `http` server per TLS
@@ -6492,6 +6530,64 @@ mod tests {
             err.contains("http3 cannot be used with proxy_protocol_in"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn http3_must_agree_on_a_shared_listen_address() {
+        let servers = |first: &str, second: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{first}\n\
+                 [[server]]\nlisten = \"127.0.0.1:443\"\nhost = [\"b\"]\n\
+                 forward = \"b:1\"\ntls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{second}\n"
+            ))
+        };
+        for (first, second) in [
+            ("", ""),
+            ("", "http3 = true"),
+            ("http3 = true", ""),
+            ("http3 = false", "http3 = false"),
+            ("http3 = false", ""),
+        ] {
+            assert!(servers(first, second).is_ok(), "{first:?} then {second:?}");
+        }
+        for (first, second) in [
+            ("", "http3 = false"),
+            ("http3 = false", "http3 = true"),
+            ("http3 = true", "http3 = false"),
+        ] {
+            let err = servers(first, second).expect_err("a later server disagrees");
+            assert!(
+                err.to_string()
+                    .contains("http3 must be the same on servers sharing"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn http3_true_is_rejected_on_the_port_of_a_udp_server() {
+        let with_udp = |udp: &str, extra: &str| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"127.0.0.1:443\"\nforward = \"a:1\"\n\
+                 tls = {{ cert = \"c.pem\", key = \"k.pem\" }}\n{extra}\n\
+                 [[server]]\nlisten = \"{udp}\"\nprotocol = \"udp\"\nforward = \"d:53\"\n"
+            ))
+        };
+        for udp in ["127.0.0.1:443", "0.0.0.0:443"] {
+            let err = with_udp(udp, "http3 = true").expect_err("the UDP port is taken");
+            assert!(
+                err.to_string().contains("http3 needs the UDP port"),
+                "{err}"
+            );
+            // Unset: HTTP/3 is simply off on that address.
+            let config = with_udp(udp, "").unwrap();
+            assert!(config.udp_listens_on(config.servers[0].listen[0]));
+        }
+        for udp in ["127.0.0.1:444", "127.0.0.2:443"] {
+            let config = with_udp(udp, "http3 = true").unwrap();
+            assert!(!config.udp_listens_on(config.servers[0].listen[0]));
+        }
     }
 
     #[test]

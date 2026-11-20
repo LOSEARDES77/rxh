@@ -13,7 +13,8 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn::rustls::{ClientConfig, RootCertStore};
-use quinn::{Connection, Endpoint, TransportConfig, VarInt};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 /// One QUIC connection to an HTTP/3 server, with its request sender.
@@ -225,6 +226,132 @@ impl Drop for Http3Client {
     fn drop(&mut self) {
         self.driver.abort();
     }
+}
+
+/// A QUIC connection that speaks HTTP/3 by hand: request streams carry the
+/// frames a test encodes, and the GOAWAY frame the server sends on its
+/// control stream is recorded, which the h3 client keeps to itself.
+pub struct RawHttp3Connection {
+    // Kept so the client socket lives as long as the connection.
+    _endpoint: Endpoint,
+    connection: Connection,
+    // Kept open: closing a control stream is a connection error.
+    _control: SendStream,
+    goaway: watch::Receiver<Option<u64>>,
+    reader: JoinHandle<()>,
+}
+
+impl RawHttp3Connection {
+    /// Connects to `address` as [`Http3Client::connect`] does, without a
+    /// client certificate, and opens this side's control stream.
+    pub async fn connect(
+        address: SocketAddr,
+        server_name: &str,
+        root_pem: &str,
+    ) -> io::Result<Self> {
+        let transport = TransportConfig::default();
+        let (endpoint, connection) =
+            quic_connect(address, server_name, root_pem, None, transport).await?;
+        let mut control = connection.open_uni().await?;
+        // Stream type 0 (control), then an empty SETTINGS frame (type 4).
+        control.write_all(&[0x00, 0x04, 0x00]).await?;
+        let (sender, goaway) = watch::channel(None);
+        let reader = tokio::task::spawn(read_server_streams(connection.clone(), sender));
+        Ok(Self {
+            _endpoint: endpoint,
+            connection,
+            _control: control,
+            goaway,
+            reader,
+        })
+    }
+
+    /// Opens a request stream for frames the caller writes.
+    pub async fn open(&self) -> io::Result<(SendStream, RecvStream)> {
+        Ok(self.connection.open_bi().await?)
+    }
+
+    /// Waits for the first GOAWAY frame of the server and returns the
+    /// stream ID it carries.
+    pub async fn goaway(&mut self) -> io::Result<u64> {
+        let id = self
+            .goaway
+            .wait_for(Option::is_some)
+            .await
+            .map_err(io::Error::other)?;
+        Ok(id.expect("waited for a GOAWAY"))
+    }
+}
+
+impl Drop for RawHttp3Connection {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// Reads the unidirectional streams the server opens on `connection`, and
+/// reports the stream ID of the first GOAWAY frame on its control stream to
+/// `goaway`.
+async fn read_server_streams(connection: Connection, goaway: watch::Sender<Option<u64>>) {
+    while let Ok(mut stream) = connection.accept_uni().await {
+        let goaway = goaway.clone();
+        tokio::task::spawn(async move {
+            if read_varint(&mut stream).await.ok() != Some(0x00) {
+                // QPACK and reserved streams: their bytes do not matter.
+                let _ = stream.read_to_end(usize::MAX).await;
+                return;
+            }
+            loop {
+                let Ok(kind) = read_varint(&mut stream).await else {
+                    return;
+                };
+                let Ok(length) = read_varint(&mut stream).await else {
+                    return;
+                };
+                let mut payload = vec![0; usize::try_from(length).expect("a small frame")];
+                if stream.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                // GOAWAY: its payload is a stream ID.
+                if kind == 0x07
+                    && let Some(id) = decode_varint(&payload)
+                {
+                    goaway.send_if_modified(|seen| {
+                        let first = seen.is_none();
+                        if first {
+                            *seen = Some(id);
+                        }
+                        first
+                    });
+                }
+            }
+        });
+    }
+}
+
+/// Reads one QUIC variable-length integer (RFC 9000, section 16).
+async fn read_varint(stream: &mut RecvStream) -> io::Result<u64> {
+    let mut bytes = [0; 8];
+    stream
+        .read_exact(&mut bytes[..1])
+        .await
+        .map_err(io::Error::other)?;
+    let length = 1 << (bytes[0] >> 6);
+    stream
+        .read_exact(&mut bytes[1..length])
+        .await
+        .map_err(io::Error::other)?;
+    decode_varint(&bytes[..length]).ok_or_else(|| io::Error::other("truncated varint"))
+}
+
+/// Decodes the QUIC variable-length integer at the start of `bytes`.
+fn decode_varint(bytes: &[u8]) -> Option<u64> {
+    let length = 1 << (bytes.first()? >> 6);
+    let mut value = u64::from(bytes[0] & 0x3f);
+    for byte in bytes.get(1..length)? {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Some(value)
 }
 
 /// Completes a QUIC handshake with `address` under `transport`, checking

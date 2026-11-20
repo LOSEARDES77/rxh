@@ -122,7 +122,7 @@ QUIC needs TLS 1.3.
 |---|---|
 | `max_connections` | One QUIC connection takes one slot of the same semaphore as TCP connections. |
 | `max_connections_per_ip` | Same counter as TCP. |
-| `idle_timeout` | QUIC `max_idle_timeout`. |
+| `idle_timeout` | As over TCP: a connection with no request in flight for that long gets a GOAWAY and is closed; unset, no idle limit. The QUIC transport keeps its own `max_idle_timeout` (30 s) only to detect dead peers, with server keep-alives every 10 s, so a slow response is never cut. |
 | `read_header_timeout` | A connection that completes no request head in that time is closed. |
 | `ip_allow`, `ip_deny`, `trusted_proxies` | Unchanged: checked per request. |
 | `client_auth` | Same verifier; the subject reaches `Service::client_subject`. |

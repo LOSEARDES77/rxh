@@ -20,6 +20,23 @@ use tokio_rustls::rustls::{CipherSuite, ServerConfig};
 use crate::server::ConnectionContext;
 use crate::tls;
 
+/// Request body bytes one stream may have in flight before the proxy reads
+/// them. quinn's default is 1.25 MB.
+// ponytail: fixed; make it configurable if uploads need more.
+const STREAM_RECEIVE_WINDOW: u32 = 1 << 20;
+
+/// Bytes all the streams of one connection may have in flight together.
+/// quinn's default has no limit: 100 streams could hold 125 MB.
+// ponytail: fixed; make it configurable if uploads need more.
+const RECEIVE_WINDOW: u32 = 8 << 20;
+
+/// PING interval of the server, so the transport idle timeout never ends a
+/// connection whose peer is alive, request in flight or not.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Silence after which the peer counts as gone, in milliseconds.
+const MAX_IDLE_TIMEOUT_MS: u32 = 30_000;
+
 /// What the connections of a [`Listener`] are asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase {
@@ -83,14 +100,7 @@ impl Listener {
             QuicServerConfig::with_initial(tls::quic_config(tls.config()), initial_suite()?)
                 .map_err(io::Error::other)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        // A timeout too large for QUIC keeps quinn's default.
-        if let Some(idle) = context.idle_timeout
-            && let Ok(idle) = IdleTimeout::try_from(idle)
-        {
-            let mut transport = TransportConfig::default();
-            transport.max_idle_timeout(Some(idle));
-            config.transport_config(Arc::new(transport));
-        }
+        config.transport_config(Arc::new(transport()));
         Ok(Self {
             address,
             config,
@@ -176,6 +186,20 @@ impl Drop for Open<'_> {
     }
 }
 
+/// QUIC settings of every connection. `idle_timeout` is not one of them: it
+/// closes connections without a request in flight, see `connection`.
+fn transport() -> TransportConfig {
+    let mut transport = TransportConfig::default();
+    transport
+        .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW))
+        .receive_window(VarInt::from_u32(RECEIVE_WINDOW))
+        .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(
+            MAX_IDLE_TIMEOUT_MS,
+        ))));
+    transport
+}
+
 /// `H3_NO_ERROR` as a QUIC application error code.
 pub(super) fn no_error() -> VarInt {
     VarInt::from_u64(Code::H3_NO_ERROR.value()).expect("HTTP/3 error codes are QUIC varints")
@@ -193,4 +217,23 @@ fn initial_suite() -> io::Result<Suite> {
         .find(|suite| suite.common.suite == CipherSuite::TLS13_AES_128_GCM_SHA256)
         .and_then(|suite| suite.quic_suite())
         .ok_or_else(|| io::Error::other("the TLS provider has no AES-128-GCM suite for QUIC"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_bounds_what_a_connection_buffers_and_keeps_live_peers() {
+        let transport = format!("{:?}", transport());
+
+        for field in [
+            "stream_receive_window: 1048576,",
+            " receive_window: 8388608,",
+            "keep_alive_interval: Some(10s),",
+            "max_idle_timeout: Some(30000),",
+        ] {
+            assert!(transport.contains(field), "{field} not in {transport}");
+        }
+    }
 }

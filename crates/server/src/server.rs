@@ -430,8 +430,11 @@ impl Server {
                     http3: OnceLock::new(),
                 };
                 let context = Arc::new(context);
+                // A `udp` server on the same port turns HTTP/3 off there.
                 let http3 = match &context.tls {
-                    Some(acceptor) if server.serves_http3() => {
+                    Some(acceptor)
+                        if server.serves_http3() && !config.udp_listens_on(requested) =>
+                    {
                         let listener = Arc::new(http3::Listener::new(
                             address,
                             acceptor,
