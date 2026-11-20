@@ -29,6 +29,7 @@ use crate::acme;
 use crate::error::Error;
 use crate::http::headers;
 use crate::http::service::{Activity, Route, Service, Site};
+use crate::http3;
 use crate::l4match::{self, Detected, L4Matcher, Rewind};
 use crate::log::{ListenerLog, Logger};
 use crate::ocsp;
@@ -99,11 +100,12 @@ enum Socket {
     Udp(Arc<UdpSocket>, UdpSettings),
 }
 
-/// Shared by every connection task of one server.
-struct ConnectionContext {
+/// Shared by every connection task of one server, and by its HTTP/3
+/// listener.
+pub(crate) struct ConnectionContext {
     handler: Handler,
     tls: Option<TlsAcceptor>,
-    log: ListenerLog,
+    pub(crate) log: ListenerLog,
     read_header_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     /// Read a PROXY header first, from peers in `trusted_proxies` (any peer
@@ -117,6 +119,33 @@ struct ConnectionContext {
     /// `max_connections_per_ip` and the open connections of each client.
     per_ip: Option<(usize, Mutex<HashMap<IpAddr, usize>>)>,
     match_timeout: Duration,
+}
+
+impl ConnectionContext {
+    /// Service of one client connection from `peer` to `local`, or `None`
+    /// if the server is not an HTTP one. `client_subject` is the subject of
+    /// the certificate the client presented.
+    pub(crate) fn http_service(
+        &self,
+        peer: SocketAddr,
+        local: SocketAddr,
+        client_subject: Option<HeaderValue>,
+    ) -> Option<Service> {
+        let Handler::Http { routes, tracer, .. } = &self.handler else {
+            return None;
+        };
+        Some(Service {
+            routes: Arc::clone(routes),
+            log_name: Arc::clone(&self.log.log_name),
+            peer,
+            peer_ip: headers::peer_ip_value(peer),
+            client_subject,
+            local,
+            activity: Arc::new(Activity::default()),
+            logger: Arc::clone(&self.log.logger),
+            tracer: tracer.clone(),
+        })
+    }
 }
 
 /// One connection counted against `max_connections_per_ip`, until dropped.
@@ -195,6 +224,9 @@ pub struct Server {
     announce: bool,
     /// Raised on shutdown, for `stream_close_delay`.
     closing: watch::Sender<bool>,
+    /// What this listener serves over HTTP/3, for the daemon's QUIC
+    /// endpoints.
+    http3: Option<Arc<http3::Listener>>,
     shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
@@ -257,7 +289,7 @@ impl Server {
 
         let mut cert_resolver = None;
         let closing = watch::Sender::new(false);
-        let (socket, context) = match socket {
+        let (socket, context, http3) = match socket {
             SocketKind::Udp(socket) => {
                 let settings = UdpSettings {
                     group: {
@@ -275,7 +307,7 @@ impl Server {
                     server: Arc::clone(&label),
                     logger: Arc::clone(&logger),
                 };
-                (Socket::Udp(socket, settings), None)
+                (Socket::Udp(socket, settings), None, None)
             }
             SocketKind::Tcp(listener) => {
                 let handler = match server.protocol {
@@ -375,7 +407,14 @@ impl Server {
                         .map(|max| (max, Mutex::default())),
                     match_timeout: server.match_timeout,
                 };
-                (Socket::Tcp(listener), Some(Arc::new(context)))
+                let context = Arc::new(context);
+                let http3 = match &context.tls {
+                    Some(acceptor) if server.serves_http3() => Some(Arc::new(
+                        http3::Listener::new(address, acceptor, Arc::clone(&context))?,
+                    )),
+                    _ => None,
+                };
+                (Socket::Tcp(listener), Some(context), http3)
             }
         };
 
@@ -399,6 +438,7 @@ impl Server {
                 .is_none_or(|options| options.ocsp_stapling),
             announce: true,
             closing,
+            http3,
             shutdown: Box::pin(std::future::pending()),
         })
     }
@@ -443,6 +483,7 @@ impl Server {
             ocsp_stapling: false,
             announce: false,
             closing: replica.closing,
+            http3: None,
             shutdown: Box::pin(std::future::pending()),
         })
     }
@@ -480,6 +521,12 @@ impl Server {
     #[must_use]
     pub fn cert_resolver(&self) -> Option<&Arc<CertResolver>> {
         self.cert_resolver.as_ref()
+    }
+
+    /// What this listener serves over HTTP/3, if it does. Replicas have
+    /// none: the daemon keeps one QUIC endpoint per address.
+    pub(crate) fn http3(&self) -> Option<&Arc<http3::Listener>> {
+        self.http3.as_ref()
     }
 
     /// Receives [`State`] updates.
@@ -828,23 +875,11 @@ async fn serve<S>(
             )
             .await;
         }
-        Handler::Http {
-            routes,
-            http2,
-            tracer,
-        } => {
-            let activity = Arc::new(Activity::default());
-            let service = Service {
-                routes: Arc::clone(routes),
-                log_name: Arc::clone(&context.log.log_name),
-                peer,
-                peer_ip: headers::peer_ip_value(peer),
-                client_subject,
-                local,
-                activity: Arc::clone(&activity),
-                logger: Arc::clone(&context.log.logger),
-                tracer: tracer.clone(),
-            };
+        Handler::Http { http2, .. } => {
+            let service = context
+                .http_service(peer, local, client_subject)
+                .expect("an HTTP handler has a service");
+            let activity = Arc::clone(&service.activity);
             let stamp = Stamp::new();
             let io = TokioIo::new(Watched::new(stream, Arc::clone(&stamp)));
             let idle = context.idle_timeout.map(|idle| (idle, stamp));

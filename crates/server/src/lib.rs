@@ -21,6 +21,7 @@ pub mod fuzzing;
 mod health;
 mod hooks;
 mod http;
+mod http3;
 mod include;
 mod kubernetes;
 mod l4match;

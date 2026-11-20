@@ -26,6 +26,7 @@ use crate::admin::{self, AdminState, Control, Current};
 use crate::catalog;
 use crate::docker::{self, Container, Provider, Route};
 use crate::error::Error;
+use crate::http3::{self, Endpoints};
 use crate::include;
 use crate::master::{Master, ServerInfo};
 use crate::per_core;
@@ -127,13 +128,15 @@ struct Generation {
 }
 
 impl Generation {
-    /// Starts `config` with routes to the Docker `containers`. Relative
-    /// `[acme]` paths are joined to `base`.
+    /// Starts `config` with routes to the Docker `containers`, and hands the
+    /// new HTTP/3 connections of `endpoints` to it. Relative `[acme]` paths
+    /// are joined to `base`.
     async fn start(
         config: Config,
         previous: Option<&Registry>,
         base: &Path,
         containers: Vec<Container>,
+        endpoints: &Endpoints,
     ) -> Result<Self, Error> {
         // What runs has the implicit HTTP to HTTPS redirect servers and the
         // Docker routes; what the admin API shows and edits is the
@@ -160,6 +163,13 @@ impl Generation {
                 (started.servers, started.acme, started.task)
             }
         };
+        // The last step that can fail: a generation that does not start
+        // leaves the QUIC endpoints to the running one.
+        let listeners: Vec<Arc<http3::Listener>> = servers
+            .iter()
+            .filter_map(|server| server.http3.clone())
+            .collect();
+        endpoints.install(&listeners)?;
         // Health checks, the admin API and ACME stay on the calling runtime.
         let mut health_checks = registry.start_background_tasks();
         if let Some(acme) = acme {
@@ -307,7 +317,10 @@ impl Daemon {
             Source::File(path) => load_config(path)?,
         };
         let admin_settings = config.admin.clone();
-        let mut generation = Generation::start(config, None, self.base_dir(), Vec::new()).await?;
+        // QUIC sockets outlive generations, see `http3`.
+        let endpoints = Endpoints::default();
+        let mut generation =
+            Generation::start(config, None, self.base_dir(), Vec::new(), &endpoints).await?;
 
         let (control, mut controls) = mpsc::channel(8);
         let admin_state = Arc::new(AdminState {
@@ -405,7 +418,8 @@ impl Daemon {
                     merged.retain(|container| container.source != source);
                     merged.extend(update);
                     merged.sort_by_key(|container| container.source);
-                    self.follow_docker(source, merged, &mut generation, &admin_state).await;
+                    self.follow_docker(source, merged, &mut generation, &admin_state, &endpoints)
+                        .await;
                     continue;
                 }
                 Some(control) = controls.recv() => match control {
@@ -415,7 +429,7 @@ impl Daemon {
                         if let Some(watcher) = &mut watcher {
                             watcher.loading();
                         }
-                        let outcome = self.reload(&mut generation, &admin_state).await;
+                        let outcome = self.reload(&mut generation, &admin_state, &endpoints).await;
                         let _ = reply.send(outcome);
                         continue;
                     }
@@ -426,7 +440,14 @@ impl Daemon {
                         let outcome = match change.apply(&generation.current().live_config()) {
                             Ok(config) => {
                                 let containers = generation.containers.clone();
-                                self.apply(config, containers, &mut generation, &admin_state).await
+                                self.apply(
+                                    config,
+                                    containers,
+                                    &mut generation,
+                                    &admin_state,
+                                    &endpoints,
+                                )
+                                .await
                             }
                             Err(message) => Err(message),
                         };
@@ -504,7 +525,9 @@ impl Daemon {
                     if let (Event::Reload, Some(watcher)) = (&event, &mut watcher) {
                         watcher.loading();
                     }
-                    if let Err(message) = self.reload(&mut generation, &admin_state).await {
+                    if let Err(message) =
+                        self.reload(&mut generation, &admin_state, &endpoints).await
+                    {
                         eprintln!(
                             "Main => Reload failed, keeping the running configuration: {message}"
                         );
@@ -534,9 +557,14 @@ impl Daemon {
     }
 
     /// Reloads the configuration file, reporting the reload to systemd.
-    async fn reload(&self, generation: &mut Generation, admin: &AdminState) -> Result<(), String> {
+    async fn reload(
+        &self,
+        generation: &mut Generation,
+        admin: &AdminState,
+        endpoints: &Endpoints,
+    ) -> Result<(), String> {
         systemd::reloading();
-        let outcome = self.reload_file(generation, admin).await;
+        let outcome = self.reload_file(generation, admin, endpoints).await;
         // The previous configuration keeps running after a failure, so the
         // service is ready either way.
         systemd::notify(&match &outcome {
@@ -553,6 +581,7 @@ impl Daemon {
         &self,
         generation: &mut Generation,
         admin: &AdminState,
+        endpoints: &Endpoints,
     ) -> Result<(), String> {
         let path = self
             .config_path()
@@ -560,7 +589,8 @@ impl Daemon {
         println!("Main => Reloading {}", path.display());
         let config = load_config(path).map_err(|err| err.to_string())?;
         let containers = generation.containers.clone();
-        self.apply(config, containers, generation, admin).await
+        self.apply(config, containers, generation, admin, endpoints)
+            .await
     }
 
     /// Takes in the containers Docker runs and the catalog instances now.
@@ -573,6 +603,7 @@ impl Daemon {
         containers: Vec<Container>,
         generation: &mut Generation,
         admin: &AdminState,
+        endpoints: &Endpoints,
     ) {
         if containers == generation.containers {
             return;
@@ -592,7 +623,10 @@ impl Daemon {
         );
         // On top of the live members, like a change from the admin API.
         let config = generation.current().live_config();
-        if let Err(message) = self.apply(config, containers, generation, admin).await {
+        if let Err(message) = self
+            .apply(config, containers, generation, admin, endpoints)
+            .await
+        {
             eprintln!("Main => Provider routes not updated, keeping the running ones: {message}");
         }
     }
@@ -605,6 +639,7 @@ impl Daemon {
         containers: Vec<Container>,
         generation: &mut Generation,
         admin: &AdminState,
+        endpoints: &Endpoints,
     ) -> Result<(), String> {
         // A server taking over the port of the challenge-only listener must
         // be able to bind it.
@@ -620,6 +655,7 @@ impl Daemon {
             Some(&previous_registry),
             self.base_dir(),
             containers.clone(),
+            endpoints,
         )
         .await;
         let next = match started {
@@ -630,10 +666,18 @@ impl Daemon {
                 // configuration if the new one still fails.
                 let previous = Config::clone(&generation.config);
                 let previous_containers = generation.containers.clone();
-                let old = std::mem::replace(generation, placeholder().await?);
+                let old = std::mem::replace(generation, placeholder(endpoints).await?);
                 old.stop().await.map_err(|err| err.to_string())?;
                 let base = self.base_dir();
-                match Generation::start(config, Some(&previous_registry), base, containers).await {
+                let started = Generation::start(
+                    config,
+                    Some(&previous_registry),
+                    base,
+                    containers,
+                    endpoints,
+                )
+                .await;
+                match started {
                     Ok(next) => next,
                     Err(err) => {
                         *generation = Generation::start(
@@ -641,6 +685,7 @@ impl Daemon {
                             Some(&previous_registry),
                             base,
                             previous_containers,
+                            endpoints,
                         )
                         .await
                         .map_err(|err| err.to_string())?;
@@ -674,10 +719,16 @@ impl Daemon {
 }
 
 /// Empty generation used while swapping.
-async fn placeholder() -> Result<Generation, String> {
-    Generation::start(Config::default(), None, Path::new(""), Vec::new())
-        .await
-        .map_err(|err| err.to_string())
+async fn placeholder(endpoints: &Endpoints) -> Result<Generation, String> {
+    Generation::start(
+        Config::default(),
+        None,
+        Path::new(""),
+        Vec::new(),
+        endpoints,
+    )
+    .await
+    .map_err(|err| err.to_string())
 }
 
 struct AbortOnDrop(JoinHandle<()>);
@@ -896,7 +947,8 @@ forward = "@api"
         let config = Config::from_toml("[admin]\nenabled = false\n").expect("valid");
         let daemon = Daemon::from_config(config);
         assert!(daemon.config_path().is_none());
-        let mut generation = placeholder().await.expect("generation");
+        let endpoints = Endpoints::default();
+        let mut generation = placeholder(&endpoints).await.expect("generation");
         let admin = {
             let (control, _) = mpsc::channel(1);
             AdminState {
@@ -909,7 +961,7 @@ forward = "@api"
             }
         };
         let err = daemon
-            .reload(&mut generation, &admin)
+            .reload(&mut generation, &admin, &endpoints)
             .await
             .expect_err("no file");
         assert_eq!(err, "no configuration file to reload");

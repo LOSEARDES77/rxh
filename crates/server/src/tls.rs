@@ -673,6 +673,16 @@ pub(crate) fn acceptor(
     Ok(Some((TlsAcceptor::from(Arc::new(config)), resolver)))
 }
 
+/// QUIC flavour of `tcp`, a configuration [`acceptor`] built: the same
+/// provider, client verifier and resolver, ALPN `h3` only and no early data.
+/// Rustls negotiates nothing but TLS 1.3 on QUIC connections.
+pub(crate) fn quic_config(tcp: &ServerConfig) -> Arc<ServerConfig> {
+    let mut config = tcp.clone();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    config.max_early_data_size = 0;
+    Arc::new(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
