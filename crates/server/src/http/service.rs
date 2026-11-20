@@ -29,7 +29,7 @@ use crate::acme;
 use crate::error::Error;
 use crate::files::Files;
 use crate::http::auth::{BasicAuth, ForwardAuth};
-use crate::http::body::Guarded;
+use crate::http::body::{self, Body, Guarded};
 use crate::http::cache::Cache;
 use crate::http::cors::Cors;
 use crate::http::encode;
@@ -424,21 +424,25 @@ impl hyper::service::Service<Request<Incoming>> for Service {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, request: Request<Incoming>) -> Self::Future {
+        let service = self.clone();
+        Box::pin(async move { Ok(service.respond(request.map(body::incoming)).await) })
+    }
+}
+
+impl Service {
+    /// Answers a request from any HTTP version: counts it as activity and
+    /// keeps the connection counted as in flight until the response body ends.
+    pub(crate) async fn respond(self, request: Request<Body>) -> BoxResponse {
         self.activity.requests.fetch_add(1, Ordering::Release);
         self.activity.notify.notify_waiters();
 
         self.activity.in_flight.fetch_add(1, Ordering::Release);
         let in_flight = InFlight(Arc::clone(&self.activity));
 
-        let service = self.clone();
-        Box::pin(async move {
-            let response = service.handle(request).await;
-            Ok(response.map(|body| Guarded::new(body, in_flight).boxed()))
-        })
+        let response = self.handle(request).await;
+        response.map(|body| Guarded::new(body, in_flight).boxed())
     }
-}
 
-impl Service {
     /// Checks a request against the `basic_auth` and the `forward_auth` of
     /// `route`, or of its site for the one the route does not set. Returns
     /// the answer for a request that may not go on.
@@ -475,7 +479,7 @@ impl Service {
         forward_auth.check(headers, request_headers).await
     }
 
-    async fn handle(self, mut request: Request<Incoming>) -> BoxResponse {
+    async fn handle(self, mut request: Request<Body>) -> BoxResponse {
         if let Some(response) = acme::challenge_response(request.method(), request.uri().path()) {
             return response;
         }
