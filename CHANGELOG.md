@@ -67,7 +67,9 @@ Changed.
   keeps the value it has in the file, and a change to one is `403` with the
   path of the key. It sets no `{env.NAME}` or `{file.PATH}` placeholder, no
   unix socket as a forward target, no `listen` address that is not listened
-  on already, and a new host needs a `host`.
+  on already, and a new host needs a `host`. A host whose table has a
+  placeholder keeps its forward targets, so the value does not reach a
+  backend the user chose.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on

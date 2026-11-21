@@ -9,8 +9,11 @@
 //!
 //! A key is named by its path in the table without the positions in arrays,
 //! and without the `match` and `subroute` it is under: an entry has the keys
-//! of a server. A chain of `fallback` counts as one. `**` stands for
-//! everything below a key.
+//! of a server. A chain of `fallback` counts as one. `*` stands for one key
+//! of a map and `**` for everything below a key. [`ALLOWED`] has `**` only
+//! on maps of strings, such as header names: the fields of a table are
+//! listed one by one, so that a field added to the model is not allowed
+//! before somebody decides.
 
 use serde_json::Value as Json;
 
@@ -29,6 +32,7 @@ pub(crate) const ALLOWED: &[&str] = &[
     "method",
     "query.**",
     "header.**",
+    "regexp",
     "regexp.**",
     "regexp_count",
     "remote_ip",
@@ -36,15 +40,39 @@ pub(crate) const ALLOWED: &[&str] = &[
     "alpn",
     "ip_allow",
     "ip_deny",
-    "rate_limit.**",
+    "rate_limit.rate",
+    "rate_limit.per",
+    "rate_limit.burst",
+    "rate_limit.key",
     // What it answers.
     "forward",
     "redirect",
-    "redirect.**",
+    "redirect.to",
+    "redirect.status",
     "rewrite",
-    "request.**",
-    "response.**",
-    "cors.**",
+    "request.method",
+    "request.max_body_size",
+    "request.headers.set.**",
+    "request.headers.add.**",
+    "request.headers.remove",
+    "request.headers.replace.*.search",
+    "request.headers.replace.*.replace",
+    "request.headers.forwarded.by",
+    "request.headers.forwarded.extend",
+    "response.headers.set.**",
+    "response.headers.add.**",
+    "response.headers.remove",
+    "response.headers.replace.*.search",
+    "response.headers.replace.*.replace",
+    "response.headers.server.override",
+    "response.headers.server.version",
+    "response.headers.via.extend",
+    "cors.origins",
+    "cors.methods",
+    "cors.headers",
+    "cors.expose_headers",
+    "cors.credentials",
+    "cors.max_age",
     "encode",
     "security_headers",
     "cache.enabled",
@@ -52,7 +80,8 @@ pub(crate) const ALLOWED: &[&str] = &[
     "handle_response.status",
     "handle_response.header.**",
     "handle_response.redirect",
-    "handle_response.redirect.**",
+    "handle_response.redirect.to",
+    "handle_response.redirect.status",
     "handle_response.replace_status",
     "handle_response.rewrite",
     "handle_response.copy_response",
@@ -73,8 +102,10 @@ pub(crate) const ALLOWED: &[&str] = &[
     "forward.retries",
     "forward.try_duration",
     "forward.try_interval",
-    "forward.retry_budget.**",
-    "forward.retry_match.**",
+    "forward.retry_budget.percent",
+    "forward.retry_budget.min_retries",
+    "forward.retry_match.method",
+    "forward.retry_match.status",
     "forward.hedge_delay",
     "forward.dial_timeout",
     "forward.read_timeout",
@@ -85,8 +116,18 @@ pub(crate) const ALLOWED: &[&str] = &[
     "forward.h2c",
     "forward.grpc_web",
     "forward.slow_start",
-    "forward.passive.**",
-    "forward.circuit_breaker.**",
+    "forward.passive.max_fails",
+    "forward.passive.fail_duration",
+    "forward.passive.unhealthy_status",
+    "forward.passive.unhealthy_latency",
+    "forward.passive.unhealthy_request_count",
+    "forward.circuit_breaker.error_ratio",
+    "forward.circuit_breaker.error_status",
+    "forward.circuit_breaker.latency",
+    "forward.circuit_breaker.latency_ratio",
+    "forward.circuit_breaker.min_requests",
+    "forward.circuit_breaker.open_duration",
+    "forward.circuit_breaker.window",
     "forward.health.interval",
     "forward.health.timeout",
     "forward.health.uri",
@@ -115,7 +156,9 @@ pub(crate) const ALLOWED: &[&str] = &[
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const DENIED: &[&str] = &[
     // Paths on the machine of the daemon.
+    "serve",
     "serve.**",
+    "handle_response.serve",
     "handle_response.serve.**",
     "error_pages.**",
     "tls.cert",
@@ -166,14 +209,24 @@ pub(crate) const DENIED: &[&str] = &[
     "forward.response_buffers",
 ];
 
-/// Whether `key` is in `list`, by itself or below a `**` entry.
+/// Whether an entry of `list` names `key`.
 fn lists(list: &[&str], key: &str) -> bool {
-    list.iter().any(|entry| match entry.strip_suffix(".**") {
-        Some(parent) => key
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
-        None => *entry == key,
-    })
+    list.iter().any(|entry| names(entry, key))
+}
+
+/// Whether `entry` names `key`: the same keys, `*` for any one of them and
+/// a last `**` for one or more.
+fn names(entry: &str, key: &str) -> bool {
+    let mut keys = key.split('.');
+    for part in entry.split('.') {
+        match (part, keys.next()) {
+            ("**", Some(_)) => return true,
+            ("*", Some(_)) => {}
+            (part, Some(name)) if part == name => {}
+            _ => return false,
+        }
+    }
+    keys.next().is_none()
 }
 
 /// Whether an entry of [`ALLOWED`] is `key` or below it: an empty table at
@@ -238,8 +291,28 @@ fn path_below(path: &str, step: Step<'_>) -> String {
 ///
 /// Entries of an array are compared by position: one that moves counts as
 /// changed.
+///
+/// A stored table with a placeholder holds a value the caller is not to
+/// read, a credential sent to the backend for one: its forward targets
+/// stay the stored ones, or the caller would receive it at a target of its
+/// own.
 pub(crate) fn check(before: Option<&Json>, after: &Json) -> Result<(), String> {
-    compare(before, Some(after), "", "")
+    let guarded = before.is_some_and(has_placeholder);
+    compare(before, Some(after), "", "", guarded)
+}
+
+fn is_placeholder(text: &str) -> bool {
+    text.contains("{env.") || text.contains("{file.")
+}
+
+/// Whether a string of `value`, at any depth, has a placeholder.
+fn has_placeholder(value: &Json) -> bool {
+    match value {
+        Json::String(text) => is_placeholder(text),
+        Json::Array(values) => values.iter().any(has_placeholder),
+        Json::Object(values) => values.values().any(has_placeholder),
+        _ => false,
+    }
 }
 
 fn compare(
@@ -247,6 +320,7 @@ fn compare(
     after: Option<&Json>,
     path: &str,
     key: &str,
+    guarded: bool,
 ) -> Result<(), String> {
     if before == after {
         return Ok(());
@@ -256,7 +330,7 @@ fn compare(
     let is_scalar =
         |value: Option<&Json>, steps: &Option<Vec<Step<'_>>>| value.is_some() && steps.is_none();
     if is_scalar(before, &old) || is_scalar(after, &new) || (old.is_none() && new.is_none()) {
-        set(after, path, key)?;
+        set(after, path, key, guarded)?;
     }
     // A table or an array that comes or goes as a whole, even empty.
     let whole = !key.is_empty() && (before.is_none() || after.is_none());
@@ -275,27 +349,34 @@ fn compare(
             get(after, step),
             &path_below(path, step),
             &key_below(key, step),
+            guarded,
         )?;
     }
     Ok(())
 }
 
-/// Whether the scalar at `key` may become `after`, or go.
-fn set(after: Option<&Json>, path: &str, key: &str) -> Result<(), String> {
+/// Whether the scalar at `key` may become `after`, or go. `guarded` says
+/// the forward targets stay as they are.
+fn set(after: Option<&Json>, path: &str, key: &str, guarded: bool) -> Result<(), String> {
     if !lists(ALLOWED, key) {
         return Err(needs_admin(path));
+    }
+    let is_target = ["forward", "backends", "address", "pool"]
+        .iter()
+        .any(|name| key == *name || key.ends_with(&format!(".{name}")));
+    if is_target && guarded {
+        return Err(format!(
+            "this host carries values only an administrator may redirect: {path}"
+        ));
     }
     let Some(Json::String(text)) = after else {
         return Ok(());
     };
-    if text.contains("{env.") || text.contains("{file.") {
+    if is_placeholder(text) {
         return Err(format!(
             "a value read from the environment or a file needs the admin role: {path}"
         ));
     }
-    let is_target = ["forward", "backends", "address"]
-        .iter()
-        .any(|name| key == *name || key.ends_with(&format!(".{name}")));
     if is_target && text.starts_with("unix/") {
         return Err(format!(
             "a unix socket as a forward target needs the admin role: {path}"
@@ -378,14 +459,46 @@ mod tests {
             "decide whether a user without the admin role may set these keys of a host, and \
              add each to ALLOWED or to DENIED: {undecided:?}"
         );
+        // `**` allows what the model does not name: only below a map of
+        // strings, where the keys are free and the values say nothing new.
+        for entry in ALLOWED {
+            let Some(map) = entry.strip_suffix(".**") else {
+                continue;
+            };
+            let below: Vec<&String> = keys
+                .iter()
+                .filter(|key| key.starts_with(&format!("{map}.")))
+                .collect();
+            let is_map = below == [&format!("{map}.*")] || (below.is_empty() && keys.contains(map));
+            assert!(
+                is_map,
+                "{entry} is not a map of strings, list its keys: {below:?}"
+            );
+        }
         // An entry that names no key of the model is a typo.
         for entry in ALLOWED.iter().chain(DENIED) {
             let parent = entry.strip_suffix(".**").unwrap_or(entry);
             assert!(
-                keys.iter().any(|key| lists(&[entry], key)) || keys.contains(parent),
+                keys.iter().any(|key| names(entry, key)) || keys.contains(parent),
                 "{entry} names no key of the schema"
             );
         }
+    }
+
+    #[test]
+    fn an_entry_names_keys_by_segment() {
+        assert!(names("a.b", "a.b"));
+        assert!(!names("a.b", "a"));
+        assert!(!names("a", "a.b"));
+        assert!(names("a.*.c", "a.x.c"));
+        assert!(!names("a.*.c", "a.x.d"));
+        assert!(!names("a.*.c", "a.c"));
+        assert!(names("a.**", "a.b.c"));
+        assert!(!names("a.**", "a"));
+        assert!(!names("a.**", "ab.c"));
+        assert!(!lists(ALLOWED, "request.body_file"));
+        assert!(!lists(ALLOWED, "cors.new_field"));
+        assert!(!lists(ALLOWED, ""));
     }
 
     #[test]
@@ -510,6 +623,24 @@ mod tests {
         let mut after = stored.clone();
         after["rewrite"] = json!("/v2{uri}");
         assert_eq!(check(Some(&stored), &after), Ok(()));
+
+        // What it is sent to stays too: the value would go there.
+        for (target, path) in [
+            (json!("10.0.0.1:80"), "forward"),
+            (json!({ "backends": ["10.0.0.1:80"] }), "forward"),
+        ] {
+            let mut after = stored.clone();
+            after["forward"] = target;
+            let error = check(Some(&stored), &after).unwrap_err();
+            assert_eq!(
+                error,
+                format!("this host carries values only an administrator may redirect: {path}")
+            );
+        }
+        let mut after = stored.clone();
+        after["match"] = json!([{ "uri": "/mine", "forward": "10.0.0.1:80" }]);
+        let error = check(Some(&stored), &after).unwrap_err();
+        assert!(error.ends_with("redirect: match[0].forward"), "{error}");
 
         let set = |path: &[&str], value: Json| {
             let mut after = json!({ "forward": "@api" });

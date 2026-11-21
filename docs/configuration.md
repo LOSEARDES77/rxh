@@ -878,14 +878,14 @@ match[0].forward.health.hooks"}`, with the path of the key. The keys of a
 |---|---|
 | `name`, `groups` | As the grants say, see the table above. |
 | `listen` | Only addresses a server of the running configuration listens on, port `0` excluded: no new socket. |
-| `host` | Yes. A new host must have one, and a host that has one keeps one. |
+| `host` | Yes. A new host must have one, and a host that has one keeps one; blank names do not count. |
 | `http_host`, `path`, `uri`, `method`, `query`, `header`, `regexp`, `regexp_count`, `remote_ip`, `sni`, `alpn` | Yes: which requests the host takes. |
 | `ip_allow`, `ip_deny`, `rate_limit` | Yes: who reaches the host. |
 | `forward` (a pool name, addresses, weighted pools) | Yes, except a `unix//` socket. |
-| `redirect`, `rewrite`, `request`, `response`, `cors`, `encode`, `security_headers` | Yes. |
+| `redirect`, `rewrite`, `request`, `response`, `cors`, `encode`, `security_headers` | Yes, every key they have today. |
 | `cache`: `enabled`, `ttl_seconds` | Yes. `max_entries`, `max_body_bytes`: no, the memory of the daemon. |
 | `handle_response`: `status`, `header`, `redirect`, `replace_status`, `rewrite`, `copy_response` | Yes. `serve`: no. |
-| `tls = "auto"` | Yes. `tls = { cert, key }`: no, paths. |
+| `tls = "auto"` | Yes, see below. `tls = { cert, key }`: no, paths. |
 | inline `forward` pool: `backends`, `policy`, `choose`, `key`, `hash_type`, `hash_balance_factor`, `retries`, `try_duration`, `try_interval`, `retry_budget`, `retry_match`, `hedge_delay`, `dial_timeout`, `read_timeout`, `write_timeout`, `response_header_timeout`, `queue_timeout`, `flush_interval`, `h2c`, `grpc_web`, `slow_start`, `passive`, `circuit_breaker`, `fallback` (`policy`, `choose`, `key`) | Yes: where the requests of the host go, and how. |
 | inline `forward` pool, `health`: `interval`, `timeout`, `uri`, `method`, `port`, `headers`, `request_body`, `status`, `body`, `passes`, `fails`, `grpc`, `grpc_service` | Yes: checks of the forward targets. |
 | inline `forward` pool, `tls`: `server_name`, `insecure_skip_verify` | Yes. `ca`, `client_cert`, `client_key`: no, paths. |
@@ -898,6 +898,22 @@ match[0].forward.health.hooks"}`, with the path of the key. The keys of a
 
 - No string a user sets may have an `{env.NAME}` or a `{file.PATH}`
   placeholder: `403`. One an administrator wrote stays as it is.
+- A host whose table has such a placeholder in any string keeps its forward
+  targets: `forward`, the `backends` and their addresses, and the pools of
+  a weighted `forward`, at every depth, new `match` entries included. A
+  user who pointed the host at a backend of its own would receive the value
+  there (a key in a request header, for example). The answer is `403
+  {"error": "this host carries values only an administrator may redirect:
+  forward"}`; the other keys of the list still change.
+- `tls = "auto"` set by a user does more than answer: the daemon orders
+  certificates for the names of `host` the user chose, and, unless
+  `https_redirect` (a key for administrators) says no, listens on
+  `[acme] http_port` of the same address to redirect to HTTPS. Give
+  `create` and `modify` on hosts of a TLS listener with that in mind.
+- The list has the keys under the names the reference gives them. An alias
+  (`connections` for `max_connections`) and a key the daemon does not know
+  are refused like a key for administrators, and so is `protocol`, also as
+  the matcher of a `match` entry of a `tcp` server.
 - The entries of an array (`match`, `handle_response`, backends) are
   compared by position: an entry with a key for administrators cannot be
   moved or removed by a user, nor can an entry before it.

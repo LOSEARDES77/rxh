@@ -132,12 +132,14 @@ fn listens(table: &Json) -> Option<Vec<SocketAddr>> {
         .collect()
 }
 
-/// Whether `table` has no `host` matcher of its own.
+/// Whether `table` has no `host` matcher of its own: none, or only blank
+/// names.
 fn has_no_host(table: &Json) -> bool {
+    let is_name = |name: &Json| name.as_str().is_some_and(|name| !name.trim().is_empty());
     match table.get("host") {
-        Some(Json::Array(names)) => names.is_empty(),
-        Some(Json::String(name)) => name.is_empty(),
-        _ => true,
+        Some(Json::Array(names)) => !names.iter().any(is_name),
+        Some(name) => !is_name(name),
+        None => true,
     }
 }
 

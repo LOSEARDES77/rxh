@@ -1244,7 +1244,13 @@ async fn a_user_sets_only_the_keys_that_route_or_answer() {
     assert!(!std::path::Path::new("/tmp/rxh-test-hook").exists());
 
     // A new host answers for names of its own.
-    for host in [Value::Null, json!([]), json!("")] {
+    for host in [
+        Value::Null,
+        json!([]),
+        json!(""),
+        json!([""]),
+        json!(["  ", ""]),
+    ] {
         let mut value = new_host(&fixture, Some(&["web"]));
         value["host"] = host.clone();
         if host.is_null() {
@@ -1409,4 +1415,73 @@ async fn a_reserved_name_is_not_told_to_who_cannot_create() {
     let reserved = fixture.create(&vera, reserved).await;
     assert_eq!(reserved.0, StatusCode::FORBIDDEN);
     assert_eq!(reserved, fixture.create(&vera, free).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_with_a_placeholder_keeps_its_targets() {
+    let fixture = daemon().await;
+    // The administrator sends a value of the environment to the backend.
+    let key = (
+        "request",
+        "{ headers = { set = { X-Key = \"{env.PATH}\" } } }",
+    );
+    let body = json!({
+        "toml": shop_toml(&fixture, &[key]),
+        "revision": fixture.revision().await,
+    });
+    let uri = format!("/config/entities/server/{SHOP}");
+    let (status, json) = fixture.token(Method::PUT, &uri, &body).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let before = fixture.text();
+
+    // A user who pointed the host at a backend of its own would read it.
+    let eva = fixture.cookie("eva").await;
+    let refused = |how: &str, (status, json): (StatusCode, Value)| {
+        assert_eq!(status, StatusCode::FORBIDDEN, "{how}: {json}");
+        let error = json["error"].as_str().expect("error");
+        assert!(
+            error.starts_with("this host carries values only an administrator may redirect"),
+            "{how}: {error}"
+        );
+        assert_eq!(fixture.text(), before, "{how}");
+    };
+    let targets = [
+        (json!("127.0.0.1:9"), "\"127.0.0.1:9\""),
+        (
+            json!({ "backends": ["127.0.0.1:9"] }),
+            "{ backends = [\"127.0.0.1:9\"] }",
+        ),
+    ];
+    for (target, toml) in &targets {
+        let changed = fixture
+            .put_value(&eva, SHOP, |shop| shop["forward"] = target.clone())
+            .await;
+        refused("form", changed);
+        let text = shop_toml(&fixture, &[key, ("forward", toml)]);
+        refused(
+            "text",
+            fixture.put(&eva, SHOP, json!({ "toml": text })).await,
+        );
+    }
+    // A new entry of the host with a target of its own is one too.
+    let entry = json!([{ "uri": "/mine", "forward": "127.0.0.1:9" }]);
+    let changed = fixture
+        .put_value(&eva, SHOP, |shop| {
+            shop.as_object_mut().expect("object").remove("forward");
+            shop["match"] = entry.clone();
+        })
+        .await;
+    refused("entry", changed);
+
+    // The rest of the host is still the user's to change.
+    let (status, json) = fixture
+        .put_value(&eva, SHOP, |shop| shop["uri"] = json!("/shop"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(fixture.text().contains("{env.PATH}"));
+    // And a host without such a value goes where its user says.
+    let (status, json) = fixture
+        .put_value(&eva, BLOG, |blog| blog["forward"] = json!("127.0.0.1:10"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
 }
