@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick as settled } from "svelte";
   import { ApiError, api, loadWithToken } from "../lib/api";
   import type { Files } from "../lib/schema";
   import { refresh as readSession, session, type Grant, type Permission } from "../lib/session";
@@ -118,7 +118,16 @@
     if (own) await readSession().catch(() => undefined);
   }
 
-  async function removeUser(user: User) {
+  /** Once the page is drawn again, focuses the first of `ids` that exists. */
+  async function focus(...ids: string[]) {
+    await settled();
+    for (const id of ids) {
+      const element = document.getElementById(id);
+      if (element) return element.focus();
+    }
+  }
+
+  async function removeUser(user: User, index: number) {
     const own = user.name === me;
     const question = own
       ? `Remove your own user ${user.name}? You are signed out and lose this tab at once.`
@@ -129,7 +138,10 @@
       () => api(path("users", user.name), { method: "DELETE" }),
       `User ${user.name} removed.`,
     );
-    if (removed && own) await readSession().catch(() => undefined);
+    if (!removed) return;
+    if (own) await readSession().catch(() => undefined);
+    // The button went with its row: the next row takes it, else the toolbar.
+    await focus(`remove-user-${index}`, "new-user");
   }
 
   async function addUser(event: SubmitEvent) {
@@ -171,12 +183,27 @@
     editing = { name: role?.name ?? "", created: role === undefined, rows };
   }
 
-  // Modify, Create and Delete change nothing without View: ticking one ticks it.
-  function tick(row: Row, permission: Permission, on: boolean) {
+  // Modify, Create and Delete change nothing without View: ticking one ticks
+  // it, and unticking View unticks them.
+  function setAllowed(row: Row, permission: Permission, on: boolean) {
+    if (permission === "view" && !on) {
+      row.allow = [];
+      return;
+    }
     const wanted = on ? [permission, "view"] : [];
     row.allow = PERMISSIONS.filter(
       (other) => wanted.includes(other) || (other !== permission && row.allow.includes(other)),
     );
+  }
+
+  function addGrant() {
+    editing?.rows.push({ kind: "group", target: "", allow: [] });
+    focus(`grant-target-${(editing?.rows.length ?? 1) - 1}`);
+  }
+
+  function removeGrant(index: number) {
+    editing?.rows.splice(index, 1);
+    focus(`grant-target-${index}`, `grant-target-${index - 1}`, "add-grant");
   }
 
   // `create` is about groups: a host grant cannot have it.
@@ -201,9 +228,14 @@
     if (saved) editing = undefined;
   }
 
-  async function removeRole(role: Role) {
+  async function removeRole(role: Role, index: number) {
     if (!confirm(`Remove role ${role.name}?`)) return;
-    await send(`role:${role.name}`, () => api(path("roles", role.name), { method: "DELETE" }), `Role ${role.name} removed.`);
+    const removed = await send(
+      `role:${role.name}`,
+      () => api(path("roles", role.name), { method: "DELETE" }),
+      `Role ${role.name} removed.`,
+    );
+    if (removed) await focus(`remove-role-${index}`, "new-role");
   }
 
   onMount(() => loadWithToken(load));
@@ -271,6 +303,7 @@
       <button
         type="button"
         class="button"
+        id="new-user"
         onclick={() => {
           delete refusals["new-user"];
           adding = { name: "", password: "", repeat: "", roles: [] };
@@ -306,7 +339,7 @@
         </tr>
       </thead>
       <tbody>
-        {#each users as user (user.name)}
+        {#each users as user, index (user.name)}
           {@const held = rolesOf(user)}
           <tr>
             <th scope="row">{user.name}</th>
@@ -316,6 +349,7 @@
                   <label>
                     <input
                       type="checkbox"
+                      aria-label="{role.name} for {user.name}"
                       checked={held.includes(role.name)}
                       onchange={(event) => (drafts[user.name] = toggle(held, role.name, event.currentTarget.checked))}
                     />
@@ -324,7 +358,7 @@
                 {/each}
               </div>
             </td>
-            <td class="actions">
+            <td class="actions stack">
               <button
                 type="button"
                 class="button"
@@ -344,8 +378,9 @@
               <button
                 type="button"
                 class="button danger"
+                id="remove-user-{index}"
                 aria-label="Remove {user.name}"
-                onclick={() => removeUser(user)}>Remove</button
+                onclick={() => removeUser(user, index)}>Remove</button
               >
             </td>
           </tr>
@@ -399,6 +434,7 @@
                 <td>
                   <input
                     type="text"
+                    id="grant-target-{index}"
                     aria-label="Target of grant {number}"
                     list={row.kind === "group" ? "known-groups" : "known-hosts"}
                     bind:value={row.target}
@@ -409,13 +445,17 @@
                 </td>
                 {#each PERMISSIONS as permission (permission)}
                   <td>
-                    <input
-                      type="checkbox"
-                      aria-label="{LABELS[permission]} (grant {number})"
-                      checked={row.allow.includes(permission)}
-                      disabled={permission === "create" && row.kind === "host"}
-                      onchange={(event) => tick(row, permission, event.currentTarget.checked)}
-                    />
+                    <label>
+                      <input
+                        type="checkbox"
+                        aria-label="{LABELS[permission]} (grant {number})"
+                        checked={row.allow.includes(permission)}
+                        disabled={permission === "create" && row.kind === "host"}
+                        onchange={(event) => setAllowed(row, permission, event.currentTarget.checked)}
+                      />
+                      <!-- The column heads do not show on a phone. -->
+                      <span class="narrow" aria-hidden="true">{LABELS[permission]}</span>
+                    </label>
                   </td>
                 {/each}
                 <td class="actions">
@@ -423,7 +463,7 @@
                     type="button"
                     class="button"
                     aria-label="Remove grant {number}"
-                    onclick={() => editing?.rows.splice(index, 1)}>Remove</button
+                    onclick={() => removeGrant(index)}>Remove</button
                   >
                 </td>
               </tr>
@@ -447,7 +487,8 @@
         <button
           type="button"
           class="button"
-          onclick={() => editing?.rows.push({ kind: "group", target: "", allow: [] })}>Add grant</button
+          id="add-grant"
+          onclick={addGrant}>Add grant</button
         >
         <button type="submit" class="button">Save role</button>
         <button type="button" class="button" onclick={() => (editing = undefined)}>Cancel</button>
@@ -455,7 +496,7 @@
     </form>
   {:else}
     <div class="toolbar">
-      <button type="button" class="button" onclick={() => edit()}>New role</button>
+      <button type="button" class="button" id="new-role" onclick={() => edit()}>New role</button>
     </div>
     <div class="scroll">
       <table class="list">
@@ -467,7 +508,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each roles as role (role.name)}
+          {#each roles as role, index (role.name)}
             <tr>
               <th scope="row">{role.name}</th>
               <td>
@@ -481,7 +522,7 @@
                   {/each}
                 {/if}
               </td>
-              <td class="actions">
+              <td class="actions stack">
                 {#if !role.builtin}
                   <button type="button" class="button" aria-label="Edit {role.name}" onclick={() => edit(role)}
                     >Edit</button
@@ -489,8 +530,9 @@
                   <button
                     type="button"
                     class="button danger"
+                    id="remove-role-{index}"
                     aria-label="Remove {role.name}"
-                    onclick={() => removeRole(role)}>Remove</button
+                    onclick={() => removeRole(role, index)}>Remove</button
                   >
                 {/if}
               </td>
@@ -585,7 +627,68 @@
   }
 
   .grants select {
-    min-width: 5rem;
+    min-width: 6.5rem;
+  }
+
+  .narrow {
+    display: none;
+  }
+
+  /* On a phone the buttons of a row stack and a grant takes two lines, so nothing scrolls sideways. */
+  @media (max-width: 40rem) {
+    table.list th,
+    table.list td {
+      padding-right: 0.5rem;
+    }
+
+    .grants thead {
+      display: none;
+    }
+
+    .grants tr {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.4rem 0.75rem;
+      padding: 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    table.list.grants td {
+      display: block;
+      padding: 0;
+      border: none;
+    }
+
+    /* Kind and name fill the first line, the boxes and Remove the second. */
+    .grants td:nth-child(2) {
+      flex: 1 1 60%;
+    }
+
+    .grants input[type="text"] {
+      min-width: 0;
+    }
+
+    .grants td.actions {
+      margin-left: auto;
+    }
+
+    .narrow {
+      display: inline;
+    }
+
+    td.stack {
+      white-space: normal;
+    }
+
+    td.stack .button {
+      display: block;
+      width: 100%;
+    }
+
+    td.stack .button + .button {
+      margin: 0.35rem 0 0;
+    }
   }
 
   td .failure {

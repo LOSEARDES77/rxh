@@ -51,9 +51,9 @@ test("users_and_roles_are_listed", async () => {
   serve(ANSWERS);
   render(Users);
   await screen.findByRole("rowheader", { name: "luis" });
-  expect((row("luis").getByRole("checkbox", { name: "web-editors" }) as HTMLInputElement).checked).toBe(true);
-  expect((row("luis").getByRole("checkbox", { name: "admin" }) as HTMLInputElement).checked).toBe(false);
-  expect((row("ana").getByRole("checkbox", { name: "admin" }) as HTMLInputElement).checked).toBe(true);
+  expect((row("luis").getByRole("checkbox", { name: "web-editors for luis" }) as HTMLInputElement).checked).toBe(true);
+  expect((row("luis").getByRole("checkbox", { name: "admin for luis" }) as HTMLInputElement).checked).toBe(false);
+  expect((row("ana").getByRole("checkbox", { name: "admin for ana" }) as HTMLInputElement).checked).toBe(true);
   expect(row("ana").getByRole("button", { name: "Set password for ana" })).toBeTruthy();
   expect(row("luis").getByRole("button", { name: "Remove luis" })).toBeTruthy();
 
@@ -150,11 +150,11 @@ test("a_refusal_is_shown_and_the_form_kept", async () => {
   expect((screen.getByLabelText("Password") as HTMLInputElement).value).toBe("correct horse");
 
   // Next to the row it is about, and the change typed there stays.
-  await fireEvent.click(row("luis").getByRole("checkbox", { name: "admin" }));
+  await fireEvent.click(row("luis").getByRole("checkbox", { name: "admin for luis" }));
   await fireEvent.click(row("luis").getByRole("button", { name: "Save roles of luis" }));
   const luis = screen.getByRole("rowheader", { name: "luis" }).closest("tr") as HTMLElement;
   await vi.waitFor(() => expect(luis.nextElementSibling?.textContent).toBe('role "shop" is not defined'));
-  expect((row("luis").getByRole("checkbox", { name: "admin" }) as HTMLInputElement).checked).toBe(true);
+  expect((row("luis").getByRole("checkbox", { name: "admin for luis" }) as HTMLInputElement).checked).toBe(true);
 });
 
 test("removing_asks_first", async () => {
@@ -187,7 +187,7 @@ test("taking_admin_from_oneself_asks_first", async () => {
   expect(confirm.mock.calls[0][0]).not.toContain("this tab");
 
   confirm.mockReturnValue(false);
-  await fireEvent.click(row("ana").getByRole("checkbox", { name: "admin" }));
+  await fireEvent.click(row("ana").getByRole("checkbox", { name: "admin for ana" }));
   await fireEvent.click(row("ana").getByRole("button", { name: "Save roles of ana" }));
   await fireEvent.click(row("ana").getByRole("button", { name: "Remove ana" }));
   expect(confirm.mock.calls[1][0]).toContain("this tab");
@@ -211,4 +211,47 @@ test("setting_a_password_sends_it_alone", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Set password" }));
   await vi.waitFor(() => expect(writes(fetch)).toHaveLength(1));
   expect(writes(fetch)[0]).toEqual({ url: "users/luis", method: "PUT", body: { password: "battery staple" } });
+});
+
+test("unticking_view_unticks_the_others", async () => {
+  const fetch = serve(ANSWERS, { status: 204, body: null });
+  render(Users);
+  await fireEvent.click(await screen.findByRole("button", { name: "Edit web-editors" }));
+  // Modify, Create or Delete without View would be a grant that does nothing.
+  await fireEvent.click(box("View (grant 1)"));
+  expect(["View", "Modify", "Create", "Delete"].map((label) => box(`${label} (grant 1)`).checked)).toEqual([false, false, false, false]);
+  await fireEvent.click(screen.getByRole("button", { name: "Save role" }));
+  await vi.waitFor(() => expect(writes(fetch)).toHaveLength(1));
+  expect(writes(fetch)[0].body.grant[0]).toEqual({ group: "web", allow: [] });
+});
+
+test("focus_follows_adding_and_removing", async () => {
+  // A local administrator: removing a user is not removing itself.
+  session.set(who({ admin: true }));
+  const answers = { ...ANSWERS };
+  serve(answers, { status: 204, body: null });
+  render(Users);
+  await fireEvent.click(await screen.findByRole("button", { name: "Edit web-editors" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Add grant" }));
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Target of grant 3")));
+  // The next row takes the place of the removed one, then the row before, then "Add grant".
+  await fireEvent.click(screen.getByRole("button", { name: "Remove grant 1" }));
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Target of grant 1")));
+  expect((document.activeElement as HTMLInputElement).value).toBe("intranet");
+  await fireEvent.click(screen.getByRole("button", { name: "Remove grant 2" }));
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Target of grant 1")));
+  await fireEvent.click(screen.getByRole("button", { name: "Remove grant 1" }));
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add grant" })));
+  await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+  // A removed user's button goes with the list read again: the next row's takes focus, then the toolbar's.
+  answers.users = [USERS[1]];
+  await fireEvent.click(screen.getByRole("button", { name: "Remove ana" }));
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove luis" })));
+  answers.users = [];
+  await fireEvent.click(screen.getByRole("button", { name: "Remove luis" }));
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "New user" })));
+  answers.roles = [ROLES[0]];
+  await fireEvent.click(screen.getByRole("button", { name: "Remove web-editors" }));
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "New role" })));
 });
