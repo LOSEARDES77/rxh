@@ -654,6 +654,14 @@ Changed.
   already in use" and keep the old configuration: the stopped listener
   reported its shutdown while its sessions still held the socket. The
   sessions now end before the listener reports that it has stopped.
+- Documentation: the container images and the systemd unit cannot write
+  next to the configuration, where the ACME storage and the users file go
+  by default (`/etc/rxh/rxh-data`); the container docs said the ACME
+  storage landed in `/var/lib/rxh`. The Docker guide, the reference and
+  the `Dockerfile` now say to set `[acme] storage` and `[admin] users` to
+  `/var/lib/rxh`, and the reference gives the systemd drop-in
+  (`StateDirectory=rxh`). The reference has an "Accounts and permissions,
+  step by step" section with what is not there yet and the known limits.
 
 ### Security
 

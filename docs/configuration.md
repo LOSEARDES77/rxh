@@ -418,6 +418,36 @@ then `READY=1` around every reload (`SIGHUP`, `rxh reload`, `watch`), with
 `STATUS=Reload failed: ...` when the new configuration is rejected (the
 previous one keeps running), and `STOPPING=1` on shutdown. No watchdog.
 
+The unit runs the daemon as a user systemd makes for it (`DynamicUser=yes`)
+with `ProtectSystem=strict` and no `WorkingDirectory` or `StateDirectory`:
+the daemon can write nowhere. `/etc/rxh` is readable and not writable, so
+the files that are relative to the directory of the configuration by
+default, the users file (`rxh-data/users.toml`) and the ACME storage
+(`rxh-data/certificates`), cannot be created there: creating the first user
+answers `400` with `Permission denied`, and ACME cannot keep its
+certificates. Give the service a state directory with a drop-in and put
+both there:
+
+```ini
+# systemctl edit rxh
+[Service]
+StateDirectory=rxh
+```
+
+```toml
+[admin]
+users = "/var/lib/rxh/users.toml"
+
+[acme]
+storage = "/var/lib/rxh/certificates"
+```
+
+Create the first user through the daemon (the page, or `curl` on the
+machine to `POST /auth/setup`), so that the file belongs to the user of
+the service. `sudo rxh -c /etc/rxh/rxh.toml user ...` then works on it: a
+file it replaces keeps its owner. A users file that `rxh user` run as root
+creates belongs to root, mode `0600`, and the service cannot read it.
+
 With socket activation ([`dist/rxh.socket`](../dist/rxh.socket)), systemd
 binds the sockets and passes them in `LISTEN_FDS`. A listener whose `listen`
 address equals the local address of a passed socket of the same kind uses
@@ -470,8 +500,21 @@ validate`). Listeners must bind `0.0.0.0` (or `[::]`) to be reachable from
 outside the container; ports below 1024 work as the unprivileged user
 because Docker allows them in the container network namespace (not with
 `--network host`, where the host's `net.ipv4.ip_unprivileged_port_start`
-applies). The relative ACME storage, `rxh-data/certificates`, lands in
-`/var/lib/rxh`: keep it on a volume.
+applies).
+
+The images ship no configuration. Relative paths of the configuration are
+taken from its directory, `/etc/rxh`, which is mounted read-only: the
+default ACME storage (`/etc/rxh/rxh-data/certificates`) and users file
+(`/etc/rxh/rxh-data/users.toml`) cannot be written there. Point both at
+`/var/lib/rxh`, which belongs to UID 65532, and keep it on a volume:
+
+```toml
+[admin]
+users = "/var/lib/rxh/users.toml"
+
+[acme]
+storage = "/var/lib/rxh/certificates"
+```
 
 ```sh
 docker run -d --name rxh -p 80:80 -p 443:443 \
@@ -481,6 +524,14 @@ docker run -d --name rxh -p 80:80 -p 443:443 \
 docker exec rxh rxh status   # the admin API stays on 127.0.0.1:2019 inside
 docker kill -s HUP rxh       # reload
 ```
+
+To open the dashboard from outside the container, the admin API must listen
+on `0.0.0.0` and be published. A published port reaches the container from
+another address, so every request is remote, the host's own browser
+included: the listener needs `token` or `tls`. With `tls` and no `token`,
+the first user is created with the setup code of the log (`docker logs
+rxh`) or with `docker exec -it rxh rxh user add ana`; see
+[Docker](guides/docker.md#the-dashboard-from-outside-the-container).
 
 The Docker provider needs the socket mounted and readable by UID 65532
 (`--group-add` the group of the socket, or a socket proxy over TCP).
@@ -912,7 +963,7 @@ What a signed-in user without the `admin` role gets from each route
 - `GET /status` and `GET /stats/history` go by the `name` and the `groups`
   of the running configuration, hosts made by a provider (Docker, Consul,
   Kubernetes...) included; those take their groups from the `rxh.groups`
-  option and no editing route reaches them. A series is shown only when every running
+  option (Kubernetes hosts have none) and no editing route reaches them. A series is shown only when every running
   server that counts under it is viewed: two servers with the same name, or
   the requests that match no server of a shared listener, are shown to who
   views them all. A series is kept under its name for an hour, whatever
@@ -999,6 +1050,128 @@ curl -b jar -H "$ORIGIN" -X PUT -d '{"value": {}, "revision": "..."}' $API/confi
   "permissions": ["view", "modify", "create", "delete"]
 }
 ```
+
+#### Accounts and permissions, step by step
+
+How the pieces above fit together, from a fresh install to a user who
+manages its own hosts and nothing else.
+
+1. **HTTPS on the admin listener.** A password must not cross the network
+   in clear text, so people who sign in from other machines need `tls`.
+   Any certificate the browsers of those people trust will do; for a
+   test, a self-signed one:
+
+   ```sh
+   openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=rxh.example.com \
+     -addext subjectAltName=DNS:rxh.example.com \
+     -keyout /etc/rxh/admin.key -out /etc/rxh/admin.pem
+   ```
+
+2. **The configuration.** Without a `token`, the machine itself stays an
+   administrator (the CLI, `curl` on the machine) and everybody else signs
+   in. Put the users file where the daemon can write: next to the
+   configuration by default, which is read-only under the shipped systemd
+   unit and in the container images (see
+   [Running under systemd](#running-under-systemd) and
+   [Running in a container](#running-in-a-container)). Give the hosts
+   groups.
+
+   ```toml
+   [admin]
+   listen = "0.0.0.0:2019"
+   tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+   users = "/var/lib/rxh/users.toml"
+
+   [[server]]
+   name = "shop"
+   listen = "0.0.0.0:443"
+   host = "shop.example.com"
+   tls = "auto"
+   groups = ["web"]
+   forward = "127.0.0.1:8080"
+   ```
+
+3. **The first administrator.** At start, while the users file has no
+   user, the daemon writes a setup code to its log. Open
+   `https://rxh.example.com:2019/dashboard`: from another machine the page
+   asks for a name, a password and that code; from the machine itself it
+   needs no code. Or, on the machine:
+
+   ```sh
+   curl -k -d '{"name": "ana", "password": "correct horse"}' https://127.0.0.1:2019/auth/setup
+   rxh -c /etc/rxh/rxh.toml user add ana     # or this, with the daemon running or not
+   ```
+
+4. **Roles and users.** In the Users tab (or with `POST /roles` and
+   `POST /users`), make a role with grants on groups or on single hosts,
+   then a user with that role. The role `web-editors` with View, Modify
+   and Create on the group `web`, and the user `luis` with it, give luis
+   the hosts of `web` in Overview and Hosts, "New host" in `web`, and
+   nothing else.
+
+5. **Every day.** People sign in at `/dashboard`; a session lasts 12
+   hours. `rxh status`, `rxh reload` and the other commands keep working
+   on the machine over plain HTTP on the same port. `rxh user passwd`
+   is the way back in when a password is lost, and ends the sessions of
+   that user.
+
+What is not there:
+
+- **OIDC.** Sign-in through an identity provider (`[admin.oidc]`,
+  `public_url`) is the next step and does not exist yet: `oidc` in
+  `GET /auth/session` is always `false`. Until then, accounts are local
+  passwords only. No two-factor codes, no passkeys, no password reset by
+  e-mail: an administrator or `rxh user passwd` sets a new one.
+- **Sessions that outlive the daemon.** Sessions are kept in memory: a
+  restart, and a hot upgrade (`rxh upgrade`), sign everybody out. A
+  reload does not.
+- **ACME or client certificates on the admin listener.** `tls` in
+  `[admin]` takes files only (`"auto"` is refused); renew them with
+  your own tool and `rxh cert reload`.
+- **Live changes of `[admin]`.** `listen`, `token`, `tls` and `users`
+  are read at start; a reload keeps the ones the daemon started with
+  (it says so for `listen` and `token`, and says nothing for `tls` and
+  `users`). Restart to apply them.
+- **Permissions on anything but hosts.** Pools, certificates, the other
+  sections, whole files, reload and stop are for administrators.
+- **Groups on Kubernetes hosts.** Docker, Podman, Swarm, Consul, Nomad
+  and etcd hosts take `rxh.groups`; Kubernetes Ingresses and routes carry
+  no such option, so their hosts are for administrators.
+
+Known limits:
+
+- **One writer at a time on the users file.** The daemon and `rxh user`
+  do not lock the file against each other: when both write at the same
+  moment, the last write wins and the other change is lost. A change
+  made by one is seen by the other at its next read (the daemon rereads
+  the file when its modification time changes).
+- **A local firewall redirect to the admin port is not seen.** RXH
+  refuses to proxy to its own admin API while no token is set, by the
+  address and port it connects to. A `nftables` or `iptables` rule of the
+  machine that redirects another port to the admin port hides that: set
+  a `token` on a machine with such rules.
+- **Modify is trust over the routing of a host.** A user with `modify`
+  may change the matchers around an entry an administrator protected (a
+  `match` entry with `serve` or `basic_auth`, for example: its `path` or
+  `host`), so that it matches nothing, and append an entry without
+  protection that takes its requests. The keys for administrators stay as
+  they are, but which requests reach them is the user's to change.
+- **Literal secrets in a host are visible to View.** A header value
+  written as it is in `request.headers` (an API key for the backend, for
+  example) is shown to every user with `view` on the host, in the form
+  and the TOML. Put such values in an `{env.NAME}` or `{file.PATH}`
+  placeholder: the user sees the placeholder, not the value, and cannot
+  point the host elsewhere.
+- **The form does not know the allow list.** Without the `admin` role
+  the host form still shows every field; a change to a key for
+  administrators is refused by the daemon when saving, `403` with the
+  path of the key, shown next to the form.
+- **The sign-in limits count per address.** Clients behind one address
+  (a NAT, a proxy on the machine) share them, and an IPv6 network gives
+  one client many addresses.
+- **The page reads the session when it opens.** A role given or taken
+  away shows in the page at its next load; the daemon applies it at the
+  next request.
 
 ### Dashboard
 
