@@ -22,7 +22,7 @@ use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::access::Store;
+use crate::access::{self, Store};
 use crate::acme;
 use crate::admin::{self, AdminState, Control, Current};
 use crate::catalog;
@@ -358,7 +358,10 @@ impl Daemon {
         // tens of milliseconds, in which the servers would answer and the
         // admin API would not.
         let sessions = Sessions::new();
-        let access = Store::open(PathBuf::from(&admin_settings.users));
+        let access = Store::open(access::users_file(
+            self.config_path(),
+            &admin_settings.users,
+        ));
         // QUIC sockets outlive generations, see `http3`.
         let endpoints = Endpoints::default();
         let mut generation = Generation::start(

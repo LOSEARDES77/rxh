@@ -11,7 +11,8 @@ Changed.
 
 - `[admin] tls = { cert, key }` for HTTPS on the admin listener (`"auto"` is
   rejected there), `[admin] users` naming the file of admin API accounts
-  (default `"rxh-data/users.toml"`), and `groups` on a `[[server]]`, the
+  (default `"rxh-data/users.toml"`, relative to the directory of the
+  configuration file), and `groups` on a `[[server]]`, the
   groups admin API roles grant permissions on. A non-loopback admin
   `listen` now accepts `tls` in place of `token`.
 - `rxh.groups=web,customers` on a Docker container (label), a Consul or

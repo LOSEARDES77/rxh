@@ -550,6 +550,18 @@ impl Scope {
     }
 }
 
+/// The file `[admin] users` names, for the configuration file at `config`
+/// (`None` for a configuration without a file). A relative path is joined to
+/// the directory of that file, as `[acme] storage` is, so the daemon and
+/// `rxh user` find one file whatever their working directories.
+#[must_use]
+pub fn users_file(config: Option<&Path>, users: &str) -> PathBuf {
+    config
+        .and_then(Path::parent)
+        .unwrap_or(Path::new(""))
+        .join(users)
+}
+
 /// The users file, reread when its modification time changes, so that edits
 /// made by another process (the CLI) apply.
 pub struct Store {
@@ -661,6 +673,26 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn a_relative_users_file_is_next_to_the_configuration_file() {
+        let config = Path::new("/etc/rxh/rxh.toml");
+        assert_eq!(
+            users_file(Some(config), "rxh-data/users.toml"),
+            Path::new("/etc/rxh/rxh-data/users.toml")
+        );
+        assert_eq!(
+            users_file(Some(config), "/var/lib/rxh/users.toml"),
+            Path::new("/var/lib/rxh/users.toml")
+        );
+        // A bare file name, or no file at all: the working directory.
+        let relative = Path::new("rxh-data/users.toml");
+        assert_eq!(
+            users_file(Some(Path::new("rxh.toml")), "rxh-data/users.toml"),
+            relative
+        );
+        assert_eq!(users_file(None, "rxh-data/users.toml"), relative);
+    }
 
     fn names(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()

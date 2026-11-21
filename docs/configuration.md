@@ -493,7 +493,7 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token` or `tls`. Changes need a restart. |
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
 | `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
-| `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API, relative to the working directory of the daemon. Must not be empty. Changes need a restart. |
+| `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API. A relative path is relative to the directory of the configuration file, like `[acme] storage`, so the daemon and `rxh user` find the same file wherever they run. Must not be empty. Changes need a restart. In the container images the configuration directory is not writable: set an absolute path on the volume, `users = "/var/lib/rxh/users.toml"`. |
 
 On a unix socket the API is reachable only by the user running the daemon
 (and root): the file is created with mode `0600`, a socket left behind by a
@@ -761,12 +761,13 @@ code is of no use any more. There are no default credentials.
 `rxh user` edits the users file directly, with or without a running
 daemon, so it is also the way back in when every password is lost. It
 reads `[admin] users` from the configuration file (`-c`, default
-`rxh.toml`) and, like the daemon, takes a relative path from the working
-directory: run it where the daemon runs. The rules are the ones of the
-routes below, and their refusals are printed as they are.
+`rxh.toml`) and, like the daemon, takes a relative path from the directory
+of that file: give it the `-c` the daemon runs with, from any directory.
+The rules are the ones of the routes below, and their refusals are printed
+as they are.
 
 ```sh
-rxh user add ana                    # the first user gets the admin role
+rxh -c /etc/rxh/rxh.toml user add ana   # the first user gets the admin role
 rxh user add luis --role web-editors --role shop
 rxh user list                       # "ana admin", "luis web-editors,shop"
 rxh user passwd ana

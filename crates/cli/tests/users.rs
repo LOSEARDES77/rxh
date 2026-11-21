@@ -167,10 +167,16 @@ impl Drop for Daemon {
 
 /// Starts `rxh run` in `directory` and waits for its admin API.
 async fn start_daemon(directory: &Path, admin: SocketAddr) -> Daemon {
+    start_daemon_with(directory, &[], admin).await
+}
+
+/// Starts `rxh run ARGS` in `directory` and waits for its admin API.
+async fn start_daemon_with(directory: &Path, args: &[&str], admin: SocketAddr) -> Daemon {
     let daemon = Daemon(
         Command::new(RXH)
             .current_dir(directory)
             .arg("run")
+            .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -266,4 +272,25 @@ async fn passwd_ends_the_sessions_of_a_running_daemon() {
     let cookie = cookie.expect("a session cookie");
     let (status, _) = call(admin, Method::GET, "/users", String::new(), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_users_file_is_next_to_the_configuration_whatever_the_working_directory() {
+    let admin = free_address();
+    let directory = directory(admin);
+    let config = directory.path().join("rxh.toml");
+    let config = config.to_str().unwrap();
+    let (daemon_cwd, cli_cwd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let _daemon = start_daemon_with(daemon_cwd.path(), &["-c", config], admin).await;
+
+    succeeds(&user(
+        cli_cwd.path(),
+        &["-c", config, "add", "ana"],
+        "password-ana\n",
+    ));
+    assert!(users(directory.path()).verify("ana", "password-ana"));
+    assert!(!cli_cwd.path().join("rxh-data").exists());
+    let (status, _) = sign_in(admin, "ana", "password-ana").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!daemon_cwd.path().join("rxh-data").exists());
 }
