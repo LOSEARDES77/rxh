@@ -13,9 +13,33 @@ export class ApiError extends Error {
   }
 }
 
-const tokenWanted = writable(false);
+/** Reads a key of a storage of the browser: null where the browser blocks it. */
+export function kept(storage: () => Storage, key: string): string | null {
+  try {
+    return storage().getItem(key);
+  } catch {
+    return null;
+  }
+}
 
-/** True after the API answered 401, until a token is given. */
+/** Keeps `value` under a key, or drops the key for null; nothing where the browser blocks it. */
+export function keep(storage: () => Storage, key: string, value: string | null): void {
+  try {
+    if (value === null) {
+      storage().removeItem(key);
+    } else {
+      storage().setItem(key, value);
+    }
+  } catch {
+    // Blocked storage: the page works, and forgets at the next load.
+  }
+}
+
+const tokenWanted = writable(false);
+let signedOut = false;
+tokenWanted.subscribe((wanted) => (signedOut = wanted));
+
+/** True after the API answered 401, until a token is given or somebody signs in. */
 export const needsToken: Readable<boolean> = readonly(tokenWanted);
 
 /**
@@ -28,14 +52,28 @@ const tokensGiven = writable(0);
 
 /** Keeps the token for this browser tab and sends it from now on. */
 export function setToken(token: string): void {
-  sessionStorage.setItem(TOKEN_KEY, token);
+  keep(() => sessionStorage, TOKEN_KEY, token);
+  authorized();
+}
+
+/** Sends no token from now on: the cookie of a session says who asks. */
+export function forgetToken(): void {
+  keep(() => sessionStorage, TOKEN_KEY, null);
+}
+
+/**
+ * Says the caller may be somebody else now (a token, a sign-in): the 401 is
+ * forgotten and what `loadWithToken` watches is read again.
+ */
+export function authorized(): void {
   tokenWanted.set(false);
   tokensGiven.update((count) => count + 1);
 }
 
 /**
- * Calls `load` now, and again each time a token is given: what a tab reads
- * once was refused without it. Returns what stops it, for `onMount`.
+ * Calls `load` now, and again each time a token is given or somebody signs
+ * in: what a tab reads once was refused before. Returns what stops it, for
+ * `onMount`.
  */
 export function loadWithToken(load: () => void): () => void {
   return tokensGiven.subscribe(() => load());
@@ -49,8 +87,10 @@ export async function api<T>(
   path: string,
   init: { method?: string; body?: unknown } = {},
 ): Promise<T> {
+  // After a 401 only the way in is asked: the polls of the page wait for a sign-in.
+  if (signedOut && !path.startsWith("auth/")) throw new ApiError(401, "Signed out.");
   const headers: Record<string, string> = {};
-  const token = sessionStorage.getItem(TOKEN_KEY);
+  const token = kept(() => sessionStorage, TOKEN_KEY);
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
@@ -66,6 +106,8 @@ export async function api<T>(
     }
     throw new ApiError(response.status, await errorText(response));
   }
+  // The routes of the accounts answer 204: there is nothing to parse.
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 

@@ -35,13 +35,82 @@ docker kill -s HUP rxh         # reload after editing rxh.toml
 - Host names in `backends` are resolved on every connection, so the names
   of other containers on the same Docker network work, and follow the
   containers when they are recreated.
-- `/var/lib/rxh` is the working directory: ACME certificates land there, so
-  keep it on a volume.
+- The image ships no configuration, and relative paths of yours are taken
+  from `/etc/rxh`, which belongs to root in the image: only the
+  configuration file is mounted into it, and the user of the image cannot
+  create anything there. Put what the daemon writes,
+  the ACME certificates and the admin accounts, in `/var/lib/rxh` (it
+  belongs to the user of the image) and keep that on a volume, as
+  `-v rxh-data:/var/lib/rxh` does above:
+
+  ```toml
+  [admin]
+  users = "/var/lib/rxh/users.toml"
+
+  [acme]
+  storage = "/var/lib/rxh/certificates"
+  ```
+
+  Without that, ACME cannot store its certificates and the first admin
+  account cannot be created.
 - The admin API stays on `127.0.0.1:2019` inside the container; use
   `docker exec` to reach it.
 
 See [Running in a container](../configuration.md#running-in-a-container) for
 the tags and variants.
+
+### The dashboard from outside the container
+
+With the default `listen`, `127.0.0.1:2019`, `docker exec rxh rxh status`
+comes from inside the container, which counts as the machine itself: it is
+an administrator without a token. A published port needs the admin API on
+`0.0.0.0`, with a `token` or `tls`, and there nobody is an administrator
+for where it connects from, `docker exec` included. A published port
+usually reaches the container from another address (the bridge gateway, or
+the client itself), but not always: rootless Podman can connect from the
+container's own address and `kubectl port-forward` from loopback, for every
+client. So on such a listener every caller needs the token or a session.
+
+With `tls`, people sign in with accounts. Mount a certificate next to the
+configuration:
+
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+users = "/var/lib/rxh/users.toml"
+
+[acme]
+storage = "/var/lib/rxh/certificates"
+
+[[server]]
+listen = "0.0.0.0:80"
+forward = "app:8080"
+```
+
+```sh
+docker run -d --name rxh -p 80:80 -p 2019:2019 \
+  -v "$PWD/rxh.toml:/etc/rxh/rxh.toml:ro" \
+  -v "$PWD/admin.pem:/etc/rxh/admin.pem:ro" \
+  -v "$PWD/admin.key:/etc/rxh/admin.key:ro" \
+  -v rxh-data:/var/lib/rxh \
+  ghcr.io/loseardes77/rxh
+docker logs rxh | grep 'setup code'      # for the first account, from the page
+docker exec -it rxh rxh user add ana     # or create it here instead
+```
+
+Then open `https://HOST:2019/dashboard`. The key must be readable by UID
+65532. Until the first account exists the page asks for the setup code of
+the log; after that, for a name and a password. `docker exec rxh rxh
+status` and the other commands that talk to the daemon now answer `401`:
+add a `token` to `[admin]` to keep using them (they read it from the
+configuration file), while `rxh user` needs none. Sessions live in memory:
+recreating or restarting the container signs everybody out, the accounts
+stay on the volume.
+
+With a `token` instead of `tls`, the page asks for the token ("Use the admin
+token"), and the API is plain HTTP: keep it on a private network or behind
+an SSH tunnel. See [Accounts](../configuration.md#accounts).
 
 ## Routes from container labels
 

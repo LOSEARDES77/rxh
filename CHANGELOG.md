@@ -9,6 +9,115 @@ Changed.
 
 ### Added
 
+- `[admin] tls = { cert, key }` for HTTPS on the admin listener (`"auto"` is
+  rejected there), `[admin] users` naming the file of admin API accounts
+  (default `"rxh-data/users.toml"`, relative to the directory of the
+  configuration file), and `groups` on a `[[server]]`, the
+  groups admin API roles grant permissions on. A non-loopback admin
+  `listen` now accepts `tls` in place of `token`.
+- `rxh.groups=web,customers` on a Docker container (label), a Consul or
+  Nomad service (tag) or an etcd instance (`groups` key) sets the `groups`
+  of its server, so the users whose roles grant View on one of them see
+  the host in the admin API; the replicas of a pool merge their groups. An
+  invalid group name ignores the container and reports it, like any bad
+  label. Kubernetes hosts have no such option.
+- The admin listener speaks TLS with `[admin] tls`: HTTPS and plain HTTP on
+  one port, told apart by the first byte of the connection. Plain HTTP is
+  answered only to connections from the machine itself, so the CLI works
+  unchanged, and a connection has 10 seconds to send its first byte and
+  finish the handshake. `POST /certificates/reload` reads the admin certificate again
+  too, and a certificate file that cannot be read stops the start. A request
+  without a token is local, and served, only when its connection comes from
+  the machine (unix socket, loopback peer, or the machine calling its own
+  address) besides the `Host` and `Origin` rule: headers alone no longer
+  decide. On a `listen` that is not a loopback address nobody is trusted
+  for where it connects from, since a port forwarder can make every client
+  look like the machine: every caller needs the token or a session, the
+  first user needs the setup code, the token or `rxh user add`, and the
+  `rxh` commands need `token`. A connection to the admin API has 30
+  seconds to send the head of each request.
+- Accounts on the admin API: `POST /auth/login` signs a user of the users
+  file in with a session cookie (`rxh_session`, `HttpOnly`,
+  `SameSite=Strict`, `Secure` over HTTPS; 12 hours, in memory),
+  `POST /auth/logout` ends it, `PUT /auth/password` changes one's own
+  password and `GET /auth/session` says who the caller is. While no user
+  exists `POST /auth/setup` creates the first administrator: for the token,
+  for a request from the machine, or on a `tls` listener without a token
+  with the setup code the daemon logs at start. Five failed sign-ins for a
+  name from one address lock that pair for a minute and an address gets 10
+  attempts a minute whatever the names (`429`; an IPv6 client is its /64),
+  at most 4 passwords are checked at a time (the others wait up to 5
+  seconds, and a wait that runs out is not a failure of the name), a user
+  keeps at most 10 sessions, a cookie request that
+  changes something needs an `Origin` equal to its `Host`, and sign-in,
+  sign-out and setup refuse an `Origin` that is not their `Host`.
+  The token and a request from the machine without a token stay
+  administrators. Every route now passes one gate that refuses by default:
+  a signed-in user without the `admin` role gets `403` on the admin routes.
+- Managing accounts through the admin API, for administrators: `GET`,
+  `POST /users`, `PUT`, `DELETE /users/{name}`, and `GET`, `POST /roles`,
+  `PUT`, `DELETE /roles/{name}`. A refusal of the users file rules (the
+  last administrator, a role in use, a taken or invalid name) is `409` with
+  its reason, an unknown name `404`. Removing a user or setting its
+  password ends its sessions, a role change applies to the next request,
+  and every change is logged with who made it.
+- `rxh user list|add|passwd|rm` edits the accounts of `[admin] users`
+  directly, with or without a running daemon: the way back in when every
+  password is lost. The first user added gets the `admin` role; passwords
+  are asked twice without echo on a terminal, or read from standard input.
+  A password changed outside the daemon (`rxh user passwd`, a hand edit)
+  now ends the sessions of that user too. `rxh user` reads only `[admin]
+  users` of the configuration file and replaces no placeholder, so it
+  works without the environment of the service.
+- A reload that changes any key of `[admin]` (not only `listen` and
+  `token`) says in the log that the change waits for a restart.
+- The dashboard signs in. It reads `GET /auth/session` first: where the
+  caller is nobody it shows a sign-in form (name and password, or the admin
+  token behind "Use the admin token"), and while no user exists the form
+  that creates the first one, with the setup code where the daemon asks for
+  it; an administrator of the machine or of the token can leave that form
+  for later. A signed-in user has its name, "Change password" and "Sign
+  out" in the header. Without the `admin` role the page shows the Overview
+  and Hosts tabs only, without pools and certificates, and in Hosts what
+  the permissions of each host allow: "New host" with a group to create in
+  (the form starts in the first one), saving and the TOML view with
+  `modify`, "Delete" with `delete`; a host that is only viewed opens as a
+  read-only form. The hosts list has a Groups column. A `401` at any time
+  brings the sign-in form over the page and keeps what is typed in an open
+  form; a refused key of a save shows its path next to the form.
+- The dashboard has a Users tab, for administrators: the users with a
+  checkbox per role, "Set password" and "Remove", "New user"; the roles with
+  their grants, "New role", "Edit" (a row per grant on a group or a host,
+  whose name is offered from the servers of the files or typed, and View,
+  Modify, Create, Delete: ticking one of the last three ticks View, Create
+  is disabled on a host) and "Remove". A refusal of the daemon is shown next
+  to its row or form, which keeps what was typed; removing, and taking
+  `admin` from oneself, ask first. A local administrator whose cookie
+  expired no longer keeps a sign-in form it cannot close, and the Overview
+  no longer reports "Signed out." while the sign-in form is up.
+- Grants on hosts: a signed-in user without the `admin` role now reads and
+  changes the hosts its roles reach. `GET /config/files` gives it the
+  servers it has `view` on, the names of the pools and the revision of each
+  file (no text, no path, no section); `POST`, `PUT` and `DELETE
+  /config/entities/server` need `create` on every group of a new host,
+  `modify` or `delete` on an existing one, and the `admin` role to change a
+  name or take one a grant names; `GET /status` and `GET /stats/history`
+  show only the servers with `view` and no pool; `GET /schema` answers every
+  signed-in user. A host without `view` answers `404` like one that does not
+  exist, a stale revision `409` with a fixed text, and pools, sections and
+  whole files stay for administrators. Each server entity of
+  `GET /config/files` has `permissions`, what the caller may do with it.
+  Such a user sets only the keys of a host that route or answer its
+  traffic (matchers, `forward` and the routing of an inline pool,
+  `redirect`, `rewrite`, headers, `cors`, `encode`, `rate_limit`, IP lists,
+  `tls = "auto"`): any other key (`serve`, `error_pages`, `forward_auth`,
+  health `hooks`, certificate files, `trusted_proxies`, `basic_auth`...)
+  keeps the value it has in the file, and a change to one is `403` with the
+  path of the key. It sets no `{env.NAME}` or `{file.PATH}` placeholder, no
+  unix socket as a forward target, no `listen` address that is not listened
+  on already, and a new host needs a `host`. A host whose table has a
+  placeholder keeps its forward targets, so the value does not reach a
+  backend the user chose.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on
@@ -53,7 +162,7 @@ Changed.
   ready; reload, certificate reload, upgrade and stop have a control. With
   `[admin] token` the page and its two assets are served without the token
   and ask for it before reading any data. `/dashboard/` redirects to
-  `/dashboard`. No certificate upload and no accounts.
+  `/dashboard`. No certificate upload.
 - Admin routes behind the page: `GET /schema`, `GET /stats/history` (one
   sample every 5 seconds, 720 kept, in memory; `?since=<unix seconds>`
   sends only the newer ones, which is what the page polls), `GET /config/files`,
@@ -437,6 +546,54 @@ Changed.
   first. Servers sharing a listen address must agree on `http3`, and
   `http3 = true` on the UDP port of a `udp` server is a validation error.
   See [HTTP/3](docs/configuration.md#http3).
+- `[admin] public_url` and `[admin.oidc]` (`issuer`, `client_id`,
+  `client_secret`, `scopes`, `groups_claim`, `name_claim`, `roles`), the
+  settings of sign-in through an OpenID Connect provider, read and checked
+  at start: `https` URLs (or `http` on loopback), `openid` among the
+  scopes, valid role names, `public_url` set, and `tls` or a loopback or
+  unix socket `listen`. `client_secret` is shown as `***` like the other
+  secrets. `issuer` is kept as it is written, a trailing `/` included,
+  since the `iss` of the provider has to equal it; `issuer` and
+  `public_url` with a user or a password in them are rejected. See
+  [OpenID Connect](docs/configuration.md#openid-connect).
+- Sign-in through an OpenID Connect provider: `GET /auth/oidc/login` sends
+  the browser to the provider (authorization code flow with PKCE `S256`,
+  `state`, `nonce`, and a cookie that ties the flow to the browser that
+  started it), and `GET /auth/oidc/callback` exchanges the code, checks
+  `iss`, `aud` (and `azp`), `exp` and `nonce` of the ID token, gives the
+  roles `[admin.oidc] roles` maps the groups of the user to, and starts a
+  12 hour session. A user without a mapped role is refused with a page that
+  names it and its groups. Every request to the provider has 10 seconds and
+  1 MiB, goes over TLS (plain HTTP on a loopback address only) and follows
+  no redirect; `[admin.oidc] ca` names a PEM file of root certificates for
+  a provider behind a private authority. Starting a flow counts against
+  the 10 sign-in attempts a minute of a client address. A user of the provider is not the local user of the same name:
+  it has only its mapped roles and no password here (`PUT /auth/password`
+  answers `403`). `GET /auth/session` gains `oidc_issuer` and `local`. See
+  [Signing in through a provider](docs/configuration.md#signing-in-through-a-provider).
+- The dashboard offers the provider: "Sign in with" the host of the
+  issuer on the sign-in form, no "Change password" for a user of the
+  provider, and a note in the Users tab that those users are not listed.
+  Over plain HTTP where no password is taken, the sign-in form says to
+  open the page over https, with the link, instead of a form that would be
+  refused (only where the listener has `tls`: without it there is no https
+  to open); `GET /auth/session` says `setup_needs_code: true` there too.
+- Documentation of sign-in through a provider: a worked example for a
+  self-hosted provider (confidential client, redirect URI, a `groups`
+  claim, `ca` for a private authority) and what is not there (one
+  provider, no check of the ID token's signature and why, no single
+  sign-out, no refresh, roles of sign-in time for 12 hours). The admin
+  section says that `kubectl port-forward` reaches a loopback listener
+  without a token as an administrator, and that a token sent to `http://`
+  through a forwarder that crosses the network travels in clear.
+- `GET /auth/oidc/login` refuses what the page of another site makes a
+  browser send (`Sec-Fetch-Site: cross-site`, or a `Sec-Fetch-Dest` other
+  than `document`) with `403`, before it counts as a sign-in attempt or
+  starts a flow: another site could spend the 10 attempts a minute of the
+  address, passwords included. An `http://` `public_url`
+  with a `listen` that is not loopback or a unix socket is a validation
+  error: use `https://`. The log names a user of the provider as
+  `"name" (oidc)`, escaped, in the sign-out line too.
 
 ### Deprecated
 
@@ -446,6 +603,13 @@ Changed.
 
 ### Changed
 
+- The daemon's log line with the setup code says `to create the first one
+  over HTTPS use the setup code`, no longer "from another machine": on a
+  listener that is not loopback the machine itself needs the code too.
+- On an admin listener with `tls` and without `token`, a request from
+  another machine is no longer refused with `403` on every route: the
+  dashboard and the `/auth` routes answer it, so that people can sign in,
+  and every other route answers `401` until they have.
 - Without `[admin] token`, the admin API on a unix socket now refuses with
   `403` a request whose `Host` is not `localhost`, `127.0.0.1` or `::1`, as
   the TCP listener already did: once the socket is forwarded to a local
@@ -552,6 +716,32 @@ Changed.
   already in use" and keep the old configuration: the stopped listener
   reported its shutdown while its sessions still held the socket. The
   sessions now end before the listener reports that it has stopped.
+- Documentation: the container images and the systemd unit cannot write
+  next to the configuration, where the ACME storage and the users file go
+  by default (`/etc/rxh/rxh-data`); the container docs said the ACME
+  storage landed in `/var/lib/rxh`. The Docker guide, the reference and
+  the `Dockerfile` now say to set `[acme] storage` and `[admin] users` to
+  `/var/lib/rxh`, and the reference gives the systemd drop-in
+  (`StateDirectory=rxh`). The reference has an "Accounts and permissions,
+  step by step" section with what is not there yet and the known limits.
+
+### Security
+
+- Without `[admin] token` the proxy no longer connects to the admin API of
+  its own process. A request from the machine is an administrator there, so
+  a forward target, pool member, health check, mirror, `forward_auth`,
+  webhook or tracing endpoint that led to the admin API (its `listen`
+  address, a loopback address or a name resolving to one with the admin
+  port, an address of the machine when the API listens on `0.0.0.0` or
+  `::`, or the admin unix socket under any name) gave administrator access
+  to whoever reached that host. Such a connection is now refused like one
+  the backend refuses (`502`, failed member) and logged once a minute at
+  most. With a `token` nothing changes: the admin API can still be
+  published through a host.
+- `rxh config show` masks `[admin] token`, the `client_secret` of
+  `[admin.oidc]` and the DNS provider credentials as `***` also when it
+  reads the files because no daemon answers. It printed them as written
+  there.
 
 ## 0.2.0 (unreleased)
 

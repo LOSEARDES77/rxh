@@ -12,6 +12,7 @@ use rxh_core::config::{
 use rxh_core::pool::{self, Pool};
 use tokio::task::JoinSet;
 
+use crate::admin_guard::AdminGuard;
 use crate::dynamic;
 use crate::error::Error;
 use crate::health;
@@ -38,7 +39,7 @@ pub struct Group {
 impl Group {
     /// `runtimes` is the number of runtimes that keep their own upstream
     /// connections.
-    fn new(pool: Pool, runtimes: usize) -> Result<Self, Error> {
+    fn new(pool: Pool, runtimes: usize, guard: AdminGuard) -> Result<Self, Error> {
         let body = pool
             .settings()
             .health
@@ -51,7 +52,7 @@ impl Group {
                 })?),
                 None => None,
             };
-        let dialer = Dialer::new(pool.settings())
+        let dialer = Dialer::new(pool.settings(), guard)
             .map(Arc::new)
             .map_err(|err| invalid(format!("upstream {}: tls: {err}", pool.name())))?;
         let transport = Transport::new(pool.settings(), Arc::clone(&dialer), runtimes);
@@ -68,6 +69,7 @@ impl Group {
 #[derive(Debug, Default)]
 pub struct Registry {
     groups: BTreeMap<String, Arc<Group>>,
+    guard: AdminGuard,
 }
 
 impl Registry {
@@ -76,6 +78,7 @@ impl Registry {
     pub fn build(config: &Config) -> Result<Self, Error> {
         let mut groups = BTreeMap::new();
         let runtimes = per_core::count(config.runtime);
+        let guard = AdminGuard::new(&config.admin);
 
         // Pools that serve UDP servers cannot have unix socket members.
         let mut udp_pools = BTreeSet::new();
@@ -108,7 +111,10 @@ impl Registry {
 
         for (name, group) in &config.upstreams {
             let pool = pool_for(name, group)?;
-            groups.insert(name.clone(), Arc::new(Group::new(pool, runtimes)?));
+            groups.insert(
+                name.clone(),
+                Arc::new(Group::new(pool, runtimes, guard.clone())?),
+            );
         }
 
         for (server_index, server) in config.servers.iter().enumerate() {
@@ -116,12 +122,12 @@ impl Registry {
                 if let Action::Forward(Forward::Inline(group)) = &pattern.action {
                     let name = Self::inline_name(server_index, server, pattern_index);
                     let pool = pool_for(&name, group)?;
-                    groups.insert(name, Arc::new(Group::new(pool, runtimes)?));
+                    groups.insert(name, Arc::new(Group::new(pool, runtimes, guard.clone())?));
                 }
             }
         }
 
-        Ok(Self { groups })
+        Ok(Self { groups, guard })
     }
 
     /// Name given to the inline group of a pattern.
@@ -169,6 +175,12 @@ impl Registry {
                 })
             }
         }
+    }
+
+    /// What the connections of this configuration keep away from, for the
+    /// dialers outside the pools.
+    pub(crate) fn guard(&self) -> &AdminGuard {
+        &self.guard
     }
 
     /// Looks up a group by name.

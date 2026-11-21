@@ -5,8 +5,11 @@
 //! [`rxh_core`]. This crate puts them on the network with [`tokio`] and
 //! [`hyper`].
 
+pub mod access;
 mod acme;
 mod admin;
+mod admin_guard;
+mod auth_api;
 mod catalog;
 mod change;
 mod config_api;
@@ -24,6 +27,7 @@ pub mod fuzzing;
 mod health;
 mod history;
 mod hooks;
+mod host_keys;
 mod http;
 mod http3;
 mod include;
@@ -33,11 +37,13 @@ mod log;
 mod master;
 mod metrics;
 mod ocsp;
+mod oidc;
 mod per_core;
 mod proxy_protocol;
 mod registry;
 mod secret;
 mod server;
+mod session;
 #[cfg(target_os = "linux")]
 mod splice;
 mod stream;
@@ -50,6 +56,8 @@ mod udp;
 mod upgrade;
 mod upstream;
 
+#[doc(hidden)]
+pub use admin::{Audience, ROUTES as ADMIN_ROUTES};
 pub use daemon::{Daemon, config_files, load_config};
 pub use error::Error;
 pub use include::covers as include_covers;

@@ -70,6 +70,35 @@ pub async fn send(admin: SocketAddr, method: Method, uri: &str, body: &str) -> (
     (status, json)
 }
 
+/// The `name=value` of the session cookie a response sets.
+pub fn session_cookie(headers: &HeaderMap) -> String {
+    let cookie = headers[header::SET_COOKIE].to_str().expect("text");
+    cookie.split(';').next().expect("a pair").to_owned()
+}
+
+/// [`call`] with a session cookie and the `Origin` the dashboard sends.
+pub async fn call_with_cookie(
+    admin: SocketAddr,
+    cookie: &str,
+    method: Method,
+    uri: &str,
+    body: &str,
+) -> (StatusCode, HeaderMap, Value) {
+    let origin = format!("http://{admin}");
+    let headers = [(header::COOKIE, cookie), (header::ORIGIN, origin.as_str())];
+    call(admin, method, uri, body, &headers).await
+}
+
+/// Signs in with a password: status, headers and JSON body.
+pub async fn sign_in(
+    admin: SocketAddr,
+    name: &str,
+    password: &str,
+) -> (StatusCode, HeaderMap, Value) {
+    let body = serde_json::json!({ "name": name, "password": password }).to_string();
+    call(admin, Method::POST, "/auth/login", &body, &[]).await
+}
+
 /// Starts a daemon on the configuration file and waits for its admin API.
 pub async fn start(
     config_path: &Path,

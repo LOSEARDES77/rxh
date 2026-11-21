@@ -11,9 +11,11 @@
 # Run:    docker run -p 80:80 -v $PWD/rxh.toml:/etc/rxh/rxh.toml:ro rxh
 #
 # Every variant runs as UID 65532 with the configuration at /etc/rxh/rxh.toml
-# (RXH_CONFIG) and /var/lib/rxh as working directory, where the relative ACME
-# storage `rxh-data/certificates` lands: mount a volume there to keep
-# certificates. The arguments are an `rxh` command, `run` by default.
+# (RXH_CONFIG) and /var/lib/rxh, owned by that user, as working directory.
+# Relative paths of the configuration are taken from /etc/rxh, read-only when
+# mounted: set `[acme] storage = "/var/lib/rxh/certificates"` and `[admin]
+# users = "/var/lib/rxh/users.toml"`, and mount a volume on /var/lib/rxh to
+# keep them. The arguments are an `rxh` command, `run` by default.
 
 FROM rust:1-slim-bookworm AS build-gnu
 WORKDIR /src

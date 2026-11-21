@@ -217,6 +217,26 @@ written against an older snapshot: their line numbers and percentages are stale,
     reload that removes one host and asserts only it disappears.
 12. **`crates/bench` (16%): excluded.** A benchmark tool, not shipped with the proxy; the CI coverage
     gate leaves it out with `--ignore-filename-regex 'crates/bench/'`.
+13. **Accounts and permissions (new, not in the measured numbers above).** Integration tests against a
+    real daemon: `server/tests/accounts.rs` (setup, sign-in, sessions, limits, `/users`, `/roles`, the gate),
+    `server/tests/permissions.rs` (grants on every host route, the allow list of host keys, placeholders),
+    `server/tests/admin_tls.rs` (HTTPS and plain HTTP on one port), `server/tests/admin_ssrf.rs` (the proxy
+    refusing its own admin API), `cli/tests/users.rs` (`rxh user`); unit tests in `access.rs`, `session.rs`
+    and `host_keys.rs`; the page in Vitest (`ui/src/lib/session.test.ts`, `SignIn.test.ts`).
+    Untested by automation: a connection that is not from the machine (every test connects from loopback,
+    so the setup code over TLS, `password_login: false` and the closed plain HTTP connection are covered by
+    unit tests of the peer and by Vitest only), the `Secure` attribute of the cookie over TLS (checked by
+    hand), the admin guard on the `forward_auth`, health webhook and tracing dialers (only the forward,
+    health check and TCP paths have tests), and restoring the terminal echo of `rxh user` after `Ctrl-C`
+    (checked by hand).
+    Sign-in through a provider: `server/tests/oidc.rs` against the stand-in provider of
+    `util/src/oidc_provider.rs` (plain HTTP and HTTPS with `ca`: the flow, every claim check, the binding
+    cookie, limits, timeouts, oversized and redirected answers, no secret in answers or `GET /config`,
+    the refusal of a login sent by another site, the admin guard on its dialers; the log was checked by hand),
+    unit tests in `oidc.rs` and `config.rs`, the page in Vitest (`SignIn.test.ts`, `Users.test.ts`). Not
+    tested by automation: a real provider (none was used, by hand either), and the `Secure` attribute of
+    the binding cookie (unit test only); the flow in a browser over a `tls` admin listener was checked by
+    hand.
 
 ## 4. Structural recommendations
 
@@ -255,4 +275,5 @@ written against an older snapshot: their line numbers and percentages are stale,
 - [ ] Small modules: error, duration, cache, net, master, registry (gap 10).
 - [x] Decide bench policy (gap 12): excluded from the coverage gate.
 - [ ] TLS error paths and shared-listener failure isolation (gap 11).
+- [ ] Accounts: a non-local peer in an integration test, and the admin guard on every dialer (gap 13).
 - [x] HTTP/3: `crates/server/tests/http3.rs` (requests, limits, timeouts, client certificates, reload and stop drain). Not in the measured table above.

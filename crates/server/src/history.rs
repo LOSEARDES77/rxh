@@ -4,7 +4,7 @@
 //! [`CAPACITY`]. Like the metrics, the history is process wide: it outlives
 //! configuration reloads and the runtimes that serve the admin API.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -41,6 +41,15 @@ pub(crate) struct Sample {
     time: u64,
     servers: BTreeMap<String, ServerCounters>,
     pools: BTreeMap<String, PoolCounters>,
+}
+
+impl Sample {
+    /// Leaves the series of `servers` only, and no pool: what a caller
+    /// without the `admin` role gets.
+    pub(crate) fn keep_servers(&mut self, servers: &BTreeSet<String>) {
+        self.servers.retain(|server, _| servers.contains(server));
+        self.pools.clear();
+    }
 }
 
 /// The last [`CAPACITY`] samples, oldest first.
@@ -217,6 +226,7 @@ mod tests {
             config_path: None,
             listen: AdminListen::Tcp("127.0.0.1:0".parse().unwrap()),
             token: None,
+            tls: None,
             current: std::sync::RwLock::new(Current {
                 registry: Arc::new(Registry::build(&config).unwrap()),
                 config: Arc::new(config),
@@ -224,6 +234,10 @@ mod tests {
             }),
             control: mpsc::channel(1).0,
             saving: tokio::sync::Mutex::new(()),
+            hashing: admin::hashing_permits(),
+            access: crate::access::Store::open(std::path::PathBuf::new()),
+            sessions: crate::session::Sessions::new(),
+            oidc: None,
         })
     }
 

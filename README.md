@@ -84,7 +84,10 @@ pool web (least_conn)
 - **Hot binary upgrades** on Linux: `rxh upgrade` starts the new binary and
   hands it the listening sockets, without refusing a connection.
 - **Admin API** on `127.0.0.1:2019` (JSON), with Caddy compatible
-  `/reverse_proxy/upstreams`.
+  `/reverse_proxy/upstreams`, optional HTTPS, and a web dashboard with
+  accounts: first-run setup, roles with View, Modify, Create and Delete on
+  groups of hosts, sign-in through an OpenID Connect provider, and
+  `rxh user` for the way back in.
 - **HTTP done right**: keep-alive pools to backends, h2/h2c, WebSocket
   tunnels, hop-by-hop header stripping, `X-Forwarded-*` with
   `trusted_proxies`, RFC 7239 `Forwarded`, `Via`, header rules (`set`, `add`,
@@ -248,6 +251,7 @@ and [layer 4 (TCP and UDP)](docs/guides/layer4.md).
 | `rxh cert reload` | Read the certificate files again now (the daemon also does it within seconds of a change). |
 | `rxh policies` | List load balancing policies. |
 | `rxh hash-password` | Hash the password read from standard input, for `basic_auth` users. |
+| `rxh user list\|add\|passwd\|rm` | Manage admin API accounts in `[admin] users`, with or without a daemon: the way back in when every password is lost. |
 
 Global flags: `-c/--config` (`RXH_CONFIG`), `--admin` (`RXH_ADMIN`),
 `--pid-file`.
@@ -255,10 +259,17 @@ Global flags: `-c/--config` (`RXH_CONFIG`), `--admin` (`RXH_ADMIN`),
 ## Admin API
 
 JSON over HTTP on `[admin] listen`: a TCP address (default `127.0.0.1:2019`)
-or a unix socket (`unix//run/rxh/admin.sock`). Requests with a non-loopback
-`Host` or `Origin` are rejected, unless `[admin] token` is set: then every
-request needs `Authorization: Bearer <token>` and the API may listen on a
-reachable address.
+or a unix socket (`unix//run/rxh/admin.sock`), and HTTPS on the same port
+with `[admin] tls = { cert, key }`. Without `[admin] token`, a request from
+the machine itself (by the address of its connection, with a loopback
+`Host` and no foreign `Origin`) is an administrator, as the CLI is. Anybody
+else sends `Authorization: Bearer <token>`, or signs in with an account of
+`[admin] users`: roles grant View, Modify, Create and Delete on groups of
+hosts (`groups` on a `[[server]]`), and the first administrator is created
+on first use. People can also sign in through one OpenID Connect provider
+(`[admin.oidc]`), whose groups give them roles. A reachable `listen` needs
+`token` or `tls`. See [Accounts](docs/configuration.md#accounts) and
+[OpenID Connect](docs/configuration.md#openid-connect).
 
 | Method | Path | Action |
 |---|---|---|
@@ -270,7 +281,7 @@ reachable address.
 | `DELETE` | `/pools/{name}/upstreams` | Remove `{"address": "host:port"}` |
 | `GET` | `/metrics` | Prometheus metrics (text format 0.0.4) |
 | `GET` | `/certificates` | Certificates served, with expiry dates |
-| `GET` | `/dashboard` | Web UI: statistics of the last hour, hosts, pools, certificates and settings, with forms that save to the configuration file. Served without the token, with `/dashboard/app.js` and `/dashboard/app.css` |
+| `GET` | `/dashboard` | Web UI: statistics of the last hour, hosts, pools, certificates and settings, with forms that save to the configuration file, sign-in and a Users tab. Served without the token, with `/dashboard/app.js` and `/dashboard/app.css` |
 | `GET` | `/schema` | JSON schema of the configuration |
 | `GET` | `/stats/history` | One hour of counters, one sample every 5 seconds |
 | `GET` | `/config/files` | Configuration files and their tables, secrets as `***` |
@@ -284,6 +295,11 @@ reachable address.
 | `PATCH` | `/config/server/{name or index}` | Merge the body into one server |
 | `POST` | `/upgrade` | Hand the listening sockets to a new process running the binary on disk (Linux) |
 | `POST` | `/stop` | Graceful shutdown |
+| `GET` | `/auth/session` | Who the caller is |
+| `POST` | `/auth/login`, `/auth/logout`, `/auth/setup` | Sign in and out (session cookie), create the first user |
+| `GET` | `/auth/oidc/login`, `/auth/oidc/callback` | Sign in through the OpenID Connect provider of `[admin.oidc]` |
+| `PUT` | `/auth/password` | Change one's own password |
+| `GET`, `POST`, `PUT`, `DELETE` | `/users`, `/users/{name}`, `/roles`, `/roles/{name}` | Accounts and roles, for administrators |
 
 ```bash
 curl -s localhost:2019/pools/web | jq

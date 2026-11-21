@@ -106,7 +106,9 @@ include = ["conf.d/*.toml", "extra.toml"]
   the main file, or to `--file PATH` (relative to the main file directory),
   which is created if missing and added to `include` if not already covered.
 - `rxh config show [--json]` prints the effective merged configuration, from
-  the running daemon when reachable, else from the files.
+  the running daemon when reachable, else from the files. Either way
+  `[admin] token`, the `client_secret` of `[admin.oidc]` and the DNS
+  provider credentials are printed as `***`.
 
 ## Watching the files
 
@@ -175,7 +177,9 @@ forward = "@api"
   request placeholders and stay as they are.
 - `POST /load` and `PATCH` bodies are taken as sent, without placeholders.
 - `GET /config` and `rxh config show` print the replaced values. `[admin]
-  token` and the DNS provider credentials are shown as `***`; other secrets
+  token`, the `client_secret` of `[admin.oidc]` and the DNS provider
+  credentials are shown as `***`, also when `rxh config show` reads the
+  files because no daemon answers; other secrets
   placed in the configuration this way are visible to whoever can read the
   admin API.
 - The CLI commands that edit the files (`rxh upstream`, `rxh pool`,
@@ -418,6 +422,36 @@ then `READY=1` around every reload (`SIGHUP`, `rxh reload`, `watch`), with
 `STATUS=Reload failed: ...` when the new configuration is rejected (the
 previous one keeps running), and `STOPPING=1` on shutdown. No watchdog.
 
+The unit runs the daemon as a user systemd makes for it (`DynamicUser=yes`)
+with `ProtectSystem=strict` and no `WorkingDirectory` or `StateDirectory`:
+the daemon can write nowhere. `/etc/rxh` is readable and not writable, so
+the files that are relative to the directory of the configuration by
+default, the users file (`rxh-data/users.toml`) and the ACME storage
+(`rxh-data/certificates`), cannot be created there: the file system is
+read-only for the service, so creating the first user fails (`400` with the
+error of the system) and ACME cannot keep its certificates. Give the service a state directory with a drop-in and put
+both there:
+
+```ini
+# systemctl edit rxh
+[Service]
+StateDirectory=rxh
+```
+
+```toml
+[admin]
+users = "/var/lib/rxh/users.toml"
+
+[acme]
+storage = "/var/lib/rxh/certificates"
+```
+
+Create the first user through the daemon (the page, or `curl` on the
+machine to `POST /auth/setup`), so that the file belongs to the user of
+the service. `sudo rxh -c /etc/rxh/rxh.toml user ...` then works on it: a
+file it replaces keeps its owner. A users file that `rxh user` run as root
+creates belongs to root, mode `0600`, and the service cannot read it.
+
 With socket activation ([`dist/rxh.socket`](../dist/rxh.socket)), systemd
 binds the sockets and passes them in `LISTEN_FDS`. A listener whose `listen`
 address equals the local address of a passed socket of the same kind uses
@@ -470,8 +504,22 @@ validate`). Listeners must bind `0.0.0.0` (or `[::]`) to be reachable from
 outside the container; ports below 1024 work as the unprivileged user
 because Docker allows them in the container network namespace (not with
 `--network host`, where the host's `net.ipv4.ip_unprivileged_port_start`
-applies). The relative ACME storage, `rxh-data/certificates`, lands in
-`/var/lib/rxh`: keep it on a volume.
+applies).
+
+The images ship no configuration. Relative paths of the configuration are
+taken from its directory, `/etc/rxh`, which belongs to root in the image
+(only the configuration file is mounted into it): the user of the image
+cannot create the default ACME storage (`/etc/rxh/rxh-data/certificates`)
+and users file (`/etc/rxh/rxh-data/users.toml`) there. Point both at
+`/var/lib/rxh`, which belongs to UID 65532, and keep it on a volume:
+
+```toml
+[admin]
+users = "/var/lib/rxh/users.toml"
+
+[acme]
+storage = "/var/lib/rxh/certificates"
+```
 
 ```sh
 docker run -d --name rxh -p 80:80 -p 443:443 \
@@ -482,6 +530,18 @@ docker exec rxh rxh status   # the admin API stays on 127.0.0.1:2019 inside
 docker kill -s HUP rxh       # reload
 ```
 
+To open the dashboard from outside the container, the admin API must listen
+on `0.0.0.0` and be published: the listener needs `token` or `tls`. On
+such a listener nobody is an administrator for where it connects from, not
+even a command inside the container, because some port forwarders (rootless
+Podman, `kubectl port-forward`) make every outside client arrive from the
+container's own address or from loopback. Every caller needs the token or a
+session. With `tls` and no `token`, the first user is created with the
+setup code of the log (`docker logs rxh`) or with
+`docker exec -it rxh rxh user add ana`, and `rxh status` and the other
+commands that talk to the daemon need a `token` to be set as well; see
+[Docker](guides/docker.md#the-dashboard-from-outside-the-container).
+
 The Docker provider needs the socket mounted and readable by UID 65532
 (`--group-add` the group of the socket, or a socket proxy over TCP).
 
@@ -490,8 +550,12 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
-| `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token`. Changes need a restart. |
+| `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token` or `tls`, and there nobody is an administrator for where it connects from: every caller, the `rxh` commands on the machine included, needs the token or a session. Port 0 is for tests: RXH tells its own admin API from a backend by the configured port. Changes need a restart. |
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
+| `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
+| `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API. A relative path is relative to the directory of the configuration file, like `[acme] storage`, so the daemon and `rxh user` find the same file wherever they run. Must not be empty. Changes need a restart. In the container images the configuration directory is not writable: set an absolute path on the volume, `users = "/var/lib/rxh/users.toml"`. |
+| `public_url` | none | Address where browsers reach the admin API: an `https://` URL, or `http://` on a loopback address (`http://127.0.0.1:2019`), without a user, a password, a query or a fragment; a trailing `/` is removed. `http://` is accepted only with a `listen` that is a loopback address or a unix socket: on any other listener nobody signs in over plain HTTP, so use `https://` there. Required by `oidc`. Changes need a restart. |
+| `oidc` | none | Sign-in through an OpenID Connect provider, see [OpenID Connect](#openid-connect). Changes need a restart. |
 
 On a unix socket the API is reachable only by the user running the daemon
 (and root): the file is created with mode `0600`, a socket left behind by a
@@ -502,8 +566,8 @@ dead daemon is replaced, and the file is removed on shutdown.
 listen = "unix//run/rxh/admin.sock"
 ```
 
-For remote administration, listen on a reachable address and set a token.
-RXH refuses to start with a non-loopback `listen` and no token.
+For remote administration, listen on a reachable address and set a token
+or `tls`. RXH refuses to start with a non-loopback `listen` and neither.
 
 ```toml
 [admin]
@@ -511,13 +575,103 @@ listen = "10.0.0.5:2019"
 token = "kq3Zp0uX7mV9cR2tLw8yHs4d"   # for instance: openssl rand -base64 24
 ```
 
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+users = "/var/lib/rxh/users.toml"
+```
+
 ```sh
 curl -H "Authorization: Bearer kq3Zp0uX7mV9cR2tLw8yHs4d" http://10.0.0.5:2019/status
 rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 ```
 
-- Without a token, on TCP and on a unix socket alike, a request is refused
-  with `403` unless its `Host` is `localhost`, `127.0.0.1` or `::1` (or the
+- On a `listen` that is not a loopback address (`0.0.0.0` and `::`
+  included) nobody is an administrator for where it connects from. A port
+  forwarder in front of a container can connect from the container's own
+  address (rootless Podman) or from loopback (`kubectl port-forward`) for
+  every outside client, so the address of a connection proves nothing
+  there. Every caller needs the token or a session, a session needs HTTPS,
+  and the first user is created with the setup code, with the token or
+  with `rxh user add`. With `tls` and no `token`, `rxh status`, `rxh
+  reload` and the other commands that talk to the daemon get `401`: set a
+  `token` as well to use them (the CLI reads it from the configuration
+  file). `rxh user` needs none, it edits the users file. Only a listener
+  on a loopback address or a unix socket trusts the machine as described
+  below.
+
+- With `tls` the listener tells a TLS handshake from HTTP by the first byte
+  of each connection, so one port answers both. HTTPS (HTTP/1.1, TLS 1.2
+  and 1.3, the defaults of a server without `tls_options`) is for
+  everybody. Plain HTTP is answered only to a connection from the machine
+  itself; from anywhere else it is closed without an answer. So the CLI and
+  `curl` on the machine reach the API as without `tls`. On `listen =
+  "10.0.0.5:2019"`, not a loopback address, every caller sends the token or
+  a session, the machine included:
+
+  ```sh
+  H='Authorization: Bearer kq3Zp0uX7mV9cR2tLw8yHs4d'
+  curl -H "$H" https://10.0.0.5:2019/status   # from anywhere: HTTPS
+  curl -b jar https://10.0.0.5:2019/status    # or a session, see Accounts
+  curl -H "$H" http://10.0.0.5:2019/status    # on the machine: plain HTTP
+  rxh status                                  # on the machine: plain HTTP, token of the file
+  ```
+
+  On `listen = "127.0.0.1:2019"` without a token, the machine needs
+  neither: `curl http://127.0.0.1:2019/status`.
+- A connection is from the machine when it comes over the unix socket, or
+  over TCP from a loopback address or from the very address it connected to
+  (the machine calling its own address). The address is the one of the
+  connection, not one a header claims. That decides whether plain HTTP is
+  answered on a `tls` listener. It makes the caller an administrator
+  without a token, lets it hold a session on plain HTTP and create the
+  first user without the setup code only when `listen` is a unix socket or
+  a loopback address. So what stands in front of the API decides, not the
+  caller behind it:
+  - A reverse proxy or a tunnel on the same machine connects from loopback,
+    which makes every request it forwards a request from the machine,
+    wherever the caller is; most proxies also send the address they
+    connect to as `Host`. Without a token that is administrator access for
+    everybody who reaches the proxy: set `token` whenever a proxy on the
+    machine forwards to the API.
+  - A proxy on another machine makes every request remote. A port
+    forwarder may not: a published Docker port usually arrives from the
+    bridge gateway or from the client, but rootless Podman and `kubectl
+    port-forward` connect from the container's own address or from
+    loopback. A published port needs a `listen` that is not loopback,
+    where that gives nobody anything.
+  - RXH itself is such a proxy, so without a `token` it does not connect to
+    its own admin API for anybody: a `forward`, pool member, health check,
+    mirror, `forward_auth`, webhook or tracing endpoint that leads there is
+    a backend that refuses connections (`502` for HTTP, a closed connection
+    for TCP, an unhealthy member), and the log says `refused to proxy to
+    the admin API of this process; set [admin] token to allow it` once a
+    minute at most. What counts is the address the connection goes to, not
+    how it is written: the `listen` address, any loopback address with the
+    admin port (a name that resolves to one too), any address of the
+    machine when `listen` is `0.0.0.0` or `::`, and the admin unix socket
+    under any name. Other ports and other machines are not concerned. With
+    a `token` the API can be published through a host, since every request
+    then needs the token or a session:
+
+    ```toml
+    [admin]
+    listen = "127.0.0.1:2019"
+    token = "kq3Zp0uX7mV9cR2tLw8yHs4d"
+
+    [[server]]
+    name = "admin"
+    listen = "0.0.0.0:8080"
+    forward = "127.0.0.1:2019"
+    ```
+- On a `tls` listener a connection has 10 seconds to send its first byte
+  and finish the TLS handshake, then it is closed. On every admin
+  listener a connection has 30 seconds to send the head of each request.
+- Without a token, on TCP and on a unix socket alike, a request from the
+  machine is refused
+  with `403` unless its `Host` is
+  `localhost`, `127.0.0.1` or `::1` (or the
   `listen` address of a TCP listener) and its `Origin`, when it has one, is
   that same `Host`, port included. The first stops a page of another site
   that reaches the API through DNS rebinding; the second stops a form or a
@@ -526,19 +680,36 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   because a browser reaches it once it is forwarded to a local port
   (`ssh -L`). The CLI and `curl` send no `Origin`, and the dashboard sends
   its own, whatever the local port of a tunnel. With a token any `Host` and
-  `Origin` are accepted: the token is the check, also on a unix socket.
+  `Origin` are accepted: the token is the check, also on a unix socket. A
+  request from another machine (over `tls`) without a token is nobody's
+  until it signs in, see [Accounts](#accounts): `401`.
 
   ```sh
   curl --unix-socket /run/rxh/admin.sock http://localhost/status         # 200
   curl --unix-socket /run/rxh/admin.sock http://rxh/status               # 403: use localhost
   curl -H 'Origin: http://localhost:3000' http://localhost:2019/status   # 403
   ```
-- `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are the
-  only routes served without the token: the page and its script and style
-  hold no data. The page asks for the token and sends it on its requests.
-- The admin API speaks plain HTTP: the token is as private as the network it
-  crosses. Use a private network, a VPN or an SSH tunnel
-  (`ssh -L 2019:/run/rxh/admin.sock host`), not the open internet.
+- `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are
+  served without the token: the page and its script and style
+  hold no data. The page asks who it is, shows a sign-in form to nobody, and
+  sends the cookie of the session or the token on its requests.
+  So are `GET /auth/session`, `POST /auth/login`, `POST /auth/logout`,
+  `POST /auth/setup`, `GET /auth/oidc/login` and `GET /auth/oidc/callback`,
+  the way in and out for [accounts](#accounts).
+- Without `tls` the admin API speaks plain HTTP: the token is as private as
+  the network it crosses. Set `tls`, or use a private network, a VPN or an
+  SSH tunnel (`ssh -L 2019:/run/rxh/admin.sock host`), not the open
+  internet.
+  - A tunnel or a port forwarder whose far end connects from loopback
+    makes every caller a request from the machine. `ssh -L` to a loopback
+    or unix socket `listen`, and `kubectl port-forward` (it connects from
+    loopback inside the pod's network namespace) to a loopback `listen`,
+    reach a daemon without a token as an administrator: whoever can open
+    the forward is one. Set `token` when other people can.
+  - A token sent to an `http://` address through a forwarder that crosses
+    the network (a published container port, a forward on another
+    machine) travels in clear on the way. Set `tls` and send it to
+    `https://` there.
 - The CLI finds the address in `--admin` / `RXH_ADMIN` (`ip:port` or
   `unix//path`), else in `[admin] listen` of its configuration file. The
   token comes from `--admin-token` / `RXH_ADMIN_TOKEN`, else from `[admin]
@@ -546,6 +717,793 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   same file.
 - `GET /config` shows the token as `***`. Keep the configuration file
   readable by the daemon's user only.
+
+### Accounts
+
+People sign in to the admin API with a name and a password of their own,
+kept in the file `[admin] users` (bcrypt hashes, mode `0600`, created on
+first use). The token and the CLI keep working as they are. Who sends a
+request is the first of these that holds:
+
+1. `Authorization: Bearer <token>` equal to `[admin] token`: an
+   administrator.
+2. The cookie of a session, over HTTPS or from the machine on a loopback
+   or unix socket `listen`: that user,
+   with the roles the users file gives the user at that moment. A user that
+   was removed from the file, or whose password in the file is not the one
+   it signed in with, is nobody, and the session ends.
+3. No `token` configured, a `listen` that is a loopback address or a unix
+   socket, and a request from the machine (the rule above): an
+   administrator. This is what `rxh status` and `curl` on the machine are.
+   On any other `listen` nobody is an administrator this way.
+4. Otherwise nobody: `401`, with `WWW-Authenticate: Bearer` when a token is
+   configured.
+
+Only an administrator (the token, a request from the machine without a
+token, or a user with the `admin` role) is answered by the routes of the
+admin API; any other signed-in user gets `403 {"error": "this needs the
+admin role"}` on them, except on the routes that read and change hosts, which
+answer as far as the roles of the user allow: see
+[Permissions](#permissions). `[admin] users`, like every other `[admin]`
+key, is read when the daemon starts: a reload that changes one keeps
+the running value and says `[admin] changes take effect after a restart`
+in the log.
+
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+users = "/var/lib/rxh/users.toml"   # default: rxh-data/users.toml
+```
+
+| Route | For | Does |
+|---|---|---|
+| `GET /auth/session` | anyone | Who the caller is, see below. |
+| `POST /auth/login` | anyone | `{"name", "password"}`: `204` and the session cookie. `401 {"error": "wrong name or password"}` for a wrong password and for an unknown name alike; `429` after too many attempts, see below; `403` on plain HTTP from another machine. |
+| `POST /auth/logout` | anyone | Ends the session of the cookie and clears the cookie: `204`, also when there is no session. |
+| `POST /auth/setup` | see First run | `{"name", "password", "code"?}`: creates the first user and signs it in, `204`. `409` once a user exists. |
+| `PUT /auth/password` | a signed-in user | `{"current", "new"}`: `204`. Ends every session of the user and gives this browser a new one. `403` when `current` is wrong, and `403 {"error": "this account signs in through the provider"}` for a user who signed in through the provider. |
+| `GET /auth/oidc/login`, `GET /auth/oidc/callback` | anyone | The two steps of [signing in through a provider](#signing-in-through-a-provider). `404` without `[admin.oidc]`. |
+
+```sh
+curl -c jar -d '{"name": "ana", "password": "correct horse"}' https://rxh.example.com:2019/auth/login
+curl -b jar https://rxh.example.com:2019/auth/session
+curl -b jar https://rxh.example.com:2019/status
+curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.example.com:2019/auth/logout
+```
+
+```json
+{
+  "user": "ana",
+  "admin": true,
+  "roles": ["admin"],
+  "grants": [],
+  "creatable_groups": [],
+  "setup": false,
+  "setup_needs_code": false,
+  "password_login": true,
+  "oidc": false,
+  "oidc_issuer": null,
+  "local": true,
+  "tls": true
+}
+```
+
+- `user` is `null` for a caller that is not signed in, which includes the
+  token and a request from the machine: for those `admin` is `true`.
+  `grants` and `creatable_groups` are what the roles of a user without
+  `admin` allow, and empty for an administrator, who may do everything.
+- `setup` is `true` while the users file has no user. `setup_needs_code`
+  says that this caller can create the first one only with the setup code
+  (no token is set and the caller is not an administrator). It says so on
+  plain HTTP too, where the code is refused: the page then asks for HTTPS.
+- `oidc` says whether `[admin.oidc]` is set, and `oidc_issuer` is the host
+  of its `issuer`, to name it. `local` is `true` for a user of the users
+  file, who has a password to change, and `false` for one signed in
+  through the provider, which has no password here, and for a caller that
+  is not signed in.
+- `tls` says whether the admin listener has `[admin] tls`, whatever this
+  request came over. On plain HTTP to such a listener the page links to
+  the same address over HTTPS; without it, it asks for the token.
+- `password_login` says whether `POST /auth/login` works on this
+  connection: over HTTPS, or from the machine on a loopback or unix socket
+  `listen`. A password does not travel in clear text over the network, so
+  plain HTTP to any other listener only takes the token.
+- A session is a cookie, `rxh_session`, with `HttpOnly; SameSite=Strict;
+  Path=/` and, over HTTPS, `Secure`. It lasts 12 hours from the sign-in,
+  used or not. Sessions are kept in memory, at most 10 for a user (its
+  own oldest goes when it signs in once more) and 1000 in all (then the
+  oldest goes): a restart or a hot upgrade of the daemon signs everybody
+  out.
+- A request with a session cookie that is not a `GET` or a `HEAD` must
+  carry an `Origin` equal to its `Host`, port included, as a page of the
+  dashboard does: `403` otherwise. `curl` needs `-H 'Origin: ...'` for
+  those, as above; requests with the token need nothing.
+- `POST /auth/login`, `/auth/logout` and `/auth/setup` refuse (`403`) an
+  `Origin` that is not their `Host`, with or without a token, so the page
+  of another site cannot sign a browser in as an account of its choice.
+  Without an `Origin`, as `curl` sends them, they are answered.
+- A session exists only over HTTPS, or on a connection from the machine
+  to a loopback or unix socket `listen`. On any other plain HTTP a cookie
+  is ignored and none is given: `POST /auth/setup` with the token creates
+  the user there and signs nobody in.
+- At most 4 passwords are hashed or compared at a time. A sign-in, a
+  password change or a setup that comes while 4 are at it waits for its
+  turn, and gets `429` when none came within 5 seconds. A sign-in that
+  waited and was refused is not a failed one for its name, whose password
+  was never compared; it is one of the attempts of its address.
+- After 5 failed sign-ins for a name from one client address, that name is
+  refused from that address for a minute (`429`), with the right password
+  too. For both limits an IPv6 client is its /64 network, not one address
+  of it, and an IPv4 address is the same client when it comes mapped in
+  IPv6. A wrong `current` in `PUT /auth/password` counts as one. A sign-in
+  counts as failed until its password is found right, so more than five at
+  the same time under one name from one address are refused as well.
+- One client address gets 10 sign-in attempts a minute, right or wrong and
+  whatever the names: the eleventh is `429` until the oldest is a minute
+  old. A password change, a `POST /auth/setup` that sends a `code`, and a
+  `GET /auth/oidc/login` count as attempts; `GET /auth/oidc/callback` does
+  not, so a sign-in through the provider takes one of the ten. A unix socket has no such limit, and requests with
+  the token or with a session are not sign-ins. Clients behind one address
+  (a NAT, a reverse proxy) share its ten.
+- A password has at least 8 characters and at most 72 bytes. Hashes never
+  leave the daemon.
+- Each sign-in, failed or refused sign-in, sign-out, password change and
+  the creation of the first user is a line in the log of the daemon, with
+  the name and the address of the client.
+- Behind a reverse proxy on the same machine every request comes from the
+  machine under the name of the proxy, which without a token is refused
+  (`403`) before it can sign in: set `token` there, as said above, and
+  people sign in with their accounts all the same. They then all count as
+  one client address for the two limits above.
+
+#### First run
+
+While the users file has no user the API works as without accounts, and
+`POST /auth/setup` creates the first user, with the `admin` role. It is
+answered:
+
+- to an administrator: the holder of the token, or a request from the
+  machine when no token is set and `listen` is a loopback address or a
+  unix socket;
+
+  ```sh
+  curl -d '{"name": "ana", "password": "correct horse"}' http://127.0.0.1:2019/auth/setup
+  ```
+- to anyone who sends the setup code over HTTPS, on a `tls` listener
+  without a `token`. The code is 10 characters, new at every start, and
+  written to the log of the daemon while no user exists:
+
+  ```text
+  Admin => no user exists yet; to create the first one over HTTPS use the setup code k7m2xq9hpd
+  ```
+
+  ```sh
+  curl -d '{"name": "ana", "password": "correct horse", "code": "k7m2xq9hpd"}' https://rxh.example.com:2019/auth/setup
+  ```
+
+Anybody else gets `403`, and once a user exists everybody gets `409`: the
+code is of no use any more. There are no default credentials. On a
+`listen` that is not loopback, with `tls` and no `token`, the code is the
+only way through the API, from the machine too; `rxh user add` creates the
+first user without the API.
+
+#### From the command line
+
+`rxh user` edits the users file directly, with or without a running
+daemon, so it is also the way back in when every password is lost. It
+reads `[admin] users` from the configuration file (`-c`, default
+`rxh.toml`) and, like the daemon, takes a relative path from the directory
+of that file: give it the `-c` the daemon runs with, from any directory.
+It reads nothing else of the file and replaces no `{env.NAME}` or
+`{file.PATH}` placeholder, so it works from a shell that has none of the
+secrets of the service; a placeholder in `users` itself is an error, write
+the path there.
+The rules are the ones of the routes below, and their refusals are printed
+as they are.
+
+```sh
+rxh -c /etc/rxh/rxh.toml user add ana   # the first user gets the admin role
+rxh user add luis --role web-editors --role shop
+rxh user list                       # "ana admin", "luis web-editors,shop"
+rxh user passwd ana
+rxh user rm luis                    # never the last administrator
+echo 'correct horse' | rxh user passwd ana
+```
+
+`add` and `passwd` ask the password twice, without showing it, on a
+terminal, and read one line of standard input otherwise. A new password
+written by `rxh user passwd`, by hand or by any other process ends the
+sessions of that user in a running daemon at their next request, as
+`PUT /users/{name}` does.
+
+#### Users and roles
+
+An administrator manages the users file through these routes, which
+answer nobody else. They change the file the way an edit by hand does, and
+a change applies to the next request, of a signed-in user too.
+
+| Route | Does |
+|---|---|
+| `GET /users` | `[{"name", "roles"}]`, in the order of the file. Never a hash. |
+| `POST /users` | `{"name", "password", "roles"?}`: adds a user, `201` with `{"name", "roles"}`. |
+| `PUT /users/{name}` | `{"roles"?, "password"?}`, at least one: replaces them, `204`. A new password ends every session of the user. |
+| `DELETE /users/{name}` | Removes the user and ends its sessions, `204`. |
+| `GET /roles` | The built-in role first, as `{"name": "admin", "builtin": true}`, then every `[[role]]` as `{"name", "grant"}`. |
+| `POST /roles` | `{"name", "grant"?}`: defines a role whose name is free, `201` with the role. |
+| `PUT /roles/{name}` | `{"name"?, "grant"}`: replaces the grants of a defined role, `204`. A `name` in the body must be the one of the path. |
+| `DELETE /roles/{name}` | Removes a role that no user has, `204`. |
+
+- What the rules of the users file refuse is `409` with their reason: a
+  name that is taken or not valid, a password shorter than 8 characters or
+  longer than 72 bytes, a role that is not defined, `create` on a host
+  grant, the last administrator removed or without `admin`, the `admin`
+  role defined or removed, a role some user has (the reason names them).
+- A name in the path that names no user or role is `404`; a body that is
+  not JSON, lacks a field or has an unknown one is `400`.
+- Names in the path are percent-decoded: `/users/ana%40example.com` is the
+  user `ana@example.com`.
+- Adding a user or setting a password hashes it, and waits for its turn
+  with the sign-ins (at most 4 at a time, `429` after 5 seconds).
+- Each change is a line in the log of the daemon with who made it (the
+  user, `token` or `local`), never a password or a hash.
+
+```sh
+H='Authorization: Bearer s3cret-admin-token'
+API=https://rxh.example.com:2019
+curl -H "$H" $API/users
+curl -H "$H" -d '{"name": "web-editors", "grant": [{"group": "web", "allow": ["view", "modify", "create"]}]}' $API/roles
+curl -H "$H" -d '{"name": "luis", "password": "luis-password", "roles": ["web-editors"]}' $API/users
+curl -H "$H" -X PUT -d '{"roles": ["admin"]}' $API/users/luis
+curl -H "$H" -X PUT -d '{"grant": [{"host": "shop", "allow": ["view"]}]}' $API/roles/web-editors
+curl -H "$H" -X DELETE $API/users/luis
+curl -H "$H" -X DELETE $API/roles/web-editors
+```
+
+```text
+Admin => Role web-editors created by token
+Admin => User luis created by token
+Admin => User luis changed by ana
+```
+
+#### Permissions
+
+A role grants permissions on hosts: on every `[[server]]` whose `groups` has
+a group, or on the one whose `name` is the `host` of the grant. The
+permissions of a user on a host add up over its roles and over the groups
+of the host; none implies another, so `modify` without `view` changes
+nothing.
+
+```toml
+# rxh.toml
+[[server]]
+name = "shop"
+listen = "0.0.0.0:8080"
+groups = ["web"]
+forward = "@api"
+```
+
+```toml
+# users.toml
+[[role]]
+name = "web-editors"
+grant = [
+  { group = "web", allow = ["view", "modify", "create", "delete"] },
+  { host = "intranet", allow = ["view"] },
+]
+```
+
+| Action | Needs |
+|---|---|
+| See a host in lists, its statistics and its form | `view` |
+| Change a host (form or the TOML of its table) | `view` and `modify`, and only the keys of the list below |
+| Add a group to a host | `modify` on the host and `create` on the added group |
+| Remove a group from a host | `modify` on the host, and still `modify` on it after the change |
+| Change the `name` of a host, give it one or take it away | the `admin` role |
+| Create a host whose `name` a `host` grant of any role names | the `admin` role |
+| Create a host | `create` on every group in its `groups`, which must not be empty; only the keys of the list below, a `host` of its own, and `listen` addresses that are already listened on |
+| Set any other key of a host, a value with an `{env.NAME}` or `{file.PATH}` placeholder, a unix socket as a forward target, or a new `listen` address | the `admin` role |
+| Delete a host | `view` and `delete` |
+| Anything else: pools, sections, whole files, certificates, `GET /config`, `/metrics`, reload, load, patch, upgrade, stop, users and roles | the `admin` role |
+
+A forward target is free text, so a user with `modify` may write the address
+of the admin API itself. Without `[admin] token` RXH refuses to connect
+there (see [`[admin]`](#admin)): such a host answers `502` and gives nobody
+the rights of a request from the machine.
+
+`modify` is trust over the host, not a subset of harmless keys: a user
+with it can change the matchers around an entry an administrator
+protected, so that other requests reach it or none do, and the
+verification of the upstream certificate and the health check port of a
+host whose other keys it cannot touch. Give it to people who may decide
+where the traffic of that host goes.
+
+What a signed-in user without the `admin` role gets from each route
+(`401` when signed out, as on every route):
+
+| Route | Answer |
+|---|---|
+| `GET /config/files` | `files` as `{"index", "revision"}` only (no path, no text); of the entities the servers with `view`, whole, and the pools as `{"kind": "upstream", "key": NAME}`; no section. |
+| `POST /config/entities/server` | `201` with `create` on every group of the new host. `403` otherwise, for a host without groups, for a key that is not on the list below, and `403 {"error": "this name is reserved"}` for a name a `host` grant names (told only to who may create in those groups). |
+| `PUT /config/entities/server/{key}` | `200` with `view` and `modify`, when the change keeps the name, adds only groups with `create`, leaves the host one the user may change and touches only keys of the list below. `403` otherwise. |
+| `DELETE /config/entities/server/{key}` | `200` with `view` and `delete`, `403` with `view` only. |
+| the three routes above, on a host without `view` or a key that names no host | `404 {"error": "no such host"}`, the same for both. |
+| the three routes above, for `upstream` and `section` | `403`. |
+| `PUT /config/files/{index}` | `403`. |
+| `GET /status` | `version`, `uptime_seconds`, the `servers` with `view` and an empty `pools`. A listener shared with servers the user does not view is listed under the names of the viewed ones. |
+| `GET /stats/history` | The samples with the series of the servers with `view` and an empty `pools`. |
+| `GET /schema` | The schema, as for everybody. |
+| every other route | `403 {"error": "this needs the admin role"}`. |
+
+- Every server entity of `GET /config/files` has `permissions`, what the
+  caller may do with it, in this order: `["view", "modify", "create",
+  "delete"]` for an administrator. `create` is there when the user may
+  create in one of the groups of the host.
+- The entity keys (`FILE:POSITION`) and the revision of each file are the
+  ones an administrator gets. They tell that the file has other tables and
+  that something changed, and nothing else: a save with another revision
+  than the one of the file is `409 {"error": "the configuration changed,
+  read it again"}`, whatever the key.
+- The grants are checked against the `name` and the `groups` the table has
+  in the file, and for a change against the ones it would have, secrets put
+  back: the form and the TOML text are checked the same. A `name` or a
+  group written as a placeholder is not the name or the group it expands
+  to, so no grant reaches it.
+- A validation error of a save is passed on as it is: a clash with the name
+  or the address of a host the user does not view shows there.
+- `GET /status` and `GET /stats/history` go by the `name` and the `groups`
+  of the running configuration, hosts made by a provider (Docker, Consul,
+  Kubernetes...) included; those take their groups from the `rxh.groups`
+  option (Kubernetes hosts have none) and no editing route reaches them. A series is shown only when every running
+  server that counts under it is viewed: two servers with the same name, or
+  the requests that match no server of a shared listener, are shown to who
+  views them all. A series is kept under its name for an hour, whatever
+  happens to the server: after a server is removed or renamed its series is
+  for administrators, and a new server that takes the name shows the counts
+  the name had before to who views the new one.
+- A user with `modify` or `create` can point a host at any address the
+  daemon can reach: give them to people you trust.
+
+A host table can make the daemon read files, run programs, call other
+services and open sockets, so a user without the `admin` role sets only the
+keys that route or answer traffic for the host. Any other key, and any key
+this list does not have, keeps the value it has in the file (it may be
+there, set by an administrator, next to a change) and is absent from a new
+host; a change to one is `403 {"error": "this needs the admin role:
+match[0].forward.health.hooks"}`, with the path of the key. The keys of a
+`[[server.match]]` and of a `subroute` entry are the ones of the server.
+
+| Keys | A user may set them |
+|---|---|
+| `name`, `groups` | As the grants say, see the table above. |
+| `listen` | Only addresses a server of the running configuration listens on, port `0` excluded: no new socket. |
+| `host` | Yes. A new host must have one, and a host that has one keeps one; blank names do not count. |
+| `http_host`, `path`, `uri`, `method`, `query`, `header`, `regexp`, `regexp_count`, `remote_ip`, `sni`, `alpn` | Yes: which requests the host takes. |
+| `ip_allow`, `ip_deny`, `rate_limit` | Yes: who reaches the host. |
+| `forward` (a pool name, addresses, weighted pools) | Yes, except a `unix//` socket. |
+| `redirect`, `rewrite`, `request`, `response`, `cors`, `encode`, `security_headers` | Yes, every key they have today. |
+| `cache`: `enabled`, `ttl_seconds` | Yes. `max_entries`, `max_body_bytes`: no, the memory of the daemon. |
+| `handle_response`: `status`, `header`, `redirect`, `replace_status`, `rewrite`, `copy_response` | Yes. `serve`: no. |
+| `tls = "auto"` | Yes, see below. `tls = { cert, key }`: no, paths. |
+| inline `forward` pool: `backends`, `policy`, `choose`, `key`, `hash_type`, `hash_balance_factor`, `retries`, `try_duration`, `try_interval`, `retry_budget`, `retry_match`, `hedge_delay`, `dial_timeout`, `read_timeout`, `write_timeout`, `response_header_timeout`, `queue_timeout`, `flush_interval`, `h2c`, `grpc_web`, `slow_start`, `passive`, `circuit_breaker`, `fallback` (`policy`, `choose`, `key`) | Yes: where the requests of the host go, and how. |
+| inline `forward` pool, `health`: `interval`, `timeout`, `uri`, `method`, `port`, `headers`, `request_body`, `status`, `body`, `passes`, `fails`, `grpc`, `grpc_service` | Yes: checks of the forward targets. |
+| inline `forward` pool, `tls`: `server_name`, `insecure_skip_verify` | Yes. `ca`, `client_cert`, `client_key`: no, paths. |
+| `serve`, `error_pages` | No: paths on the machine of the daemon. |
+| `forward.health.hooks`, `forward.health.upstream`, `forward.health.follow_redirects`, `forward.dynamic`, `forward_auth`, `mirror` | No: programs, and requests to somewhere else than the forward targets. |
+| `basic_auth`, `forward.secret`, `forward.fallback.secret` | No: credentials. |
+| `trusted_proxies`, `client_auth`, `proxy_protocol`, `proxy_protocol_in` | No: who is trusted. |
+| `protocol`, `http2`, `http3`, `https_redirect`, `tls_options`, `max_connections`, `max_connections_per_ip`, `match_timeout`, `idle_timeout`, `read_header_timeout`, `stream_timeout`, `stream_close_delay`, `udp_idle_timeout` | No: sockets, and what every server of a shared listener gets. |
+| inline `forward` pool: `keepalive`, `keepalive_idle_conns_per_host`, `http2_conns_per_host`, `max_conns_per_host`, `max_connections`, `queue_size`, `request_buffers`, `response_buffers` | No: memory and connections of the daemon. |
+
+- No string a user sets may have an `{env.NAME}` or a `{file.PATH}`
+  placeholder: `403`. One an administrator wrote stays as it is.
+- A host whose table has such a placeholder in any string keeps its forward
+  targets: `forward`, the `backends` and their addresses, and the pools of
+  a weighted `forward`, at every depth, new `match` entries included. A
+  user who pointed the host at a backend of its own would receive the value
+  there (a key in a request header, for example). The answer is `403
+  {"error": "this host carries values only an administrator may redirect:
+  forward"}`; the other keys of the list still change.
+- `tls = "auto"` set by a user does more than answer: the daemon orders
+  certificates for the names of `host` the user chose, and, unless
+  `https_redirect` (a key for administrators) says no, listens on
+  `[acme] http_port` of the same address to redirect to HTTPS. Give
+  `create` and `modify` on hosts of a TLS listener with that in mind.
+- The list has the keys under the names the reference gives them. An alias
+  (`connections` for `max_connections`) and a key the daemon does not know
+  are refused like a key for administrators, and so is `protocol`, also as
+  the matcher of a `match` entry of a `tcp` server.
+- The entries of an array (`match`, `handle_response`, backends) are
+  compared by position: an entry with a key for administrators cannot be
+  moved or removed by a user, nor can an entry before it.
+- An administrator (the token, a request from the machine without a token,
+  a user with `admin`) is not limited by any of this.
+
+```sh
+API=https://rxh.example.com:2019
+ORIGIN="Origin: $API"
+curl -c jar -d '{"name": "luis", "password": "luis-password"}' $API/auth/login
+curl -b jar $API/config/files      # the hosts of luis, each with "permissions"
+curl -b jar $API/status            # their listeners
+curl -b jar -H "$ORIGIN" -d '{"value": {"listen": "0.0.0.0:8080", "host": "news.example.com", "groups": ["web"], "forward": "@api"}}' \
+  $API/config/entities/server      # 201 {"key": "0:4"}
+curl -b jar -H "$ORIGIN" -X DELETE "$API/config/entities/server/0:4?revision=$REVISION"
+curl -b jar -H "$ORIGIN" -X PUT -d '{"value": {}, "revision": "..."}' $API/config/entities/upstream/api   # 403
+```
+
+```json
+{
+  "kind": "server",
+  "key": "0:0",
+  "file": 0,
+  "value": { "name": "shop", "listen": "0.0.0.0:8080", "groups": ["web"], "forward": "@api" },
+  "toml": "name = \"shop\"\nlisten = \"0.0.0.0:8080\"\ngroups = [\"web\"]\nforward = \"@api\"\n",
+  "permissions": ["view", "modify", "create", "delete"]
+}
+```
+
+#### Accounts and permissions, step by step
+
+How the pieces above fit together, from a fresh install to a user who
+manages its own hosts and nothing else.
+
+1. **HTTPS on the admin listener.** A password must not cross the network
+   in clear text, so people who sign in from other machines need `tls`.
+   Any certificate the browsers of those people trust will do; for a
+   test, a self-signed one:
+
+   ```sh
+   openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=rxh.example.com \
+     -addext subjectAltName=DNS:rxh.example.com \
+     -keyout /etc/rxh/admin.key -out /etc/rxh/admin.pem
+   ```
+
+2. **The configuration.** On a `listen` that is not a loopback address
+   nobody is an administrator for where it connects from: everybody signs
+   in, and `rxh status`, `rxh reload` and the other commands that talk to
+   the daemon need a `token` in `[admin]` as well (leave it out if the
+   dashboard is all you use). Put the users file where the daemon can
+   write: next to the configuration by default, where it cannot under the
+   shipped systemd unit and in the container images (see
+   [Running under systemd](#running-under-systemd) and
+   [Running in a container](#running-in-a-container)). Give the hosts
+   groups.
+
+   ```toml
+   [admin]
+   listen = "0.0.0.0:2019"
+   tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+   users = "/var/lib/rxh/users.toml"
+
+   [[server]]
+   name = "shop"
+   listen = "0.0.0.0:443"
+   host = "shop.example.com"
+   tls = "auto"
+   groups = ["web"]
+   forward = "127.0.0.1:8080"
+   ```
+
+3. **The first administrator.** At start, while the users file has no
+   user, the daemon writes a setup code to its log. Open
+   `https://rxh.example.com:2019/dashboard`: the page asks for a name, a
+   password and that code, from the machine too. Or, on the machine:
+
+   ```sh
+   curl -k -d '{"name": "ana", "password": "correct horse", "code": "k7m2xq9hpd"}' https://127.0.0.1:2019/auth/setup
+   rxh -c /etc/rxh/rxh.toml user add ana     # or this, with the daemon running or not
+   ```
+
+4. **Roles and users.** In the Users tab (or with `POST /roles` and
+   `POST /users`), make a role with grants on groups or on single hosts,
+   then a user with that role. The role `web-editors` with View, Modify
+   and Create on the group `web`, and the user `luis` with it, give luis
+   the hosts of `web` in Overview and Hosts, "New host" in `web`, and
+   nothing else.
+
+5. **Every day.** People sign in at `/dashboard`; a session lasts 12
+   hours. With a `token` set, `rxh status`, `rxh reload` and the other
+   commands keep working on the machine over plain HTTP on the same port;
+   without one they get `401` on this listener. `rxh user passwd`
+   is the way back in when a password is lost, and ends the sessions of
+   that user.
+
+6. **Through a provider, if you have one.** People can sign in with the
+   accounts of an OpenID Connect provider instead of, or next to, the users
+   file; their groups at the provider give them roles. Take a self-hosted
+   provider at `https://id.example.com/realms/ops` whose certificate comes
+   from the company's own authority. At the provider (the menus differ from
+   one product to another; these are the settings to look for):
+   - a client `rxh`, confidential (with a secret), for the authorization
+     code flow, whose secret is sent with HTTP Basic
+     (`client_secret_basic`);
+   - the redirect URI `https://rxh.example.com:2019/auth/oidc/callback`,
+     that is `{public_url}/auth/oidc/callback`, exactly;
+   - the groups of the user in the ID token, as a claim named `groups`
+     (often a "groups" mapper or scope of the client to switch on).
+
+   Then in rxh, with the secret in an environment variable of the service
+   and the authority's certificate in a file:
+
+   ```toml
+   [admin]
+   listen = "0.0.0.0:2019"
+   tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+   users = "/var/lib/rxh/users.toml"
+   public_url = "https://rxh.example.com:2019"
+
+   [admin.oidc]
+   issuer = "https://id.example.com/realms/ops"   # as the provider publishes it
+   client_id = "rxh"
+   client_secret = "{env.RXH_OIDC_SECRET}"
+   ca = "/etc/rxh/company-ca.pem"   # added to the public roots, not instead
+   roles = { ops = ["admin"], web = ["web-editors"] }
+   ```
+
+   After a restart the sign-in form has a "Sign in with id.example.com"
+   button. A member of `web` gets the role `web-editors` of step 4; a
+   member of `ops` is an administrator; a person in neither group is
+   refused by a page that names the person and the groups received, and
+   the log says the same. `web-editors` is a role of the users file: one
+   that is not defined there gives nothing, and a member of `web` would be
+   signed in with no permission at all. The flow is described in
+   [Signing in through a provider](#signing-in-through-a-provider).
+
+   Keep the local administrator of step 3 (`ana`): with an empty users
+   file the setup code is written to the log at every start and stays
+   valid, and a local administrator is the way back in when the provider
+   is down. A provider session ends after 12 hours, at sign-out, or when
+   the daemon restarts or is upgraded; removing the person at the provider
+   does not end one already made. To take someone's access at once, remove
+   or empty the role in the users file (`web-editors` here).
+
+What is not there:
+
+- **More than a password, here.** No two-factor codes, no passkeys, no
+  password reset by e-mail: an administrator or `rxh user passwd` sets a
+  new one. An identity provider that has those can be the way in, see
+  [OpenID Connect](#openid-connect).
+- **Sessions that outlive the daemon.** Sessions are kept in memory: a
+  restart, and a hot upgrade (`rxh upgrade`), sign everybody out. A
+  reload does not.
+- **ACME or client certificates on the admin listener.** `tls` in
+  `[admin]` takes files only (`"auto"` is refused); renew them with
+  your own tool and `rxh cert reload`.
+- **Live changes of `[admin]`.** Every key of `[admin]` is read at
+  start; a reload keeps the ones the daemon started with and says so in
+  the log when any of them changed. Restart to apply them.
+- **Permissions on anything but hosts.** Pools, certificates, the other
+  sections, whole files, reload and stop are for administrators.
+- **Groups on Kubernetes hosts.** Docker, Podman, Swarm, Consul, Nomad
+  and etcd hosts take `rxh.groups`; Kubernetes Ingresses and routes carry
+  no such option, so their hosts are for administrators.
+- **More than one provider.** `[admin.oidc]` names one issuer.
+- **A check of the ID token's signature.** The token is read only from
+  the token endpoint's answer, over TLS to the provider, which OpenID
+  Connect Core 3.1.3.7 allows in place of the signature: the TLS
+  connection already proves where it comes from. A token from anywhere
+  else (a query parameter, a fragment) is never accepted.
+- **Single sign-out.** Signing out of rxh ends the rxh session only, not
+  the one at the provider; signing out at the provider leaves the rxh
+  session until its 12 hours are over.
+- **Refresh.** No refresh token is kept and nothing is asked of the
+  provider after the sign-in. The groups, and so the roles, of a provider
+  user are those of the sign-in for the 12 hours of the session; taking
+  someone out of a group at the provider takes effect at their next
+  sign-in. What a role grants is read from the users file on every
+  request, so a role edited or removed there applies at once.
+- **Provider users in the users file.** They are not stored: not listed
+  in `GET /users` or the Users tab, no password here, at most 10 sessions
+  each like everybody.
+
+Known limits:
+
+- **One writer at a time on the users file.** The daemon and `rxh user`
+  do not lock the file against each other: when both write at the same
+  moment, the last write wins and the other change is lost. A change
+  made by one is seen by the other at its next read (the daemon rereads
+  the file when its modification time changes).
+- **A local firewall redirect to the admin port is not seen.** RXH
+  refuses to proxy to its own admin API while no token is set, by the
+  address and port it connects to. A `nftables` or `iptables` rule of the
+  machine that redirects another port to the admin port hides that: set
+  a `token` on a machine with such rules.
+- **Modify is trust over the routing of a host.** A user with `modify`
+  may change the matchers around an entry an administrator protected (a
+  `match` entry with `serve` or `basic_auth`, for example: its `path` or
+  `host`), so that it matches nothing, and append an entry without
+  protection that takes its requests. The keys for administrators stay as
+  they are, but which requests reach them is the user's to change.
+- **Literal secrets in a host are visible to View.** A header value
+  written as it is in `request.headers` (an API key for the backend, for
+  example) is shown to every user with `view` on the host, in the form
+  and the TOML. Put such values in an `{env.NAME}` or `{file.PATH}`
+  placeholder: the user sees the placeholder, not the value, and cannot
+  point the host elsewhere.
+- **The form does not know the allow list.** Without the `admin` role
+  the host form still shows every field; a change to a key for
+  administrators is refused by the daemon when saving, `403` with the
+  path of the key, shown next to the form.
+- **The sign-in limits count per address.** Clients behind one address
+  (a NAT, a proxy on the machine) share them, and an IPv6 network gives
+  one client many addresses.
+- **The page reads the session when it opens.** A role given or taken
+  away shows in the page at its next load; the daemon applies it at the
+  next request.
+
+#### OpenID Connect
+
+`[admin.oidc]` lets users sign in through an OpenID Connect provider
+(Keycloak, Authentik, Dex, Auth0, ...), next to the users of the users file
+or instead of them. The flow is the standard authorization code flow; it
+is tested against a stand-in provider, not against any of these products.
+A worked example is step 6 of
+[Accounts and permissions, step by step](#accounts-and-permissions-step-by-step).
+
+| Key | Default | Description |
+|---|---|---|
+| `issuer` | required | Issuer of the provider, written exactly as the provider publishes it, a trailing `/` included when it has one (Auth0): an `https://` URL, or `http://` on a loopback address, without a user, a password, a query or a fragment. The discovery document is read from `{issuer}/.well-known/openid-configuration`, and its `issuer` and the `iss` of every ID token must be equal to this value, character by character. |
+| `client_id` | required | Client ID registered at the provider. Must not be empty. |
+| `client_secret` | required | Client secret registered at the provider. Must not be empty. `GET /config`, `rxh config show` and the configuration editor show it as `***`; use an `{env.NAME}` or `{file.PATH}` placeholder to keep it out of the file. |
+| `scopes` | `["openid", "profile", "email"]` | Scopes asked for. Must contain `"openid"`. |
+| `groups_claim` | `"groups"` | Claim of the ID token that lists the groups of the user. |
+| `name_claim` | `"preferred_username"` | Claim of the ID token that names the user. |
+| `roles` | `{}` | Roles granted for each value of `groups_claim`: claim value to role names (`admin` or a role of the users file, `[a-z0-9][a-z0-9_-]*`). |
+| `ca` | none | Path to a PEM file with root certificates trusted for the connections to the provider, besides the public ones: for a provider whose certificate comes from a private authority. Read at start; a file that cannot be read stops the start. |
+
+`oidc` needs `public_url` in `[admin]`, and `tls` in `[admin]` or a
+loopback or unix socket `listen`, since a session cookie is only offered
+over TLS or from the machine. For the same reason an `http://`
+`public_url` is refused unless `listen` is a loopback address or a unix
+socket: the browser would come back from the provider over plain HTTP,
+where no session starts. Like every `[admin]` key, `[admin.oidc]` is
+read at start only: changes need a restart.
+
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+public_url = "https://rxh.example.com:2019"
+
+[admin.oidc]
+issuer = "https://id.example.com/realms/ops"
+client_id = "rxh"
+client_secret = "{env.RXH_OIDC_SECRET}"
+roles = { ops = ["admin"], web = ["web-editors"] }
+```
+
+A provider inside the network, with a certificate of the company's own
+authority:
+
+```toml
+[admin.oidc]
+issuer = "https://id.internal.example/realms/ops"
+client_id = "rxh"
+client_secret = "{file./run/secrets/rxh-oidc}"
+ca = "/etc/rxh/internal-ca.pem"
+roles = { ops = ["admin"] }
+```
+
+##### Signing in through a provider
+
+At the provider, register rxh as a client:
+
+- **A confidential client** (one with a secret) for the authorization
+  code flow. Its ID and secret are `client_id` and `client_secret`. The
+  secret is sent to the token endpoint with HTTP Basic, both values encoded
+  as RFC 6749 section 2.3.1 says (`client_secret_basic`).
+- **Redirect URI**: `{public_url}/auth/oidc/callback`, exactly, for
+  example `https://rxh.example.com:2019/auth/oidc/callback`.
+- **The groups in the ID token**: a claim (`groups_claim`, `groups` by
+  default) that is the name of one group or a list of names. Most
+  providers add it only when asked: a "groups" mapper or scope on the
+  client. Add that scope to `scopes` when the provider wants it asked for.
+  `roles` gives roles to those names; a group that is not there gives
+  nothing.
+
+How a sign-in goes:
+
+1. The browser opens `GET /auth/oidc/login`. rxh reads the discovery
+   document of the provider (kept for an hour) and answers `302` to its
+   authorization endpoint, with a new `state`, `nonce` and PKCE challenge
+   (`S256`), and a cookie (`rxh_oidc`, `HttpOnly`, `SameSite=Lax`, 10
+   minutes, `Secure` over TLS) that ties the sign-in to this browser.
+   A request that the page of another site made the browser send
+   (`Sec-Fetch-Site: cross-site`, or a `Sec-Fetch-Dest` other than
+   `document`: an image, a frame, a script) goes no further: it answers
+   `403` and does not count as a sign-in attempt. A client that sends
+   neither header, like `curl`, passes. Open the page under the host name
+   of `public_url`: under another name of the same listener (for example
+   `localhost` instead of `127.0.0.1`) the provider sends the browser back
+   to `public_url`, where the cookie of the other name is not sent, and
+   the sign-in is refused as "not started in this browser".
+2. The user signs in at the provider, which sends the browser back to
+   `GET /auth/oidc/callback?code=...&state=...`.
+3. rxh checks that the `state` is one it gave to this browser less than 10
+   minutes ago (the cookie), and uses it up. It sends the code, with the
+   PKCE verifier and the client secret, to the token endpoint, and reads
+   the ID token of the answer.
+4. The claims are checked, all of them: `iss` is `issuer` exactly; `aud`
+   is `client_id`, or a list with it (and then `azp` is `client_id` when
+   the list has more than one entry); an `azp`, when there is one, is
+   `client_id`; `exp` is not past, with a minute of margin for clocks;
+   `nonce` is the one of step 1.
+5. The name is the claim `name_claim`, or `sub` without it. The roles are
+   those `roles` gives to the groups, all together. The session lasts 12
+   hours, like any other, with the cookie `rxh_session`. The answer is a
+   small page that goes on to `{public_url}/dashboard`.
+
+What the user may do is worked out on every request from the roles of the
+session and the users file as it is then: a role edited or removed with
+`PUT`/`DELETE /roles/{name}` applies at once. The groups are those of the
+sign-in: a user taken out of a group at the provider keeps its roles until
+the session ends, 12 hours at most. Signing out ends the rxh session only,
+not the one at the provider.
+
+A session of a provider user ends in three ways: after its 12 hours, when
+the user signs out, and when the daemon restarts or is upgraded
+(`rxh upgrade`), which ends every session. Removing the person at the
+provider, or from a group there, does not end a session already made. To
+take the access of such a user now, remove its role from the users file
+or empty it (`DELETE` or `PUT /roles/{name}`): that applies at the next
+request, to everybody who has the role. For a user whose groups give
+`admin`, which is not a role of the file, restart the daemon.
+
+With only provider users the users file stays empty. On a `tls` listener
+without a `token` the daemon then writes the setup code to its log at
+every start, and the code stays valid: whoever reads the log can create
+the first local user, an administrator. Create one local administrator
+yourself (`rxh user add`, or the form of the dashboard): it closes the
+setup, and it is the way back in when the provider is down.
+
+A user of the provider is not a user of the users file, even under the same
+name: it has only the roles its groups give, it is not listed in
+`GET /users`, it has no password here (`PUT /auth/password` answers `403`),
+and what ends the sessions of the local user of that name leaves its own.
+Its sign-in is logged as `"name" signed in through the provider`, with its
+roles and groups, and the changes it makes, and its sign-out, as `"name" (oidc)`. A user
+keeps at most 10 sessions. Provider users are not stored anywhere: the
+session is all rxh knows of them.
+
+A sign-in that does not happen answers with a small page that says why in
+one sentence, and starts no session:
+
+| Answer | When |
+|---|---|
+| `403` | `GET /auth/oidc/login` was sent by the page of another site, or for something that is not a page (see step 1). Not counted as an attempt. |
+| `403` | The callback is not of a sign-in this browser started: no cookie or another one, an unknown or used `state`, or more than 10 minutes. Start again. |
+| `403` | The provider sent an error instead of a code (the user said no, for example), or no code. |
+| `403` | A claim of the ID token is wrong or missing, or the token does not name the user, or names it with control characters or more than 256 bytes. |
+| `403` | None of the groups of the user gives a role. The page names the user and the groups received: the first 20, each up to 64 bytes. |
+| `502` | The provider could not be reached (the log says why), took more than 10 seconds, answered more than 1 MiB, answered an error or a redirect, or sent no ID token; or its discovery document is of another issuer, or names an endpoint that is not `https` (an `http` endpoint on a loopback address is taken only from an issuer that is itself `http` on a loopback address). |
+| `429` | The client address used up its 10 sign-in attempts of the minute, which `GET /auth/oidc/login` shares with `POST /auth/login`. The callback is not an attempt: it does nothing without a sign-in that was started. |
+| `404` (JSON) | `[admin.oidc]` is not set. |
+| `403` (JSON) | The connection is one where no session may be: plain HTTP from another machine, and also plain HTTP from the machine itself on a `tls` listener that is not loopback, where the position of a client is not trusted. |
+
+Known limits:
+
+- **The signature of the ID token is not checked.** The token is read
+  only from the answer of the token endpoint, over TLS checked against the
+  public roots upstream TLS uses and those of `ca`, which OpenID Connect
+  Core 3.1.3.7 allows. A
+  token from anywhere else is never accepted.
+- **One sign-in at a time for a browser.** Starting a second one (another
+  tab) replaces the cookie of the first, whose callback is then refused.
+- **The provider is reached directly.** No proxy setting, no redirects
+  followed, HTTP/1.1.
+- **Sign-ins under way live in one process.** Several rxh instances
+  behind one `public_url` need the balancer to send a browser to the same
+  instance for the whole sign-in (stickiness): the callback is refused by
+  an instance that did not start it. A sign-in under way when the daemon
+  restarts or is upgraded answers "start again".
+- **Cookies belong to a host name, not to a port.** A browser sends
+  `rxh_session` and `rxh_oidc` to every port of the host name of the
+  admin API, so to every other service under that name. Give the admin
+  API a host name of its own (`rxh.example.com`, not a port of a name
+  other services share).
+- **Names come from the provider.** With a `name_claim` users can edit
+  at the provider, two people can show under one name in the log; roles
+  never depend on the name.
 
 ### Dashboard
 
@@ -559,7 +1517,7 @@ is. `/dashboard/` redirects to `/dashboard`.
 listen = "127.0.0.1:2019"   # then open http://127.0.0.1:2019/dashboard
 ```
 
-Five tabs:
+Six tabs (Users only for an administrator, see [Accounts](#accounts)):
 
 | Tab | Shows | Changes |
 |---|---|---|
@@ -568,6 +1526,7 @@ Five tabs:
 | Pools | Every pool with its backends: health, state, weight, requests in flight, total requests, failures. | New pool, Edit (backends are part of the pool form), and Ready, Drain, Maintenance on each backend. |
 | Certificates | The certificates served, soonest expiry first, with listener, source, issuer and OCSP staple. | "Reload certificates" (`POST /certificates/reload`), and the `[acme]` form. |
 | Settings | The other sections (`top` level keys, `[admin]`, `[log]`, `[tracing]`, `[docker]`, `[consul]`, `[etcd]`, `[nomad]`, `[kubernetes]`), set or not, and every configuration file as text. | A form per section ("Set up" for one that is not in the file), "Save and reload" of a file edited as text, and the daemon controls: Reload, Upgrade, Stop. |
+| Users | The users of `[admin] users` with their roles, and the roles with their grants; `admin` is built in. | New user, the roles of a user (ticked, then Save), Set password, Remove; New role, Edit (a row per grant: group or host, its name chosen from the groups and host names of the servers or typed, View, Modify, Create, Delete) and Remove. |
 
 - Every key of the configuration has a field, drawn from the JSON schema
   (`GET /schema`), with the description of the key as help. The common keys
@@ -589,6 +1548,12 @@ Five tabs:
 - Ready, Drain and Maintenance are the runtime states of
   [Draining backends and maintenance](#draining-backends-and-maintenance):
   they last "until restart" and do not change the file.
+- In Users, ticking Modify, Create or Delete on a grant ticks View, which
+  the others need; Create cannot be ticked on a host grant. A refusal of the
+  daemon (a name that is not valid, the last administrator, a role some
+  user has) is shown next to its row or form, which keeps what was typed.
+  Remove asks first, and so does an administrator taking `admin` from
+  itself: either one takes the Users tab away at once.
 - Upgrade and Stop ask to type the word `upgrade` or `stop`. After Upgrade
   the page keeps working with the new process, whose history starts empty.
   After Stop the page says the daemon was stopped and asks nothing more.
@@ -603,12 +1568,59 @@ Five tabs:
 
 On a remote host, tunnel the admin address
 (`ssh -L 2019:127.0.0.1:2019 host`) and open the same URL. With `token`
-set, the page asks for the token once per browser tab, keeps it in
-`sessionStorage` (gone when the tab is closed) and sends it on its requests;
-a wrong token is asked again. The admin API is plain HTTP: the token and
-everything the page saves cross the network as sent, so keep the tunnel. A
-browser cannot open a unix socket: forward it to a local port
+set, the page shows its sign-in form; "Use the admin token" there asks for
+the token once per browser tab, keeps it in `sessionStorage` (gone when the
+tab is closed) and sends it on its requests; a wrong token is asked again.
+Without `tls` the admin API is plain HTTP: the token and everything the
+page saves cross the network as sent, so keep the tunnel. A browser cannot
+open a unix socket: forward it to a local port
 (`ssh -L 2019:/run/rxh/admin.sock host`).
+
+The page and [accounts](#accounts):
+
+- It reads `GET /auth/session` when it opens. A caller that is nobody (no
+  session, and no token or request from the machine that makes it an
+  administrator) gets the sign-in form and nothing else: name and
+  password, or the token where `password_login` is `false`. The password
+  is sent to `POST /auth/login` and kept nowhere; signing in with a
+  password drops a token kept for the tab, which would outrank the session.
+  Opened over plain HTTP where `password_login` is `false`, the form says
+  "Open this page over https to sign in." with the same address in
+  `https://`, and "Use the admin token" stays.
+- With `[admin.oidc]`, the form starts with "Sign in with" and the host of
+  the `issuer`: a link to `auth/oidc/login`. It is there where
+  `password_login` is `true`, while no user exists too (an administrator
+  of the provider needs no local user), and the password form stays under
+  it. After the provider the browser comes back to the dashboard signed
+  in; a refused sign-in is a page of the daemon with a link back.
+- While no user exists (`setup`), a caller that may create the first one
+  gets the form for it, with a "Setup code" field when `setup_needs_code`
+  says so. An administrator (the machine without a token, or the token)
+  can answer "Not now": the choice is kept in the `localStorage` of the
+  browser and the API works without accounts as before. A user of the
+  provider does not get it: it creates local users in the Users tab.
+- A signed-in user has its name, "Change password" (`PUT /auth/password`)
+  and "Sign out" in the header; a user of the provider has no "Change
+  password". Under the users list, the Users tab says that users of the
+  provider are not listed and get their roles from `[admin.oidc.roles]`. A caller that is an administrator without
+  being a user, as a browser of the machine is by default, has none of
+  them and sees no form.
+- Without the `admin` role the page has the Overview and Hosts tabs. The
+  overview shows the servers the user views, without pools and
+  certificates. Hosts lists them with their groups, and follows the
+  `permissions` of each: "Edit" with `modify`, "View" (a form that takes
+  no input, without the TOML view) otherwise, "Delete" with `delete`, and
+  "New host" for a user with a group to create in, whose form starts with
+  the first of its `creatable_groups` in `groups`. The paths of the files
+  are not shown. What the daemon refuses, a key the user may not set for
+  example, is shown next to the form with the path of the key, and the
+  form keeps what was typed.
+- A session ends after 12 hours, or when the password of the user changes:
+  the next call is answered `401` and the sign-in form comes over the
+  page. An open form stays behind it with what was typed, to be saved
+  after signing in. Until then the page asks the daemon nothing. When
+  somebody else signs in, or the token is given, the tabs start again:
+  nothing the user before had on screen is kept, an open form included.
 
 Differences from the design of the page
 ([`docs/superpowers/specs/2026-11-20-webui-design.md`](superpowers/specs/2026-11-20-webui-design.md)):
@@ -1268,6 +2280,7 @@ Labels of a container:
 | `rxh.tcp.port` | Container port of the TCP route, with the same default as `rxh.http.port`. |
 | `rxh.pool` | Name of the pool. Containers with the same pool are load balanced. Defaults to `PROJECT-SERVICE` for Docker Compose containers, so the replicas of a service share a pool, else to the container name. Letters, digits, `-`, `_` and `.`. |
 | `rxh.policy` | Load balancing policy of the pool, see [Policies](#policies). Default `weighted_round_robin`. |
+| `rxh.groups` | `groups` of the server, comma separated: the admin API users whose roles grant View on one of them see it in `rxh status` and the dashboard (see [Permissions](#permissions)). Each name matches `[a-z0-9][a-z0-9_-]*`, 64 bytes at most, a repeat counted once. The groups of a pool are those of all its replicas: any container that joins the pool adds its groups to the server. The server stays read only for them: it is not in a file. |
 
 ```yaml
 # compose.yaml
@@ -1281,6 +2294,7 @@ services:
       rxh.http.host: app.example.com
       rxh.http.port: "8080"
       rxh.policy: least_conn
+      rxh.groups: web, customers
   db:
     image: postgres:16
     labels:
@@ -1293,7 +2307,7 @@ the containers, at their IP address on the Docker network and the container
 port (published ports are not needed). Both show in `rxh status` and in the
 metrics, not in `rxh config`. A replica that starts or stops only changes the
 members of its pool; when a pool appears, disappears or changes its hosts,
-address or policy the listeners are swapped as a reload does, without
+groups, address or policy the listeners are swapped as a reload does, without
 dropping connections.
 
 - rxh must reach the container addresses: run it on the Docker host or in a
@@ -1302,9 +2316,9 @@ dropping connections.
   `network_mode: host` at `127.0.0.1`.
 - A container is HTTP or TCP: `rxh.http.host` and `rxh.tcp.listen` cannot be
   combined. The containers of a pool must agree on `rxh.policy` and
-  `rxh.tcp.listen`; their hosts are merged.
+  `rxh.tcp.listen`; their hosts and groups are merged.
 - A container whose labels are wrong (unknown `rxh.*` label, missing port,
-  invalid host or policy), whose pool has the name of an `[upstream.NAME]`
+  invalid host, policy or group name), whose pool has the name of an `[upstream.NAME]`
   of the file, or whose server would make the configuration invalid is
   ignored and reported once on standard error. The other containers are
   not affected.
@@ -1390,7 +2404,9 @@ Each table makes the daemon list a service catalog every `refresh` and
 route to its service instances with the options of the
 [`[docker]` labels](#docker-routes-to-containers-from-their-labels)
 (`rxh.enable`, `rxh.http.host`, `rxh.http.port`, `rxh.tcp.listen`,
-`rxh.tcp.port`, `rxh.pool`, `rxh.policy`). An instance is reached at its
+`rxh.tcp.port`, `rxh.pool`, `rxh.policy`, `rxh.groups`): a tag
+`rxh.groups=web,customers` for Consul and Nomad, a key
+`PREFIX/SERVICE/INSTANCE/groups` for etcd. An instance is reached at its
 address and port, so `rxh.http.port` and `rxh.tcp.port` are rarely needed.
 The pool defaults to the service name, and the server of a pool is named
 after the section: `consul-web`. Instances that come and go change the
@@ -1477,6 +2493,8 @@ shared by every Ingress and HTTPRoute that points at it; pods that come and
 go only change its members. It behaves like the
 [service catalogs](#consul-etcd-nomad-routes-from-a-service-catalog)
 otherwise: while the API cannot be reached or read, the last routes stay.
+Ingresses and HTTPRoutes carry no `rxh.*` options, so their servers have no
+`groups` and only administrators see them in the admin API.
 
 | Key | Default | Description |
 |---|---|---|
@@ -2008,6 +3026,7 @@ socket, except that `http` servers listing the same address share one socket
 | `match` | | List of patterns instead of `forward`/`serve`/`redirect`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog; a QUIC connection over the limit is refused, see [HTTP/3](#http3). The old `connections` is deprecated, see [migration](migration.md). |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
+| `groups` | | Groups of this host, like `["web", "customers"]`; admin API roles grant permissions on groups. Each name matches `[a-z0-9][a-z0-9_-]*`, at most 64 bytes, listed once. |
 | `client_auth` | | `{ mode, ca, header }`: ask clients for a certificate in the TLS handshake, see [Client certificates (mTLS)](#client-certificates-mtls) (servers with `tls` only). |
 | `tls_options` | | `{ min_version, cipher_suites, curves, ocsp_stapling }`: what the TLS handshake accepts, and OCSP stapling, see [TLS options](#tls-options) (servers with `tls` only). |
 | `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |

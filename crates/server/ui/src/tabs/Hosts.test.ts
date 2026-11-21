@@ -1,7 +1,8 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { session } from "../lib/session";
 import Hosts from "./Hosts.svelte";
-import { serve, writes } from "./serve";
+import { serve, who, writes } from "./serve";
 
 const STATUS = {
   servers: [
@@ -36,6 +37,7 @@ function files(entities: unknown[], revision = "r1") {
 let confirm: ReturnType<typeof vi.fn<(message?: string) => boolean>>;
 
 beforeEach(() => {
+  session.set(undefined);
   confirm = vi.fn(() => true);
   vi.stubGlobal("confirm", confirm);
 });
@@ -188,4 +190,99 @@ test("an_unnamed_server_on_port_0_is_unknown_and_its_listener_is_not_called_runt
   expect(row("127.0.0.1:40001")).not.toContain("runtime");
   // A listener with a name no server of the files has is a runtime one for sure.
   expect(row("docker")).toContain("runtime");
+});
+
+/** `GET config/files` as a user without the `admin` role gets it. */
+function reduced(entities: unknown[]) {
+  return {
+    editable: true,
+    files: [{ index: 0, revision: "r1" }],
+    entities: [...entities, { kind: "upstream", key: "api" }],
+  };
+}
+
+function host(position: number, name: string, permissions: string[], groups = ["web"]) {
+  return {
+    kind: "server",
+    key: `0:${position}`,
+    file: 0,
+    value: { name, listen: "127.0.0.1:8080", host: `${name}.example`, forward: "@api", groups },
+    toml: "",
+    permissions,
+  };
+}
+
+test("the_list_shows_the_groups_of_each_host", async () => {
+  serve({ status: STATUS, "config/files": files([host(0, "shop", ["view", "modify", "create", "delete"], ["web", "paid"]), FILES_SERVER]) });
+  render(Hosts);
+  await screen.findByRole("button", { name: "Edit shop" });
+  expect(screen.getByRole("columnheader", { name: "Groups" })).toBeTruthy();
+  expect(row("shop.example")).toContain("web, paid");
+});
+
+test("buttons_follow_the_permissions_of_each_host", async () => {
+  session.set(who({ user: "luis", roles: ["web-editors"] }));
+  const entities = [host(0, "seen", ["view"]), host(1, "changed", ["view", "modify"]), host(2, "removed", ["view", "delete"])];
+  serve({ status: { servers: [] }, "config/files": reduced(entities) });
+  render(Hosts);
+  await screen.findByRole("button", { name: "View seen" });
+  const names = screen.getAllByRole("button").map((button) => button.getAttribute("aria-label"));
+  expect(names).toEqual(["View seen", "Edit changed", "View removed", "Delete removed"]);
+  // No path of a file is told to this user, and none is made up.
+  expect(document.body.textContent).not.toContain("undefined");
+
+  await fireEvent.click(screen.getByRole("button", { name: "View seen" }));
+  expect(screen.getByRole("heading", { name: "Server seen" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Save and reload" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  expect(screen.queryByRole("radio", { name: "TOML" })).toBeNull();
+  expect((screen.getByLabelText("Name") as HTMLInputElement).matches(":disabled")).toBe(true);
+  // The pools are names only, and still offered.
+  const pool: HTMLSelectElement = screen.getByLabelText("Pool", { selector: "select" });
+  expect([...pool.options].map((option) => option.value)).toContain("@api");
+  await fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+  await fireEvent.click(screen.getByRole("button", { name: "Edit changed" }));
+  expect(screen.getByRole("button", { name: "Save and reload" })).toBeTruthy();
+  expect(screen.getByRole("radio", { name: "TOML" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  expect((screen.getByLabelText("Name") as HTMLInputElement).matches(":disabled")).toBe(false);
+  await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+  await fireEvent.click(screen.getByRole("button", { name: "View removed" }));
+  expect(screen.queryByRole("button", { name: "Save and reload" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+});
+
+test("a_save_refused_for_a_key_shows_its_path_and_keeps_the_form", async () => {
+  session.set(who({ user: "luis", roles: ["web-editors"] }));
+  serve(
+    { status: { servers: [] }, "config/files": reduced([host(0, "changed", ["view", "modify"])]) },
+    { status: 403, body: { error: "this needs the admin role: serve" } },
+  );
+  render(Hosts);
+  await fireEvent.click(await screen.findByRole("button", { name: "Edit changed" }));
+  await fireEvent.click(screen.getByRole("radio", { name: "TOML" }));
+  await fireEvent.input(screen.getByLabelText("TOML of the table"), { target: { value: 'serve = "/etc"' } });
+  await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
+  expect((await screen.findByRole("alert")).textContent).toContain("this needs the admin role: serve");
+  expect((screen.getByLabelText("TOML of the table") as HTMLTextAreaElement).value).toBe('serve = "/etc"');
+});
+
+test("new_host_starts_in_a_creatable_group", async () => {
+  session.set(who({ user: "luis", roles: ["web-editors"], creatable_groups: ["web", "shop"] }));
+  const fetch = serve({ status: { servers: [] }, "config/files": reduced([]) });
+  render(Hosts);
+  await fireEvent.click(await screen.findByRole("button", { name: "New host" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
+  await vi.waitFor(() => expect(writes(fetch)).toHaveLength(1));
+  expect(writes(fetch)[0]).toEqual({ url: "config/entities/server", method: "POST", body: { value: { groups: ["web"] }, file: 0 } });
+});
+
+test("no_new_host_without_a_group_to_create_in", async () => {
+  session.set(who({ user: "luis", roles: ["viewers"] }));
+  serve({ status: { servers: [] }, "config/files": reduced([host(0, "seen", ["view"])]) });
+  render(Hosts);
+  await screen.findByRole("button", { name: "View seen" });
+  expect(screen.queryByRole("button", { name: "New host" })).toBeNull();
 });

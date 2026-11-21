@@ -76,15 +76,16 @@
       [files, schema] = await Promise.all([api<Files>("config/files"), schema ?? api<Schema>("schema")]);
       for (const file of files.files) {
         const base = bases[file.index];
-        const disk = { text: file.text, revision: file.revision };
+        // This tab is an administrator's, who gets the text of every file.
+        const disk = { text: file.text ?? "", revision: file.revision };
         if (!base || file.index === saved || drafts[file.index] === base.text) {
-          drafts[file.index] = file.text;
+          drafts[file.index] = disk.text;
           bases[file.index] = disk;
           delete holds[file.index];
           delete refusals[file.index];
         } else if (file.index === accepted) {
           bases[file.index] = disk;
-          holds[file.index] = file.text;
+          holds[file.index] = disk.text;
           delete refusals[file.index];
         }
       }

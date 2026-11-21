@@ -466,7 +466,7 @@
           "default": true
         },
         "listen": {
-          "description": "Address of the admin API: a TCP address, on loopback unless `token`\nis set, or a unix socket only its owner can open.",
+          "description": "Address of the admin API: a TCP address, on loopback unless `token`\nor `tls` is set, or a unix socket only its owner can open.",
           "allOf": [
             {
               "$ref": "#/definitions/AdminListen"
@@ -474,12 +474,45 @@
           ],
           "default": "127.0.0.1:2019"
         },
+        "oidc": {
+          "description": "Sign-in through an OpenID Connect provider.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Oidc"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "public_url": {
+          "description": "Address where browsers reach the admin API, without a trailing `/`:\nan `https` URL, or `http` on a loopback address. Required by `oidc`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tls": {
+          "description": "HTTPS on the admin listener, from certificate and key files.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "token": {
           "description": "Secret every request must carry as `Authorization: Bearer <token>`.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "users": {
+          "description": "File holding the user accounts and roles of the admin API.",
+          "type": "string"
         }
       },
       "additionalProperties": false
@@ -1417,6 +1450,62 @@
         "pool"
       ]
     },
+    "Oidc": {
+      "description": "Sign-in through an OpenID Connect provider (`[admin.oidc]`).",
+      "type": "object",
+      "properties": {
+        "ca": {
+          "description": "Path to a PEM file with extra root certificates trusted for the\nconnections to the provider, for one behind a private authority.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_id": {
+          "description": "Client ID registered at the provider.",
+          "type": "string"
+        },
+        "client_secret": {
+          "description": "Client secret registered at the provider.",
+          "type": "string"
+        },
+        "groups_claim": {
+          "description": "Claim of the ID token that lists the groups of the user.",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "Issuer of the provider, exactly as the provider publishes it, a\ntrailing `/` included: an `https` URL, or `http` on a loopback\naddress. The `iss` of every ID token must equal it.",
+          "type": "string"
+        },
+        "name_claim": {
+          "description": "Claim of the ID token that names the user.",
+          "type": "string"
+        },
+        "roles": {
+          "description": "Roles granted for each value of `groups_claim`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "scopes": {
+          "description": "Scopes asked for; must contain `openid`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "issuer",
+        "client_id",
+        "client_secret"
+      ]
+    },
     "OneOrMany_Mirror": {
       "description": "A single value or a list of values; the schema of `one_or_many` fields.",
       "anyOf": [
@@ -2341,6 +2430,13 @@
               "type": "null"
             }
           ]
+        },
+        "groups": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "handle_response": {
           "type": "array",

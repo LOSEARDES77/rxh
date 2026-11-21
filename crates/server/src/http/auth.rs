@@ -13,6 +13,7 @@ use hyper_util::rt::TokioIo;
 use rxh_core::config::{self, UpstreamGroup, UpstreamTls};
 use sha2::{Digest, Sha256};
 
+use crate::admin_guard::AdminGuard;
 use crate::http::body::{self, Guarded};
 use crate::http::headers;
 use crate::http::response::{self, BoxResponse};
@@ -117,7 +118,7 @@ pub(crate) struct ForwardAuth {
 
 impl ForwardAuth {
     /// Fails when the TLS settings for an `https://` service cannot be built.
-    pub(crate) fn new(settings: &config::ForwardAuth) -> io::Result<Self> {
+    pub(crate) fn new(settings: &config::ForwardAuth, guard: AdminGuard) -> io::Result<Self> {
         let url: Uri = settings
             .url
             .parse()
@@ -131,7 +132,7 @@ impl ForwardAuth {
         };
         let target = url.path_and_query().map_or("/", |path| path.as_str());
         Ok(Self {
-            dialer: Dialer::new(&group)?,
+            dialer: Dialer::new(&group, guard)?,
             address: format!("{scheme}://{authority}"),
             host: HeaderValue::from_str(authority).expect("a URI authority is visible ASCII"),
             target: target.parse().expect("part of a valid URI"),

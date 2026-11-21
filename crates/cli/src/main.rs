@@ -8,6 +8,7 @@ mod fmt;
 mod process;
 mod quick;
 mod top;
+mod users;
 
 use std::env;
 use std::fs;
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
         Some(Command::Adapt { file, adapter }) => adapt_file(&file, adapter),
         Some(Command::Schema) => schema(),
         Some(Command::HashPassword) => hash_password(),
+        Some(Command::User(command)) => users::execute(&cli, command),
         Some(Command::Completions { shell }) => completions(shell),
         Some(Command::Man { dir }) => man(dir.as_deref()),
         Some(command) => tokio::runtime::Builder::new_current_thread()

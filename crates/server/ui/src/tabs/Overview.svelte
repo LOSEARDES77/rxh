@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "../lib/api";
+  import { ApiError, api } from "../lib/api";
   import Chart from "../lib/Chart.svelte";
+  import { session } from "../lib/session";
   import Sparkline from "../lib/Sparkline.svelte";
   import { append, last, quantile, rate, window, type History, type Point, type Sample } from "../lib/stats";
 
@@ -19,6 +20,10 @@
   let certificates: Certificate[] = $state([]);
   let failure = $state("");
   let range: Range = $state(3600);
+
+  // Pools and certificates are an administrator's: anybody else gets its servers only.
+  // Alone, as in a test, the tab is an administrator's.
+  const admin = $derived($session?.admin ?? true);
 
   const samples = $derived(history ? window(history.samples, range) : []);
   const newest: Sample | undefined = $derived(samples[samples.length - 1]);
@@ -141,13 +146,15 @@
       const since = history?.samples.at(-1)?.time;
       const [update, served] = await Promise.all([
         api<History>(since === undefined ? "stats/history" : `stats/history?since=${since}`),
-        api<Certificate[]>("certificates"),
+        admin ? api<Certificate[]>("certificates") : [],
       ]);
       history = append(history, update);
       certificates = served;
       failure = "";
     } catch (err) {
-      failure = err instanceof Error ? err.message : String(err);
+      // Refused because signed out: the sign-in form says so, it is no failure.
+      const signedOut = err instanceof ApiError && err.status === 401;
+      failure = signedOut ? "" : err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -178,8 +185,10 @@
   <div><dt>Requests per second</dt><dd>{fixed(requestsPerSecond, 1)}</dd></div>
   <div><dt>Errors (5xx)</dt><dd>{percent(errorShare)}</dd></div>
   <div><dt>Latency p95</dt><dd>{fixed(p95, 1, " ms")}</dd></div>
-  <div><dt>In flight</dt><dd>{fixed(inFlight, 0)}</dd></div>
-  <div><dt>Healthy backends</dt><dd>{healthy}</dd></div>
+  {#if admin}
+    <div><dt>In flight</dt><dd>{fixed(inFlight, 0)}</dd></div>
+    <div><dt>Healthy backends</dt><dd>{healthy}</dd></div>
+  {/if}
 </dl>
 
 <div class="range" role="group" aria-label="Range">
@@ -203,20 +212,26 @@
 
 <div class="scroll">
 <table>
-  <caption>Averages over the range; latency is the mean for pools and p95 for servers.</caption>
+  <caption>
+    {admin
+      ? "Averages over the range; latency is the mean for pools and p95 for servers."
+      : "Averages over the range; latency is the p95."}
+  </caption>
   <thead>
     <tr>
       <th scope="col">Name</th>
       <th scope="col">Requests/s</th>
       <th scope="col">Errors</th>
       <th scope="col">Latency</th>
-      <th scope="col">In flight</th>
-      <th scope="col">Healthy</th>
+      {#if admin}
+        <th scope="col">In flight</th>
+        <th scope="col">Healthy</th>
+      {/if}
       <th scope="col">Trend</th>
     </tr>
   </thead>
   <tbody>
-    {#each poolRows as row (row.name)}
+    {#each admin ? poolRows : [] as row (row.name)}
       <tr>
         <th scope="row">Pool {row.name}</th>
         <td>{fixed(row.perSecond, 1)}</td>
@@ -233,13 +248,15 @@
         <td>{fixed(row.perSecond, 1)}</td>
         <td>{percent(row.errors)}</td>
         <td>{fixed(row.latency, 1, " ms")}</td>
-        <td>—</td>
-        <td>—</td>
+        {#if admin}
+          <td>—</td>
+          <td>—</td>
+        {/if}
         <td><Sparkline points={row.trend} /></td>
       </tr>
     {:else}
-      {#if !poolRows.length}
-        <tr><td colspan="7">No pool or server has counters yet.</td></tr>
+      {#if !admin || !poolRows.length}
+        <tr><td colspan="7">{admin ? "No pool or server has counters yet." : "No server has counters yet."}</td></tr>
       {/if}
     {/each}
   </tbody>

@@ -15,23 +15,29 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use rxh_core::config::{
-    AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime,
+    Admin, AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime,
+    Tls,
 };
 use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::access::{self, Store};
 use crate::acme;
 use crate::admin::{self, AdminState, Control, Current};
+use crate::admin_guard::AdminGuard;
 use crate::catalog;
 use crate::docker::{self, Container, Provider, Route};
 use crate::error::Error;
 use crate::http3::{self, Endpoints};
 use crate::include;
 use crate::master::{Master, ServerInfo};
+use crate::oidc;
 use crate::per_core;
 use crate::registry::Registry;
+use crate::session::Sessions;
 use crate::systemd;
+use crate::tls::AdminTls;
 use crate::upgrade::{self, Lease};
 
 fn read_file(path: &Path) -> Result<String, Error> {
@@ -97,6 +103,14 @@ pub fn config_files(path: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(read_merged(path, /* expand= */ false)?.1)
 }
 
+/// Whether the `[admin]` table `next` of a reload differs in any key from
+/// `in_force`, the one the admin API started with. None of its keys changes
+/// in a running daemon.
+fn admin_differs(next: &Admin, in_force: &Admin) -> bool {
+    // As JSON, which holds every key of the table, the ones added later too.
+    serde_json::to_value(next).ok() != serde_json::to_value(in_force).ok()
+}
+
 /// Daemon bound to a configuration file, or to a configuration without one.
 #[derive(Debug, Clone)]
 pub struct Daemon {
@@ -125,23 +139,31 @@ struct Generation {
     routes: Vec<Route>,
     /// Containers, instances and pools that are not routed, already logged.
     ignored: Vec<String>,
+    /// The `[admin]` table the admin API started with, which the upstream
+    /// connections are guarded against: a reload does not change it.
+    admin: Admin,
 }
 
 impl Generation {
     /// Starts `config` with routes to the Docker `containers`, and hands the
     /// new HTTP/3 connections of `endpoints` to it. Relative `[acme]` paths
-    /// are joined to `base`.
+    /// are joined to `base`. `admin` is the `[admin]` table in force.
     async fn start(
         config: Config,
         previous: Option<&Registry>,
         base: &Path,
         containers: Vec<Container>,
         endpoints: &Endpoints,
+        admin: &Admin,
     ) -> Result<Self, Error> {
         // What runs has the implicit HTTP to HTTPS redirect servers and the
         // Docker routes; what the admin API shows and edits is the
         // configuration as written.
-        let (effective, plan) = docker::plan(&config.with_https_redirects(), &containers);
+        let (mut effective, plan) = docker::plan(&config.with_https_redirects(), &containers);
+        // The admin API that listens is the one of the first configuration,
+        // whatever `[admin]` a reload brings: that is the one to keep the
+        // upstream connections away from.
+        effective.admin = admin.clone();
         let registry = Arc::new(Registry::build(&effective)?);
         // Docker members first, so they keep their drain state too.
         plan.sync(&registry);
@@ -191,6 +213,7 @@ impl Generation {
             containers,
             routes: plan.routes,
             ignored: plan.ignored,
+            admin: admin.clone(),
         })
     }
 
@@ -330,10 +353,44 @@ impl Daemon {
             Source::File(path) => load_config(path)?,
         };
         let admin_settings = config.admin.clone();
+        // Before anything listens: a certificate that cannot be read stops
+        // the start.
+        let admin_tls = match &admin_settings.tls {
+            Some(Tls::Files { cert, key }) if admin_settings.enabled => {
+                let tls = AdminTls::from_files(cert, key)
+                    .map_err(|err| io::Error::new(err.kind(), format!("[admin] tls: {err}")))?;
+                Some(tls)
+            }
+            // Validation refuses `"auto"` in `[admin]`.
+            Some(_) | None => None,
+        };
+        // Before the listeners too: the first random bytes of a process take
+        // tens of milliseconds, in which the servers would answer and the
+        // admin API would not.
+        let sessions = Sessions::new();
+        let access = Store::open(access::users_file(
+            self.config_path(),
+            &admin_settings.users,
+        ));
+        let oidc = match (&admin_settings.oidc, &admin_settings.public_url) {
+            (Some(settings), Some(public_url)) if admin_settings.enabled => {
+                let guard = AdminGuard::new(&admin_settings);
+                Some(oidc::Client::new(settings, public_url, guard)?)
+            }
+            // Validation refuses `oidc` without `public_url`.
+            _ => None,
+        };
         // QUIC sockets outlive generations, see `http3`.
         let endpoints = Endpoints::default();
-        let mut generation =
-            Generation::start(config, None, self.base_dir(), Vec::new(), &endpoints).await?;
+        let mut generation = Generation::start(
+            config,
+            None,
+            self.base_dir(),
+            Vec::new(),
+            &endpoints,
+            &admin_settings,
+        )
+        .await?;
 
         let (control, mut controls) = mpsc::channel(8);
         let admin_state = Arc::new(AdminState {
@@ -343,9 +400,14 @@ impl Daemon {
                 .and_then(|path| std::fs::canonicalize(path).ok()),
             listen: admin_settings.listen.clone(),
             token: admin_settings.token.clone(),
+            tls: admin_tls,
             current: RwLock::new(generation.current()),
             control,
             saving: tokio::sync::Mutex::new(()),
+            hashing: admin::hashing_permits(),
+            access,
+            sessions,
+            oidc,
         });
 
         let admin_listener: Option<(AbortOnDrop, Lease)> = if admin_settings.enabled {
@@ -359,10 +421,24 @@ impl Daemon {
                 )
             })?;
             match &admin_settings.listen {
+                AdminListen::Tcp(address) if admin_state.tls.is_some() => {
+                    println!("Admin => API listening on https://{address}");
+                }
                 AdminListen::Tcp(address) => println!("Admin => API listening on http://{address}"),
                 AdminListen::Unix(path) => {
                     println!("Admin => API listening on unix socket {}", path.display());
                 }
+            }
+            if admin::announces_setup_code(
+                admin_state.tls.is_some(),
+                admin_state.token.is_some(),
+                !admin_state.access.read().user.is_empty(),
+            ) {
+                println!(
+                    "Admin => no user exists yet; to create the first one over HTTPS use the \
+                     setup code {}",
+                    admin_state.sessions.setup_code()
+                );
             }
             let lease = listener.lease()?;
             let task = admin::serve(listener, Arc::clone(&admin_state));
@@ -664,7 +740,8 @@ impl Daemon {
         // be able to bind it.
         acme::release_challenge_port(&config.with_https_redirects()).await;
 
-        if config.admin.listen != admin.listen || config.admin.token != admin.token {
+        let in_force = generation.admin.clone();
+        if admin_differs(&config.admin, &in_force) {
             eprintln!("Main => [admin] changes take effect after a restart");
         }
 
@@ -675,6 +752,7 @@ impl Daemon {
             self.base_dir(),
             containers.clone(),
             endpoints,
+            &in_force,
         )
         .await;
         let next = match started {
@@ -685,7 +763,7 @@ impl Daemon {
                 // configuration if the new one still fails.
                 let previous = Config::clone(&generation.config);
                 let previous_containers = generation.containers.clone();
-                let old = std::mem::replace(generation, placeholder(endpoints).await?);
+                let old = std::mem::replace(generation, placeholder(endpoints, &in_force).await?);
                 old.stop().await.map_err(|err| err.to_string())?;
                 let base = self.base_dir();
                 let started = Generation::start(
@@ -694,6 +772,7 @@ impl Daemon {
                     base,
                     containers,
                     endpoints,
+                    &in_force,
                 )
                 .await;
                 match started {
@@ -705,6 +784,7 @@ impl Daemon {
                             base,
                             previous_containers,
                             endpoints,
+                            &in_force,
                         )
                         .await
                         .map_err(|err| err.to_string())?;
@@ -749,13 +829,14 @@ fn http3_listeners(servers: &[ServerInfo]) -> Vec<Arc<http3::Listener>> {
 }
 
 /// Empty generation used while swapping.
-async fn placeholder(endpoints: &Endpoints) -> Result<Generation, String> {
+async fn placeholder(endpoints: &Endpoints, admin: &Admin) -> Result<Generation, String> {
     Generation::start(
         Config::default(),
         None,
         Path::new(""),
         Vec::new(),
         endpoints,
+        admin,
     )
     .await
     .map_err(|err| err.to_string())
@@ -835,6 +916,44 @@ forward = "@api"
 
     fn server(name: &str) -> String {
         format!("[[server]]\nname = \"{name}\"\nlisten = \"127.0.0.1:0\"\nforward = \"@api\"\n")
+    }
+
+    #[test]
+    fn a_reload_that_changes_any_admin_key_asks_for_a_restart() {
+        let admin = |table: &str| {
+            Config::from_toml(&format!("[admin]\n{table}\n"))
+                .expect("valid configuration")
+                .admin
+        };
+        let in_force = admin("tls = { cert = \"admin.pem\", key = \"admin.key\" }");
+        assert!(!admin_differs(&in_force.clone(), &in_force));
+        for changed in [
+            "",
+            "tls = { cert = \"other.pem\", key = \"admin.key\" }",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\nusers = \"other.toml\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\nlisten = \"127.0.0.1:2020\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\ntoken = \"0123456789abcdef\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\nenabled = false",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\n\
+             public_url = \"https://rxh.example\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\n\
+             public_url = \"https://rxh.example\"\n\
+             oidc = { issuer = \"https://id.example\", client_id = \"rxh\", \
+             client_secret = \"secret\" }",
+        ] {
+            assert!(admin_differs(&admin(changed), &in_force), "{changed}");
+        }
+        let with_oidc = admin(
+            "public_url = \"https://rxh.example\"\n\
+             oidc = { issuer = \"https://id.example\", client_id = \"rxh\", \
+             client_secret = \"secret\" }",
+        );
+        let other_client = admin(
+            "public_url = \"https://rxh.example\"\n\
+             oidc = { issuer = \"https://id.example\", client_id = \"other\", \
+             client_secret = \"secret\" }",
+        );
+        assert!(admin_differs(&other_client, &with_oidc));
     }
 
     #[test]
@@ -978,7 +1097,9 @@ forward = "@api"
         let daemon = Daemon::from_config(config);
         assert!(daemon.config_path().is_none());
         let endpoints = Endpoints::default();
-        let mut generation = placeholder(&endpoints).await.expect("generation");
+        let mut generation = placeholder(&endpoints, &Admin::default())
+            .await
+            .expect("generation");
         let admin = {
             let (control, _) = mpsc::channel(1);
             AdminState {
@@ -986,9 +1107,14 @@ forward = "@api"
                 config_path: None,
                 listen: "127.0.0.1:0".parse().expect("address"),
                 token: None,
+                tls: None,
                 current: RwLock::new(generation.current()),
                 control,
                 saving: tokio::sync::Mutex::new(()),
+                hashing: admin::hashing_permits(),
+                access: Store::open(PathBuf::new()),
+                sessions: Sessions::new(),
+                oidc: None,
             }
         };
         let err = daemon
