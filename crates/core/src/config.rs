@@ -1024,8 +1024,20 @@ impl Admin {
                  use a loopback address or a unix socket"
             ));
         }
+        let local_listen = match &self.listen {
+            AdminListen::Tcp(address) => address.ip().is_loopback(),
+            AdminListen::Unix(_) => true,
+        };
         if let Some(public_url) = &self.public_url {
             validate_secure_url("public_url", public_url)?;
+            // No session is held on plain HTTP where the position of a
+            // client is not trusted: the callback would always be refused.
+            if public_url.starts_with("http://") && !local_listen {
+                return Err(format!(
+                    "public_url {public_url:?} must be https: with a listen that is not \
+                     loopback or a unix socket, nobody signs in over plain http"
+                ));
+            }
         }
         if let Some(oidc) = &self.oidc {
             if self.public_url.is_none() {
@@ -1034,10 +1046,6 @@ impl Admin {
                 ));
             }
             // A session cookie is only offered over TLS or from this machine.
-            let local_listen = match &self.listen {
-                AdminListen::Tcp(address) => address.ip().is_loopback(),
-                AdminListen::Unix(_) => true,
-            };
             if self.tls.is_none() && !local_listen {
                 return Err(String::from(
                     "oidc needs tls, or a loopback or unix socket listen",
@@ -5815,6 +5823,37 @@ mod tests {
         ] {
             let err: String = admin_error(&public_url(rejected));
             assert!(err.contains("public_url"), "{rejected}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_http_public_url_needs_a_loopback_or_unix_listen() {
+        let admin = |listen: &str, url: &str| {
+            format!(
+                "[admin]\nlisten = \"{listen}\"\npublic_url = \"{url}\"\n\
+                 tls = {{ cert = \"a.pem\", key = \"a.key\" }}\n"
+            )
+        };
+        for (listen, url) in [
+            ("127.0.0.1:2019", "http://127.0.0.1:2019"),
+            ("[::1]:2019", "http://[::1]:2019"),
+            ("unix//run/rxh/admin.sock", "http://127.0.0.1:2019"),
+            ("0.0.0.0:2019", "https://rxh.example.com"),
+            ("192.0.2.1:2019", "https://127.0.0.1:2019"),
+        ] {
+            let parsed = Config::from_toml(&admin(listen, url));
+            assert!(parsed.is_ok(), "{listen} {url}: {parsed:?}");
+        }
+        for (listen, url) in [
+            ("0.0.0.0:2019", "http://127.0.0.1:2019"),
+            ("192.0.2.1:2019", "http://127.0.0.1:2019"),
+            ("[::]:2019", "http://[::1]:2019"),
+        ] {
+            let err: String = admin_error(&admin(listen, url));
+            assert!(
+                err.contains("public_url") && err.contains("must be https"),
+                "{listen} {url}: {err}"
+            );
         }
     }
 
