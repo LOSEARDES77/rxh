@@ -9,10 +9,12 @@ use std::fmt::Write;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::registry::Registry;
 
 /// Upper bounds of the request duration histogram, in seconds.
-const BUCKETS: [f64; 11] = [
+pub(crate) const BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
@@ -35,6 +37,19 @@ struct HttpStats {
 struct Counters {
     http: BTreeMap<String, HttpStats>,
     l4: BTreeMap<String, BTreeMap<&'static str, u64>>,
+}
+
+/// Counters of one server at one point in time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub(crate) struct ServerCounters {
+    /// HTTP responses by status class, 1xx to 5xx.
+    pub(crate) status: [u64; 5],
+    pub(crate) duration_count: u64,
+    pub(crate) duration_sum: f64,
+    /// Requests per bucket of [`BUCKETS`], not cumulative.
+    pub(crate) duration_buckets: [u64; BUCKETS.len()],
+    /// Layer 4 connections and UDP sessions.
+    pub(crate) connections: u64,
 }
 
 /// Entry of `map` for `key`, allocating the key only the first time.
@@ -84,6 +99,27 @@ impl Metrics {
         *entry(&mut self.lock().l4, server)
             .entry(protocol)
             .or_default() += 1;
+    }
+
+    /// Copy of the request and connection counters of every server.
+    pub(crate) fn snapshot(&self) -> BTreeMap<String, ServerCounters> {
+        let counters = self.lock();
+        let mut snapshot: BTreeMap<String, ServerCounters> = BTreeMap::new();
+        for (server, stats) in &counters.http {
+            let server_counters = snapshot.entry(server.clone()).or_default();
+            for (code, count) in &stats.codes {
+                if let class @ 1..=5 = usize::from(code / 100) {
+                    server_counters.status[class - 1] += count;
+                }
+            }
+            server_counters.duration_count = stats.duration.count;
+            server_counters.duration_sum = stats.duration.sum;
+            server_counters.duration_buckets = stats.duration.buckets;
+        }
+        for (server, protocols) in &counters.l4 {
+            snapshot.entry(server.clone()).or_default().connections = protocols.values().sum();
+        }
+        snapshot
     }
 
     /// Renders every metric for the pools of `registry`.
@@ -281,5 +317,23 @@ mod tests {
         assert!(text.contains("le=\"10\"} 1"));
         assert!(text.contains("le=\"+Inf\"} 2"));
         assert!(text.contains("code=\"500\"} 1"));
+    }
+
+    #[test]
+    fn snapshot_groups_status_classes() {
+        let metrics = Metrics {
+            counters: Mutex::default(),
+        };
+        for status in [200, 204, 404, 503] {
+            metrics.record_http("s", status, Duration::from_millis(7));
+        }
+        metrics.record_l4("t", "tcp");
+        metrics.record_l4("t", "udp");
+        let snapshot = metrics.snapshot();
+        let web = &snapshot["s"];
+        assert_eq!(web.status, [0, 2, 0, 1, 1]);
+        assert_eq!(web.duration_count, 4);
+        assert_eq!(web.duration_buckets[1], 4);
+        assert_eq!(snapshot["t"].connections, 2);
     }
 }

@@ -4,3 +4,4 @@ rxh.log
 *.profraw
 *.profdata
 .ruff_cache/
+node_modules/

@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod admin;
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;

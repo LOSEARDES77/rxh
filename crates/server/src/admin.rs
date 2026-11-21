@@ -7,13 +7,19 @@
 //! |----------|-------------------------------|-------------------------------------|
 //! | `GET`    | `/status`                     | Version, listeners and pools        |
 //! | `GET`    | `/config`                     | Running configuration (JSON)        |
+//! | `GET`    | `/config/files`               | Files on disk as entities, masked   |
+//! | `GET`    | `/schema`                     | JSON schema of the configuration    |
+//! | `PUT`    | `/config/files/{index}`       | Save the text of one file           |
+//! | `POST`   | `/config/entities/{kind}`     | Save a new pool, server or section  |
+//! | `PUT`    | `/config/entities/{kind}/{key}` | Save one pool, server or section  |
+//! | `DELETE` | `/config/entities/{kind}/{key}` | Delete it from its file           |
 //! | `GET`    | `/pools`, `/pools/{name}`     | Pool members and health             |
 //! | `GET`    | `/reverse_proxy/upstreams`    | Caddy compatible upstream list      |
 //! | `POST`   | `/pools/{name}/upstreams`     | Add `{"address", "weight"}`         |
 //! | `DELETE` | `/pools/{name}/upstreams`     | Remove `{"address"}`                |
 //! | `GET`    | `/metrics`                    | Prometheus metrics                  |
 //! | `GET`    | `/certificates`               | Certificates served, with expiry    |
-//! | `GET`    | `/dashboard`                  | Read only web page over the routes  |
+//! | `GET`    | `/dashboard`                  | Web UI over the routes              |
 //! | `POST`   | `/certificates/reload`        | Read certificate files again        |
 //! | `POST`   | `/reload`                     | Reload the configuration file       |
 //! | `POST`   | `/load`                       | Run the configuration in the body   |
@@ -24,7 +30,9 @@
 //! `/load` takes a whole configuration and the `PATCH` routes a JSON merge
 //! patch (RFC 7396), as JSON or TOML. Both validate and swap like a reload,
 //! and neither writes the configuration file: the next reload or restart
-//! goes back to it. `/load` without a body reloads the file. A server is
+//! goes back to it. The `/config/files` and `/config/entities` routes write
+//! the file, then reload it; a change that is not valid or does not reload
+//! leaves the file as it was. `/load` without a body reloads the file. A server is
 //! addressed by `name`, else by its index.
 //!
 //! With `[admin] token` every request must carry `Authorization: Bearer
@@ -32,9 +40,10 @@
 //! loopback name are rejected, so web pages cannot reach the API through DNS
 //! rebinding.
 //!
-//! `/dashboard` is one static page that reads `/status`, `/config` and
-//! `/certificates` from the browser. It holds no data, so it is served
-//! without the token, which the page asks for and sends on those requests.
+//! `/dashboard` is a static web UI (built from `ui/`, served with
+//! `/dashboard/app.js` and `/dashboard/app.css`) that calls the routes from
+//! the browser. It holds no data, so those three paths are served without
+//! the token, which the page asks for and sends on its requests.
 
 use std::convert::Infallible;
 use std::io;
@@ -66,6 +75,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::change::{self, Change, Section};
+use crate::config_api;
 use crate::files;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
@@ -73,18 +83,21 @@ use crate::server::{ShutdownState, State};
 use crate::systemd;
 use crate::tls::{self, CertificateInfo};
 
-/// The whole dashboard: markup, style and script, with no other resource.
-const DASHBOARD: &str = include_str!("dashboard.html");
+/// The web UI, built from `ui/` by `bun run build` and committed, so building
+/// the crate needs no JavaScript tooling.
+const UI_INDEX: &str = include_str!("../ui/dist/index.html");
+const UI_SCRIPT: &str = include_str!("../ui/dist/app.js");
+const UI_STYLE: &str = include_str!("../ui/dist/app.css");
 
-/// Lets the dashboard run its inline script and style and call the API it
-/// came from, and nothing else: no other origin, no frames around it.
-const DASHBOARD_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; \
-     style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'";
+/// Lets the web UI load its own script and style and call the API it came
+/// from, and nothing else: no inline code, no other origin, no frames around it.
+const DASHBOARD_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
 
 const MAX_BODY: usize = 64 * 1024;
 
 /// Limit for the bodies that carry configuration.
-const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
 
 /// Requests from the admin API to the daemon loop.
 #[derive(Debug)]
@@ -131,6 +144,9 @@ pub(crate) struct AdminState {
     pub(crate) token: Option<String>,
     pub(crate) current: RwLock<Current>,
     pub(crate) control: mpsc::Sender<Control>,
+    /// Held while a configuration file is saved and reloaded, so two saves
+    /// do not write over each other.
+    pub(crate) saving: tokio::sync::Mutex<()>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +269,7 @@ async fn bind_unix(path: &Path) -> io::Result<Listener> {
 
 /// Serves the admin API until the task is dropped.
 pub(crate) async fn serve(listener: Listener, state: Arc<AdminState>) {
+    crate::history::global().start(&state);
     loop {
         match &listener {
             Listener::Tcp(listener) => {
@@ -288,7 +305,11 @@ async fn handle(
     state: Arc<AdminState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let raw_path = request.uri().path();
-    let is_dashboard = request.method() == Method::GET && raw_path.trim_matches('/') == "dashboard";
+    let is_dashboard = request.method() == Method::GET
+        && matches!(
+            raw_path.trim_matches('/'),
+            "dashboard" | "dashboard/app.js" | "dashboard/app.css"
+        );
     // The page calls the API with relative URLs, which only resolve to the
     // API routes from this exact path.
     let is_dashboard_page = raw_path == "/dashboard";
@@ -305,12 +326,10 @@ async fn handle(
             );
             return Ok(response);
         }
-    } else if let AdminListen::Tcp(listen) = state.listen
-        && !is_local_request(&request, listen)
-    {
+    } else if !is_local_request(&request, &state.listen) {
         return Ok(error(
             StatusCode::FORBIDDEN,
-            "admin API only accepts loopback Host and Origin",
+            "admin API only accepts a loopback Host and its own Origin",
         ));
     }
 
@@ -335,9 +354,54 @@ async fn handle(
             );
             response
         }
-        (&Method::GET, ["dashboard"]) if is_dashboard_page => dashboard(),
+        (&Method::GET, ["stats", "history"]) => {
+            // `since=<unix seconds>`: only the samples taken after it.
+            let since: Option<Result<u64, _>> = request.uri().query().and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("since="))
+                    .map(str::parse)
+            });
+            match since.transpose() {
+                // Polled every few seconds by the page: no indentation.
+                Ok(since) => json_bytes(
+                    StatusCode::OK,
+                    serde_json::to_vec(&json!({
+                        "interval_seconds": crate::history::INTERVAL.as_secs(),
+                        "buckets": crate::metrics::BUCKETS,
+                        "samples": crate::history::global().samples(since),
+                    })),
+                ),
+                Err(_) => error(
+                    StatusCode::BAD_REQUEST,
+                    "since must be a unix time in seconds",
+                ),
+            }
+        }
+        (&Method::GET, ["dashboard"]) if is_dashboard_page => {
+            dashboard(UI_INDEX, "text/html; charset=utf-8")
+        }
         (&Method::GET, ["dashboard"]) => dashboard_redirect(),
+        (&Method::GET, ["dashboard", "app.js"]) => {
+            dashboard(UI_SCRIPT, "text/javascript; charset=utf-8")
+        }
+        (&Method::GET, ["dashboard", "app.css"]) => dashboard(UI_STYLE, "text/css; charset=utf-8"),
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
+        (&Method::GET, ["config", "files"]) => config_api::files(&state).await,
+        (&Method::GET, ["schema"]) => config_api::schema(),
+        (&Method::PUT, ["config", "files", index]) => {
+            config_api::put_file(&state, index, request).await
+        }
+        (&Method::POST, ["config", "entities", kind]) => {
+            config_api::create(&state, kind, request).await
+        }
+        (&Method::PUT, ["config", "entities", kind, key]) => {
+            config_api::replace(&state, kind, key, request).await
+        }
+        (&Method::DELETE, ["config", "entities", kind, key]) => {
+            let query = request.uri().query();
+            config_api::remove(&state, kind, key, query).await
+        }
         (&Method::GET, ["pools"]) => {
             let registry = registry(&state);
             let pools: Vec<_> = registry.groups().map(|group| group.pool.status()).collect();
@@ -433,14 +497,32 @@ async fn control(
     request: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Control,
     done: &str,
 ) -> Response<Full<Bytes>> {
+    match self::request(state, request).await {
+        Ok(()) => json_response(StatusCode::OK, &json!({ done: true })),
+        Err((status, message)) => error(status, &message),
+    }
+}
+
+/// Sends a request to the daemon loop and waits for its outcome: `400` with
+/// the reason it was rejected, `503` when the daemon is stopping.
+pub(crate) async fn request(
+    state: &AdminState,
+    request: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Control,
+) -> Result<(), (StatusCode, String)> {
+    let stopping = || {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            String::from("daemon is shutting down"),
+        )
+    };
     let (reply, outcome) = oneshot::channel();
     if state.control.send(request(reply)).await.is_err() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down");
+        return Err(stopping());
     }
     match outcome.await {
-        Ok(Ok(())) => json_response(StatusCode::OK, &json!({ done: true })),
-        Ok(Err(message)) => error(StatusCode::BAD_REQUEST, &message),
-        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down"),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err((StatusCode::BAD_REQUEST, message)),
+        Err(_) => Err(stopping()),
     }
 }
 
@@ -474,7 +556,8 @@ async fn patch(
     control(state, |reply| Control::Apply(change, reply), "patched").await
 }
 
-fn registry(state: &AdminState) -> Arc<Registry> {
+/// The registry running now.
+pub(crate) fn registry(state: &AdminState) -> Arc<Registry> {
     Arc::clone(
         &state
             .current
@@ -661,33 +744,45 @@ fn has_token<B>(request: &Request<B>, token: &str) -> bool {
         })
 }
 
-/// True if both `Host` and `Origin` (when present) name a loopback host or
-/// the admin address itself.
-fn is_local_request<B>(request: &Request<B>, listen: SocketAddr) -> bool {
-    let allowed = |authority: &str| {
-        let host = match authority.strip_prefix('[') {
+/// True if a request without a token is not one a web page of another origin
+/// can send. `Host` must name a loopback host, or the address of a TCP
+/// listener: a page that reaches the API through DNS rebinding sends its own
+/// name. `Origin`, which browsers add to every request that can change
+/// something, must be that same `Host`: the port counts, so the page of
+/// another web server on this machine is refused. The comparison is with
+/// `Host` and not with the listen address because a tunnel to the API, or to
+/// its unix socket, can be on any local port. A request without `Host` and
+/// `Origin` passes: browsers always send `Host`.
+fn is_local_request<B>(request: &Request<B>, listen: &AdminListen) -> bool {
+    // `None` for a header that is not text: refused.
+    let text = |name: header::HeaderName| -> Option<Option<&str>> {
+        match request.headers().get(name) {
+            Some(value) => value.to_str().ok().map(Some),
+            None => Some(None),
+        }
+    };
+    let (Some(host), Some(origin)) = (text(header::HOST), text(header::ORIGIN)) else {
+        return false;
+    };
+
+    let is_loopback = |authority: &str| {
+        let name = match authority.strip_prefix('[') {
             Some(rest) => rest.split(']').next().unwrap_or_default(),
             None => authority.split(':').next().unwrap_or_default(),
         };
-        matches!(host, "localhost" | "127.0.0.1" | "::1") || host == listen.ip().to_string()
+        name.eq_ignore_ascii_case("localhost")
+            || matches!(name, "127.0.0.1" | "::1")
+            || matches!(listen, AdminListen::Tcp(listen) if name == listen.ip().to_string())
+    };
+    let is_same_origin = |origin: &str| {
+        // `null`, the origin of sandboxed pages and files, has no scheme.
+        origin
+            .split_once("://")
+            .zip(host)
+            .is_some_and(|((_, authority), host)| authority.eq_ignore_ascii_case(host))
     };
 
-    let host_ok = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_none_or(allowed);
-
-    let origin_ok = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .is_none_or(|origin| {
-            let authority = origin.split("://").nth(1).unwrap_or(origin);
-            allowed(authority.trim_end_matches('/'))
-        });
-
-    host_ok && origin_ok
+    host.is_none_or(is_loopback) && origin.is_none_or(is_same_origin)
 }
 
 async fn read_json<T: for<'de> Deserialize<'de>>(
@@ -702,7 +797,7 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
     })
 }
 
-async fn read_body(
+pub(crate) async fn read_body(
     request: Request<Incoming>,
     limit: usize,
 ) -> Result<Bytes, Box<Response<Full<Bytes>>>> {
@@ -718,8 +813,12 @@ async fn read_body(
     Ok(body.to_bytes())
 }
 
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec_pretty(value).unwrap_or_else(|err| {
+pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
+    json_bytes(status, serde_json::to_vec_pretty(value))
+}
+
+fn json_bytes(status: StatusCode, body: serde_json::Result<Vec<u8>>) -> Response<Full<Bytes>> {
+    let body = body.unwrap_or_else(|err| {
         format!("{{\"error\":\"serialization failed: {err}\"}}").into_bytes()
     });
     let mut response = Response::new(Full::new(Bytes::from(body)));
@@ -731,11 +830,12 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<B
     response
 }
 
-fn dashboard() -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from_static(DASHBOARD.as_bytes())));
+/// One file of the web UI.
+fn dashboard(body: &'static str, content_type: &'static str) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
     let headers = response.headers_mut();
     for (name, value) in [
-        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        (header::CONTENT_TYPE, content_type),
         (header::CONTENT_SECURITY_POLICY, DASHBOARD_POLICY),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::CACHE_CONTROL, "no-cache"),
@@ -756,7 +856,7 @@ fn dashboard_redirect() -> Response<Full<Bytes>> {
     response
 }
 
-fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+pub(crate) fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     json_response(status, &json!({ "error": message }))
 }
 
@@ -779,21 +879,51 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_only_reads() {
-        for write in ["POST", "PUT", "PATCH", "DELETE", "method:", "innerHTML"] {
-            assert!(
-                !DASHBOARD.contains(write),
-                "the read only page must not hold {write}"
-            );
+    fn the_front_end_builds_no_markup_from_strings() {
+        let mut directories = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/src")];
+        let mut files = 0;
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                // Markup from strings can run injected script, and `style=`
+                // is refused by the `style-src 'self'` policy.
+                // An absolute API path breaks the page behind a path prefix.
+                for banned in [
+                    "innerHTML",
+                    "{@html",
+                    "style=",
+                    "api(\"/",
+                    "api(`/",
+                    "api('/",
+                ] {
+                    assert!(!text.contains(banned), "{} holds {banned}", path.display());
+                }
+                // Every call goes through `api`, which keeps paths relative
+                // and sends the token.
+                let name = path.to_string_lossy();
+                if !name.ends_with("lib/api.ts") && !name.contains(".test.") {
+                    assert!(!text.contains("fetch("), "{} calls fetch", path.display());
+                }
+                files += 1;
+            }
         }
-        // Relative, so the page also works behind a path prefix of a proxy.
-        for route in [
-            "api(\"status\")",
-            "api(\"config\")",
-            "api(\"certificates\")",
-        ] {
-            assert!(DASHBOARD.contains(route), "{route}");
-        }
+        assert!(files > 0, "the walk must reach the sources to check them");
+    }
+
+    #[test]
+    fn the_built_page_runs_no_inline_script() {
+        // The policy only lets scripts and styles of the same origin run.
+        assert_eq!(UI_INDEX.matches("<script").count(), 1);
+        assert!(
+            UI_INDEX.contains("<script type=\"module\" crossorigin src=\"./dashboard/app.js\">")
+        );
+        assert!(!UI_INDEX.contains("<style"));
+        assert!(!UI_INDEX.contains("style="));
     }
 
     #[test]
@@ -818,20 +948,76 @@ mod tests {
 
     #[test]
     fn only_loopback_hosts_are_allowed() {
-        let listen: SocketAddr = "127.0.0.1:2019".parse().unwrap();
-        assert!(is_local_request(&request("localhost:2019", None), listen));
-        assert!(is_local_request(
-            &request("127.0.0.1:2019", Some("http://localhost:2019")),
-            listen
-        ));
-        assert!(is_local_request(&request("[::1]:2019", None), listen));
-        assert!(!is_local_request(
-            &request("evil.example:2019", None),
-            listen
-        ));
-        assert!(!is_local_request(
-            &request("localhost:2019", Some("https://evil.example")),
-            listen
-        ));
+        let tcp = AdminListen::Tcp("127.0.0.1:2019".parse().unwrap());
+        let unix = AdminListen::Unix(PathBuf::from("/run/rxh/admin.sock"));
+        for listen in [&tcp, &unix] {
+            let local =
+                |host: &str, origin: Option<&str>| is_local_request(&request(host, origin), listen);
+            for host in [
+                "localhost",
+                "localhost:2019",
+                "LocalHost:2019",
+                "127.0.0.1:2019",
+                "[::1]:2019",
+            ] {
+                assert!(local(host, None), "{host}");
+            }
+            for host in [
+                "evil.example",
+                "evil.example:2019",
+                "127.0.0.1.evil.example",
+                "localhost.evil.example:2019",
+                "",
+            ] {
+                assert!(!local(host, None), "{host}");
+            }
+            assert!(is_local_request(&Request::new(()), listen), "no Host");
+        }
+
+        // The address of a TCP listener is a name of the API, on TCP only.
+        let wide = AdminListen::Tcp("10.0.0.5:2019".parse().unwrap());
+        assert!(is_local_request(&request("10.0.0.5:2019", None), &wide));
+        assert!(!is_local_request(&request("10.0.0.5:2019", None), &tcp));
+        assert!(!is_local_request(&request("10.0.0.5:2019", None), &unix));
+    }
+
+    #[test]
+    fn an_origin_must_be_the_host_of_the_request() {
+        let tcp = AdminListen::Tcp("127.0.0.1:2019".parse().unwrap());
+        let unix = AdminListen::Unix(PathBuf::from("/run/rxh/admin.sock"));
+        for listen in [&tcp, &unix] {
+            let local =
+                |host: &str, origin: &str| is_local_request(&request(host, Some(origin)), listen);
+            assert!(local("localhost:2019", "http://localhost:2019"));
+            assert!(local("127.0.0.1:2019", "http://127.0.0.1:2019"));
+            assert!(local("[::1]:2019", "http://[::1]:2019"));
+            assert!(local("localhost", "http://localhost"));
+            assert!(local("localhost:2019", "HTTP://LOCALHOST:2019"));
+            // A tunnel on a port that is not the one the daemon listens on.
+            assert!(local("localhost:8080", "http://localhost:8080"));
+
+            // Another site, and another web server of this machine.
+            assert!(!local("localhost:2019", "https://evil.example"));
+            assert!(!local("localhost:2019", "http://localhost:3000"));
+            assert!(!local("localhost:2019", "http://localhost"));
+            assert!(!local("localhost", "http://localhost:2019"));
+            assert!(!local("localhost:2019", "http://127.0.0.1:2019"));
+            // The same origin, but not of this machine.
+            assert!(!local("evil.example", "http://evil.example"));
+            // Not an origin.
+            assert!(!local("localhost:2019", "null"));
+            assert!(!local("localhost:2019", ""));
+            assert!(!local("localhost:2019", "localhost:2019"));
+            assert!(!local("localhost:2019", "http://localhost:2019/"));
+            assert!(!local("localhost:2019", "http://user@localhost:2019"));
+
+            // Nothing to compare the origin with.
+            let mut no_host = Request::new(());
+            no_host.headers_mut().insert(
+                header::ORIGIN,
+                header::HeaderValue::from_static("http://localhost:2019"),
+            );
+            assert!(!is_local_request(&no_host, listen));
+        }
     }
 }

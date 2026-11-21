@@ -122,6 +122,18 @@ Tests: unit tests next to the code in every crate; integration tests in `server/
 (the admin API in `admin.rs`, upstream connection handling in `upstream_pooling.rs`) and
 `cli/tests/daemon.rs` (the `rxh` binary: `run`, `start`, `stop`, `reload`, every client command).
 
+The web UI and its routes were added after the measurement of this section, which was not run
+again: `server/src/config_api.rs`, `entity.rs`, `secret.rs`, `edit.rs` and `history.rs` are not in
+the tables. Their tests: unit tests next to the code (the JSON merge into the TOML document, masking
+and restoring secrets, the mode of a saved file, the history ring), `server/tests/config_edit.rs` (every `/config/files` and
+`/config/entities` route against a daemon on port 0: save, invalid value and failed reload rolled
+back, included file edited in place, revision conflict, no configuration file, token, a directory
+that cannot be written)
+and `server/tests/history.rs` (`GET /stats/history`). The page itself has Vitest unit tests in
+`crates/server/ui/src` (`bun run test`: the schema renderer, rates and percentiles, the API client,
+each tab), run by the CI job `ui`; they are outside the Rust line coverage. No test drives a real
+browser: that check is made by hand against a running `rxh`.
+
 ## 3. Biggest gaps
 
 Line numbers of gaps 1 to 4 and 6 are from the measurement of section 2. The other gaps were

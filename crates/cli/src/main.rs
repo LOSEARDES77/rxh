@@ -4,7 +4,6 @@ mod adapt;
 mod cli;
 mod client;
 mod commands;
-mod edit;
 mod fmt;
 mod process;
 mod quick;

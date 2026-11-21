@@ -11,30 +11,44 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Val
 
 /// New pool definition.
 #[derive(Debug, Default)]
-pub(crate) struct PoolSpec {
-    pub(crate) policy: String,
-    pub(crate) backends: Vec<String>,
-    pub(crate) key: Option<String>,
-    pub(crate) retries: Option<u32>,
-    pub(crate) health_uri: Option<String>,
-    pub(crate) health_interval: Option<String>,
-    pub(crate) fail_duration: Option<String>,
+pub struct PoolSpec {
+    /// Load balancing policy, as written in `policy`.
+    pub policy: String,
+    /// Backend addresses.
+    pub backends: Vec<String>,
+    /// Hash key of the policies that take one.
+    pub key: Option<String>,
+    /// Attempts on other backends after a failure.
+    pub retries: Option<u32>,
+    /// URI of the active health check.
+    pub health_uri: Option<String>,
+    /// Interval of the active health check, as a duration.
+    pub health_interval: Option<String>,
+    /// How long passive health checks keep a failed backend out.
+    pub fail_duration: Option<String>,
 }
 
 /// New service definition.
 #[derive(Debug, Default)]
-pub(crate) struct ServiceSpec {
-    pub(crate) listen: Vec<SocketAddr>,
-    pub(crate) protocol: &'static str,
-    pub(crate) to: Vec<String>,
-    pub(crate) serve: Option<String>,
-    pub(crate) name: Option<String>,
-    pub(crate) uri: Option<String>,
-    pub(crate) host: Vec<String>,
+pub struct ServiceSpec {
+    /// Listen addresses.
+    pub listen: Vec<SocketAddr>,
+    /// `http`, `tcp` or `udp`; `http` is left implicit.
+    pub protocol: &'static str,
+    /// Forward targets: addresses or `@pool`.
+    pub to: Vec<String>,
+    /// Directory served as static files instead of forwarding.
+    pub serve: Option<String>,
+    /// Name of the service.
+    pub name: Option<String>,
+    /// Path the service matches.
+    pub uri: Option<String>,
+    /// Host names the service matches.
+    pub host: Vec<String>,
 }
 
 /// A configuration file loaded for editing.
-pub(crate) struct ConfigFile {
+pub struct ConfigFile {
     path: PathBuf,
     document: DocumentMut,
     /// Text on disk when opened, `None` if the file did not exist.
@@ -43,7 +57,7 @@ pub(crate) struct ConfigFile {
 
 impl ConfigFile {
     /// Loads `path`. A missing file starts as an empty document.
-    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, String> {
         let original = match fs::read_to_string(path) {
             Ok(text) => Some(text),
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
@@ -71,12 +85,41 @@ impl ConfigFile {
     }
 
     /// Path of the file.
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// The edited document as TOML text.
+    pub fn text(&self) -> String {
+        self.document.to_string()
+    }
+
+    /// Text on disk when the file was opened, `None` if it did not exist.
+    pub fn original(&self) -> Option<&str> {
+        self.original.as_deref()
+    }
+
+    /// The edited document.
+    pub fn document(&self) -> &DocumentMut {
+        &self.document
+    }
+
+    /// The edited document, for changes the methods of this type do not cover.
+    pub fn document_mut(&mut self) -> &mut DocumentMut {
+        &mut self.document
+    }
+
+    /// Replaces the whole document with `text`. On a parse error the document
+    /// is left unchanged and the error names the file.
+    pub fn set_text(&mut self, text: &str) -> Result<(), String> {
+        self.document = text
+            .parse()
+            .map_err(|err| format!("{}: {err}", self.path.display()))?;
+        Ok(())
+    }
+
     /// True if `[upstream.NAME]` is defined in this file.
-    pub(crate) fn defines_pool(&self, name: &str) -> bool {
+    pub fn defines_pool(&self, name: &str) -> bool {
         self.document
             .get("upstream")
             .and_then(|upstreams| upstreams.get(name))
@@ -84,7 +127,7 @@ impl ConfigFile {
     }
 
     /// Entries of the top level `include` list.
-    pub(crate) fn includes(&self) -> Vec<String> {
+    pub fn includes(&self) -> Vec<String> {
         self.document
             .get("include")
             .and_then(Item::as_array)
@@ -98,7 +141,7 @@ impl ConfigFile {
     }
 
     /// Appends `path` to the top level `include` list unless it is there.
-    pub(crate) fn add_include(&mut self, path: &str) -> Result<(), String> {
+    pub fn add_include(&mut self, path: &str) -> Result<(), String> {
         let include = self
             .document
             .entry("include")
@@ -125,12 +168,7 @@ impl ConfigFile {
     }
 
     /// Appends a backend to `[upstream.POOL].backends`.
-    pub(crate) fn add_backend(
-        &mut self,
-        pool: &str,
-        address: &str,
-        weight: u32,
-    ) -> Result<(), String> {
+    pub fn add_backend(&mut self, pool: &str, address: &str, weight: u32) -> Result<(), String> {
         let table = self.pool_mut(pool)?;
         let key = if table.contains_key("to") {
             "to"
@@ -162,7 +200,7 @@ impl ConfigFile {
     }
 
     /// Removes a backend from `[upstream.POOL].backends`.
-    pub(crate) fn remove_backend(&mut self, pool: &str, address: &str) -> Result<(), String> {
+    pub fn remove_backend(&mut self, pool: &str, address: &str) -> Result<(), String> {
         let table = self.pool_mut(pool)?;
         for key in ["backends", "to"] {
             if let Some(backends) = table.get_mut(key).and_then(Item::as_array_mut) {
@@ -177,7 +215,7 @@ impl ConfigFile {
     }
 
     /// Adds an `[upstream.NAME]` table.
-    pub(crate) fn add_pool(&mut self, name: &str, spec: &PoolSpec) -> Result<(), String> {
+    pub fn add_pool(&mut self, name: &str, spec: &PoolSpec) -> Result<(), String> {
         spec.policy.parse::<Policy>()?;
 
         let upstreams = self
@@ -227,7 +265,7 @@ impl ConfigFile {
     }
 
     /// Deletes an `[upstream.NAME]` table.
-    pub(crate) fn remove_pool(&mut self, name: &str) -> Result<(), String> {
+    pub fn remove_pool(&mut self, name: &str) -> Result<(), String> {
         let upstreams = self
             .document
             .get_mut("upstream")
@@ -240,7 +278,7 @@ impl ConfigFile {
     }
 
     /// Appends a `[[server]]`.
-    pub(crate) fn add_service(&mut self, spec: &ServiceSpec) -> Result<(), String> {
+    pub fn add_service(&mut self, spec: &ServiceSpec) -> Result<(), String> {
         let mut server = Table::new();
 
         if let Some(name) = &spec.name {
@@ -285,7 +323,7 @@ impl ConfigFile {
     }
 
     /// Removes services whose name or one of whose listen addresses matches.
-    pub(crate) fn remove_service(&mut self, service: &str) -> Result<usize, String> {
+    pub fn remove_service(&mut self, service: &str) -> Result<usize, String> {
         let servers = self
             .document
             .get_mut("server")
@@ -302,10 +340,30 @@ impl ConfigFile {
     }
 }
 
+/// Why [`try_save_all`] did not save.
+#[derive(Debug)]
+#[must_use]
+pub enum SaveError {
+    /// The configuration would not be valid with the change. Every file is
+    /// as it was.
+    Invalid(String),
+    /// A file could not be written, or could not be put back.
+    Io(String),
+}
+
 /// Writes the edited `files`, then loads the whole configuration starting at
 /// `main` (includes merged) to validate it. If that fails every file goes
-/// back to what it was and the error is returned.
-pub(crate) fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
+/// back to what it was and the error is returned. A file that cannot be
+/// written stops the save before validation; the error names it.
+pub fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, String> {
+    try_save_all(files, main).map_err(|err| match err {
+        SaveError::Invalid(message) | SaveError::Io(message) => message,
+    })
+}
+
+/// [`save_all`] with an error that tells an invalid configuration from a
+/// file system failure.
+pub fn try_save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, SaveError> {
     // Topmost directory each new file needs, removed again on rollback.
     let created_directories: Vec<PathBuf> = files
         .iter()
@@ -322,18 +380,60 @@ pub(crate) fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, Str
         })
         .collect();
 
-    let written = files
-        .iter()
-        .try_for_each(|file| write_atomically(&file.path, &file.document.to_string()));
-    let outcome = written
-        .map_err(|err| err.to_string())
-        .and_then(|()| rxh_server::load_config(main).map_err(|err| err.to_string()));
-    let err = match outcome {
-        Ok(config) => return Ok(config),
-        Err(err) => err,
+    // Files before this index were replaced and are the ones to put back.
+    let mut written: usize = 0;
+    let mut unwritable: Option<String> = None;
+    for file in files {
+        if let Err(err) = write_atomically(&file.path, &file.document.to_string()) {
+            unwritable = Some(format!(
+                "the configuration file {} cannot be written, nothing was changed: {err}",
+                file.path.display()
+            ));
+            break;
+        }
+        written += 1;
+    }
+    let (mut message, is_invalid) = match unwritable {
+        Some(message) => (message, false),
+        None => match crate::load_config(main) {
+            Ok(config) => return Ok(config),
+            Err(err) => (
+                format!("the change would break the configuration: {err}"),
+                true,
+            ),
+        },
     };
 
-    let mut failures = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    if let Err(err) = restore(&files[..written]) {
+        failures.push(err);
+    }
+    for directory in created_directories {
+        if let Err(err) = fs::remove_dir_all(&directory)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            failures.push(format!("{}: {err}", directory.display()));
+        }
+    }
+
+    if !failures.is_empty() {
+        message.push_str(&format!(
+            "\nrollback failed, check these files by hand: {}",
+            failures.join("; ")
+        ));
+    }
+    Err(if is_invalid && failures.is_empty() {
+        SaveError::Invalid(message)
+    } else {
+        SaveError::Io(message)
+    })
+}
+
+/// Writes every file back to the text it had when opened, and removes the
+/// files that did not exist then. Tries every file even after a failure; the
+/// error lists each file that could not be restored.
+pub fn restore(files: &[&ConfigFile]) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
     for file in files {
         let restored = match &file.original {
             Some(text) => write_atomically(&file.path, text),
@@ -348,33 +448,74 @@ pub(crate) fn save_all(files: &[&ConfigFile], main: &Path) -> Result<Config, Str
             failures.push(err);
         }
     }
-    for directory in created_directories {
-        if let Err(err) = fs::remove_dir_all(&directory)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            failures.push(format!("{}: {err}", directory.display()));
-        }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
-
-    let mut message = format!("the change would break the configuration: {err}");
-    if !failures.is_empty() {
-        message.push_str(&format!(
-            "\nrollback failed, check these files by hand: {}",
-            failures.join("; ")
-        ));
-    }
-    Err(message)
 }
 
+/// Replaces `path` with `text` through a temporary file and a rename, so a
+/// reader sees the old text or the new one. The text is on disk before the
+/// rename: a power loss cannot leave an empty file under the name.
 fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
+    // A link stays a link: the file it points to is the one replaced.
+    let resolved = fs::canonicalize(path);
+    let path = resolved.as_deref().unwrap_or(path);
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory).map_err(|err| format!("{}: {err}", directory.display()))?;
     }
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    fs::write(&temporary, text).map_err(|err| format!("{}: {err}", temporary.display()))?;
-    fs::rename(&temporary, path).map_err(|err| format!("{}: {err}", path.display()))
+    write_like(&temporary, path, text).map_err(|err| format!("{}: {err}", temporary.display()))?;
+    fs::rename(&temporary, path).map_err(|err| format!("{}: {err}", path.display()))?;
+    // The rename is durable once the directory is; the file is already in
+    // place, so a failure here is not a failed save.
+    #[cfg(unix)]
+    if let Some(directory) = path.parent()
+        && let Ok(directory) = fs::File::open(directory)
+    {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+/// Writes `text` to the new file `temporary`, which gets the mode and, when
+/// the process may give it, the owner of `like`. Without `like` only the
+/// owner can read it: a configuration file can hold secrets. The file is
+/// private before anything is written to it.
+#[cfg(unix)]
+fn write_like(temporary: &Path, like: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{self as unix_fs, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    // One left by a process that died would keep its own mode.
+    match fs::remove_file(temporary) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        _ => {}
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(temporary)?;
+    if let Ok(metadata) = fs::metadata(like) {
+        // Only root can give a file away; the mode is what protects it.
+        let _ = unix_fs::fchown(&file, Some(metadata.uid()), Some(metadata.gid()));
+        file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
+    }
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_like(temporary: &Path, _like: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::File::create(temporary)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 /// Value as a string when there is one entry, as an array otherwise.
@@ -522,6 +663,145 @@ forward = "@api"
         .unwrap();
         let text = file.document.to_string();
         Config::from_toml(&text).unwrap_or_else(|err| panic!("{err}\n{text}"));
+    }
+
+    #[test]
+    fn restore_puts_back_the_text_and_removes_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.toml");
+        fs::write(&existing, "a = 1").unwrap();
+        let mut file = ConfigFile::open(&existing).unwrap();
+        file.set_text("a = 2").unwrap();
+        assert!(file.set_text("a = ").unwrap_err().contains("a.toml"));
+        assert_eq!(file.original(), Some("a = 1"));
+        fs::write(&existing, file.text()).unwrap();
+
+        let missing = dir.path().join("new.toml");
+        let new = ConfigFile::open(&missing).unwrap();
+        assert_eq!(new.original(), None);
+        fs::write(&missing, "b = 1").unwrap();
+
+        restore(&[&file, &new]).unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "a = 1");
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_the_mode_of_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("rxh.toml");
+        fs::write(&main, BASE).unwrap();
+        // A temporary file left behind, readable by everybody.
+        fs::write(dir.path().join("rxh.toml.tmp"), "stale").unwrap();
+
+        for wanted in [0o600, 0o640] {
+            fs::set_permissions(&main, fs::Permissions::from_mode(wanted)).unwrap();
+
+            let mut file = ConfigFile::open(&main).unwrap();
+            file.add_backend("api", "127.0.0.1:8081", 1).unwrap();
+            save_all(&[&file], &main).unwrap();
+            assert_eq!(mode(&main), wanted, "after a save");
+            assert!(fs::read_to_string(&main).unwrap().contains("8081"));
+
+            let before = fs::read_to_string(&main).unwrap();
+            let mut file = ConfigFile::open(&main).unwrap();
+            file.set_text("[upstream.api]\npolicy = \"nope\"\n")
+                .unwrap();
+            save_all(&[&file], &main).unwrap_err();
+            assert_eq!(mode(&main), wanted, "after a rejected save");
+            assert_eq!(fs::read_to_string(&main).unwrap(), before);
+            file.remove_backend("api", "127.0.0.1:8081").unwrap_err();
+            fs::write(&main, BASE).unwrap();
+        }
+
+        let new = dir.path().join("new.toml");
+        write_atomically(&new, "a = 1").unwrap();
+        assert_eq!(mode(&new), 0o600, "a new file is private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_symlink_writes_its_target() {
+        use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let target = real.join("rxh.toml");
+        fs::write(&target, BASE).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let main = dir.path().join("rxh.toml");
+        unix_fs::symlink("real/rxh.toml", &main).unwrap();
+        let check = |when: &str| {
+            assert!(
+                fs::symlink_metadata(&main).unwrap().is_symlink(),
+                "still a link {when}"
+            );
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o640, "{when}");
+            let names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .chain(fs::read_dir(&real).unwrap())
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 3, "no temporary file left {when}: {names:?}");
+        };
+
+        let mut file = ConfigFile::open(&main).unwrap();
+        file.add_backend("api", "127.0.0.1:8081", 1).unwrap();
+        save_all(&[&file], &main).unwrap();
+        check("after a save");
+        let saved = fs::read_to_string(&target).unwrap();
+        assert!(saved.contains("8081"), "{saved}");
+
+        let mut file = ConfigFile::open(&main).unwrap();
+        file.set_text("[upstream.api]\npolicy = \"nope\"\n")
+            .unwrap();
+        save_all(&[&file], &main).unwrap_err();
+        check("after a rejected save");
+        assert_eq!(fs::read_to_string(&target).unwrap(), saved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_written_is_named_and_the_others_are_put_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("rxh.toml");
+        let main_text = format!("include = [\"locked/*.toml\"]\n{BASE}");
+        fs::write(&main, &main_text).unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let extra = locked.join("extra.toml");
+        fs::write(&extra, "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(locked.join("probe"), "").is_ok() {
+            // Root writes anywhere: nothing to check.
+            return;
+        }
+
+        let mut first = ConfigFile::open(&main).unwrap();
+        first.add_backend("api", "127.0.0.1:8081", 1).unwrap();
+        let mut second = ConfigFile::open(&extra).unwrap();
+        second.set_text("[upstream.other]\n").unwrap();
+        let err = save_all(&[&first, &second], &main).unwrap_err();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let expected = format!(
+            "the configuration file {} cannot be written, nothing was changed: ",
+            extra.display()
+        );
+        assert!(err.starts_with(&expected), "{err}");
+        assert!(err.contains("Permission denied"), "{err}");
+        assert!(!err.contains("would break"), "{err}");
+        assert!(!err.contains("rollback failed"), "{err}");
+        assert_eq!(fs::read_to_string(&main).unwrap(), main_text);
+        assert_eq!(fs::read_to_string(&extra).unwrap(), "");
     }
 
     #[test]

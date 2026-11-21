@@ -41,14 +41,25 @@ Changed.
   also shipped as `docs/rxh.schema.json`: with a `#:schema` line, Taplo,
   Even Better TOML and Tombi complete keys, show their documentation and
   flag unknown keys and wrong values in the editor.
-- Read only web dashboard: `GET /dashboard` on the admin API
-  (`http://127.0.0.1:2019/dashboard` by default) shows listeners, hosts
-  with their routes, the live health of every backend and the certificates
-  with their expiry, refreshed every 2 seconds. One page embedded in the
-  binary, without external resources. With `[admin] token` the page is
-  served without the token and asks for it before reading any data.
-  `/dashboard/` redirects to `/dashboard`, the path its requests are
-  relative to.
+- Web UI at `GET /dashboard` on the admin API
+  (`http://127.0.0.1:2019/dashboard` by default), embedded in the binary,
+  without external resources. Five tabs: Overview (requests, errors and
+  latency of the last hour, per pool and per server), Hosts, Pools,
+  Certificates and Settings. Every key of the configuration has a form
+  field generated from the JSON schema, with a "Form | TOML" switch; a save
+  is written to the configuration file, validated, applied with a reload
+  and rolled back when either fails, keeping the comments outside the
+  table that changed. Backends can be drained, put in maintenance and made
+  ready; reload, certificate reload, upgrade and stop have a control. With
+  `[admin] token` the page and its two assets are served without the token
+  and ask for it before reading any data. `/dashboard/` redirects to
+  `/dashboard`. No certificate upload and no accounts.
+- Admin routes behind the page: `GET /schema`, `GET /stats/history` (one
+  sample every 5 seconds, 720 kept, in memory; `?since=<unix seconds>`
+  sends only the newer ones, which is what the page polls), `GET /config/files`,
+  `PUT /config/files/{index}`, `POST /config/entities/{kind}`, and `PUT`
+  and `DELETE /config/entities/{kind}/{key}`. Secrets are shown as `***`
+  and a `***` sent back keeps the stored value.
 - `rxh top`: requests per second, errors per second and error share,
   mean upstream latency, requests in flight and healthy backends of every
   pool, refreshed every `--interval` (1s) from `GET /metrics` until
@@ -435,10 +446,31 @@ Changed.
 
 ### Changed
 
+- Without `[admin] token`, the admin API on a unix socket now refuses with
+  `403` a request whose `Host` is not `localhost`, `127.0.0.1` or `::1`, as
+  the TCP listener already did: once the socket is forwarded to a local
+  port (`ssh -L 2019:/run/rxh/admin.sock host`) any web page could reach it
+  and, with the routes that save the configuration, add a server. On both
+  listeners `Origin` must now be the `Host` of the request, port included,
+  so a page served on another local port (`http://localhost:3000`) is
+  refused too. The CLI is not affected; a script that talks to the socket
+  with another name (`curl --unix-socket ... http://rxh/status`) must use
+  `http://localhost/`. With a token nothing changes.
 - `rxh_upstream_failures_total` counts requests and connections that failed
   without a response only. Responses that passive health checks treat as
   failures (`unhealthy_status`, `unhealthy_latency`) are no longer added to
   it; 5xx responses are in `rxh_upstream_server_errors_total`.
+- The commands that edit the configuration files (`rxh upstream add`,
+  `rxh pool add`, `rxh service add`, ...) and the saves of the web UI keep
+  the mode of the file they rewrite, and create a file that did not exist
+  with mode `0600` instead of the mode the umask gave (usually `0644`). The
+  owner is kept only when the process may `chown`. A configuration file
+  created by `rxh` run as root is therefore not readable by a daemon
+  running as another user until it is given to it (`chown`, or `chmod 640`
+  with its group).
+- `GET /dashboard` is the web UI and no longer the read only page; with
+  `[admin] token`, `/dashboard/app.js` and `/dashboard/app.css` are served
+  without the token too.
 - `[admin] listen` on an address outside loopback is rejected unless
   `[admin] token` is set; it used to serve the admin API to the network
   without authentication.
@@ -501,6 +533,18 @@ Changed.
 
 ### Fixed
 
+- The commands that edit the configuration files and the saves of the web
+  UI sync the new text to disk before it takes the name of the file, so a
+  power loss right after a save cannot leave an empty configuration file.
+  A configuration file that is a symbolic link stays a link and the file
+  it points to is the one rewritten; the link used to be replaced by a
+  regular file, leaving the real file with the old text.
+- A configuration file that cannot be written (a read-only directory, for
+  instance) is reported as such by the commands that edit the files and by
+  the saves of the web UI: "the configuration file /etc/rxh/rxh.toml cannot
+  be written, nothing was changed: ...". The message used to start with
+  "the change would break the configuration" and to end with "rollback
+  failed, check these files by hand", although nothing had been written.
 - An HTTP/3 request carrying `Connection: upgrade` and `Upgrade` no longer
   asks the backend for the upgrade: the fields are dropped, as HTTP/3 has
   no upgrades.

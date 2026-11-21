@@ -345,6 +345,7 @@ impl Daemon {
             token: admin_settings.token.clone(),
             current: RwLock::new(generation.current()),
             control,
+            saving: tokio::sync::Mutex::new(()),
         });
 
         let admin_listener: Option<(AbortOnDrop, Lease)> = if admin_settings.enabled {
@@ -987,6 +988,7 @@ forward = "@api"
                 token: None,
                 current: RwLock::new(generation.current()),
                 control,
+                saving: tokio::sync::Mutex::new(()),
             }
         };
         let err = daemon

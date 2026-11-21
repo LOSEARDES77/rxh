@@ -9,16 +9,20 @@ mod acme;
 mod admin;
 mod catalog;
 mod change;
+mod config_api;
 mod daemon;
 mod dns01;
 mod docker;
 mod dynamic;
+pub mod edit;
+mod entity;
 mod error;
 mod files;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
 mod health;
+mod history;
 mod hooks;
 mod http;
 mod http3;
@@ -32,6 +36,7 @@ mod ocsp;
 mod per_core;
 mod proxy_protocol;
 mod registry;
+mod secret;
 mod server;
 #[cfg(target_os = "linux")]
 mod splice;
