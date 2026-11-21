@@ -219,8 +219,35 @@ Saving as a user without `admin`:
 - A validation error is passed on as it is. A clash with the name of a host
   the user cannot see is therefore visible; that is accepted.
 
-A user with Modify can point a host at any address the daemon can reach. That
-is accepted; trust the people you give Modify.
+### What a user without `admin` may put in a host
+
+Found while building: a host table can make the daemon read files (`serve`,
+`error_pages`, certificate paths, `{file.…}` and `{env.…}` placeholders), run
+programs (health `hooks.command`), call other services (`forward_auth`,
+webhooks) and open sockets. So Modify and Create do not mean "any table".
+
+- A user without `admin` may set only the keys of an allow list kept in one
+  place in the code: the keys that route or answer traffic for the host and
+  do nothing else. Everything else, and every key the list does not know,
+  must keep the value it has in the file (Modify) or be absent (Create); a
+  change to it answers `403` and names the key.
+- Never on the list: anything that names a path on the daemon's machine,
+  runs a command, sends requests anywhere but to the forward targets, holds
+  credentials, or changes who is trusted (`trusted_proxies`, client
+  certificates). No string may contain a `{file.` or `{env.` placeholder.
+  No forward target may be a unix socket.
+- `listen`: only addresses that another server of the running configuration
+  already listens on; no new sockets. `host` must not be empty on a host a
+  user without `admin` creates.
+- Forward targets stay free: a user with Modify can point a host at any
+  address the daemon can reach. That is accepted, with one exception the
+  daemon enforces for everybody: while no `token` is set, the proxy refuses
+  to connect to its own admin API, because such a connection would arrive
+  as a local administrator.
+- Claiming a host name nobody uses yet on a shared listener is what Create
+  is for; taking over a name another host already answers is refused when
+  the configuration validation refuses it, and is otherwise a matter of
+  trust.
 
 The check lives in one place that every route goes through, written so that a
 new route is administrator only unless it says otherwise.
