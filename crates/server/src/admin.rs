@@ -26,6 +26,10 @@
 //! | `PATCH`  | `/config/upstream/{name}`     | Merge the body into one pool        |
 //! | `PATCH`  | `/config/server/{name}`       | Merge the body into one server      |
 //! | `POST`   | `/stop`                       | Graceful shutdown                   |
+//! | `GET`    | `/auth/session`               | Who the caller is                   |
+//! | `POST`   | `/auth/login`, `/auth/logout` | Sign in and out with a session      |
+//! | `POST`   | `/auth/setup`                 | Create the first user               |
+//! | `PUT`    | `/auth/password`              | Change one's own password           |
 //!
 //! `/load` takes a whole configuration and the `PATCH` routes a JSON merge
 //! patch (RFC 7396), as JSON or TOML. Both validate and swap like a reload,
@@ -35,11 +39,14 @@
 //! leaves the file as it was. `/load` without a body reloads the file. A server is
 //! addressed by `name`, else by its index.
 //!
-//! With `[admin] token` every request must carry `Authorization: Bearer
-//! <token>`. Without it, only local requests are served: the connection
-//! comes from this machine (see [`connection_is_local`]) and neither `Host`
-//! nor `Origin` is a name other than a loopback one, so web pages cannot
-//! reach the API through DNS rebinding.
+//! Every request goes through one gate, which first works out who sends it
+//! (see [`Caller`]): the holder of `[admin] token`, a signed-in user, a
+//! local request when no token is set, or nobody. A request is local when
+//! its connection comes from this machine (see [`connection_is_local`]) and
+//! neither `Host` nor `Origin` is a name other than a loopback one, so web
+//! pages cannot reach the API through DNS rebinding. The gate then lets the
+//! request through only when [`ROUTES`] says the route is for that caller:
+//! a route that is not listed there is for administrators.
 //!
 //! With `[admin] tls` the listener answers HTTPS, and plain HTTP to
 //! connections from this machine, on the same port.
@@ -80,12 +87,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
+use crate::access::{Access, Scope, Store};
+use crate::auth_api;
 use crate::change::{self, Change, Section};
 use crate::config_api;
 use crate::files;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
+use crate::session::{self, Session, Sessions};
 use crate::systemd;
 use crate::tls::{self, AdminTls, CertificateInfo};
 
@@ -104,6 +114,59 @@ const MAX_BODY: usize = 64 * 1024;
 
 /// Limit for the bodies that carry configuration.
 pub(crate) const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
+
+/// Who a route of the admin API answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    /// Everybody, signed in or not.
+    Anyone,
+    /// Whoever is signed in. The route itself checks what its caller may do.
+    Caller,
+    /// Administrators: the token, a local request without a token, and
+    /// users with the `admin` role.
+    Admin,
+}
+
+/// Every route of the admin API: method, path without its outer slashes
+/// (`{}` is a segment that names something) and audience. The gate reads
+/// the audience here, and what is not here is for administrators: a route
+/// answers anybody else only because this table says so.
+pub const ROUTES: &[(&str, &str, Audience)] = &[
+    ("GET", "", Audience::Admin),
+    ("GET", "status", Audience::Admin),
+    ("GET", "metrics", Audience::Admin),
+    ("GET", "stats/history", Audience::Admin),
+    ("GET", "dashboard", Audience::Anyone),
+    ("GET", "dashboard/app.js", Audience::Anyone),
+    ("GET", "dashboard/app.css", Audience::Anyone),
+    ("GET", "auth/session", Audience::Anyone),
+    ("POST", "auth/login", Audience::Anyone),
+    ("POST", "auth/setup", Audience::Anyone),
+    ("POST", "auth/logout", Audience::Caller),
+    ("PUT", "auth/password", Audience::Caller),
+    ("GET", "config", Audience::Admin),
+    ("GET", "config/files", Audience::Admin),
+    ("GET", "schema", Audience::Admin),
+    ("PUT", "config/files/{}", Audience::Admin),
+    ("POST", "config/entities/{}", Audience::Admin),
+    ("PUT", "config/entities/{}/{}", Audience::Admin),
+    ("DELETE", "config/entities/{}/{}", Audience::Admin),
+    ("GET", "pools", Audience::Admin),
+    ("GET", "pools/{}", Audience::Admin),
+    ("GET", "reverse_proxy/upstreams", Audience::Admin),
+    ("POST", "pools/{}/upstreams", Audience::Admin),
+    ("PUT", "pools/{}/upstreams", Audience::Admin),
+    ("POST", "pools/{}/upstreams/state", Audience::Admin),
+    ("PUT", "pools/{}/upstreams/state", Audience::Admin),
+    ("DELETE", "pools/{}/upstreams", Audience::Admin),
+    ("POST", "reload", Audience::Admin),
+    ("POST", "load", Audience::Admin),
+    ("PATCH", "config/{}/{}", Audience::Admin),
+    ("GET", "certificates", Audience::Admin),
+    ("POST", "certificates/reload", Audience::Admin),
+    ("POST", "upgrade", Audience::Admin),
+    ("POST", "stop", Audience::Admin),
+];
 
 /// Requests from the admin API to the daemon loop.
 #[derive(Debug)]
@@ -155,6 +218,10 @@ pub(crate) struct AdminState {
     /// Held while a configuration file is saved and reloaded, so two saves
     /// do not write over each other.
     pub(crate) saving: tokio::sync::Mutex<()>,
+    /// The users file, from `[admin] users`.
+    pub(crate) access: Store,
+    /// Who is signed in.
+    pub(crate) sessions: Sessions,
 }
 
 /// Who is at the other end of a connection to the admin API.
@@ -164,10 +231,8 @@ pub(crate) struct Peer {
     /// for which [`connection_is_local`] holds.
     pub(crate) local: bool,
     /// The connection is encrypted.
-    #[expect(dead_code, reason = "read by the session cookie, in a later change")]
     pub(crate) tls: bool,
     /// Address of a TCP peer.
-    #[expect(dead_code, reason = "read by the sign-in lockout, in a later change")]
     pub(crate) address: Option<IpAddr>,
 }
 
@@ -426,34 +491,17 @@ async fn handle(
     state: Arc<AdminState>,
     peer: Peer,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let raw_path = request.uri().path();
-    let is_dashboard = request.method() == Method::GET
-        && matches!(
-            raw_path.trim_matches('/'),
-            "dashboard" | "dashboard/app.js" | "dashboard/app.css"
-        );
     // The page calls the API with relative URLs, which only resolve to the
     // API routes from this exact path.
-    let is_dashboard_page = raw_path == "/dashboard";
-    if let Some(token) = &state.token {
-        // A browser cannot send the token when it opens a page.
-        if !is_dashboard && !has_token(&request, token) {
-            let mut response = error(
-                StatusCode::UNAUTHORIZED,
-                "admin API requires Authorization: Bearer <token>",
-            );
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                header::HeaderValue::from_static("Bearer"),
-            );
-            return Ok(response);
-        }
-    } else if !is_local_request(&request, &state.listen, peer) {
-        return Ok(error(StatusCode::FORBIDDEN, refusal(peer)));
-    }
-
+    let is_dashboard_page = request.uri().path() == "/dashboard";
     let method = request.method().clone();
     let path = request.uri().path().trim_matches('/').to_owned();
+
+    let caller = caller(&request, &state, peer);
+    if let Some(refused) = gate(&request, &state, peer, &caller, audience(&method, &path)) {
+        return Ok(refused);
+    }
+
     let decoded: Vec<String> = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -596,6 +644,13 @@ async fn handle(
         (&Method::GET, ["certificates"]) => json_response(StatusCode::OK, &certificates(&state)),
         (&Method::POST, ["certificates", "reload"]) => reload_certificates(&state),
         (&Method::POST, ["upgrade"]) => control(&state, Control::Upgrade, "upgraded").await,
+        (&Method::GET, ["auth", "session"]) => auth_api::session(&state, &caller, peer),
+        (&Method::POST, ["auth", "login"]) => auth_api::login(&state, peer, request).await,
+        (&Method::POST, ["auth", "logout"]) => auth_api::logout(&state, &caller, peer),
+        (&Method::POST, ["auth", "setup"]) => auth_api::setup(&state, &caller, peer, request).await,
+        (&Method::PUT, ["auth", "password"]) => {
+            auth_api::password(&state, &caller, peer, request).await
+        }
         (&Method::POST, ["stop"]) => {
             let _ = state.control.send(Control::Stop).await;
             json_response(StatusCode::OK, &json!({ "stopping": true }))
@@ -607,6 +662,192 @@ async fn handle(
     };
 
     Ok(response)
+}
+
+/// Who sends a request.
+pub(crate) enum Caller {
+    /// The holder of `[admin] token`: an administrator.
+    Token,
+    /// A local request to a daemon without a token: an administrator.
+    Local,
+    /// A signed-in user.
+    User {
+        name: String,
+        /// What the roles of the user allow, as of this request.
+        scope: Scope,
+        /// Id of the session.
+        session: String,
+    },
+    /// Anybody else.
+    Nobody,
+}
+
+impl Caller {
+    /// What the caller may do with hosts.
+    pub(crate) fn scope(&self) -> Scope {
+        match self {
+            Self::Token | Self::Local => Scope::Admin,
+            Self::User { scope, .. } => scope.clone(),
+            Self::Nobody => Scope::Grants(Vec::new()),
+        }
+    }
+
+    pub(crate) fn is_admin(&self) -> bool {
+        match self {
+            Self::Token | Self::Local => true,
+            Self::User { scope, .. } => scope.is_admin(),
+            Self::Nobody => false,
+        }
+    }
+
+    /// The name that stands for the caller in the log.
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Self::Token => "token",
+            Self::Local => "local",
+            Self::User { name, .. } => name,
+            Self::Nobody => "nobody",
+        }
+    }
+}
+
+/// Who sends `request`. The first that holds: the token, a session cookie,
+/// a local request when no token is configured, nobody. A session comes
+/// before the local rule, so a browser on the machine acts as its user; and
+/// a session whose user is no longer in the users file is nobody's.
+fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
+    if let Some(token) = &state.token
+        && has_token(request, token)
+    {
+        return Caller::Token;
+    }
+    if let Some(id) = session::cookie_of(request)
+        && let Some(session) = state.sessions.get(id)
+    {
+        let access = state.access.read();
+        return match roles(&access, &session) {
+            Some(roles) => Caller::User {
+                name: session.user,
+                scope: access.scope(&roles),
+                session: id.to_owned(),
+            },
+            None => Caller::Nobody,
+        };
+    }
+    if state.token.is_none() && is_local_request(request, &state.listen, peer) {
+        return Caller::Local;
+    }
+    Caller::Nobody
+}
+
+/// The roles of a session: its own when it carries them, else the ones its
+/// user has in the users file now. `None` when that user is not there.
+pub(crate) fn roles(access: &Access, session: &Session) -> Option<Vec<String>> {
+    match &session.roles {
+        Some(roles) => Some(roles.clone()),
+        None => access
+            .user
+            .iter()
+            .find(|user| user.name == session.user)
+            .map(|user| user.roles.clone()),
+    }
+}
+
+/// Who the route of `method` and `path` (without its outer slashes, not
+/// decoded) answers. A route that [`ROUTES`] does not list is for
+/// administrators, and so is a listed one spelled another way.
+fn audience(method: &Method, path: &str) -> Audience {
+    let is_route = |pattern: &str| {
+        let mut segments = path.split('/');
+        pattern.split('/').all(|expected| {
+            segments
+                .next()
+                .is_some_and(|s| expected == "{}" || expected == s)
+        }) && segments.next().is_none()
+    };
+    ROUTES
+        .iter()
+        .find(|(route_method, pattern, _)| method.as_str() == *route_method && is_route(pattern))
+        .map_or(Audience::Admin, |(_, _, audience)| *audience)
+}
+
+/// The check every request goes through before its route: the answer that
+/// refuses `caller` on a route for `audience`, or `None` to let it through.
+fn gate<B>(
+    request: &Request<B>,
+    state: &AdminState,
+    peer: Peer,
+    caller: &Caller,
+    audience: Audience,
+) -> Option<Response<Full<Bytes>>> {
+    match caller {
+        Caller::Token | Caller::Local => None,
+        Caller::User { scope, .. } => {
+            // A browser sends the cookie by itself; `Origin` tells whose
+            // page asked. `SameSite=Strict` already keeps other sites out.
+            let reads = matches!(*request.method(), Method::GET | Method::HEAD);
+            if !reads && !origin_is_host(request) {
+                return Some(error(
+                    StatusCode::FORBIDDEN,
+                    "a request with a session cookie needs an Origin equal to its Host",
+                ));
+            }
+            if audience == Audience::Admin && !scope.is_admin() {
+                return Some(error(StatusCode::FORBIDDEN, "this needs the admin role"));
+            }
+            None
+        }
+        Caller::Nobody => {
+            // What a page of another site sends from a browser of this
+            // machine gets nothing, not even the dashboard.
+            if state.token.is_none()
+                && peer.local
+                && !is_local_request(request, &state.listen, peer)
+            {
+                return Some(error(StatusCode::FORBIDDEN, NOT_LOCAL));
+            }
+            if audience == Audience::Anyone {
+                return None;
+            }
+            if state.token.is_none() {
+                return Some(error(
+                    StatusCode::UNAUTHORIZED,
+                    "sign in to use the admin API",
+                ));
+            }
+            let mut response = error(
+                StatusCode::UNAUTHORIZED,
+                "admin API requires Authorization: Bearer <token>",
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+            Some(response)
+        }
+    }
+}
+
+/// True if the request has an `Origin` and it is the `Host` the request was
+/// sent to, port included: the page that sent it came from this API.
+fn origin_is_host<B>(request: &Request<B>) -> bool {
+    let text = |name: header::HeaderName| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    let authority = text(header::ORIGIN).and_then(|origin| origin.split_once("://"));
+    authority
+        .zip(text(header::HOST))
+        .is_some_and(|((_, authority), host)| authority.eq_ignore_ascii_case(host))
+}
+
+/// Whether the setup code may create the first user on this connection:
+/// only over TLS, since the code and the new password travel with it, and
+/// only without a token, whose holder is the one to create the user.
+pub(crate) fn code_opens_setup(peer: Peer, has_token: bool) -> bool {
+    peer.tls && !has_token
 }
 
 /// Sends a request to the daemon loop and answers with its outcome:
@@ -910,16 +1151,10 @@ fn is_local_request<B>(request: &Request<B>, listen: &AdminListen, peer: Peer) -
     host.is_none_or(is_loopback) && origin.is_none_or(is_same_origin)
 }
 
-/// Why a request that failed [`is_local_request`] is refused.
-fn refusal(peer: Peer) -> &'static str {
-    if peer.local {
-        "admin API only accepts a loopback Host and its own Origin"
-    } else {
-        "admin API without a token only accepts connections from this machine"
-    }
-}
+/// Answer to a request from this machine that fails [`is_local_request`].
+const NOT_LOCAL: &str = "admin API only accepts a loopback Host and its own Origin";
 
-async fn read_json<T: for<'de> Deserialize<'de>>(
+pub(crate) async fn read_json<T: for<'de> Deserialize<'de>>(
     request: Request<Incoming>,
 ) -> Result<T, Box<Response<Full<Bytes>>>> {
     let body = read_body(request, MAX_BODY).await?;
@@ -1146,9 +1381,238 @@ mod tests {
             !is_local_request(&Request::new(()), &wide, remote),
             "no Host"
         );
-        // The answer names the cause that applies.
-        assert!(refusal(remote).contains("from this machine"));
-        assert!(refusal(LOCAL).contains("loopback Host"));
+    }
+
+    /// A TLS connection from another machine.
+    const REMOTE: Peer = Peer {
+        local: false,
+        tls: true,
+        address: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8))),
+    };
+
+    /// The state of a daemon that listens on every address, with the users
+    /// file `users`.
+    fn state(token: Option<&str>, users: PathBuf) -> AdminState {
+        let config = Config::default();
+        let registry = Registry::build(&config).unwrap();
+        let (control, _) = mpsc::channel(1);
+        AdminState {
+            started: Instant::now(),
+            config_path: None,
+            listen: AdminListen::Tcp("0.0.0.0:2019".parse().unwrap()),
+            token: token.map(str::to_owned),
+            tls: None,
+            current: RwLock::new(Current {
+                config: Arc::new(config),
+                registry: Arc::new(registry),
+                servers: Vec::new(),
+            }),
+            control,
+            saving: tokio::sync::Mutex::new(()),
+            access: Store::open(users),
+            sessions: Sessions::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_peer_with_a_loopback_host_is_nobody() {
+        let open = state(None, PathBuf::new());
+        for host in ["localhost:2019", "127.0.0.1:2019", "0.0.0.0:2019"] {
+            let forged = request(host, None);
+            assert!(matches!(caller(&forged, &open, LOCAL), Caller::Local));
+            let nobody = caller(&forged, &open, REMOTE);
+            assert!(matches!(nobody, Caller::Nobody), "{host}");
+            assert!(!nobody.is_admin());
+            assert_eq!(nobody.scope(), Scope::Grants(Vec::new()));
+            // Refused on a route for administrators, served the sign-in.
+            let refused = gate(&forged, &open, REMOTE, &nobody, Audience::Admin).unwrap();
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+            assert!(!refused.headers().contains_key(header::WWW_AUTHENTICATE));
+            let refused = gate(&forged, &open, REMOTE, &nobody, Audience::Caller).unwrap();
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+            assert!(gate(&forged, &open, REMOTE, &nobody, Audience::Anyone).is_none());
+        }
+        let same_origin = request("localhost:2019", Some("http://localhost:2019"));
+        assert!(matches!(
+            caller(&same_origin, &open, REMOTE),
+            Caller::Nobody
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_token_comes_first_and_a_local_request_last() {
+        let directory = tempfile::tempdir().unwrap();
+        let users = directory.path().join("users.toml");
+        let with = |authorization: Option<&str>, cookie: Option<&str>| {
+            let mut builder = Request::builder().header(header::HOST, "localhost:2019");
+            if let Some(authorization) = authorization {
+                builder = builder.header(header::AUTHORIZATION, authorization);
+            }
+            if let Some(cookie) = cookie {
+                builder = builder.header(header::COOKIE, format!("rxh_session={cookie}"));
+            }
+            builder.body(()).unwrap()
+        };
+
+        let closed = state(Some("0123456789abcdef"), users.clone());
+        closed
+            .access
+            .change(|access| access.add_user("luis", "password-luis", &[]))
+            .unwrap();
+        let id = closed.sessions.create("luis", None);
+        let bearer = Some("Bearer 0123456789abcdef");
+        assert!(matches!(
+            caller(&with(bearer, Some(&id)), &closed, REMOTE),
+            Caller::Token
+        ));
+        // With a token configured, being local is nothing.
+        assert!(matches!(
+            caller(&with(None, None), &closed, LOCAL),
+            Caller::Nobody
+        ));
+        assert!(matches!(
+            caller(&with(Some("Bearer wrong"), None), &closed, LOCAL),
+            Caller::Nobody
+        ));
+        let user = caller(&with(Some("Bearer wrong"), Some(&id)), &closed, REMOTE);
+        assert!(matches!(&user, Caller::User { name, scope, session }
+                if name == "luis" && !scope.is_admin() && *session == id));
+        assert_eq!(user.label(), "luis");
+        assert!(!user.is_admin());
+
+        // Without a token a session still comes before the local rule.
+        let open = state(None, users);
+        let id = open.sessions.create("luis", None);
+        assert!(matches!(
+            caller(&with(None, Some(&id)), &open, LOCAL),
+            Caller::User { .. }
+        ));
+        assert!(matches!(
+            caller(&with(None, Some("no-such-session")), &open, LOCAL),
+            Caller::Local
+        ));
+        // A session of a user that is not in the file is nobody's, also on
+        // the machine.
+        let gone = open.sessions.create("eva", None);
+        assert!(matches!(
+            caller(&with(None, Some(&gone)), &open, LOCAL),
+            Caller::Nobody
+        ));
+        // Roles a session carries need no user in the file.
+        let carried = open
+            .sessions
+            .create("eva", Some(vec![String::from("admin")]));
+        assert!(caller(&with(None, Some(&carried)), &open, REMOTE).is_admin());
+    }
+
+    #[test]
+    fn setup_with_code_needs_tls_and_no_token() {
+        let plain = Peer {
+            tls: false,
+            ..REMOTE
+        };
+        assert!(code_opens_setup(REMOTE, /* has_token= */ false));
+        assert!(!code_opens_setup(REMOTE, /* has_token= */ true));
+        assert!(!code_opens_setup(plain, /* has_token= */ false));
+        // Plain HTTP on the machine: a local request needs no code, and one
+        // that is not local (a page of another site) must not use it.
+        assert!(!code_opens_setup(LOCAL, /* has_token= */ false));
+        assert!(!code_opens_setup(LOCAL, /* has_token= */ true));
+    }
+
+    #[test]
+    fn a_route_outside_the_table_is_for_administrators() {
+        let of = |method: Method, path: &str| audience(&method, path);
+        assert_eq!(of(Method::GET, "dashboard"), Audience::Anyone);
+        assert_eq!(of(Method::GET, "auth/session"), Audience::Anyone);
+        assert_eq!(of(Method::POST, "auth/login"), Audience::Anyone);
+        assert_eq!(of(Method::POST, "auth/logout"), Audience::Caller);
+        assert_eq!(of(Method::GET, "pools/api"), Audience::Admin);
+        // Another method, a longer or shorter path, another spelling.
+        for (method, path) in [
+            (Method::POST, "dashboard"),
+            (Method::GET, "auth/login"),
+            (Method::DELETE, "auth/session"),
+            (Method::GET, "auth/session/x"),
+            (Method::GET, "auth"),
+            (Method::GET, "dashboard//app.css"),
+            (Method::GET, "auth/%73ession"),
+            (Method::GET, "AUTH/SESSION"),
+            (Method::GET, "nope"),
+        ] {
+            assert_eq!(of(method.clone(), path), Audience::Admin, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn every_route_of_the_router_is_in_the_table() {
+        // The arms of the router, read from this file: `(&Method::GET, [] |
+        // ["pools", name]) =>` is `GET ""` and `GET "pools/{}"`.
+        let source = include_str!("admin.rs");
+        let router = source.split("#[cfg(test)]").next().unwrap();
+        let mut routed: Vec<(String, String)> = Vec::new();
+        for line in router.lines() {
+            let Some(arm) = line.trim().strip_prefix("(&Method::") else {
+                continue;
+            };
+            let (methods, patterns) = arm.split_once(", ").unwrap();
+            let patterns = patterns.split(") ").next().unwrap();
+            for method in methods.split(" | ") {
+                let method = method.trim_start_matches("&Method::");
+                for pattern in patterns.split(" | ") {
+                    let inner = pattern.trim_matches(['[', ']']);
+                    let segments: Vec<&str> = inner
+                        .split(", ")
+                        .map(|segment| match segment.strip_prefix('"') {
+                            Some(literal) => literal.trim_end_matches('"'),
+                            None if segment.is_empty() => "",
+                            None => "{}",
+                        })
+                        .collect();
+                    routed.push((method.to_owned(), segments.join("/")));
+                }
+            }
+        }
+        assert!(routed.len() > 30, "the scan must find the arms: {routed:?}");
+        for (method, path) in &routed {
+            assert!(
+                ROUTES
+                    .iter()
+                    .any(|(listed, pattern, _)| listed == method && pattern == path),
+                "{method} /{path} is routed and missing from ROUTES"
+            );
+        }
+        // And the table lists nothing the router does not have, which would
+        // also mean that the scan missed an arm.
+        for (index, (method, path, _)) in ROUTES.iter().enumerate() {
+            assert!(
+                routed
+                    .iter()
+                    .any(|(routed_method, routed_path)| routed_method == method
+                        && routed_path == path),
+                "{method} /{path} is in ROUTES and not routed"
+            );
+            assert!(
+                !ROUTES[..index]
+                    .iter()
+                    .any(|(other, pattern, _)| other == method && pattern == path),
+                "{method} /{path} is in ROUTES twice"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cookie_request_that_changes_something_needs_its_own_origin() {
+        let own = |host: &str, origin: &str| origin_is_host(&request(host, Some(origin)));
+        assert!(own("rxh.example:2019", "https://rxh.example:2019"));
+        assert!(own("localhost:2019", "http://LOCALHOST:2019"));
+        assert!(!own("rxh.example:2019", "https://evil.example"));
+        assert!(!own("rxh.example:2019", "https://rxh.example"));
+        assert!(!own("rxh.example:2019", "https://rxh.example:2019/"));
+        assert!(!own("rxh.example:2019", "null"));
+        assert!(!own("rxh.example:2019", "rxh.example:2019"));
+        assert!(!origin_is_host(&request("rxh.example:2019", None)));
+        assert!(!origin_is_host(&Request::new(())));
     }
 
     #[test]

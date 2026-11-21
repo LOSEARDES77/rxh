@@ -21,6 +21,7 @@ use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::access::Store;
 use crate::acme;
 use crate::admin::{self, AdminState, Control, Current};
 use crate::catalog;
@@ -31,6 +32,7 @@ use crate::include;
 use crate::master::{Master, ServerInfo};
 use crate::per_core;
 use crate::registry::Registry;
+use crate::session::Sessions;
 use crate::systemd;
 use crate::tls::AdminTls;
 use crate::upgrade::{self, Lease};
@@ -342,6 +344,11 @@ impl Daemon {
             // Validation refuses `"auto"` in `[admin]`.
             Some(_) | None => None,
         };
+        // Before the listeners too: the first random bytes of a process take
+        // tens of milliseconds, in which the servers would answer and the
+        // admin API would not.
+        let sessions = Sessions::new();
+        let access = Store::open(PathBuf::from(&admin_settings.users));
         // QUIC sockets outlive generations, see `http3`.
         let endpoints = Endpoints::default();
         let mut generation =
@@ -359,6 +366,8 @@ impl Daemon {
             current: RwLock::new(generation.current()),
             control,
             saving: tokio::sync::Mutex::new(()),
+            access,
+            sessions,
         });
 
         let admin_listener: Option<(AbortOnDrop, Lease)> = if admin_settings.enabled {
@@ -379,6 +388,17 @@ impl Daemon {
                 AdminListen::Unix(path) => {
                     println!("Admin => API listening on unix socket {}", path.display());
                 }
+            }
+            // Only where the code works, see `admin::code_opens_setup`.
+            if admin_state.tls.is_some()
+                && admin_state.token.is_none()
+                && admin_state.access.read().user.is_empty()
+            {
+                println!(
+                    "Admin => no user exists yet; to create the first one from another machine \
+                     use the setup code {}",
+                    admin_state.sessions.setup_code()
+                );
             }
             let lease = listener.lease()?;
             let task = admin::serve(listener, Arc::clone(&admin_state));
@@ -1006,6 +1026,8 @@ forward = "@api"
                 current: RwLock::new(generation.current()),
                 control,
                 saving: tokio::sync::Mutex::new(()),
+                access: Store::open(PathBuf::new()),
+                sessions: Sessions::new(),
             }
         };
         let err = daemon

@@ -1,0 +1,716 @@
+//! Accounts of the admin API: first-run setup, sign-in, sessions, and the
+//! gate that keeps a user without the `admin` role out of the admin routes.
+
+mod util;
+
+use std::fs;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use hyper::{HeaderMap, Method, StatusCode, header};
+use rxh_server::access::{Access, Grant, Permission, Role, Target, User};
+use rxh_server::{ADMIN_ROUTES, Audience};
+use rxh_test_util::free_address;
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio::task::JoinHandle;
+use util::admin::{call, call_with_cookie, get, send, session_cookie, sign_in, start};
+
+const TOKEN: &str = "s3cret-admin-token-0123";
+const NOT_LOCAL: &str = "admin API only accepts a loopback Host and its own Origin";
+const NEEDS_ADMIN: &str = "this needs the admin role";
+
+/// A running daemon and its users file.
+struct Fixture {
+    admin: SocketAddr,
+    users: PathBuf,
+    _directory: TempDir,
+    _daemon: JoinHandle<Result<(), rxh_server::Error>>,
+}
+
+/// Starts a daemon whose users file holds `access` (no file for `None`),
+/// with `[admin] token` when `token` is set.
+async fn daemon(access: Option<&Access>, token: bool) -> Fixture {
+    let admin = free_address();
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let users = directory.path().join("data").join("users.toml");
+    if let Some(access) = access {
+        access.save(&users).expect("write the users file");
+    }
+    let token = if token {
+        format!("token = \"{TOKEN}\"\n")
+    } else {
+        String::new()
+    };
+    let config_path = directory.path().join("rxh.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[admin]\nlisten = \"{admin}\"\nusers = {users:?}\n{token}\n\
+             [upstream.api]\nbackends = [\"127.0.0.1:9\"]\n"
+        ),
+    )
+    .expect("write the configuration");
+    let daemon = start(&config_path, admin).await;
+    Fixture {
+        admin,
+        users,
+        _directory: directory,
+        _daemon: daemon,
+    }
+}
+
+/// A user whose hash has the lowest cost, so that signing in is fast.
+fn user(name: &str, password: &str, roles: &[&str]) -> User {
+    User {
+        name: name.to_owned(),
+        password: bcrypt::hash(password, 4).expect("hash"),
+        roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+    }
+}
+
+/// `ana`, an administrator, and `luis`, who may view and create hosts of
+/// the group `web`.
+fn accounts() -> Access {
+    Access {
+        user: vec![
+            user("ana", "password-ana", &["admin"]),
+            user("luis", "password-luis", &["web-editors"]),
+        ],
+        role: vec![Role {
+            name: "web-editors".to_owned(),
+            grant: vec![Grant {
+                target: Target::Group("web".to_owned()),
+                allow: vec![Permission::View, Permission::Create],
+            }],
+        }],
+    }
+}
+
+/// Signs in and returns the session cookie as `name=value`.
+async fn cookie_of(admin: SocketAddr, name: &str, password: &str) -> String {
+    let (status, headers, json) = sign_in(admin, name, password).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    session_cookie(&headers)
+}
+
+fn bearer() -> String {
+    format!("Bearer {TOKEN}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn before_any_user_the_api_behaves_as_before() {
+    // Without a token: a local request is the administrator, and what a page
+    // of another site sends is refused, the dashboard and `/auth` included.
+    let open = daemon(None, /* token= */ false).await;
+    let (status, json) = get(open.admin, "/status").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let (status, json) = send(open.admin, Method::POST, "/reload", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let stale = [(header::COOKIE, "rxh_session=not-a-session")];
+    let (status, _, json) = call(open.admin, Method::GET, "/pools", "", &stale).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let foreign = [(header::HOST, "evil.example")];
+    for (method, uri) in [
+        (Method::GET, "/status"),
+        (Method::GET, "/dashboard"),
+        (Method::GET, "/auth/session"),
+        (Method::POST, "/auth/login"),
+        (Method::POST, "/auth/setup"),
+    ] {
+        let (status, _, json) = call(open.admin, method.clone(), uri, "{}", &foreign).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(json["error"], NOT_LOCAL, "{method} {uri}");
+    }
+    assert!(!open.users.exists(), "nothing wrote the users file");
+
+    // With a token: nothing without it but the page, and everything with it.
+    let closed = daemon(None, /* token= */ true).await;
+    let (status, headers, json) = call(closed.admin, Method::GET, "/status", "", &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+    assert_eq!(
+        json["error"],
+        "admin API requires Authorization: Bearer <token>"
+    );
+    let (status, _, _) = util::get(closed.admin, "/dashboard").await;
+    assert_eq!(status, StatusCode::OK);
+    let bearer = bearer();
+    let authorized = [(header::AUTHORIZATION, bearer.as_str())];
+    let (status, _, json) = call(closed.admin, Method::GET, "/status", "", &authorized).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_reports_setup_while_no_user_exists() {
+    let open = daemon(None, /* token= */ false).await;
+    let (status, json) = get(open.admin, "/auth/session").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json,
+        json!({
+            "user": null,
+            "admin": true,
+            "roles": [],
+            "grants": [],
+            "creatable_groups": [],
+            "setup": true,
+            "setup_needs_code": false,
+            "password_login": true,
+            "oidc": false,
+        })
+    );
+
+    // Signed out: the route still answers, and says who may not set up. The
+    // code is for TLS connections, which this one is not.
+    let closed = daemon(None, /* token= */ true).await;
+    let (status, json) = get(closed.admin, "/auth/session").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["user"], Value::Null);
+    assert_eq!(json["admin"], false);
+    assert_eq!(json["setup"], true);
+    assert_eq!(json["setup_needs_code"], false);
+
+    let with_users = daemon(Some(&accounts()), /* token= */ true).await;
+    let (status, json) = get(with_users.admin, "/auth/session").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["setup"], false);
+    assert_eq!(json["admin"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_creates_the_first_administrator_and_signs_in() {
+    let open = daemon(None, /* token= */ false).await;
+    let admin = open.admin;
+
+    // What the users file refuses is refused here, and creates nothing.
+    for (body, reason) in [
+        (
+            json!({ "name": "ana", "password": "short" }),
+            "8 characters",
+        ),
+        (
+            json!({ "name": "Ana B", "password": "password-ana" }),
+            "name",
+        ),
+    ] {
+        let (status, json) = send(admin, Method::POST, "/auth/setup", &body.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        let error = json["error"].as_str().expect("error");
+        assert!(error.contains(reason), "{error}");
+        assert!(!open.users.exists());
+    }
+    let (status, json) = send(admin, Method::POST, "/auth/setup", "{}").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+
+    let body = json!({ "name": "ana", "password": "password-ana" }).to_string();
+    let (status, headers, json) = call(admin, Method::POST, "/auth/setup", &body, &[]).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    let saved = Access::load(&open.users).expect("users file");
+    assert_eq!(saved.user.len(), 1);
+    assert_eq!(saved.user[0].name, "ana");
+    assert_eq!(saved.user[0].roles, ["admin"]);
+    assert!(saved.verify("ana", "password-ana"));
+
+    // The answer signed the new user in.
+    let cookie = session_cookie(&headers);
+    let (status, _, json) =
+        call_with_cookie(admin, &cookie, Method::GET, "/auth/session", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["user"], "ana");
+    assert_eq!(json["admin"], true);
+    assert_eq!(json["roles"], json!(["admin"]));
+    assert_eq!(json["setup"], false);
+    let (status, _, json) = sign_in(admin, "ana", "password-ana").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_needs_an_administrator() {
+    // With a token, a caller without it is nobody, and the setup code only
+    // counts on a TLS connection.
+    let closed = daemon(None, /* token= */ true).await;
+    for body in [
+        json!({ "name": "eva", "password": "password-eva" }),
+        json!({ "name": "eva", "password": "password-eva", "code": "abcdefghjk" }),
+        json!({ "name": "eva", "password": "password-eva", "code": "" }),
+    ] {
+        let body = body.to_string();
+        let (status, json) = send(closed.admin, Method::POST, "/auth/setup", &body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert_eq!(
+            json["error"],
+            "creating the first user needs an administrator or the setup code"
+        );
+        assert!(!closed.users.exists());
+    }
+
+    let bearer = bearer();
+    let authorized = [(header::AUTHORIZATION, bearer.as_str())];
+    let body = json!({ "name": "eva", "password": "password-eva" }).to_string();
+    let (status, _, json) = call(
+        closed.admin,
+        Method::POST,
+        "/auth/setup",
+        &body,
+        &authorized,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(
+        Access::load(&closed.users).expect("file").user[0].name,
+        "eva"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_is_refused_once_a_user_exists() {
+    let open = daemon(Some(&accounts()), /* token= */ false).await;
+    let before = fs::read_to_string(&open.users).expect("users file");
+    let body = json!({ "name": "eva", "password": "password-eva" }).to_string();
+    // A local request without a token is an administrator, and still refused.
+    let (status, json) = send(open.admin, Method::POST, "/auth/setup", &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["error"], "a user exists already; sign in");
+    assert_eq!(fs::read_to_string(&open.users).expect("users file"), before);
+    let (status, _, _) = sign_in(open.admin, "eva", "password-eva").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_in_sets_a_private_cookie() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let (status, headers, json) = sign_in(closed.admin, "ana", "password-ana").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(json, Value::Null, "no body");
+    let cookies: Vec<_> = headers.get_all(header::SET_COOKIE).iter().collect();
+    assert_eq!(cookies.len(), 1);
+    let cookie = cookies[0].to_str().expect("text");
+    let (pair, attributes) = cookie.split_once(';').expect("attributes");
+    let id = pair.strip_prefix("rxh_session=").expect("cookie name");
+    assert_eq!(id.len(), 43, "{id}");
+    // A plain connection from this machine: no `Secure`.
+    assert_eq!(attributes, " HttpOnly; SameSite=Strict; Path=/");
+
+    let bad = "{\"name\": \"ana\"}";
+    let (status, json) = send(closed.admin, Method::POST, "/auth/login", bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_password_and_an_unknown_name_get_the_same_answer() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let long = "x".repeat(65);
+    let mut answers = Vec::new();
+    for (name, password) in [
+        ("ana", "password-luis"),
+        ("nobody", "password-ana"),
+        ("", ""),
+        (long.as_str(), "password-ana"),
+    ] {
+        let (status, headers, json) = sign_in(closed.admin, name, password).await;
+        assert!(!headers.contains_key(header::SET_COOKIE), "{name}");
+        assert!(!headers.contains_key(header::WWW_AUTHENTICATE), "{name}");
+        answers.push((status, json));
+    }
+    let wrong = json!({ "error": "wrong name or password" });
+    for answer in &answers {
+        assert_eq!(*answer, (StatusCode::UNAUTHORIZED, wrong.clone()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn five_failures_lock_the_name_for_that_client() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    for attempt in 1..=5 {
+        let (status, _, _) = sign_in(closed.admin, "luis", "not-the-password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {attempt}");
+    }
+    // Not even the right password now.
+    let (status, headers, json) = sign_in(closed.admin, "luis", "password-luis").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    assert_eq!(
+        json["error"],
+        "too many failed sign-ins for this name; try again in a minute"
+    );
+    // Another name from the same client is not locked.
+    cookie_of(closed.admin, "ana", "password-ana").await;
+
+    // A good sign-in before the fifth failure starts the count again.
+    for _ in 0..4 {
+        sign_in(closed.admin, "ana", "not-the-password").await;
+    }
+    cookie_of(closed.admin, "ana", "password-ana").await;
+    for _ in 0..4 {
+        sign_in(closed.admin, "ana", "not-the-password").await;
+    }
+    cookie_of(closed.admin, "ana", "password-ana").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_cookie_identifies_the_user() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let cookie = cookie_of(admin, "luis", "password-luis").await;
+    let session = async || {
+        let (status, _, json) =
+            call_with_cookie(admin, &cookie, Method::GET, "/auth/session", "").await;
+        assert_eq!(status, StatusCode::OK);
+        json
+    };
+    assert_eq!(
+        session().await,
+        json!({
+            "user": "luis",
+            "admin": false,
+            "roles": ["web-editors"],
+            "grants": [{ "group": "web", "allow": ["view", "create"] }],
+            "creatable_groups": ["web"],
+            "setup": false,
+            "setup_needs_code": false,
+            "password_login": true,
+            "oidc": false,
+        })
+    );
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["error"], NEEDS_ADMIN);
+
+    // The roles are read on every request: a change applies to the session.
+    let mut promoted = accounts();
+    promoted.user[1].roles = vec!["admin".to_owned()];
+    promoted.save(&closed.users).expect("save");
+    util::eventually(async || session().await["admin"] == true).await;
+    let promoted = session().await;
+    assert_eq!(promoted["roles"], json!(["admin"]));
+    assert_eq!(promoted["grants"], json!([]));
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    // A session of a user that was removed is nobody's.
+    let mut removed = accounts();
+    removed.user.truncate(1);
+    removed.save(&closed.users).expect("save");
+    util::eventually(async || session().await["user"] == Value::Null).await;
+    assert_eq!(session().await["admin"], false);
+    let (status, _, _) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A cookie that names no session, with and without the token.
+    let made_up = format!("rxh_session={}", "A".repeat(43));
+    let (status, headers, _) = call_with_cookie(admin, &made_up, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_out_ends_the_session() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let cookie = cookie_of(admin, "ana", "password-ana").await;
+    let other = cookie_of(admin, "ana", "password-ana").await;
+    assert_ne!(cookie, other);
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    let (status, headers, _) =
+        call_with_cookie(admin, &cookie, Method::POST, "/auth/logout", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        headers[header::SET_COOKIE],
+        "rxh_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+    );
+    let (status, _, _) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, json) =
+        call_with_cookie(admin, &cookie, Method::GET, "/auth/session", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["user"], Value::Null);
+    // Only that session ended.
+    let (status, _, json) = call_with_cookie(admin, &other, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    // Signed out, there is nothing to sign out of.
+    let (status, _, _) = call(admin, Method::POST, "/auth/logout", "", &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cookie_write_without_matching_origin_is_forbidden() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let cookie = cookie_of(admin, "ana", "password-ana").await;
+    let other_port = format!("http://127.0.0.1:{}", admin.port().wrapping_add(1));
+    let origins: [&[(header::HeaderName, &str)]; 5] = [
+        &[],
+        &[(header::ORIGIN, "http://evil.example")],
+        &[(header::ORIGIN, "null")],
+        &[(header::ORIGIN, other_port.as_str())],
+        // Equal to each other, but not the `Origin` of the `Host`.
+        &[
+            (header::HOST, "evil.example"),
+            (header::ORIGIN, "http://rxh.example"),
+        ],
+    ];
+    for origin in origins {
+        for (method, uri) in [
+            (Method::POST, "/reload"),
+            (Method::POST, "/stop"),
+            (Method::POST, "/auth/logout"),
+            (Method::PUT, "/auth/password"),
+            (Method::DELETE, "/pools/api/upstreams?address=127.0.0.1:9"),
+        ] {
+            let mut headers = vec![(header::COOKIE, cookie.as_str())];
+            headers.extend_from_slice(origin);
+            let (status, _, json) = call(admin, method.clone(), uri, "", &headers).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} {origin:?}");
+            assert_eq!(
+                json["error"],
+                "a request with a session cookie needs an Origin equal to its Host"
+            );
+        }
+    }
+
+    // Reading needs no `Origin`: nothing changed, the session is still there.
+    let with_cookie = [(header::COOKIE, cookie.as_str())];
+    let (status, _, pool) = call(admin, Method::GET, "/pools/api", "", &with_cookie).await;
+    assert_eq!(status, StatusCode::OK, "{pool}");
+    assert_eq!(pool["upstreams"][0]["address"], "127.0.0.1:9");
+    // The page sends its own origin, under whatever name it was reached.
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::POST, "/reload", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let named = [
+        (header::COOKIE, cookie.as_str()),
+        (header::HOST, "rxh.example:2019"),
+        (header::ORIGIN, "https://rxh.example:2019"),
+    ];
+    let (status, _, json) = call(admin, Method::POST, "/reload", "", &named).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changing_the_password_needs_the_current_one_and_ends_other_sessions() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let cookie = cookie_of(admin, "luis", "password-luis").await;
+    let other = cookie_of(admin, "luis", "password-luis").await;
+    let ana = cookie_of(admin, "ana", "password-ana").await;
+    let change = async |cookie: &str, current: &str, new: &str| {
+        let body = json!({ "current": current, "new": new }).to_string();
+        call_with_cookie(admin, cookie, Method::PUT, "/auth/password", &body).await
+    };
+
+    let (status, _, json) = change(&cookie, "password-ana", "new-password").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["error"], "the current password is wrong");
+    let (status, _, json) = change(&cookie, "password-luis", "short").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    // The token is no user, and has no password to change.
+    let bearer = bearer();
+    let authorized = [(header::AUTHORIZATION, bearer.as_str())];
+    let body = json!({ "current": "password-luis", "new": "new-password" }).to_string();
+    let (status, _, _) = call(admin, Method::PUT, "/auth/password", &body, &authorized).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = call(admin, Method::PUT, "/auth/password", &body, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let session = async |cookie: &str| {
+        let (_, _, json) = call_with_cookie(admin, cookie, Method::GET, "/auth/session", "").await;
+        json["user"].clone()
+    };
+    assert_eq!(session(&other).await, "luis", "nothing changed so far");
+
+    let (status, headers, json) = change(&cookie, "password-luis", "new-password").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    let renewed = session_cookie(&headers);
+    assert_ne!(renewed, cookie);
+    assert_eq!(session(&renewed).await, "luis");
+    assert_eq!(session(&other).await, Value::Null);
+    assert_eq!(session(&cookie).await, Value::Null);
+    assert_eq!(session(&ana).await, "ana", "another user stays signed in");
+
+    let (status, _, _) = sign_in(admin, "luis", "password-luis").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    cookie_of(admin, "luis", "new-password").await;
+    let saved = Access::load(&closed.users).expect("users file");
+    assert_eq!(saved.user[1].roles, ["web-editors"], "only the password");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_token_still_is_administrator_when_users_exist() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let bearer = bearer();
+    let authorized = [(header::AUTHORIZATION, bearer.as_str())];
+    for (method, uri) in [
+        (Method::GET, "/status"),
+        (Method::GET, "/config"),
+        (Method::POST, "/reload"),
+    ] {
+        let (status, _, json) = call(admin, method.clone(), uri, "", &authorized).await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {json}");
+        let (status, headers, _) = call(admin, method.clone(), uri, "", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+    }
+    let (_, _, json) = call(admin, Method::GET, "/auth/session", "", &authorized).await;
+    assert_eq!(json["user"], Value::Null);
+    assert_eq!(json["admin"], true);
+
+    // The token wins over the cookie of a user without the role, and needs
+    // no `Origin`.
+    let cookie = cookie_of(admin, "luis", "password-luis").await;
+    let both = [
+        (header::AUTHORIZATION, bearer.as_str()),
+        (header::COOKIE, cookie.as_str()),
+    ];
+    let (status, _, json) = call(admin, Method::POST, "/reload", "", &both).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_request_still_is_administrator_when_users_exist() {
+    let open = daemon(Some(&accounts()), /* token= */ false).await;
+    let admin = open.admin;
+    for (method, uri) in [
+        (Method::GET, "/status"),
+        (Method::GET, "/config"),
+        (Method::POST, "/reload"),
+    ] {
+        let (status, json) = send(admin, method.clone(), uri, "").await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {json}");
+    }
+    let (_, json) = get(admin, "/auth/session").await;
+    assert_eq!(json["user"], Value::Null);
+    assert_eq!(json["admin"], true);
+    assert_eq!(json["setup"], false);
+
+    // A session comes before the local rule: the browser of a user without
+    // the role, on the machine, gets what the user may do.
+    let cookie = cookie_of(admin, "luis", "password-luis").await;
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["error"], NEEDS_ADMIN);
+    // And a foreign `Host` is still refused, as before the accounts.
+    let foreign = [(header::HOST, "evil.example")];
+    let (status, _, json) = call(admin, Method::GET, "/status", "", &foreign).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["error"], NOT_LOCAL);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_without_admin_is_forbidden_on_every_admin_route() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let luis = cookie_of(admin, "luis", "password-luis").await;
+    let ana = cookie_of(admin, "ana", "password-ana").await;
+
+    let routes: Vec<(Method, String)> = ADMIN_ROUTES
+        .iter()
+        .filter(|(_, _, audience)| *audience == Audience::Admin)
+        .map(|(method, path, _)| {
+            let method: Method = method.parse().expect("method");
+            (method, format!("/{}", path.replace("{}", "x")))
+        })
+        .collect();
+    assert!(routes.len() > 20, "the table lists the routes");
+    assert!(routes.contains(&(Method::POST, "/stop".to_owned())));
+    // What the router does not know is for administrators too.
+    let unknown = [
+        (Method::GET, "/nope".to_owned()),
+        (Method::GET, "/users".to_owned()),
+        (Method::DELETE, "/auth/session".to_owned()),
+        (Method::GET, "/dashboard/x".to_owned()),
+    ];
+    for (method, uri) in routes.iter().chain(&unknown) {
+        let (status, _, json) = call_with_cookie(admin, &luis, method.clone(), uri, "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(json["error"], NEEDS_ADMIN, "{method} {uri}");
+        // Signed out it is `401`.
+        let (status, _, _) = call(admin, method.clone(), uri, "{}", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+
+    // None of them ran (`/stop` is one), and the role opens every one.
+    for (method, uri) in &routes {
+        if *method != Method::GET {
+            continue;
+        }
+        let (status, _, json) = call_with_cookie(admin, &ana, method.clone(), uri, "").await;
+        assert!(
+            matches!(status, StatusCode::OK | StatusCode::NOT_FOUND),
+            "{method} {uri}: {status} {json}"
+        );
+    }
+    let (status, _, json) = call_with_cookie(admin, &ana, Method::POST, "/reload", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    // The routes written for every signed-in user answer luis.
+    let (status, _, _) = call_with_cookie(admin, &luis, Method::GET, "/auth/session", "").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call_with_cookie(admin, &luis, Method::POST, "/auth/logout", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hashes_and_session_ids_never_appear_in_responses() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let hashes: Vec<String> = accounts_on_disk(&closed)
+        .user
+        .into_iter()
+        .map(|user| user.password)
+        .collect();
+    assert!(hashes.iter().all(|hash| hash.starts_with("$2")));
+
+    let mut answers: Vec<(String, HeaderMap, Value)> = Vec::new();
+    let (_, headers, json) = sign_in(admin, "ana", "password-ana").await;
+    let ana = session_cookie(&headers);
+    answers.push(("sign-in".to_owned(), HeaderMap::new(), json));
+    let luis = cookie_of(admin, "luis", "password-luis").await;
+    let ids: Vec<&str> = [&ana, &luis]
+        .iter()
+        .map(|cookie| cookie.strip_prefix("rxh_session=").expect("cookie"))
+        .collect();
+
+    for cookie in [&ana, &luis] {
+        for uri in [
+            "/auth/session",
+            "/status",
+            "/config",
+            "/config/files",
+            "/pools",
+            "/stats/history",
+            "/nope",
+        ] {
+            let (_, headers, json) = call_with_cookie(admin, cookie, Method::GET, uri, "").await;
+            answers.push((uri.to_owned(), headers, json));
+        }
+        let body = json!({ "current": "wrong", "new": "x" }).to_string();
+        let (_, headers, json) =
+            call_with_cookie(admin, cookie, Method::PUT, "/auth/password", &body).await;
+        answers.push(("password".to_owned(), headers, json));
+    }
+    let (_, headers, json) = sign_in(admin, "ana", "wrong-password").await;
+    answers.push(("failed sign-in".to_owned(), headers, json));
+    let (_, headers, json) = send_setup(admin).await;
+    answers.push(("setup".to_owned(), headers, json));
+
+    assert!(answers.len() > 15);
+    for (route, headers, json) in &answers {
+        let text = format!("{headers:?} {json}");
+        for secret in hashes.iter().map(String::as_str).chain(ids.iter().copied()) {
+            assert!(!text.contains(secret), "{route}: {text}");
+        }
+        assert!(!text.contains("$2b$"), "{route}: {text}");
+    }
+}
+
+fn accounts_on_disk(fixture: &Fixture) -> Access {
+    Access::load(&fixture.users).expect("users file")
+}
+
+async fn send_setup(admin: SocketAddr) -> (StatusCode, HeaderMap, Value) {
+    let body = json!({ "name": "eva", "password": "password-eva" }).to_string();
+    call(admin, Method::POST, "/auth/setup", &body, &[]).await
+}

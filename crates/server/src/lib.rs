@@ -8,6 +8,7 @@
 pub mod access;
 mod acme;
 mod admin;
+mod auth_api;
 mod catalog;
 mod change;
 mod config_api;
@@ -39,6 +40,7 @@ mod proxy_protocol;
 mod registry;
 mod secret;
 mod server;
+mod session;
 #[cfg(target_os = "linux")]
 mod splice;
 mod stream;
@@ -51,6 +53,8 @@ mod udp;
 mod upgrade;
 mod upstream;
 
+#[doc(hidden)]
+pub use admin::{Audience, ROUTES as ADMIN_ROUTES};
 pub use daemon::{Daemon, config_files, load_config};
 pub use error::Error;
 pub use include::covers as include_covers;

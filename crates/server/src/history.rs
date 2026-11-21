@@ -225,6 +225,8 @@ mod tests {
             }),
             control: mpsc::channel(1).0,
             saving: tokio::sync::Mutex::new(()),
+            access: crate::access::Store::open(std::path::PathBuf::new()),
+            sessions: crate::session::Sessions::new(),
         })
     }
 

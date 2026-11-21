@@ -552,8 +552,9 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
     another address (a published Docker port), makes every request remote.
 - On a `tls` listener a connection has 10 seconds to send its first byte
   and finish the TLS handshake, then it is closed.
-- Without a token, on TCP and on a unix socket alike, a request is refused
-  with `403` unless it comes from the machine and its `Host` is
+- Without a token, on TCP and on a unix socket alike, a request from the
+  machine is refused
+  with `403` unless its `Host` is
   `localhost`, `127.0.0.1` or `::1` (or the
   `listen` address of a TCP listener) and its `Origin`, when it has one, is
   that same `Host`, port included. The first stops a page of another site
@@ -563,16 +564,20 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   because a browser reaches it once it is forwarded to a local port
   (`ssh -L`). The CLI and `curl` send no `Origin`, and the dashboard sends
   its own, whatever the local port of a tunnel. With a token any `Host` and
-  `Origin` are accepted: the token is the check, also on a unix socket.
+  `Origin` are accepted: the token is the check, also on a unix socket. A
+  request from another machine (over `tls`) without a token is nobody's
+  until it signs in, see [Accounts](#accounts): `401`.
 
   ```sh
   curl --unix-socket /run/rxh/admin.sock http://localhost/status         # 200
   curl --unix-socket /run/rxh/admin.sock http://rxh/status               # 403: use localhost
   curl -H 'Origin: http://localhost:3000' http://localhost:2019/status   # 403
   ```
-- `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are the
-  only routes served without the token: the page and its script and style
+- `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are
+  served without the token: the page and its script and style
   hold no data. The page asks for the token and sends it on its requests.
+  So are `GET /auth/session`, `POST /auth/login` and `POST /auth/setup`,
+  the way in for [accounts](#accounts).
 - Without `tls` the admin API speaks plain HTTP: the token is as private as
   the network it crosses. Set `tls`, or use a private network, a VPN or an
   SSH tunnel (`ssh -L 2019:/run/rxh/admin.sock host`), not the open
@@ -584,6 +589,124 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   same file.
 - `GET /config` shows the token as `***`. Keep the configuration file
   readable by the daemon's user only.
+
+### Accounts
+
+People sign in to the admin API with a name and a password of their own,
+kept in the file `[admin] users` (bcrypt hashes, mode `0600`, created on
+first use). The token and the CLI keep working as they are. Who sends a
+request is the first of these that holds:
+
+1. `Authorization: Bearer <token>` equal to `[admin] token`: an
+   administrator.
+2. The cookie of a session: that user, with the roles the users file gives
+   the user at that moment. A user that was removed from the file is signed
+   out.
+3. No `token` configured and a request from the machine (the rule above):
+   an administrator. This is what `rxh status` and `curl` on the machine
+   are.
+4. Otherwise nobody: `401`, with `WWW-Authenticate: Bearer` when a token is
+   configured.
+
+Only an administrator (the token, a request from the machine without a
+token, or a user with the `admin` role) is answered by the routes of the
+admin API; any other signed-in user gets `403 {"error": "this needs the
+admin role"}` on them. `[admin] users`, like `listen`, `token` and `tls`, is
+read when the daemon starts.
+
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+users = "/var/lib/rxh/users.toml"   # default: rxh-data/users.toml
+```
+
+| Route | For | Does |
+|---|---|---|
+| `GET /auth/session` | anyone | Who the caller is, see below. |
+| `POST /auth/login` | anyone | `{"name", "password"}`: `204` and the session cookie. `401 {"error": "wrong name or password"}` for a wrong password and for an unknown name alike; `429` while the name is locked; `403` on plain HTTP from another machine. |
+| `POST /auth/logout` | signed in | Ends the session and clears the cookie: `204`. |
+| `POST /auth/setup` | see First run | `{"name", "password", "code"?}`: creates the first user and signs it in, `204`. `409` once a user exists. |
+| `PUT /auth/password` | a signed-in user | `{"current", "new"}`: `204`. Ends every session of the user and gives this browser a new one. `403` when `current` is wrong. |
+
+```sh
+curl -c jar -d '{"name": "ana", "password": "correct horse"}' https://rxh.example.com:2019/auth/login
+curl -b jar https://rxh.example.com:2019/auth/session
+curl -b jar https://rxh.example.com:2019/status
+curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.example.com:2019/auth/logout
+```
+
+```json
+{
+  "user": "ana",
+  "admin": true,
+  "roles": ["admin"],
+  "grants": [],
+  "creatable_groups": [],
+  "setup": false,
+  "setup_needs_code": false,
+  "password_login": true,
+  "oidc": false
+}
+```
+
+- `user` is `null` for a caller that is not signed in, which includes the
+  token and a request from the machine: for those `admin` is `true`.
+  `grants` and `creatable_groups` are what the roles of a user without
+  `admin` allow, and empty for an administrator, who may do everything.
+- `setup` is `true` while the users file has no user. `setup_needs_code`
+  says that this caller can create the first one only with the setup code.
+- `password_login` says whether `POST /auth/login` works on this
+  connection: over HTTPS, or from the machine. A password does not travel
+  in clear text over the network, so a listener without `tls` reached from
+  another machine only takes the token.
+- A session is a cookie, `rxh_session`, with `HttpOnly; SameSite=Strict;
+  Path=/` and, over HTTPS, `Secure`. It lasts 12 hours from the sign-in,
+  used or not. Sessions are kept in memory, at most 1000 (the oldest goes
+  first): a restart or a hot upgrade of the daemon signs everybody out.
+- A request with a session cookie that is not a `GET` or a `HEAD` must
+  carry an `Origin` equal to its `Host`, port included, as a page of the
+  dashboard does: `403` otherwise. `curl` needs `-H 'Origin: ...'` for
+  those, as above; requests with the token need nothing.
+- After 5 failed sign-ins for a name from one client address, that name is
+  refused from that address for a minute (`429`), with the right password
+  too. A wrong `current` in `PUT /auth/password` counts as one.
+- A password has at least 8 characters and at most 72 bytes. Hashes never
+  leave the daemon.
+- Each sign-in, failed sign-in, sign-out, password change and the creation
+  of the first user is a line in the log of the daemon, with the name and
+  the address of the client.
+- Behind a reverse proxy on the same machine every request comes from the
+  machine under the name of the proxy, which without a token is refused
+  (`403`) before it can sign in: set `token` there, as said above, and
+  people sign in with their accounts all the same.
+
+#### First run
+
+While the users file has no user the API works as without accounts, and
+`POST /auth/setup` creates the first user, with the `admin` role. It is
+answered:
+
+- to an administrator: the holder of the token, or a request from the
+  machine when no token is set;
+
+  ```sh
+  curl -d '{"name": "ana", "password": "correct horse"}' http://127.0.0.1:2019/auth/setup
+  ```
+- to anyone who sends the setup code, on a `tls` listener without a
+  `token`. The code is 10 characters, new at every start, and written to
+  the log of the daemon while no user exists:
+
+  ```text
+  Admin => no user exists yet; to create the first one from another machine use the setup code k7m2xq9hpd
+  ```
+
+  ```sh
+  curl -d '{"name": "ana", "password": "correct horse", "code": "k7m2xq9hpd"}' https://rxh.example.com:2019/auth/setup
+  ```
+
+Anybody else gets `403`, and once a user exists everybody gets `409`: the
+code is of no use any more. There are no default credentials.
 
 ### Dashboard
 

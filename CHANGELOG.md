@@ -24,6 +24,19 @@ Changed.
   the machine (unix socket, loopback peer, or the machine calling its own
   address) besides the `Host` and `Origin` rule: headers alone no longer
   decide.
+- Accounts on the admin API: `POST /auth/login` signs a user of the users
+  file in with a session cookie (`rxh_session`, `HttpOnly`,
+  `SameSite=Strict`, `Secure` over HTTPS; 12 hours, in memory),
+  `POST /auth/logout` ends it, `PUT /auth/password` changes one's own
+  password and `GET /auth/session` says who the caller is. While no user
+  exists `POST /auth/setup` creates the first administrator: for the token,
+  for a request from the machine, or on a `tls` listener without a token
+  with the setup code the daemon logs at start. Five failed sign-ins for a
+  name from one address lock that pair for a minute (`429`), and a cookie
+  request that changes something needs an `Origin` equal to its `Host`.
+  The token and a request from the machine without a token stay
+  administrators. Every route now passes one gate that refuses by default:
+  a signed-in user without the `admin` role gets `403` on the admin routes.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on
@@ -461,6 +474,10 @@ Changed.
 
 ### Changed
 
+- On an admin listener with `tls` and without `token`, a request from
+  another machine is no longer refused with `403` on every route: the
+  dashboard and the `/auth` routes answer it, so that people can sign in,
+  and every other route answers `401` until they have.
 - Without `[admin] token`, the admin API on a unix socket now refuses with
   `403` a request whose `Host` is not `localhost`, `127.0.0.1` or `::1`, as
   the TCP listener already did: once the socket is forwarded to a local
