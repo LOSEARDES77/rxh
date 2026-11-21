@@ -810,12 +810,13 @@ grant = [
 | Action | Needs |
 |---|---|
 | See a host in lists, its statistics and its form | `view` |
-| Change a host (form or the TOML of its table) | `view` and `modify` |
+| Change a host (form or the TOML of its table) | `view` and `modify`, and only the keys of the list below |
 | Add a group to a host | `modify` on the host and `create` on the added group |
 | Remove a group from a host | `modify` on the host, and still `modify` on it after the change |
 | Change the `name` of a host, give it one or take it away | the `admin` role |
-| Create a host whose `name` a `host` grant of any role names, or whose `name` has an `{env.NAME}` or `{file.PATH}` placeholder | the `admin` role |
-| Create a host | `create` on every group in its `groups`, which must not be empty |
+| Create a host whose `name` a `host` grant of any role names | the `admin` role |
+| Create a host | `create` on every group in its `groups`, which must not be empty; only the keys of the list below, a `host` of its own, and `listen` addresses that are already listened on |
+| Set any other key of a host, a value with an `{env.NAME}` or `{file.PATH}` placeholder, a unix socket as a forward target, or a new `listen` address | the `admin` role |
 | Delete a host | `view` and `delete` |
 | Anything else: pools, sections, whole files, certificates, `GET /config`, `/metrics`, reload, load, patch, upgrade, stop, users and roles | the `admin` role |
 
@@ -825,8 +826,8 @@ What a signed-in user without the `admin` role gets from each route
 | Route | Answer |
 |---|---|
 | `GET /config/files` | `files` as `{"index", "revision"}` only (no path, no text); of the entities the servers with `view`, whole, and the pools as `{"kind": "upstream", "key": NAME}`; no section. |
-| `POST /config/entities/server` | `201` with `create` on every group of the new host. `403` otherwise, for a host without groups, and `403 {"error": "this name is reserved"}` for a name a `host` grant names. |
-| `PUT /config/entities/server/{key}` | `200` with `view` and `modify`, when the change keeps the name, adds only groups with `create` and leaves the host one the user may change. `403` otherwise. |
+| `POST /config/entities/server` | `201` with `create` on every group of the new host. `403` otherwise, for a host without groups, for a key that is not on the list below, and `403 {"error": "this name is reserved"}` for a name a `host` grant names (told only to who may create in those groups). |
+| `PUT /config/entities/server/{key}` | `200` with `view` and `modify`, when the change keeps the name, adds only groups with `create`, leaves the host one the user may change and touches only keys of the list below. `403` otherwise. |
 | `DELETE /config/entities/server/{key}` | `200` with `view` and `delete`, `403` with `view` only. |
 | the three routes above, on a host without `view` or a key that names no host | `404 {"error": "no such host"}`, the same for both. |
 | the three routes above, for `upstream` and `section` | `403`. |
@@ -857,11 +858,51 @@ What a signed-in user without the `admin` role gets from each route
   Kubernetes...) included. A series is shown only when every running
   server that counts under it is viewed: two servers with the same name, or
   the requests that match no server of a shared listener, are shown to who
-  views them all. Series of servers that no longer run are for
-  administrators.
+  views them all. A series is kept under its name for an hour, whatever
+  happens to the server: after a server is removed or renamed its series is
+  for administrators, and a new server that takes the name shows the counts
+  the name had before to who views the new one.
 - A user with `modify` or `create` can point a host at any address the
-  daemon can reach and serve any directory the daemon can read: give them
-  to people you trust.
+  daemon can reach: give them to people you trust.
+
+A host table can make the daemon read files, run programs, call other
+services and open sockets, so a user without the `admin` role sets only the
+keys that route or answer traffic for the host. Any other key, and any key
+this list does not have, keeps the value it has in the file (it may be
+there, set by an administrator, next to a change) and is absent from a new
+host; a change to one is `403 {"error": "this needs the admin role:
+match[0].forward.health.hooks"}`, with the path of the key. The keys of a
+`[[server.match]]` and of a `subroute` entry are the ones of the server.
+
+| Keys | A user may set them |
+|---|---|
+| `name`, `groups` | As the grants say, see the table above. |
+| `listen` | Only addresses a server of the running configuration listens on, port `0` excluded: no new socket. |
+| `host` | Yes. A new host must have one, and a host that has one keeps one. |
+| `http_host`, `path`, `uri`, `method`, `query`, `header`, `regexp`, `regexp_count`, `remote_ip`, `sni`, `alpn` | Yes: which requests the host takes. |
+| `ip_allow`, `ip_deny`, `rate_limit` | Yes: who reaches the host. |
+| `forward` (a pool name, addresses, weighted pools) | Yes, except a `unix//` socket. |
+| `redirect`, `rewrite`, `request`, `response`, `cors`, `encode`, `security_headers` | Yes. |
+| `cache`: `enabled`, `ttl_seconds` | Yes. `max_entries`, `max_body_bytes`: no, the memory of the daemon. |
+| `handle_response`: `status`, `header`, `redirect`, `replace_status`, `rewrite`, `copy_response` | Yes. `serve`: no. |
+| `tls = "auto"` | Yes. `tls = { cert, key }`: no, paths. |
+| inline `forward` pool: `backends`, `policy`, `choose`, `key`, `hash_type`, `hash_balance_factor`, `retries`, `try_duration`, `try_interval`, `retry_budget`, `retry_match`, `hedge_delay`, `dial_timeout`, `read_timeout`, `write_timeout`, `response_header_timeout`, `queue_timeout`, `flush_interval`, `h2c`, `grpc_web`, `slow_start`, `passive`, `circuit_breaker`, `fallback` (`policy`, `choose`, `key`) | Yes: where the requests of the host go, and how. |
+| inline `forward` pool, `health`: `interval`, `timeout`, `uri`, `method`, `port`, `headers`, `request_body`, `status`, `body`, `passes`, `fails`, `grpc`, `grpc_service` | Yes: checks of the forward targets. |
+| inline `forward` pool, `tls`: `server_name`, `insecure_skip_verify` | Yes. `ca`, `client_cert`, `client_key`: no, paths. |
+| `serve`, `error_pages` | No: paths on the machine of the daemon. |
+| `forward.health.hooks`, `forward.health.upstream`, `forward.health.follow_redirects`, `forward.dynamic`, `forward_auth`, `mirror` | No: programs, and requests to somewhere else than the forward targets. |
+| `basic_auth`, `forward.secret`, `forward.fallback.secret` | No: credentials. |
+| `trusted_proxies`, `client_auth`, `proxy_protocol`, `proxy_protocol_in` | No: who is trusted. |
+| `protocol`, `http2`, `http3`, `https_redirect`, `tls_options`, `max_connections`, `max_connections_per_ip`, `match_timeout`, `idle_timeout`, `read_header_timeout`, `stream_timeout`, `stream_close_delay`, `udp_idle_timeout` | No: sockets, and what every server of a shared listener gets. |
+| inline `forward` pool: `keepalive`, `keepalive_idle_conns_per_host`, `http2_conns_per_host`, `max_conns_per_host`, `max_connections`, `queue_size`, `request_buffers`, `response_buffers` | No: memory and connections of the daemon. |
+
+- No string a user sets may have an `{env.NAME}` or a `{file.PATH}`
+  placeholder: `403`. One an administrator wrote stays as it is.
+- The entries of an array (`match`, `handle_response`, backends) are
+  compared by position: an entry with a key for administrators cannot be
+  moved or removed by a user, nor can an entry before it.
+- An administrator (the token, a request from the machine without a token,
+  a user with `admin`) is not limited by any of this.
 
 ```sh
 API=https://rxh.example.com:2019
@@ -869,7 +910,7 @@ ORIGIN="Origin: $API"
 curl -c jar -d '{"name": "luis", "password": "luis-password"}' $API/auth/login
 curl -b jar $API/config/files      # the hosts of luis, each with "permissions"
 curl -b jar $API/status            # their listeners
-curl -b jar -H "$ORIGIN" -d '{"value": {"listen": "0.0.0.0:8081", "groups": ["web"], "forward": "@api"}}' \
+curl -b jar -H "$ORIGIN" -d '{"value": {"listen": "0.0.0.0:8080", "host": "news.example.com", "groups": ["web"], "forward": "@api"}}' \
   $API/config/entities/server      # 201 {"key": "0:4"}
 curl -b jar -H "$ORIGIN" -X DELETE "$API/config/entities/server/0:4?revision=$REVISION"
 curl -b jar -H "$ORIGIN" -X PUT -d '{"value": {}, "revision": "..."}' $API/config/entities/upstream/api   # 403

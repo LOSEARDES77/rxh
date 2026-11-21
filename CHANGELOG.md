@@ -59,6 +59,15 @@ Changed.
   exist, a stale revision `409` with a fixed text, and pools, sections and
   whole files stay for administrators. Each server entity of
   `GET /config/files` has `permissions`, what the caller may do with it.
+  Such a user sets only the keys of a host that route or answer its
+  traffic (matchers, `forward` and the routing of an inline pool,
+  `redirect`, `rewrite`, headers, `cors`, `encode`, `rate_limit`, IP lists,
+  `tls = "auto"`): any other key (`serve`, `error_pages`, `forward_auth`,
+  health `hooks`, certificate files, `trusted_proxies`, `basic_auth`...)
+  keeps the value it has in the file, and a change to one is `403` with the
+  path of the key. It sets no `{env.NAME}` or `{file.PATH}` placeholder, no
+  unix socket as a forward target, no `listen` address that is not listened
+  on already, and a new host needs a `host`.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on

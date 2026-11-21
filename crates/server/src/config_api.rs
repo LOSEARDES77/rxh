@@ -11,12 +11,14 @@
 //! A caller without the `admin` role reads and writes hosts only, and only
 //! as far as [`Scope::allowed`] says for the `name` and the `groups` of each:
 //! see [`Listed::of`] for what it reads, and [`viewed_host`],
-//! [`check_changed`] and [`check_created`] for what it writes. Those checks
+//! [`check_changed`], [`check_created`] and [`check_table`] for what it
+//! writes. Those checks
 //! run on the file that is being written, while it is locked.
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -34,6 +36,7 @@ use crate::access::{Host, Permission, Scope};
 use crate::admin::{self, AdminState, Caller, Control};
 use crate::edit::{self, ConfigFile, SaveError};
 use crate::entity::{self, Body, Entity, Kind};
+use crate::host_keys;
 use crate::secret;
 
 /// Status and message of a request that failed.
@@ -107,12 +110,66 @@ fn host_of(value: &Json) -> Option<Host> {
     Host::deserialize(value).ok()
 }
 
-/// The host of the server `key` (`FILE:POSITION`) of file `index`.
-fn host_at(document: &DocumentMut, index: usize, key: &str) -> Option<Host> {
-    entity::list(index, document)
-        .iter()
-        .find(|entity| entity.kind == Kind::Server && entity.key == key)
-        .and_then(|entity| host_of(&entity.value))
+/// The table of the server `key` (`FILE:POSITION`) of file `index`, and
+/// its host: `None` when there is no such server or it is not a host.
+fn host_at(document: &DocumentMut, index: usize, key: &str) -> Option<(Host, Json)> {
+    let server: Entity = entity::list(index, document)
+        .into_iter()
+        .find(|entity| entity.kind == Kind::Server && entity.key == key)?;
+    Some((host_of(&server.value)?, server.value))
+}
+
+/// The addresses `table` listens on, `None` when one is not an address.
+fn listens(table: &Json) -> Option<Vec<SocketAddr>> {
+    let texts: Vec<&Json> = match table.get("listen") {
+        Some(Json::Array(texts)) => texts.iter().collect(),
+        Some(text) => vec![text],
+        None => Vec::new(),
+    };
+    texts
+        .into_iter()
+        .map(|text| text.as_str()?.parse().ok())
+        .collect()
+}
+
+/// Whether `table` has no `host` matcher of its own.
+fn has_no_host(table: &Json) -> bool {
+    match table.get("host") {
+        Some(Json::Array(names)) => names.is_empty(),
+        Some(Json::String(name)) => name.is_empty(),
+        _ => true,
+    }
+}
+
+/// What a caller without the `admin` role may put in the table of a host,
+/// besides what its grants say: the keys of [`host_keys::ALLOWED`], on the
+/// addresses in `running` (the ones the servers that run listen on), under
+/// a `host` of its own. `before` is the stored table, `None` for a new one.
+fn check_table(before: Option<&Json>, after: &Json, running: &[SocketAddr]) -> Result<(), Failure> {
+    host_keys::check(before, after).map_err(|message| forbidden(&message))?;
+    let kept: Vec<SocketAddr> = before.and_then(listens).unwrap_or_default();
+    let shared = |address: &SocketAddr| {
+        kept.contains(address) || (address.port() != 0 && running.contains(address))
+    };
+    let is_kept = before.is_some_and(|before| before.get("listen") == after.get("listen"));
+    if !is_kept && !listens(after).is_some_and(|addresses| addresses.iter().all(shared)) {
+        return Err(forbidden(
+            "this needs the admin role: listen takes only addresses another server listens on",
+        ));
+    }
+    if has_no_host(after) && !before.is_some_and(has_no_host) {
+        return Err(forbidden(
+            "this needs the admin role: host must name what the host answers for",
+        ));
+    }
+    Ok(())
+}
+
+/// The addresses the running servers listen on.
+fn running_listens(state: &AdminState) -> Vec<SocketAddr> {
+    let current = state.current.read().unwrap_or_else(PoisonError::into_inner);
+    let servers = current.config.servers.iter();
+    servers.flat_map(|server| server.listen.clone()).collect()
 }
 
 /// Answer to a caller without the `admin` role about a host it does not
@@ -159,12 +216,12 @@ fn viewed_host(
     key: &str,
     needed: Permission,
     refusal: &str,
-) -> Result<Host, Failure> {
-    let host: Host = host_at(stored, index, key)
-        .filter(|host| scope.views(host))
+) -> Result<(Host, Json), Failure> {
+    let (host, table) = host_at(stored, index, key)
+        .filter(|(host, _)| scope.views(host))
         .ok_or((StatusCode::NOT_FOUND, String::from(NO_HOST)))?;
     if scope.allowed(&host).contains(&needed) {
-        Ok(host)
+        Ok((host, table))
     } else {
         Err(forbidden(refusal))
     }
@@ -199,28 +256,20 @@ fn check_changed(scope: &Scope, before: &Host, after: &Host) -> Result<(), Failu
 }
 
 /// Whether a caller without the `admin` role may create `host`. `reserved`
-/// says whether a grant of any role targets a name.
+/// says whether a grant of any role targets a name: it is asked only of who
+/// may create, so the others do not learn which names are reserved.
 fn check_created(
     scope: &Scope,
     host: &Host,
     reserved: impl Fn(&str) -> bool,
 ) -> Result<(), Failure> {
-    if let Some(name) = &host.name {
-        if reserved(name) {
-            return Err(forbidden("this name is reserved"));
-        }
-        // The name the daemon runs with is not the one written here, and
-        // could be a reserved one.
-        if name.contains("{env.") || name.contains("{file.") {
-            return Err(forbidden(
-                "a name read from the environment or a file needs the admin role",
-            ));
-        }
-    }
     if !scope.may_create(&host.groups) {
         return Err(forbidden(
             "creating a host needs create on each of its groups, and at least one group",
         ));
+    }
+    if host.name.as_deref().is_some_and(reserved) {
+        return Err(forbidden("this name is reserved"));
     }
     Ok(())
 }
@@ -439,8 +488,9 @@ pub(crate) async fn create(
                 Kind::Upstream | Kind::Section => key,
             };
             if !scope.is_admin() {
-                let host: Host = host_at(file.document(), index, &key).ok_or_else(not_a_host)?;
+                let (host, table) = host_at(file.document(), index, &key).ok_or_else(not_a_host)?;
                 check_created(&scope, &host, |name| users.access.reserved_host(name))?;
+                check_table(None, &table, &running_listens(&users))?;
             }
             let _ = key_found.send(key);
             Ok(())
@@ -475,9 +525,10 @@ pub(crate) async fn replace(
         let listed: String = key.to_owned();
         let (index, key) = position_of(state, &scope, kind, key).await?;
         let scope: Scope = scope.clone();
+        let users: Arc<AdminState> = Arc::clone(state);
         save(state, index, Some(&revision), move |file| {
             let stored: DocumentMut = file.document().clone();
-            let before: Option<Host> = if scope.is_admin() {
+            let before: Option<(Host, Json)> = if scope.is_admin() {
                 None
             } else {
                 let refusal = "changing this host needs modify on it";
@@ -495,10 +546,11 @@ pub(crate) async fn replace(
             // The other tables are the stored ones, so this only reaches the
             // entity that was written.
             secret::restore(document, &stored).map_err(bad_request)?;
-            if let Some(before) = before {
+            if let Some((before, stored)) = before {
                 // The table as it will be written, secrets put back.
-                let after: Host = host_at(document, index, &listed).ok_or_else(not_a_host)?;
+                let (after, table) = host_at(document, index, &listed).ok_or_else(not_a_host)?;
                 check_changed(&scope, &before, &after)?;
+                check_table(Some(&stored), &table, &running_listens(&users))?;
             }
             Ok(())
         })

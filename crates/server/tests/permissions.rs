@@ -6,6 +6,7 @@ mod util;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hyper::{Method, StatusCode, header};
@@ -246,9 +247,13 @@ fn keys(files: &Value, kind: &str) -> Vec<String> {
         .collect()
 }
 
-/// A host for `POST /config/entities/server`.
-fn new_host(groups: Option<&[&str]>) -> Value {
-    let mut value = json!({ "listen": free_address().to_string(), "forward": "127.0.0.1:9" });
+/// A host for `POST /config/entities/server`: on the address of `shop`,
+/// under a name of its own.
+fn new_host(fixture: &Fixture, groups: Option<&[&str]>) -> Value {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let host = format!("new-{}.example", COUNT.fetch_add(1, Ordering::Relaxed));
+    let listen = fixture.listens[0].to_string();
+    let mut value = json!({ "listen": listen, "host": [host], "forward": "127.0.0.1:9" });
     if let Some(groups) = groups {
         value["groups"] = json!(groups);
     }
@@ -351,13 +356,13 @@ async fn modify_changes_a_host_and_the_file() {
     let fixture = daemon().await;
     let eva = fixture.cookie("eva").await;
     let (status, json) = fixture
-        .put_value(&eva, SHOP, |value| value["max_connections"] = json!(7))
+        .put_value(&eva, SHOP, |value| value["uri"] = json!("/shop"))
         .await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json, json!({ "saved": true }));
 
     let text = fixture.text();
-    assert!(text.contains("max_connections = 7"), "{text}");
+    assert!(text.contains("uri = \"/shop\""), "{text}");
     for kept in [
         "# The pool of the shop. This comment stays.",
         "# The shop. This comment stays.",
@@ -367,13 +372,13 @@ async fn modify_changes_a_host_and_the_file() {
         assert!(text.contains(kept), "{kept} in {text}");
     }
     let (_, config) = fixture.token(Method::GET, "/config", &Value::Null).await;
-    assert_eq!(config["server"][0]["max_connections"], 7, "{config}");
+    assert_eq!(config["server"][0]["match"][0]["uri"], "/shop", "{config}");
     assert_eq!(config["server"][2]["name"], "intra");
 
     // View alone does not change a host.
     let vera = fixture.cookie("vera").await;
     let (status, json) = fixture
-        .put_value(&vera, SHOP, |value| value["max_connections"] = json!(8))
+        .put_value(&vera, SHOP, |value| value["uri"] = json!("/v"))
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
     assert_eq!(fixture.text(), text);
@@ -387,7 +392,7 @@ async fn modify_through_the_toml_of_the_table_is_checked_the_same() {
     let table = |name: &str, groups: &str| {
         format!(
             "name = \"{name}\"\nlisten = \"{listen}\"\ngroups = {groups}\n\
-             forward = \"@api\"\nmax_connections = 9\n"
+             forward = \"@api\"\nuri = \"/shop\"\n"
         )
     };
 
@@ -422,7 +427,7 @@ async fn modify_through_the_toml_of_the_table_is_checked_the_same() {
     let (status, json) = fixture.put(&eva, SHOP, json!({ "toml": toml })).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     let text = fixture.text();
-    assert!(text.contains("max_connections = 9"), "{text}");
+    assert!(text.contains("uri = \"/shop\""), "{text}");
     assert!(text.contains("# The shop. This comment stays."), "{text}");
     assert!(text.contains("name = \"intra\""), "{text}");
 }
@@ -528,12 +533,16 @@ async fn create_needs_create_on_every_group() {
         (&pia, &["press", "web"]),
         (&vera, &["web"]),
     ] {
-        let (status, json) = fixture.create(cookie, new_host(Some(groups))).await;
+        let (status, json) = fixture
+            .create(cookie, new_host(&fixture, Some(groups)))
+            .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{groups:?}: {json}");
         assert_eq!(fixture.text(), before, "{groups:?}");
     }
 
-    let (status, json) = fixture.create(&eva, new_host(Some(&["web"]))).await;
+    let (status, json) = fixture
+        .create(&eva, new_host(&fixture, Some(&["web"])))
+        .await;
     assert_eq!(status, StatusCode::CREATED, "{json}");
     assert_eq!(json, json!({ "key": "0:4" }));
     let files = fixture.get(&eva, "/config/files").await;
@@ -541,8 +550,9 @@ async fn create_needs_create_on_every_group() {
 
     // Through the text of the table, and by somebody who will not see it.
     let toml = format!(
-        "listen = \"{}\"\ngroups = [\"press\"]\nforward = \"127.0.0.1:9\"\n",
-        free_address()
+        "listen = \"{}\"\nhost = \"press.example\"\ngroups = [\"press\"]\n\
+         forward = \"127.0.0.1:9\"\n",
+        fixture.listens[0]
     );
     let body = json!({ "toml": toml });
     let (status, json) = fixture
@@ -559,7 +569,7 @@ async fn create_without_groups_is_refused() {
     let fixture = daemon().await;
     let before = fixture.text();
     let eva = fixture.cookie("eva").await;
-    for value in [new_host(None), new_host(Some(&[]))] {
+    for value in [new_host(&fixture, None), new_host(&fixture, Some(&[]))] {
         let (status, json) = fixture.create(&eva, value).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
     }
@@ -575,7 +585,7 @@ async fn create_without_groups_is_refused() {
     assert_eq!(fixture.text(), before);
 
     // The token creates a host without groups, as before.
-    let body = json!({ "value": new_host(None) });
+    let body = json!({ "value": new_host(&fixture, None) });
     let (status, json) = fixture
         .token(Method::POST, "/config/entities/server", &body)
         .await;
@@ -589,25 +599,25 @@ async fn creating_a_reserved_name_is_refused() {
     let eva = fixture.cookie("eva").await;
 
     // `shop` is the target of a grant of the role `shop-only`.
-    let mut value = new_host(Some(&["web"]));
+    let mut value = new_host(&fixture, Some(&["web"]));
     value["name"] = json!("shop");
     let (status, json) = fixture.create(&eva, value).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
     assert_eq!(json, json!({ "error": "this name is reserved" }));
     // A name read from the environment could be any name.
-    let mut value = new_host(Some(&["web"]));
+    let mut value = new_host(&fixture, Some(&["web"]));
     value["name"] = json!("{env.RXH_TEST_HOST_NAME}");
     let (status, json) = fixture.create(&eva, value).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
     assert_eq!(fixture.text(), before);
 
-    let mut value = new_host(Some(&["web"]));
+    let mut value = new_host(&fixture, Some(&["web"]));
     value["name"] = json!("store");
     let (status, json) = fixture.create(&eva, value).await;
     assert_eq!(status, StatusCode::CREATED, "{json}");
     // The administrator may take the name.
     let ana = fixture.cookie("ana").await;
-    let mut value = new_host(None);
+    let mut value = new_host(&fixture, None);
     value["name"] = json!("shop-2");
     let (status, json) = fixture.create(&ana, value).await;
     assert_eq!(status, StatusCode::CREATED, "{json}");
@@ -646,14 +656,16 @@ async fn a_host_grant_does_not_reach_other_hosts_of_the_group() {
         json!(["view", "modify"])
     );
 
-    let change = |value: &mut Value| value["max_connections"] = json!(5);
+    let change = |value: &mut Value| value["uri"] = json!("/shop");
     for key in [BLOG, UNNAMED, INTRA] {
         let (status, json) = fixture.put_value(&sam, key, change).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{key}: {json}");
         let (status, json) = fixture.delete(&sam, key).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{key}: {json}");
     }
-    let (status, json) = fixture.create(&sam, new_host(Some(&["web"]))).await;
+    let (status, json) = fixture
+        .create(&sam, new_host(&fixture, Some(&["web"])))
+        .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
     assert_eq!(fixture.text(), before);
 
@@ -740,7 +752,7 @@ async fn pools_sections_and_whole_files_are_refused() {
         fixture.admin,
         Method::POST,
         "/config/entities/server",
-        &json!({ "value": new_host(Some(&["web"])) }).to_string(),
+        &json!({ "value": new_host(&fixture, Some(&["web"])) }).to_string(),
         &[],
     )
     .await;
@@ -999,7 +1011,7 @@ async fn after_each_refused_write_the_file_is_unchanged() {
             &eva,
             Method::PUT,
             server(SHOP),
-            with(&shop, "listen", json!("nowhere")),
+            with(&shop, "uri", json!(5)),
             400,
         ),
         (
@@ -1020,21 +1032,21 @@ async fn after_each_refused_write_the_file_is_unchanged() {
             &eva,
             Method::POST,
             create.clone(),
-            json!({ "value": new_host(Some(&["internal"])) }),
+            json!({ "value": new_host(&fixture, Some(&["internal"])) }),
             403,
         ),
         (
             &eva,
             Method::POST,
             create.clone(),
-            json!({ "value": new_host(Some(&["web"])), "file": 7 }),
+            json!({ "value": new_host(&fixture, Some(&["web"])), "file": 7 }),
             404,
         ),
         (
             &eva,
             Method::POST,
             create.clone(),
-            json!({ "value": { "groups": ["web"] } }),
+            json!({ "value": { "groups": ["web"], "host": "x.example", "uri": 5 } }),
             400,
         ),
         (&sam, Method::DELETE, delete(SHOP), Value::Null, 403),
@@ -1064,7 +1076,7 @@ async fn after_each_refused_write_the_file_is_unchanged() {
             &pia,
             Method::POST,
             create.clone(),
-            json!({ "value": new_host(Some(&["web"])) }),
+            json!({ "value": new_host(&fixture, Some(&["web"])) }),
             403,
         ),
         (&pia, Method::POST, "/reload".to_owned(), Value::Null, 403),
@@ -1086,4 +1098,315 @@ async fn after_each_refused_write_the_file_is_unchanged() {
     assert_eq!(config["server"].as_array().map(Vec::len), Some(4));
     assert_eq!(config["server"][0]["name"], "shop");
     assert_eq!(config["server"][0]["groups"], json!(["web"]));
+}
+
+/// The table of `shop` as TOML text, with `lines` in place of, or next to,
+/// the lines of the same keys.
+fn shop_toml(fixture: &Fixture, lines: &[(&str, &str)]) -> String {
+    let listen = format!("\"{}\"", fixture.listens[0]);
+    let mut table = vec![
+        ("name", "\"shop\""),
+        ("listen", listen.as_str()),
+        ("groups", "[\"web\"]"),
+        ("forward", "\"@api\""),
+    ];
+    for (key, value) in lines {
+        match table.iter_mut().find(|(known, _)| known == key) {
+            Some(line) => line.1 = value,
+            None => table.push((key, value)),
+        }
+    }
+    let lines: Vec<String> = table
+        .iter()
+        .map(|(key, value)| format!("{key} = {value}\n"))
+        .collect();
+    lines.concat()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_sets_only_the_keys_that_route_or_answer() {
+    let fixture = daemon().await;
+    let before = fixture.text();
+    // Modify and Create on the group of `shop`.
+    let eva = fixture.cookie("eva").await;
+    let fresh = free_address().to_string();
+    let both = json!([fixture.listens[0].to_string(), fresh]);
+    let both_toml = format!("[\"{}\", \"{fresh}\"]", fixture.listens[0]);
+    let fresh_toml = format!("\"{fresh}\"");
+    let header = |value: &str| json!({ "headers": { "set": { "X-A": value } } });
+
+    // Key, its value in the form, its value in the text, what the answer names.
+    let refused: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "forward",
+            json!({ "backends": ["127.0.0.1:9"], "health": { "hooks": { "command": ["touch", "/tmp/rxh-test-hook"] } } }),
+            "{ backends = [\"127.0.0.1:9\"], health = { hooks = { command = [\"touch\", \"/tmp/rxh-test-hook\"] } } }",
+            "forward.health.hooks",
+        ),
+        (
+            "forward",
+            json!({ "backends": ["127.0.0.1:9"], "health": { "hooks": { "webhook": "http://127.0.0.1:9/" } } }),
+            "{ backends = [\"127.0.0.1:9\"], health = { hooks = { webhook = \"http://127.0.0.1:9/\" } } }",
+            "forward.health.hooks",
+        ),
+        ("serve", json!("/"), "\"/\"", ": serve"),
+        (
+            "error_pages",
+            json!({ "404": "/etc/hostname" }),
+            "{ 404 = \"/etc/hostname\" }",
+            ": error_pages",
+        ),
+        (
+            "forward_auth",
+            json!({ "url": "http://127.0.0.1:9/check" }),
+            "{ url = \"http://127.0.0.1:9/check\" }",
+            ": forward_auth",
+        ),
+        (
+            "tls",
+            json!({ "cert": "/etc/hostname", "key": "/etc/hostname" }),
+            "{ cert = \"/etc/hostname\", key = \"/etc/hostname\" }",
+            ": tls.cert",
+        ),
+        (
+            "response",
+            header("{file./etc/hostname}"),
+            "{ headers = { set = { X-A = \"{file./etc/hostname}\" } } }",
+            "environment or a file needs the admin role: response.headers.set.X-A",
+        ),
+        (
+            "response",
+            header("{env.HOME}"),
+            "{ headers = { set = { X-A = \"{env.HOME}\" } } }",
+            "environment or a file needs the admin role: response.headers.set.X-A",
+        ),
+        (
+            "forward",
+            json!("unix//run/rxh-admin.sock"),
+            "\"unix//run/rxh-admin.sock\"",
+            "unix socket as a forward target needs the admin role: forward",
+        ),
+        (
+            "forward",
+            json!({ "backends": ["unix//run/rxh-admin.sock"] }),
+            "{ backends = [\"unix//run/rxh-admin.sock\"] }",
+            "unix socket as a forward target needs the admin role: forward.backends[0]",
+        ),
+        ("listen", json!(fresh), &fresh_toml, "listen takes only"),
+        ("listen", both, &both_toml, "listen takes only"),
+        (
+            "trusted_proxies",
+            json!(["0.0.0.0/0"]),
+            "[\"0.0.0.0/0\"]",
+            ": trusted_proxies",
+        ),
+        ("max_connections", json!(1), "1", ": max_connections"),
+        (
+            "mirror",
+            json!({ "pool": "api" }),
+            "{ pool = \"api\" }",
+            ": mirror",
+        ),
+        (
+            "basic_auth",
+            json!({ "users": { "eva": "$2b$04$abcdefghijklmnopqrstuuWv0tTFLmu4BUQ4ZxWXdhwPQx6a4ZJ." } }),
+            "{ users = { eva = \"$2b$04$abcdefghijklmnopqrstuuWv0tTFLmu4BUQ4ZxWXdhwPQx6a4ZJ.\" } }",
+            ": basic_auth",
+        ),
+        ("not_a_key_yet", json!(true), "true", ": not_a_key_yet"),
+    ];
+    for (key, value, toml, named) in &refused {
+        let told = |how: &str, (status, json): (StatusCode, Value)| {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{how} {key} = {value}: {json}"
+            );
+            let error = json["error"].as_str().expect("error");
+            assert!(
+                error.contains("needs the admin role"),
+                "{how} {key}: {error}"
+            );
+            assert!(error.contains(named), "{how} {key}: {error}");
+            assert_eq!(fixture.text(), before, "{how} {key} = {value}");
+        };
+        let changed = fixture
+            .put_value(&eva, SHOP, |shop| shop[*key] = value.clone())
+            .await;
+        told("form", changed);
+        let text = shop_toml(&fixture, &[(key, toml)]);
+        let changed = fixture.put(&eva, SHOP, json!({ "toml": text })).await;
+        told("text", changed);
+        let mut host = new_host(&fixture, Some(&["web"]));
+        host[*key] = value.clone();
+        told("new", fixture.create(&eva, host).await);
+    }
+    assert!(!std::path::Path::new("/tmp/rxh-test-hook").exists());
+
+    // A new host answers for names of its own.
+    for host in [Value::Null, json!([]), json!("")] {
+        let mut value = new_host(&fixture, Some(&["web"]));
+        value["host"] = host.clone();
+        if host.is_null() {
+            value.as_object_mut().expect("object").remove("host");
+        }
+        let (status, json) = fixture.create(&eva, value).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{host}: {json}");
+        assert_eq!(fixture.text(), before, "{host}");
+    }
+
+    // What routes and answers is set, on an address that is listened on.
+    let (status, json) = fixture
+        .put_value(&eva, SHOP, |shop| {
+            shop["listen"] = json!([fixture.listens[0].to_string(), fixture.listens[1].to_string()]);
+            shop["host"] = json!(["shop.example"]);
+            shop["forward"] = json!({ "backends": ["127.0.0.1:9"], "policy": "random", "health": { "uri": "/up" } });
+            shop["response"] = header("{host}");
+        })
+        .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    // Once it has a `host`, it keeps one.
+    let (status, json) = fixture
+        .put_value(&eva, SHOP, |shop| shop["host"] = json!([]))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    // The administrator is not limited.
+    let (status, json) = fixture
+        .token(
+            Method::PUT,
+            &format!("/config/entities/server/{SHOP}"),
+            &json!({
+                "toml": shop_toml(&fixture, &[("max_connections", "5"), ("listen", &fresh_toml)]),
+                "revision": fixture.revision().await,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_for_administrators_stays_as_it_is() {
+    let fixture = daemon().await;
+    // The administrator sets what a user may not.
+    let admin_keys = [
+        ("trusted_proxies", "[\"10.0.0.0/8\"]"),
+        ("max_connections", "5"),
+        (
+            "forward",
+            "{ backends = [\"127.0.0.1:9\"], secret = \"s3cret-of-the-pool\", health = { hooks = { webhook = \"http://127.0.0.1:9/\" } } }",
+        ),
+    ];
+    let body = json!({
+        "toml": shop_toml(&fixture, &admin_keys),
+        "revision": fixture.revision().await,
+    });
+    let uri = format!("/config/entities/server/{SHOP}");
+    let (status, json) = fixture.token(Method::PUT, &uri, &body).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    // A user changes an allowed key next to them, in the form and in the
+    // text, and they stay, the secret it sees masked included.
+    let eva = fixture.cookie("eva").await;
+    let (status, json) = fixture
+        .put_value(&eva, SHOP, |shop| {
+            assert_eq!(shop["forward"]["secret"], "***");
+            shop["uri"] = json!("/shop");
+            shop["forward"]["policy"] = json!("random");
+        })
+        .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut lines = admin_keys.to_vec();
+    lines[2].1 = "{ backends = [\"127.0.0.1:9\"], secret = \"***\", policy = \"random\", health = { hooks = { webhook = \"http://127.0.0.1:9/\" } } }";
+    lines.push(("uri", "\"/v2\""));
+    let text = shop_toml(&fixture, &lines);
+    let (status, json) = fixture.put(&eva, SHOP, json!({ "toml": text })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let kept = fixture.text();
+    for line in [
+        "uri = \"/v2\"",
+        "trusted_proxies = [\"10.0.0.0/8\"]",
+        "max_connections = 5",
+        "s3cret-of-the-pool",
+        "webhook = \"http://127.0.0.1:9/\"",
+        "policy = \"random\"",
+    ] {
+        assert!(kept.contains(line), "{line} in {kept}");
+    }
+
+    // It does not change or remove them.
+    type Change = Box<dyn Fn(&mut Value)>;
+    let changes: [(&str, Change); 7] = [
+        (
+            "trusted_proxies",
+            Box::new(|shop| shop["trusted_proxies"] = json!(["0.0.0.0/0"])),
+        ),
+        (
+            "trusted_proxies",
+            Box::new(|shop| {
+                shop.as_object_mut()
+                    .expect("object")
+                    .remove("trusted_proxies");
+            }),
+        ),
+        (
+            "max_connections",
+            Box::new(|shop| shop["max_connections"] = json!(6)),
+        ),
+        (
+            "max_connections",
+            Box::new(|shop| {
+                shop.as_object_mut()
+                    .expect("object")
+                    .remove("max_connections");
+            }),
+        ),
+        (
+            "forward.secret",
+            Box::new(|shop| shop["forward"]["secret"] = json!("mine")),
+        ),
+        (
+            "forward.health.hooks",
+            Box::new(|shop| {
+                shop["forward"]["health"]
+                    .as_object_mut()
+                    .expect("object")
+                    .remove("hooks");
+            }),
+        ),
+        ("forward.", Box::new(|shop| shop["forward"] = json!("@api"))),
+    ];
+    for (named, change) in &changes {
+        let (status, json) = fixture.put_value(&eva, SHOP, change).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{named}: {json}");
+        let error = json["error"].as_str().expect("error");
+        assert!(error.contains(named), "{named}: {error}");
+        assert_eq!(fixture.text(), kept, "{named}");
+    }
+    for (named, lines) in [
+        ("trusted_proxies", &lines[1..]),
+        ("max_connections", &[lines[0], lines[2], lines[3]][..]),
+        ("forward.", &lines[..2]),
+    ] {
+        let text = shop_toml(&fixture, lines);
+        let (status, json) = fixture.put(&eva, SHOP, json!({ "toml": text })).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{named}: {json}");
+        let error = json["error"].as_str().expect("error");
+        assert!(error.contains(named), "{named}: {error}");
+        assert_eq!(fixture.text(), kept, "{named}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reserved_name_is_not_told_to_who_cannot_create() {
+    let fixture = daemon().await;
+    // vera has no Create: the answer for a reserved name is the one for
+    // any other.
+    let vera = fixture.cookie("vera").await;
+    let mut reserved = new_host(&fixture, Some(&["web"]));
+    reserved["name"] = json!("shop");
+    let mut free = new_host(&fixture, Some(&["web"]));
+    free["name"] = json!("anything");
+    let reserved = fixture.create(&vera, reserved).await;
+    assert_eq!(reserved.0, StatusCode::FORBIDDEN);
+    assert_eq!(reserved, fixture.create(&vera, free).await);
 }

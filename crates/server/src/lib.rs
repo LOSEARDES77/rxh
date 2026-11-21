@@ -26,6 +26,7 @@ pub mod fuzzing;
 mod health;
 mod history;
 mod hooks;
+mod host_keys;
 mod http;
 mod http3;
 mod include;
