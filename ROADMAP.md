@@ -221,20 +221,19 @@ A release people can run without reading the source.
 - [x] `rxh-bench --quick` as a correctness gate in CI for RXH, with the
       other proxies as information only.
 
-## Later, or maybe never
+## Near future plans
 
-Large features that wait for a clear need.
+- [] GeoIP rules.
+- [] State shared between several RXH instances (rate limits, sticky tables,
+  health), through gossip or Redis. For clustering
+- [] Profile Guided optimizations (PGO)
+- [] FastCGI transport.
+- [] Scripting to transform requests
+  - Maybe use Plugins or WASM middleware.
+- [] Beat Nginx
+- [] Docker integration
 
-- FastCGI transport.
-- Plugins or WASM middleware.
-- State shared between several RXH instances (rate limits, sticky tables,
-  health), through gossip or Redis.
-- GeoIP rules.
-- Windows service support.
+## Far future
 
-## Not planned
-
-- A scripting language in the configuration. Matchers and middleware cover
-  routing; anything bigger belongs in a backend.
-- An application server. RXH serves static files and proxies; it does not
+- [] An application server. RXH serves static files and proxies; it does not
   run PHP, Python or Node itself.
