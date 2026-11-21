@@ -22,12 +22,18 @@ COLORS = {"rxh": "#2a78d6", "caddy": "#eb6834", "nginx": "#1baf7a", "traefik": "
 SURFACE, INK, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#e1e0d9", "#c3c2b7"
 
 
+# Not requests of a small GET: 1 MiB bodies and idle memory would flatten the other bars.
+# Their numbers are in the tables of docs/benchmarks.md.
+SKIP = {"large-body", "memory"}
+
+
 def chart(outcomes, value, title, unit, path):
+    outcomes = [o for o in outcomes if o["scenario"] not in SKIP]
     scenarios = list(dict.fromkeys(o["scenario"] for o in outcomes))
     targets = [t for t in COLORS if any(o["target"] == t and o["stats"] for o in outcomes)]
     values = {(o["scenario"], o["target"]): value(o["stats"]) for o in outcomes if o["stats"]}
 
-    figure, axes = plt.subplots(figsize=(11, 4.6), facecolor=SURFACE)
+    figure, axes = plt.subplots(figsize=(14, 4.6), facecolor=SURFACE)
     axes.set_facecolor(SURFACE)
     width = 0.8 / len(targets)
     for index, target in enumerate(targets):

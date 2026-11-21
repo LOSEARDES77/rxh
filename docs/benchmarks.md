@@ -4,12 +4,14 @@ RXH against Caddy, NGINX and Traefik, measured with
 [`rxh-bench`](../crates/bench/README.md). Every proxy runs in Docker with
 host networking, in front of the same backends, with the same load.
 
-Measured 2026-11-18 on an Intel Core Ultra 7 255H (16 threads), Linux 7.3.
-Each scenario runs for 5 seconds with 32 keep-alive connections.
+Measured 2026-11-21 on an AMD Ryzen 9 7950X (32 threads), Linux 7.3, in one
+`rxh-bench --docker` run of every scenario. Each scenario runs for 5 seconds
+with 32 keep-alive connections, and `idle` and `memory` hold 5000 idle
+connections.
 
 | Proxy | Image |
 |---|---|
-| rxh 0.2.0 | release binary mounted into `debian:stable-slim` |
+| rxh 0.3.0 (unreleased) | release binary mounted into `debian:stable-slim` |
 | Caddy 2 | `caddy:2` |
 | NGINX (open source) | `nginx:stable-alpine` |
 | Traefik 3.7 | `traefik:v3` |
@@ -20,35 +22,38 @@ Each scenario runs for 5 seconds with 32 keep-alive connections.
 
 ![p99 latency by scenario and proxy](bench/p99.svg)
 
+The charts leave out `large-body` and `memory`, whose numbers are in
+[their own section](#more-scenarios-tls-http2-bodies-websocket-udp-idle-connections).
+
 Requests per second:
 
 | Scenario | rxh | Caddy | NGINX | Traefik |
 |---|---:|---:|---:|---:|
-| throughput | 138 548 | 88 232 | 218 945 | 114 217 |
-| weighted | 140 674 | 87 920 | 249 433 | 123 621 |
-| least-conn | 128 661 | 86 823 | 278 087 | 109 913 |
-| ip-hash | 142 265 | 87 235 | 245 292 | 120 854 |
-| uri-hash | 114 083 | 84 189 | 233 607 | n/a |
-| header | 135 184 | 85 445 | 239 717 | n/a |
-| cookie | 112 793 | 79 696 | n/a | 119 561 |
-| failover | 142 170 | 88 806 | 190 324 | 110 918 |
-| active-health | 136 747 | 87 950 | n/a | 123 563 |
-| tcp | 270 016 | n/a | 361 123 | 140 306 |
+| throughput | 216 776 | 105 769 | 309 489 | 160 116 |
+| weighted | 215 578 | 107 980 | 292 459 | 159 188 |
+| least-conn | 197 727 | 103 843 | 283 299 | 137 823 |
+| ip-hash | 214 818 | 106 384 | 322 955 | 159 550 |
+| uri-hash | 215 685 | 106 686 | 312 504 | n/a |
+| header | 213 364 | 105 721 | 321 176 | n/a |
+| cookie | 215 534 | 95 659 | n/a | 158 070 |
+| failover | 213 369 | 108 000 | 297 968 | 148 932 |
+| active-health | 217 008 | 107 415 | n/a | 161 176 |
+| tcp | 276 361 | n/a | 334 747 | 228 753 |
 
 p99 latency in milliseconds:
 
 | Scenario | rxh | Caddy | NGINX | Traefik |
 |---|---:|---:|---:|---:|
-| throughput | 0.64 | 1.32 | 0.46 | 0.97 |
-| weighted | 0.62 | 1.34 | 0.41 | 0.92 |
-| least-conn | 0.52 | 1.04 | 0.28 | 0.72 |
-| ip-hash | 0.61 | 1.33 | 0.42 | 0.94 |
-| uri-hash | 0.91 | 1.40 | 0.44 | n/a |
-| header | 0.65 | 1.33 | 0.43 | n/a |
-| cookie | 0.76 | 1.43 | n/a | 0.94 |
-| failover | 0.61 | 1.31 | 0.66 | 1.06 |
-| active-health | 0.67 | 1.31 | n/a | 0.90 |
-| tcp | 0.32 | n/a | 0.31 | 1.31 |
+| throughput | 0.39 | 0.82 | 0.19 | 0.58 |
+| weighted | 0.40 | 0.80 | 0.22 | 0.59 |
+| least-conn | 0.28 | 0.58 | 0.17 | 0.46 |
+| ip-hash | 0.39 | 0.82 | 0.17 | 0.59 |
+| uri-hash | 0.40 | 0.82 | 0.18 | n/a |
+| header | 0.41 | 0.83 | 0.18 | n/a |
+| cookie | 0.39 | 0.88 | n/a | 0.60 |
+| failover | 0.39 | 0.80 | 0.33 | 0.61 |
+| active-health | 0.39 | 0.81 | n/a | 0.58 |
+| tcp | 0.31 | n/a | 0.18 | 0.50 |
 
 The full report, with the verdict and the share of requests per backend for
 each run, is in [bench/results.md](bench/results.md). The raw data is in
@@ -56,59 +61,58 @@ each run, is in [bench/results.md](bench/results.md). The raw data is in
 
 ## More scenarios: TLS, HTTP/2, bodies, WebSocket, UDP, idle connections
 
-Measured 2026-11-19 on the same machine, with rxh 0.3.0 (unreleased) and
-the same images: 5 seconds per scenario, 32 connections, 5000 idle
-connections for `idle` and `memory`. The scenarios are described in the
+Same run. The scenarios are described in the
 [rxh-bench README](../crates/bench/README.md#scenarios).
 
 Requests (or echo round trips) per second, and p99 latency in milliseconds:
 
 | Scenario | rxh | Caddy | NGINX | Traefik |
 |---|---:|---:|---:|---:|
-| tls | 190 136 / 0.49 | 100 248 / 0.84 | 288 884 / 0.22 | 150 499 / 0.60 |
-| http2 | 151 601 / 0.42 | 76 200 / 1.07 | 167 035 / 0.28 | 111 044 / 0.69 |
-| large-body (1 MiB each way) | 1 999 / 25.83 | 2 649 / 19.93 | 1 096 / 49.10 | 2 648 / 19.59 (FAIL) |
-| websocket | 258 879 / 0.34 | 181 093 / 0.57 | 311 340 / 0.25 | 185 572 / 0.56 |
-| udp | 247 093 / 0.21 | n/a | 233 041 / 0.35 | 199 523 / 0.45 |
-| idle (load next to 5000 idle connections) | 193 355 / 0.52 | 125 458 / 1.12 | 320 431 / 0.22 | 151 221 / 0.60 |
+| tls | 203 700 / 0.40 | 99 865 / 0.85 | 312 769 / 0.19 | 155 378 / 0.60 |
+| http2 | 159 387 / 0.40 | 75 768 / 1.07 | 164 666 / 0.32 | 109 140 / 0.71 |
+| large-body (1 MiB each way) | 1 955 / 25.67 | 2 549 / 20.89 | 1 114 / 49.02 | 2 631 / 19.63 (FAIL) |
+| websocket | 256 788 / 0.35 | 184 669 / 0.56 | 314 435 / 0.23 | 193 875 / 0.53 |
+| udp | 239 114 / 0.22 | n/a | 234 184 / 0.34 | 193 351 / 0.46 |
+| idle (load next to 5000 idle connections) | 218 128 / 0.48 | 126 900 / 1.18 | 321 637 / 0.18 | 154 387 / 0.59 |
 
 Memory per idle keep-alive connection (RSS growth over 5000 connections,
 after 100 warm-up connections):
 
 | | rxh | Caddy | NGINX | Traefik |
 |---|---:|---:|---:|---:|
-| Per connection | 27.7 KiB | 30.2 KiB | 0.6 KiB | 35.3 KiB |
-| RSS with 100 connections | 14.5 MiB | 65.5 MiB | 234.3 MiB | 112.4 MiB |
-| RSS with 5100 connections | 150.0 MiB | 212.8 MiB | 237.2 MiB | 284.5 MiB |
+| Per connection | 35.7 KiB | 33.9 KiB | 0.6 KiB | 36.0 KiB |
+| RSS with 100 connections | 19.9 MiB | 68.1 MiB | 235.8 MiB | 112.7 MiB |
+| RSS with 5100 connections | 194.3 MiB | 233.7 MiB | 238.7 MiB | 288.7 MiB |
 
-NGINX's RSS is summed over its master and one worker per core (16 here),
+NGINX's RSS is summed over its master and one worker per core (32 here),
 which is why it starts high; its per connection cost is the lowest by far.
 
-- **rxh passes all seven.** Traefik failed `large-body` in two runs out of
-  two: about one response body in a thousand was cut off mid-stream (6 or 7
-  of ~6 600). The same backends and client pass through the three other
-  proxies.
-- **rxh is slower with large bodies**: 2.0 GB/s each way against 2.6 for
-  Caddy and Traefik. NGINX buffers request bodies to disk by default and
-  comes last.
-- **HTTP/2 narrows the gap with NGINX** (0.91x) compared with HTTP/1.1 over
-  TLS (0.66x). rxh leads on UDP.
-- **Memory**: rxh starts the smallest and holds an idle connection in
-  slightly less than Caddy and Traefik, but about 45 times more than NGINX.
-  Idle buffers per connection are a target for the performance milestone.
+- **rxh passes all seven.** Traefik failed `large-body` again: 8 of ~6 600
+  response bodies were cut off mid-stream. The same backends and client
+  pass through the three other proxies.
+- **rxh is slower with large bodies**: 2.0 GB/s each way against 2.5 for
+  Caddy and 2.6 for Traefik. NGINX buffers request bodies to disk by
+  default and comes last.
+- **HTTP/2 and UDP close the gap with NGINX**: rxh serves 0.97x NGINX's
+  requests over HTTP/2 and matches it on UDP, against 0.65x for HTTP/1.1
+  over TLS.
+- **Memory**: rxh starts the smallest and holds an idle connection in about
+  what Caddy and Traefik take, but about 60 times more than NGINX. Idle
+  buffers per connection are a target for the performance milestone.
 
 ## What the numbers say
 
-- **Correctness**: every scenario a proxy can run passes. No run failed.
-- **rxh and Caddy**: rxh serves about 1.5 times the requests of Caddy, with
+- **Correctness**: rxh passes every scenario. The only failure of the run is
+  Traefik's `large-body`.
+- **rxh and Caddy**: rxh serves about twice the requests of Caddy, with
   about half the p99 latency.
-- **rxh and Traefik**: rxh is 10% to 30% faster over HTTP and almost twice
-  as fast over TCP. Traefik wins the `cookie` scenario by 6%.
-- **rxh and NGINX**: NGINX is the fastest. It serves 1.3 to 2.2 times the
-  requests of rxh. Closing this gap is the performance milestone of the
-  [roadmap](../ROADMAP.md).
-- **Coverage**: rxh is the only proxy of the four that runs all ten
-  scenarios. Open source NGINX has no sticky cookies and no active health
+- **rxh and Traefik**: rxh is 35% to 45% faster over HTTP, 20% faster over
+  TCP and 45% faster over HTTP/2. It now also wins the `cookie` scenario.
+- **rxh and NGINX**: NGINX is still the fastest over HTTP/1.1, with 1.4 to
+  1.5 times the requests of rxh, and 1.2 times over TCP. Closing this gap
+  is the performance milestone of the [roadmap](../ROADMAP.md). Over HTTP/2 and UDP they are even.
+- **Coverage**: rxh is the only proxy of the four that runs every
+  scenario. Open source NGINX has no sticky cookies and no active health
   checks. Traefik hashes only the client IP. Core Caddy has no layer 4
   proxy.
 
@@ -157,8 +161,9 @@ are kept). Extra arguments go to `rxh-bench`, for example `-s throughput`.
 Commit the three files.
 
 Numbers from different machines are not comparable: the history lists the
-CPU of every release and warns when they differ. The 0.2.0 entry is the run
-above.
+CPU of every release and warns when they differ. The 0.2.0 entry was
+measured on an Intel Core Ultra 7 255H, so its numbers are not comparable
+with the run above.
 
 ## Policy micro benchmarks
 

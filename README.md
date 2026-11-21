@@ -1,15 +1,17 @@
-# RXH: reverse proxy and load balancer for HTTP, TCP and UDP
+# RXH: reverse proxy and load balancer for HTTP/1, HTTP/2, HTTP/3, TCP and UDP
 
 [![CI](https://github.com/LOSEARDES77/rxh/actions/workflows/ci.yml/badge.svg)](https://github.com/LOSEARDES77/rxh/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.100%2B-orange.svg)](https://www.rust-lang.org)
 
 **RXH** is a fast, lightweight **reverse proxy** and **load balancer** written
-in Rust. It balances **HTTP/1.1, HTTP/2 and WebSocket** traffic (layer 7) and
-**any TCP or UDP protocol** (layer 4): databases, Redis, MQTT, gRPC, game
-servers, DNS. It runs as a **daemon** that you manage from a **CLI**: add or
-remove backends from a load balancing pool while it runs, without dropping a
-connection.
+in Rust. It balances **HTTP/1.1, HTTP/2, HTTP/3 (QUIC) and WebSocket**
+traffic (layer 7) and **any TCP or UDP protocol** (layer 4): databases,
+Redis, MQTT, gRPC, game servers, DNS. It runs as a **daemon** that you manage
+from a **CLI**, the **admin API** or a **web dashboard**: add or remove
+backends from a load balancing pool while it runs, without dropping a
+connection. It gets certificates from Let's Encrypt by itself, and finds its
+backends in Docker, Kubernetes, Consul, etcd or Nomad.
 
 RXH implements every load balancing policy, retry option and health check of
 [Caddy](https://caddyserver.com)'s `reverse_proxy`, and adds TCP/UDP
@@ -36,8 +38,12 @@ pool web (least_conn)
 - **Layer 7 and layer 4.** HTTP reverse proxy, raw TCP proxy (with optional
   TLS termination and PROXY protocol v1/v2) and UDP proxy with per client
   sessions, all from one binary.
+- **HTTP/3 over QUIC**, on by default on every `http` server with `tls`, on
+  the UDP port next to HTTP/1.1 and HTTP/2, announced with `Alt-Svc`
+  (`http3 = false` turns it off).
 - **Layer 4 routing**: `tcp` servers route by TLS SNI and ALPN (TLS
-  passthrough), detected protocol (`tls`, `http`, `ssh`) and HTTP `Host`, and
+  passthrough), detected protocol (`tls`, `http`, `ssh`, PostgreSQL), HTTP
+  `Host`, `remote_ip` and `regexp`, with subroutes, and
   `http` and `tcp` servers accept an incoming PROXY v1/v2 header
   (`proxy_protocol_in`) from `trusted_proxies` and send one to their backends
   (`proxy_protocol`).
@@ -56,9 +62,14 @@ pool web (least_conn)
   adding a backend only moves the keys it takes over, or a Maglev table
   (`hash_type = "maglev"`), with optional bounded loads
   (`hash_balance_factor`).
-- **Health checks.** Active HTTP checks (path, port, method, headers, status,
-  body regex) or TCP connect checks, plus passive checks on real traffic
-  (failed dials, 5xx, slow responses, concurrency limits).
+- **Health checks.** Active HTTP, gRPC or TCP connect checks (path, port,
+  method, headers, status, body regex), plus passive checks on real traffic
+  (failed dials, 5xx, slow responses, concurrency limits), with hooks and
+  webhooks on health events.
+- **Traffic management**: weighted pools for canary releases and traffic
+  splitting, request mirroring, circuit breakers on error ratio or latency,
+  slow start, per backend connection limits with a queue, and drain and
+  maintenance states (`rxh upstream drain`).
 - **Retries and failover**: `retries`, `try_duration`, `try_interval`,
   retry budgets (`retry_budget`) and hedged requests (`hedge_delay`).
   Failed dials and stale keep-alive connections move to another backend, and
@@ -70,8 +81,16 @@ pool web (least_conn)
   bounding TLS handshakes and silent clients), `idle_timeout` and
   `stream_timeout`.
 - **Observability**: Prometheus `/metrics` on the admin API (requests,
-  latency histogram, layer 4 connections, per upstream counters and health)
-  and text or JSON access logs to stdout, stderr or a file.
+  latency histogram, layer 4 connections, per upstream counters and health),
+  OpenTelemetry tracing with W3C trace context, text or JSON access logs to
+  stdout, stderr or a file with filters and sampling, and `rxh top`.
+- **Service discovery**: routes to Docker, Docker Swarm and Podman
+  containers from their `rxh.*` labels, to Consul, etcd and Nomad services,
+  and from Kubernetes Ingress and Gateway API resources, followed live.
+- **Security**: mutual TLS, TLS versions, ciphers and curves, OCSP stapling,
+  `ip_allow`/`ip_deny`, `rate_limit`, `max_connections_per_ip`,
+  `basic_auth`, `forward_auth` (Authelia, Authentik, oauth2-proxy), CORS
+  and security header presets.
 - **Daemon and CLI**: `rxh start | stop | reload | status`, and
   `rxh upstream | pool | service` to manage peers, pools and listeners. The
   CLI edits the TOML file without losing your comments, validates it, then
@@ -80,7 +99,9 @@ pool web (least_conn)
 - **Quick commands**: `rxh file-server` and `rxh reverse-proxy` serve a
   directory or proxy to backends right away, without a configuration file.
 - **Zero downtime reloads** (`SO_REUSEPORT`). An invalid configuration is
-  rejected and the running one keeps serving.
+  rejected and the running one keeps serving. `watch = true` reloads when a
+  file changes, and `{env.NAME}` and `{file.PATH}` placeholders keep secrets
+  out of the file.
 - **Hot binary upgrades** on Linux: `rxh upgrade` starts the new binary and
   hands it the listening sockets, without refusing a connection.
 - **Admin API** on `127.0.0.1:2019` (JSON), with Caddy compatible
@@ -92,7 +113,8 @@ pool web (least_conn)
   tunnels, hop-by-hop header stripping, `X-Forwarded-*` with
   `trusted_proxies`, RFC 7239 `Forwarded`, `Via`, header rules (`set`, `add`,
   wildcard `remove`, regex `replace`), on the fly `zstd`/`br`/`gzip`
-  compression (`encode`) and a response cache.
+  compression (`encode`), a response cache, gRPC-Web and custom error
+  pages.
 - **File server**: streamed files with range requests, `ETag` and
   `Last-Modified` conditional requests, precompressed `.zst`/`.br`/`.gz`
   files, `index` files, `hide` patterns and an optional directory listing.
@@ -103,17 +125,22 @@ pool web (least_conn)
 - **Rewrites and redirects**: `rewrite` and `request.method` change the
   request a route forwards or serves, `redirect` answers `301`/`302`/`308`
   with `{host}`, `{path}`, `{query}` and `{uri}` placeholders.
-- **Also**: TLS with ALPN, connection limits, graceful shutdown with
+- **Deployment**: official images, static musl binaries and packages,
+  systemd readiness and socket activation, shell completions and man pages.
+- **Also**: one runtime per core (`runtime = "per_core"`), `splice` zero
+  copy for TCP on Linux, connection limits, graceful shutdown with
   `grace_period`.
 
 ## Benchmarks
 
 `rxh-bench` starts the same backends behind rxh, Caddy, NGINX and Traefik,
 runs every scenario on each and checks that each policy does what it
-promises. With every proxy in Docker (32 keep-alive connections, Intel Core
-Ultra 7 255H), rxh serves about 1.5 times the requests of Caddy, is 10% to
-30% faster than Traefik, and reaches about half the throughput of NGINX. It
-is the only one of the four that runs all ten scenarios.
+promises. With every proxy in Docker (32 keep-alive connections, AMD Ryzen 9
+7950X), rxh serves about twice the requests of Caddy, is 35% to 45% faster
+than Traefik over HTTP, and reaches about 70% of the throughput of NGINX
+over HTTP/1.1, level with it over HTTP/2 and UDP. It is the only one of the
+four that runs and passes all seventeen scenarios: every policy, failover,
+TCP, TLS, HTTP/2, WebSocket, UDP, large bodies and idle connections.
 
 ![Requests per second by scenario and proxy](docs/bench/rps.svg)
 
@@ -205,17 +232,6 @@ rxh file-server --root ./public --listen 0.0.0.0:8000 --no-browse --encode
 rxh reverse-proxy --from 127.0.0.1:8080 --to 127.0.0.1:3001 127.0.0.1:3002 --policy round_robin
 ```
 
-### CLI
-
-| Command | Does |
-|---|---|
-| `rxh run`, `start`, `stop`, `reload`, `upgrade`, `status`, `validate` | Daemon lifecycle |
-| `rxh upstream add\|rm\|list` | Backends of a pool, live and saved |
-| `rxh pool add\|rm\|list [--file PATH]` | Pools (`--file` writes to an included file) |
-| `rxh service add\|rm\|list [--file PATH]` | Listeners |
-| `rxh config show [--json]` | Effective configuration, includes merged |
-| `rxh file-server`, `rxh reverse-proxy` | Run without a file |
-
 Split big setups with `include = ["conf.d/*.toml"]`, see
 [`examples/includes`](examples/includes) and the [reference](docs/configuration.md#includes).
 
@@ -245,12 +261,16 @@ and [layer 4 (TCP and UDP)](docs/guides/layer4.md).
 | `rxh schema` | Print the JSON schema of the configuration file, for completion in editors. |
 | `rxh adapt FILE` | Convert a Caddyfile or an nginx configuration into RXH TOML. |
 | `rxh upstream list\|add\|rm` | Manage the backends (peers) of a pool, live and in the file. `--no-save` changes only the running daemon. |
-| `rxh pool list\|add\|rm` | Manage `[upstream.NAME]` pools. |
+| `rxh upstream drain\|maintenance\|ready` | Take a backend out of rotation, letting requests in flight (and, with `drain`, sticky sessions) finish, then put it back. |
+| `rxh pool list\|add\|rm` | Manage `[upstream.NAME]` pools (`--file` writes to an included file). |
 | `rxh service list\|add\|rm` | Manage `[[server]]` listeners (HTTP, TCP, UDP, files). |
+| `rxh config show [--json]` | Effective configuration, includes merged. |
+| `rxh file-server`, `rxh reverse-proxy` | Serve a directory or proxy to backends without a configuration file. |
 | `rxh cert list [--json]` | Certificates of every TLS listener, with expiry dates. |
 | `rxh cert reload` | Read the certificate files again now (the daemon also does it within seconds of a change). |
 | `rxh policies` | List load balancing policies. |
 | `rxh hash-password` | Hash the password read from standard input, for `basic_auth` users. |
+| `rxh completions SHELL`, `rxh man` | Shell completion scripts and man pages. |
 | `rxh user list\|add\|passwd\|rm` | Manage admin API accounts in `[admin] users`, with or without a daemon: the way back in when every password is lost. |
 
 Global flags: `-c/--config` (`RXH_CONFIG`), `--admin` (`RXH_ADMIN`),
