@@ -5,19 +5,19 @@
     "verdict": "pass",
     "reason": "spread off by 0.0pp max, 0 errors",
     "stats": {
-      "requests": 692915,
+      "requests": 1084257,
       "errors": 0,
-      "rps": 138547.94152407127,
-      "p50_us": 198,
-      "p90_us": 383,
-      "p99_us": 635,
-      "max_us": 6303
+      "rps": 216775.67189026778,
+      "p50_us": 133,
+      "p90_us": 197,
+      "p99_us": 389,
+      "max_us": 9725
     },
     "distribution": [
-      173229,
-      173229,
-      173229,
-      173228
+      271065,
+      271064,
+      271064,
+      271064
     ]
   },
   {
@@ -26,19 +26,19 @@
     "verdict": "pass",
     "reason": "spread off by 0.0pp max, 0 errors",
     "stats": {
-      "requests": 441225,
+      "requests": 528944,
       "errors": 0,
-      "rps": 88232.25887359671,
-      "p50_us": 277,
-      "p90_us": 709,
-      "p99_us": 1322,
-      "max_us": 7732
+      "rps": 105768.8523963597,
+      "p50_us": 227,
+      "p90_us": 604,
+      "p99_us": 821,
+      "max_us": 11167
     },
     "distribution": [
-      110306,
-      110307,
-      110306,
-      110306
+      132236,
+      132236,
+      132236,
+      132236
     ]
   },
   {
@@ -47,19 +47,19 @@
     "verdict": "pass",
     "reason": "spread off by 0.0pp max, 0 errors",
     "stats": {
-      "requests": 1094974,
+      "requests": 1547835,
       "errors": 0,
-      "rps": 218945.08628491915,
-      "p50_us": 111,
-      "p90_us": 294,
-      "p99_us": 461,
-      "max_us": 7793
+      "rps": 309488.5431068797,
+      "p50_us": 98,
+      "p90_us": 133,
+      "p99_us": 186,
+      "max_us": 11826
     },
     "distribution": [
-      273744,
-      273744,
-      273743,
-      273743
+      386959,
+      386959,
+      386959,
+      386958
     ]
   },
   {
@@ -68,19 +68,19 @@
     "verdict": "pass",
     "reason": "spread off by 0.0pp max, 0 errors",
     "stats": {
-      "requests": 571138,
+      "requests": 800635,
       "errors": 0,
-      "rps": 114216.66549037262,
-      "p50_us": 249,
-      "p90_us": 426,
-      "p99_us": 972,
-      "max_us": 5999
+      "rps": 160116.08933741716,
+      "p50_us": 172,
+      "p90_us": 300,
+      "p99_us": 583,
+      "max_us": 11866
     },
     "distribution": [
-      142785,
-      142784,
-      142784,
-      142785
+      200158,
+      200159,
+      200159,
+      200159
     ]
   },
   {
@@ -89,18 +89,18 @@
     "verdict": "pass",
     "reason": "weights 1:3:2, off by 0.0pp max",
     "stats": {
-      "requests": 703416,
+      "requests": 1077964,
       "errors": 0,
-      "rps": 140674.26940654614,
-      "p50_us": 198,
-      "p90_us": 370,
-      "p99_us": 625,
-      "max_us": 7608
+      "rps": 215577.68757294578,
+      "p50_us": 134,
+      "p90_us": 199,
+      "p99_us": 400,
+      "max_us": 9699
     },
     "distribution": [
-      117236,
-      351708,
-      234472
+      179661,
+      538982,
+      359321
     ]
   },
   {
@@ -109,218 +109,218 @@
     "verdict": "pass",
     "reason": "weights 1:3:2, off by 0.0pp max",
     "stats": {
-      "requests": 439670,
+      "requests": 539929,
       "errors": 0,
-      "rps": 87919.68968137326,
-      "p50_us": 276,
-      "p90_us": 712,
-      "p99_us": 1342,
-      "max_us": 8000
-    },
-    "distribution": [
-      73278,
-      219836,
-      146556
-    ]
-  },
-  {
-    "scenario": "weighted",
-    "target": "nginx",
-    "verdict": "pass",
-    "reason": "weights 1:3:2, off by 0.0pp max",
-    "stats": {
-      "requests": 1247420,
-      "errors": 0,
-      "rps": 249432.63383884827,
-      "p50_us": 97,
-      "p90_us": 268,
-      "p99_us": 412,
-      "max_us": 1808
-    },
-    "distribution": [
-      207903,
-      623710,
-      415807
-    ]
-  },
-  {
-    "scenario": "weighted",
-    "target": "traefik",
-    "verdict": "pass",
-    "reason": "weights 1:3:2, off by 0.0pp max",
-    "stats": {
-      "requests": 618168,
-      "errors": 0,
-      "rps": 123621.36188076215,
-      "p50_us": 221,
-      "p90_us": 409,
-      "p99_us": 915,
-      "max_us": 8770
-    },
-    "distribution": [
-      103028,
-      309084,
-      206056
-    ]
-  },
-  {
-    "scenario": "least-conn",
-    "target": "rxh",
-    "verdict": "pass",
-    "reason": "slow backend got 0.1% (round robin would give 33%)",
-    "stats": {
-      "requests": 649685,
-      "errors": 0,
-      "rps": 128661.32810403389,
-      "p50_us": 148,
-      "p90_us": 282,
-      "p99_us": 517,
-      "max_us": 53967
-    },
-    "distribution": [
-      949,
-      324483,
-      324253
-    ]
-  },
-  {
-    "scenario": "least-conn",
-    "target": "caddy",
-    "verdict": "pass",
-    "reason": "slow backend got 0.2% (round robin would give 33%)",
-    "stats": {
-      "requests": 437028,
-      "errors": 0,
-      "rps": 86822.52439276555,
-      "p50_us": 198,
-      "p90_us": 478,
-      "p99_us": 1039,
-      "max_us": 63940
-    },
-    "distribution": [
-      976,
-      218157,
-      217895
-    ]
-  },
-  {
-    "scenario": "least-conn",
-    "target": "nginx",
-    "verdict": "pass",
-    "reason": "slow backend got 0.1% (round robin would give 33%)",
-    "stats": {
-      "requests": 1404506,
-      "errors": 0,
-      "rps": 278087.4583708219,
-      "p50_us": 62,
-      "p90_us": 149,
-      "p99_us": 285,
-      "max_us": 52660
-    },
-    "distribution": [
-      936,
-      701950,
-      701620
-    ]
-  },
-  {
-    "scenario": "least-conn",
-    "target": "traefik",
-    "verdict": "pass",
-    "reason": "slow backend got 0.2% (round robin would give 33%)",
-    "stats": {
-      "requests": 554269,
-      "errors": 0,
-      "rps": 109913.1138905968,
-      "p50_us": 168,
-      "p90_us": 280,
-      "p99_us": 724,
-      "max_us": 62396
-    },
-    "distribution": [
-      1082,
-      276550,
-      276637
-    ]
-  },
-  {
-    "scenario": "ip-hash",
-    "target": "rxh",
-    "verdict": "pass",
-    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
-    "stats": {
-      "requests": 711387,
-      "errors": 0,
-      "rps": 142264.54321179504,
-      "p50_us": 194,
-      "p90_us": 367,
-      "p99_us": 614,
-      "max_us": 5151
-    },
-    "distribution": [
-      178092,
-      222125,
-      311170
-    ]
-  },
-  {
-    "scenario": "ip-hash",
-    "target": "caddy",
-    "verdict": "pass",
-    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
-    "stats": {
-      "requests": 436241,
-      "errors": 0,
-      "rps": 87235.24061180749,
-      "p50_us": 278,
-      "p90_us": 724,
-      "p99_us": 1331,
-      "max_us": 13932
-    },
-    "distribution": [
-      136407,
-      163614,
-      136220
-    ]
-  },
-  {
-    "scenario": "ip-hash",
-    "target": "nginx",
-    "verdict": "pass",
-    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
-    "stats": {
-      "requests": 1227227,
-      "errors": 0,
-      "rps": 245292.07822416935,
-      "p50_us": 97,
-      "p90_us": 273,
-      "p99_us": 420,
-      "max_us": 2820
-    },
-    "distribution": [
-      458054,
-      231421,
-      537752
-    ]
-  },
-  {
-    "scenario": "ip-hash",
-    "target": "traefik",
-    "verdict": "pass",
-    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
-    "stats": {
-      "requests": 604323,
-      "errors": 0,
-      "rps": 120853.78629325156,
+      "rps": 107980.43691404369,
       "p50_us": 225,
-      "p90_us": 420,
-      "p99_us": 935,
-      "max_us": 9688
+      "p90_us": 585,
+      "p99_us": 804,
+      "max_us": 14536
     },
     "distribution": [
-      283219,
-      132181,
-      188923
+      89988,
+      269965,
+      179976
+    ]
+  },
+  {
+    "scenario": "weighted",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "weights 1:3:2, off by 0.0pp max",
+    "stats": {
+      "requests": 1462419,
+      "errors": 0,
+      "rps": 292459.1952909165,
+      "p50_us": 106,
+      "p90_us": 153,
+      "p99_us": 221,
+      "max_us": 1525
+    },
+    "distribution": [
+      243737,
+      731209,
+      487473
+    ]
+  },
+  {
+    "scenario": "weighted",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "weights 1:3:2, off by 0.0pp max",
+    "stats": {
+      "requests": 796007,
+      "errors": 0,
+      "rps": 159187.85846195693,
+      "p50_us": 173,
+      "p90_us": 301,
+      "p99_us": 589,
+      "max_us": 10183
+    },
+    "distribution": [
+      132667,
+      398004,
+      265336
+    ]
+  },
+  {
+    "scenario": "least-conn",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "slow backend got 0.1% (round robin would give 33%)",
+    "stats": {
+      "requests": 998520,
+      "errors": 0,
+      "rps": 197726.79735538005,
+      "p50_us": 101,
+      "p90_us": 145,
+      "p99_us": 283,
+      "max_us": 60109
+    },
+    "distribution": [
+      966,
+      498815,
+      498739
+    ]
+  },
+  {
+    "scenario": "least-conn",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "slow backend got 0.2% (round robin would give 33%)",
+    "stats": {
+      "requests": 523960,
+      "errors": 0,
+      "rps": 103843.00926814316,
+      "p50_us": 170,
+      "p90_us": 403,
+      "p99_us": 583,
+      "max_us": 52606
+    },
+    "distribution": [
+      997,
+      261356,
+      261607
+    ]
+  },
+  {
+    "scenario": "least-conn",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "slow backend got 0.1% (round robin would give 33%)",
+    "stats": {
+      "requests": 1428980,
+      "errors": 0,
+      "rps": 283298.53125724377,
+      "p50_us": 71,
+      "p90_us": 106,
+      "p99_us": 172,
+      "max_us": 52033
+    },
+    "distribution": [
+      956,
+      713768,
+      714256
+    ]
+  },
+  {
+    "scenario": "least-conn",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "slow backend got 0.2% (round robin would give 33%)",
+    "stats": {
+      "requests": 696082,
+      "errors": 0,
+      "rps": 137822.76683356235,
+      "p50_us": 131,
+      "p90_us": 204,
+      "p99_us": 456,
+      "max_us": 60859
+    },
+    "distribution": [
+      1107,
+      347957,
+      347018
+    ]
+  },
+  {
+    "scenario": "ip-hash",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
+    "stats": {
+      "requests": 1074168,
+      "errors": 0,
+      "rps": 214817.90901250843,
+      "p50_us": 134,
+      "p90_us": 200,
+      "p99_us": 391,
+      "max_us": 4713
+    },
+    "distribution": [
+      335783,
+      402631,
+      335754
+    ]
+  },
+  {
+    "scenario": "ip-hash",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
+    "stats": {
+      "requests": 531981,
+      "errors": 0,
+      "rps": 106384.02181676334,
+      "p50_us": 227,
+      "p90_us": 595,
+      "p99_us": 818,
+      "max_us": 13081
+    },
+    "distribution": [
+      182901,
+      199565,
+      149515
+    ]
+  },
+  {
+    "scenario": "ip-hash",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
+    "stats": {
+      "requests": 1614925,
+      "errors": 0,
+      "rps": 322955.15183895675,
+      "p50_us": 94,
+      "p90_us": 127,
+      "p99_us": 173,
+      "max_us": 825
+    },
+    "distribution": [
+      714876,
+      509393,
+      390656
+    ]
+  },
+  {
+    "scenario": "ip-hash",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "32 keys, 0 hit more than one backend, 3 backends used",
+    "stats": {
+      "requests": 797807,
+      "errors": 0,
+      "rps": 159550.49848882007,
+      "p50_us": 172,
+      "p90_us": 300,
+      "p99_us": 590,
+      "max_us": 13105
+    },
+    "distribution": [
+      224219,
+      274133,
+      299455
     ]
   },
   {
@@ -329,18 +329,18 @@
     "verdict": "pass",
     "reason": "64 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 570505,
+      "requests": 1078582,
       "errors": 0,
-      "rps": 114083.47988056099,
-      "p50_us": 240,
-      "p90_us": 454,
-      "p99_us": 905,
-      "max_us": 5741
+      "rps": 215684.7381706277,
+      "p50_us": 134,
+      "p90_us": 198,
+      "p99_us": 395,
+      "max_us": 5289
     },
     "distribution": [
-      178285,
-      187194,
-      205026
+      320204,
+      337053,
+      421325
     ]
   },
   {
@@ -349,18 +349,18 @@
     "verdict": "pass",
     "reason": "64 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 421005,
+      "requests": 533531,
       "errors": 0,
-      "rps": 84188.94904229399,
-      "p50_us": 288,
-      "p90_us": 741,
-      "p99_us": 1403,
-      "max_us": 10020
+      "rps": 106686.07045089011,
+      "p50_us": 225,
+      "p90_us": 601,
+      "p99_us": 824,
+      "max_us": 11089
     },
     "distribution": [
-      138131,
-      138143,
-      144731
+      225090,
+      133381,
+      175060
     ]
   },
   {
@@ -369,18 +369,18 @@
     "verdict": "pass",
     "reason": "64 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 1168252,
+      "requests": 1562773,
       "errors": 0,
-      "rps": 233606.82396420639,
-      "p50_us": 103,
-      "p90_us": 285,
-      "p99_us": 439,
-      "max_us": 1968
+      "rps": 312503.8699342773,
+      "p50_us": 96,
+      "p90_us": 136,
+      "p99_us": 181,
+      "max_us": 1065
     },
     "distribution": [
-      346859,
-      365073,
-      456320
+      415105,
+      537209,
+      610459
     ]
   },
   {
@@ -397,18 +397,18 @@
     "verdict": "pass",
     "reason": "64 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 676010,
+      "requests": 1066979,
       "errors": 0,
-      "rps": 135183.84145753298,
-      "p50_us": 204,
-      "p90_us": 386,
-      "p99_us": 654,
-      "max_us": 5570
+      "rps": 213363.8918567006,
+      "p50_us": 134,
+      "p90_us": 202,
+      "p99_us": 406,
+      "max_us": 9002
     },
     "distribution": [
-      264068,
-      232375,
-      179567
+      350101,
+      300089,
+      416789
     ]
   },
   {
@@ -417,18 +417,18 @@
     "verdict": "pass",
     "reason": "64 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 427281,
+      "requests": 528714,
       "errors": 0,
-      "rps": 85445.2695335183,
-      "p50_us": 285,
-      "p90_us": 738,
-      "p99_us": 1331,
-      "max_us": 14570
+      "rps": 105721.16179608442,
+      "p50_us": 228,
+      "p90_us": 607,
+      "p99_us": 829,
+      "max_us": 10986
     },
     "distribution": [
-      133526,
-      146867,
-      146888
+      165221,
+      181752,
+      181741
     ]
   },
   {
@@ -437,18 +437,18 @@
     "verdict": "pass",
     "reason": "64 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 1198850,
+      "requests": 1606311,
       "errors": 0,
-      "rps": 239716.558836899,
-      "p50_us": 102,
-      "p90_us": 274,
-      "p99_us": 429,
-      "max_us": 2764
+      "rps": 321176.3839826698,
+      "p50_us": 94,
+      "p90_us": 131,
+      "p99_us": 176,
+      "max_us": 927
     },
     "distribution": [
-      355906,
-      374638,
-      468306
+      577269,
+      451776,
+      577266
     ]
   },
   {
@@ -465,18 +465,18 @@
     "verdict": "pass",
     "reason": "32 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 564051,
+      "requests": 1077770,
       "errors": 0,
-      "rps": 112793.29578155451,
-      "p50_us": 263,
-      "p90_us": 451,
-      "p99_us": 764,
-      "max_us": 7423
+      "rps": 215534.34335409987,
+      "p50_us": 134,
+      "p90_us": 200,
+      "p99_us": 388,
+      "max_us": 4924
     },
     "distribution": [
-      229034,
-      229038,
-      105979
+      437730,
+      303302,
+      336738
     ]
   },
   {
@@ -485,18 +485,18 @@
     "verdict": "pass",
     "reason": "32 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 398527,
+      "requests": 478338,
       "errors": 0,
-      "rps": 79696.13336397156,
-      "p50_us": 300,
-      "p90_us": 791,
-      "p99_us": 1429,
-      "max_us": 8963
+      "rps": 95658.95797841832,
+      "p50_us": 253,
+      "p90_us": 652,
+      "p99_us": 877,
+      "max_us": 9272
     },
     "distribution": [
-      137193,
-      124691,
-      136643
+      135239,
+      224209,
+      118890
     ]
   },
   {
@@ -513,18 +513,18 @@
     "verdict": "pass",
     "reason": "32 keys, 0 hit more than one backend, 3 backends used",
     "stats": {
-      "requests": 597910,
+      "requests": 790401,
       "errors": 0,
-      "rps": 119561.41891255895,
-      "p50_us": 228,
-      "p90_us": 425,
-      "p99_us": 941,
-      "max_us": 10947
+      "rps": 158069.89662477025,
+      "p50_us": 173,
+      "p90_us": 302,
+      "p99_us": 597,
+      "max_us": 15786
     },
     "distribution": [
-      205557,
-      205615,
-      186738
+      271938,
+      271534,
+      246929
     ]
   },
   {
@@ -533,18 +533,18 @@
     "verdict": "pass",
     "reason": "backend 0 killed after 1.7s: 0 client errors (0.00%)",
     "stats": {
-      "requests": 710910,
+      "requests": 1066915,
       "errors": 0,
-      "rps": 142170.35411544263,
-      "p50_us": 195,
-      "p90_us": 368,
-      "p99_us": 615,
-      "max_us": 6662
+      "rps": 213368.92883122902,
+      "p50_us": 134,
+      "p90_us": 200,
+      "p99_us": 394,
+      "max_us": 251297
     },
     "distribution": [
-      77995,
-      395944,
-      236971
+      119915,
+      591360,
+      355640
     ]
   },
   {
@@ -553,18 +553,18 @@
     "verdict": "pass",
     "reason": "backend 0 killed after 1.7s: 0 client errors (0.00%)",
     "stats": {
-      "requests": 444068,
+      "requests": 540074,
       "errors": 0,
-      "rps": 88805.55059384972,
-      "p50_us": 276,
-      "p90_us": 702,
-      "p99_us": 1307,
-      "max_us": 11813
+      "rps": 107999.53055117273,
+      "p50_us": 226,
+      "p90_us": 586,
+      "p99_us": 804,
+      "max_us": 11864
     },
     "distribution": [
-      49045,
-      197512,
-      197511
+      59005,
+      240535,
+      240534
     ]
   },
   {
@@ -573,38 +573,38 @@
     "verdict": "pass",
     "reason": "backend 0 killed after 1.7s: 0 client errors (0.00%)",
     "stats": {
-      "requests": 951761,
+      "requests": 1489954,
       "errors": 0,
-      "rps": 190324.0740605946,
-      "p50_us": 120,
-      "p90_us": 323,
-      "p99_us": 664,
-      "max_us": 8120
+      "rps": 297968.44795647025,
+      "p50_us": 76,
+      "p90_us": 255,
+      "p99_us": 327,
+      "max_us": 918
     },
     "distribution": [
-      74634,
-      438564,
-      438563
+      164751,
+      662602,
+      662601
     ]
   },
   {
     "scenario": "failover",
     "target": "traefik",
     "verdict": "pass",
-    "reason": "backend 0 killed after 1.7s: 8 client errors (0.00%)",
+    "reason": "backend 0 killed after 1.7s: 6 client errors (0.00%)",
     "stats": {
-      "requests": 554676,
-      "errors": 8,
-      "rps": 110918.06686333306,
-      "p50_us": 241,
-      "p90_us": 468,
-      "p99_us": 1059,
-      "max_us": 10510
+      "requests": 744723,
+      "errors": 6,
+      "rps": 148931.71284952812,
+      "p50_us": 183,
+      "p90_us": 337,
+      "p99_us": 612,
+      "max_us": 4098
     },
     "distribution": [
-      62967,
-      245855,
-      245854
+      82394,
+      331165,
+      331164
     ]
   },
   {
@@ -613,38 +613,38 @@
     "verdict": "pass",
     "reason": "unhealthy backend got 0 requests more than 3s after /health=503, 0 client errors",
     "stats": {
-      "requests": 957341,
+      "requests": 1519156,
       "errors": 0,
-      "rps": 136747.1115484622,
-      "p50_us": 201,
-      "p90_us": 379,
-      "p99_us": 666,
-      "max_us": 8459
+      "rps": 217007.97806828027,
+      "p50_us": 133,
+      "p90_us": 197,
+      "p99_us": 394,
+      "max_us": 9667
     },
     "distribution": [
-      125533,
-      512695,
-      319113
+      199676,
+      813095,
+      506385
     ]
   },
   {
     "scenario": "active-health",
     "target": "caddy",
     "verdict": "pass",
-    "reason": "unhealthy backend got 0 requests more than 3s after /health=503, 4 client errors",
+    "reason": "unhealthy backend got 0 requests more than 3s after /health=503, 0 client errors",
     "stats": {
-      "requests": 615698,
-      "errors": 4,
-      "rps": 87949.56683992688,
-      "p50_us": 277,
-      "p90_us": 716,
-      "p99_us": 1306,
-      "max_us": 5353
+      "requests": 751939,
+      "errors": 0,
+      "rps": 107414.65986919442,
+      "p50_us": 224,
+      "p90_us": 597,
+      "p99_us": 807,
+      "max_us": 10376
     },
     "distribution": [
-      78314,
-      268692,
-      268692
+      98538,
+      326701,
+      326700
     ]
   },
   {
@@ -661,37 +661,37 @@
     "verdict": "pass",
     "reason": "unhealthy backend got 0 requests more than 3s after /health=503, 0 client errors",
     "stats": {
-      "requests": 865011,
+      "requests": 1128304,
       "errors": 0,
-      "rps": 123562.60556058423,
-      "p50_us": 222,
-      "p90_us": 409,
-      "p99_us": 901,
-      "max_us": 8959
+      "rps": 161176.26699752916,
+      "p50_us": 171,
+      "p90_us": 295,
+      "p99_us": 581,
+      "max_us": 16658
     },
     "distribution": [
-      123044,
-      370984,
-      370983
+      159187,
+      484558,
+      484559
     ]
   },
   {
     "scenario": "tcp",
     "target": "rxh",
     "verdict": "pass",
-    "reason": "0 echo errors, connections per backend [13514, 13514]",
+    "reason": "0 echo errors, connections per backend [13828, 13828]",
     "stats": {
-      "requests": 1350500,
+      "requests": 1381922,
       "errors": 0,
-      "rps": 270015.6459241445,
-      "p50_us": 95,
-      "p90_us": 212,
-      "p99_us": 322,
-      "max_us": 5503
+      "rps": 276361.4753181717,
+      "p50_us": 107,
+      "p90_us": 144,
+      "p99_us": 307,
+      "max_us": 21025
     },
     "distribution": [
-      13514,
-      13514
+      13828,
+      13828
     ]
   },
   {
@@ -706,38 +706,559 @@
     "scenario": "tcp",
     "target": "nginx",
     "verdict": "pass",
-    "reason": "0 echo errors, connections per backend [18065, 18065]",
+    "reason": "0 echo errors, connections per backend [16746, 16746]",
     "stats": {
-      "requests": 1805874,
+      "requests": 1673874,
       "errors": 0,
-      "rps": 361122.95588841004,
-      "p50_us": 70,
-      "p90_us": 143,
-      "p99_us": 307,
-      "max_us": 5988
+      "rps": 334747.4647898232,
+      "p50_us": 91,
+      "p90_us": 123,
+      "p99_us": 177,
+      "max_us": 992
     },
     "distribution": [
-      18065,
-      18065
+      16746,
+      16746
     ]
   },
   {
     "scenario": "tcp",
     "target": "traefik",
     "verdict": "pass",
-    "reason": "0 echo errors, connections per backend [7023, 7023]",
+    "reason": "0 echo errors, connections per backend [11447, 11447]",
     "stats": {
-      "requests": 701647,
+      "requests": 1143843,
       "errors": 0,
-      "rps": 140305.82486122721,
-      "p50_us": 194,
-      "p90_us": 315,
-      "p99_us": 1314,
-      "max_us": 18048
+      "rps": 228753.10723830605,
+      "p50_us": 109,
+      "p90_us": 246,
+      "p99_us": 496,
+      "max_us": 14365
     },
     "distribution": [
-      7023,
-      7023
+      11447,
+      11447
+    ]
+  },
+  {
+    "scenario": "tls",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "HTTP/1.1 over TLS, 0 errors",
+    "stats": {
+      "requests": 1018594,
+      "errors": 0,
+      "rps": 203699.85656517898,
+      "p50_us": 142,
+      "p90_us": 213,
+      "p99_us": 398,
+      "max_us": 7874
+    },
+    "distribution": [
+      509297,
+      509297
+    ]
+  },
+  {
+    "scenario": "tls",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "HTTP/1.1 over TLS, 0 errors",
+    "stats": {
+      "requests": 499358,
+      "errors": 0,
+      "rps": 99864.99994212683,
+      "p50_us": 242,
+      "p90_us": 627,
+      "p99_us": 852,
+      "max_us": 5473
+    },
+    "distribution": [
+      249679,
+      249679
+    ]
+  },
+  {
+    "scenario": "tls",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "HTTP/1.1 over TLS, 0 errors",
+    "stats": {
+      "requests": 1563989,
+      "errors": 0,
+      "rps": 312768.68905426626,
+      "p50_us": 95,
+      "p90_us": 135,
+      "p99_us": 193,
+      "max_us": 2116
+    },
+    "distribution": [
+      781995,
+      781994
+    ]
+  },
+  {
+    "scenario": "tls",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "HTTP/1.1 over TLS, 0 errors",
+    "stats": {
+      "requests": 776964,
+      "errors": 0,
+      "rps": 155378.43156599504,
+      "p50_us": 178,
+      "p90_us": 305,
+      "p99_us": 599,
+      "max_us": 6700
+    },
+    "distribution": [
+      388482,
+      388482
+    ]
+  },
+  {
+    "scenario": "http2",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "796975 of 796975 responses over HTTP/2, 0 errors",
+    "stats": {
+      "requests": 796975,
+      "errors": 0,
+      "rps": 159387.03106285314,
+      "p50_us": 189,
+      "p90_us": 265,
+      "p99_us": 397,
+      "max_us": 1702
+    },
+    "distribution": [
+      398488,
+      398487
+    ]
+  },
+  {
+    "scenario": "http2",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "378864 of 378864 responses over HTTP/2, 0 errors",
+    "stats": {
+      "requests": 378864,
+      "errors": 0,
+      "rps": 75767.57785607791,
+      "p50_us": 331,
+      "p90_us": 758,
+      "p99_us": 1066,
+      "max_us": 2230
+    },
+    "distribution": [
+      189432,
+      189432
+    ]
+  },
+  {
+    "scenario": "http2",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "823381 of 823381 responses over HTTP/2, 0 errors",
+    "stats": {
+      "requests": 823381,
+      "errors": 0,
+      "rps": 164665.60304391547,
+      "p50_us": 196,
+      "p90_us": 236,
+      "p99_us": 324,
+      "max_us": 1859
+    },
+    "distribution": [
+      411691,
+      411690
+    ]
+  },
+  {
+    "scenario": "http2",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "545728 of 545728 responses over HTTP/2, 0 errors",
+    "stats": {
+      "requests": 545728,
+      "errors": 0,
+      "rps": 109139.59505216856,
+      "p50_us": 263,
+      "p90_us": 414,
+      "p99_us": 715,
+      "max_us": 3563
+    },
+    "distribution": [
+      272864,
+      272864
+    ]
+  },
+  {
+    "scenario": "large-body",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "1 MiB up and back per request, 1955 MiB/s each way, 0 errors (wrong echoes included)",
+    "stats": {
+      "requests": 9794,
+      "errors": 0,
+      "rps": 1955.4160227330365,
+      "p50_us": 15982,
+      "p90_us": 20848,
+      "p99_us": 25670,
+      "max_us": 42670
+    },
+    "distribution": [
+      4897,
+      4897
+    ]
+  },
+  {
+    "scenario": "large-body",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "1 MiB up and back per request, 2549 MiB/s each way, 0 errors (wrong echoes included)",
+    "stats": {
+      "requests": 12766,
+      "errors": 0,
+      "rps": 2549.193912705373,
+      "p50_us": 12213,
+      "p90_us": 16621,
+      "p99_us": 20888,
+      "max_us": 28459
+    },
+    "distribution": [
+      6383,
+      6383
+    ]
+  },
+  {
+    "scenario": "large-body",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "1 MiB up and back per request, 1114 MiB/s each way, 0 errors (wrong echoes included)",
+    "stats": {
+      "requests": 5612,
+      "errors": 0,
+      "rps": 1113.5380088656937,
+      "p50_us": 43578,
+      "p90_us": 45595,
+      "p99_us": 49020,
+      "max_us": 57599
+    },
+    "distribution": [
+      2806,
+      2806
+    ]
+  },
+  {
+    "scenario": "large-body",
+    "target": "traefik",
+    "verdict": "fail",
+    "reason": "1 MiB up and back per request, 2631 MiB/s each way, 8 errors (wrong echoes included)",
+    "stats": {
+      "requests": 13178,
+      "errors": 8,
+      "rps": 2631.369568721597,
+      "p50_us": 11867,
+      "p90_us": 15720,
+      "p99_us": 19631,
+      "max_us": 52985
+    },
+    "distribution": [
+      6593,
+      6593
+    ]
+  },
+  {
+    "scenario": "websocket",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "0 frame echo errors, upgrades per backend [12847, 12847]",
+    "stats": {
+      "requests": 1284041,
+      "errors": 0,
+      "rps": 256787.61991027487,
+      "p50_us": 108,
+      "p90_us": 146,
+      "p99_us": 355,
+      "max_us": 1273
+    },
+    "distribution": [
+      12847,
+      12847
+    ]
+  },
+  {
+    "scenario": "websocket",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "0 frame echo errors, upgrades per backend [9243, 9244]",
+    "stats": {
+      "requests": 923442,
+      "errors": 0,
+      "rps": 184669.00764897018,
+      "p50_us": 126,
+      "p90_us": 289,
+      "p99_us": 564,
+      "max_us": 14523
+    },
+    "distribution": [
+      9243,
+      9244
+    ]
+  },
+  {
+    "scenario": "websocket",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "0 frame echo errors, upgrades per backend [15730, 15730]",
+    "stats": {
+      "requests": 1572309,
+      "errors": 0,
+      "rps": 314435.3201439494,
+      "p50_us": 90,
+      "p90_us": 123,
+      "p99_us": 231,
+      "max_us": 1656
+    },
+    "distribution": [
+      15730,
+      15730
+    ]
+  },
+  {
+    "scenario": "websocket",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "0 frame echo errors, upgrades per backend [9703, 9704]",
+    "stats": {
+      "requests": 969498,
+      "errors": 0,
+      "rps": 193875.05150220377,
+      "p50_us": 121,
+      "p90_us": 268,
+      "p99_us": 534,
+      "max_us": 2110
+    },
+    "distribution": [
+      9703,
+      9704
+    ]
+  },
+  {
+    "scenario": "udp",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "0.00% datagrams lost, sessions per backend [17, 16]",
+    "stats": {
+      "requests": 1195642,
+      "errors": 0,
+      "rps": 239114.1322031999,
+      "p50_us": 131,
+      "p90_us": 158,
+      "p99_us": 221,
+      "max_us": 1824
+    },
+    "distribution": [
+      17,
+      16
+    ]
+  },
+  {
+    "scenario": "udp",
+    "target": "caddy",
+    "verdict": "n/a",
+    "reason": "no layer 4 proxy (Caddy needs the caddy-l4 plugin, pass --caddy-l4)",
+    "stats": null,
+    "distribution": []
+  },
+  {
+    "scenario": "udp",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "0.00% datagrams lost, sessions per backend [455, 454]",
+    "stats": {
+      "requests": 1170994,
+      "errors": 0,
+      "rps": 234183.86206715353,
+      "p50_us": 123,
+      "p90_us": 207,
+      "p99_us": 345,
+      "max_us": 1401
+    },
+    "distribution": [
+      455,
+      454
+    ]
+  },
+  {
+    "scenario": "udp",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "0.00% datagrams lost, sessions per backend [16, 17]",
+    "stats": {
+      "requests": 966809,
+      "errors": 0,
+      "rps": 193351.4216304223,
+      "p50_us": 163,
+      "p90_us": 288,
+      "p99_us": 458,
+      "max_us": 1891
+    },
+    "distribution": [
+      16,
+      17
+    ]
+  },
+  {
+    "scenario": "idle",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "5000 of 5000 idle connections opened, 0 of them failed after the load, 0 load errors",
+    "stats": {
+      "requests": 1090899,
+      "errors": 0,
+      "rps": 218127.95046266797,
+      "p50_us": 129,
+      "p90_us": 192,
+      "p99_us": 476,
+      "max_us": 1904
+    },
+    "distribution": [
+      550450,
+      550449
+    ]
+  },
+  {
+    "scenario": "idle",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "5000 of 5000 idle connections opened, 0 of them failed after the load, 0 load errors",
+    "stats": {
+      "requests": 634846,
+      "errors": 0,
+      "rps": 126899.57157559184,
+      "p50_us": 198,
+      "p90_us": 401,
+      "p99_us": 1176,
+      "max_us": 4779
+    },
+    "distribution": [
+      322423,
+      322423
+    ]
+  },
+  {
+    "scenario": "idle",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "5000 of 5000 idle connections opened, 0 of them failed after the load, 0 load errors",
+    "stats": {
+      "requests": 1608507,
+      "errors": 0,
+      "rps": 321636.6005816813,
+      "p50_us": 93,
+      "p90_us": 130,
+      "p99_us": 185,
+      "max_us": 1534
+    },
+    "distribution": [
+      809254,
+      809253
+    ]
+  },
+  {
+    "scenario": "idle",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "5000 of 5000 idle connections opened, 0 of them failed after the load, 0 load errors",
+    "stats": {
+      "requests": 772018,
+      "errors": 0,
+      "rps": 154387.454993649,
+      "p50_us": 172,
+      "p90_us": 319,
+      "p99_us": 587,
+      "max_us": 5243
+    },
+    "distribution": [
+      391009,
+      391009
+    ]
+  },
+  {
+    "scenario": "memory",
+    "target": "rxh",
+    "verdict": "pass",
+    "reason": "35.7 KiB per idle connection: RSS 19.9 MiB with 100, 194.3 MiB with 5000 more (5000 opened)",
+    "stats": {
+      "requests": 5000,
+      "errors": 0,
+      "rps": 35713.85689290403,
+      "p50_us": 1027,
+      "p90_us": 1653,
+      "p99_us": 18227,
+      "max_us": 19091
+    },
+    "distribution": [
+      2550,
+      2550
+    ]
+  },
+  {
+    "scenario": "memory",
+    "target": "caddy",
+    "verdict": "pass",
+    "reason": "33.9 KiB per idle connection: RSS 68.1 MiB with 100, 233.7 MiB with 5000 more (5000 opened)",
+    "stats": {
+      "requests": 5000,
+      "errors": 0,
+      "rps": 38145.05190015762,
+      "p50_us": 797,
+      "p90_us": 3131,
+      "p99_us": 14023,
+      "max_us": 15119
+    },
+    "distribution": [
+      2550,
+      2550
+    ]
+  },
+  {
+    "scenario": "memory",
+    "target": "nginx",
+    "verdict": "pass",
+    "reason": "0.6 KiB per idle connection: RSS 235.8 MiB with 100, 238.7 MiB with 5000 more (5000 opened)",
+    "stats": {
+      "requests": 5000,
+      "errors": 0,
+      "rps": 145046.59215642567,
+      "p50_us": 292,
+      "p90_us": 439,
+      "p99_us": 682,
+      "max_us": 1000
+    },
+    "distribution": [
+      2550,
+      2550
+    ]
+  },
+  {
+    "scenario": "memory",
+    "target": "traefik",
+    "verdict": "pass",
+    "reason": "36.0 KiB per idle connection: RSS 112.7 MiB with 100, 288.7 MiB with 5000 more (5000 opened)",
+    "stats": {
+      "requests": 5000,
+      "errors": 0,
+      "rps": 36842.638628220055,
+      "p50_us": 817,
+      "p90_us": 2558,
+      "p99_us": 16734,
+      "max_us": 17251
+    },
+    "distribution": [
+      2550,
+      2550
     ]
   }
 ]
