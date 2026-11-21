@@ -474,6 +474,24 @@
           ],
           "default": "127.0.0.1:2019"
         },
+        "oidc": {
+          "description": "Sign-in through an OpenID Connect provider.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Oidc"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "public_url": {
+          "description": "Address where browsers reach the admin API, without a trailing `/`:\nan `https` URL, or `http` on a loopback address. Required by `oidc`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "tls": {
           "description": "HTTPS on the admin listener, from certificate and key files.",
           "anyOf": [
@@ -1430,6 +1448,55 @@
       "additionalProperties": false,
       "required": [
         "pool"
+      ]
+    },
+    "Oidc": {
+      "description": "Sign-in through an OpenID Connect provider (`[admin.oidc]`).",
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "description": "Client ID registered at the provider.",
+          "type": "string"
+        },
+        "client_secret": {
+          "description": "Client secret registered at the provider.",
+          "type": "string"
+        },
+        "groups_claim": {
+          "description": "Claim of the ID token that lists the groups of the user.",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "Issuer of the provider, without a trailing `/`: an `https` URL, or\n`http` on a loopback address.",
+          "type": "string"
+        },
+        "name_claim": {
+          "description": "Claim of the ID token that names the user.",
+          "type": "string"
+        },
+        "roles": {
+          "description": "Roles granted for each value of `groups_claim`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "scopes": {
+          "description": "Scopes asked for; must contain `openid`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "issuer",
+        "client_id",
+        "client_secret"
       ]
     },
     "OneOrMany_Mirror": {

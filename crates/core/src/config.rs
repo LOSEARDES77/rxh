@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -952,6 +952,19 @@ pub struct Admin {
         skip_serializing_if = "default::is_admin_users"
     )]
     pub users: String,
+
+    /// Address where browsers reach the admin API, without a trailing `/`:
+    /// an `https` URL, or `http` on a loopback address. Required by `oidc`.
+    #[serde(
+        default,
+        deserialize_with = "without_trailing_slash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_url: Option<String>,
+
+    /// Sign-in through an OpenID Connect provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<Oidc>,
 }
 
 impl Default for Admin {
@@ -962,15 +975,21 @@ impl Default for Admin {
             token: None,
             tls: None,
             users: default::admin_users(),
+            public_url: None,
+            oidc: None,
         }
     }
 }
 
 impl Admin {
-    /// Replaces the token with `***`, for output that leaves the process.
+    /// Replaces the token and the OIDC client secret with `***`, for output
+    /// that leaves the process.
     pub fn redact(&mut self) {
         if let Some(token) = &mut self.token {
             *token = String::from("***");
+        }
+        if let Some(oidc) = &mut self.oidc {
+            oidc.client_secret = String::from("***");
         }
     }
 
@@ -1005,8 +1024,134 @@ impl Admin {
                  use a loopback address or a unix socket"
             ));
         }
+        if let Some(public_url) = &self.public_url {
+            validate_secure_url("public_url", public_url)?;
+        }
+        if let Some(oidc) = &self.oidc {
+            if self.public_url.is_none() {
+                return Err(String::from(
+                    "oidc needs public_url, where the provider sends the browser back",
+                ));
+            }
+            // A session cookie is only offered over TLS or from this machine.
+            let local_listen = match &self.listen {
+                AdminListen::Tcp(address) => address.ip().is_loopback(),
+                AdminListen::Unix(_) => true,
+            };
+            if self.tls.is_none() && !local_listen {
+                return Err(String::from(
+                    "oidc needs tls, or a loopback or unix socket listen",
+                ));
+            }
+            oidc.validate().map_err(|err| format!("oidc: {err}"))?;
+        }
         Ok(())
     }
+}
+
+/// Sign-in through an OpenID Connect provider (`[admin.oidc]`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Oidc {
+    /// Issuer of the provider, without a trailing `/`: an `https` URL, or
+    /// `http` on a loopback address.
+    #[serde(deserialize_with = "without_trailing_slash")]
+    pub issuer: String,
+
+    /// Client ID registered at the provider.
+    pub client_id: String,
+
+    /// Client secret registered at the provider.
+    pub client_secret: String,
+
+    /// Scopes asked for; must contain `openid`.
+    #[serde(
+        default = "default::oidc_scopes",
+        skip_serializing_if = "default::is_oidc_scopes"
+    )]
+    pub scopes: Vec<String>,
+
+    /// Claim of the ID token that lists the groups of the user.
+    #[serde(
+        default = "default::oidc_groups_claim",
+        skip_serializing_if = "default::is_oidc_groups_claim"
+    )]
+    pub groups_claim: String,
+
+    /// Claim of the ID token that names the user.
+    #[serde(
+        default = "default::oidc_name_claim",
+        skip_serializing_if = "default::is_oidc_name_claim"
+    )]
+    pub name_claim: String,
+
+    /// Roles granted for each value of `groups_claim`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, Vec<String>>,
+}
+
+impl Oidc {
+    fn validate(&self) -> Result<(), String> {
+        validate_secure_url("issuer", &self.issuer)?;
+        if self.client_id.is_empty() {
+            return Err(String::from("client_id must not be empty"));
+        }
+        if self.client_secret.is_empty() {
+            return Err(String::from("client_secret must not be empty"));
+        }
+        if !self.scopes.iter().any(|scope| scope == "openid") {
+            return Err(String::from("scopes must contain \"openid\""));
+        }
+        for (value, roles) in &self.roles {
+            if let Some(role) = roles.iter().find(|role| !is_group_name(role)) {
+                return Err(format!(
+                    "roles.{value}: invalid role name {role:?}, expected [a-z0-9][a-z0-9_-]*"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Deserializes a URL without its trailing `/`.
+fn without_trailing_slash<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + From<String>,
+{
+    let text = String::deserialize(deserializer)?;
+    Ok(T::from(text.trim_end_matches('/').to_owned()))
+}
+
+/// Checks that the `value` of `key` is an `https://` URL, or `http://` on a
+/// loopback address, without a query or a fragment.
+fn validate_secure_url(key: &str, value: &str) -> Result<(), String> {
+    let uri: http::Uri = value
+        .parse()
+        .map_err(|err| format!("{key} {value:?}: {err}"))?;
+    let host: &str = uri.host().unwrap_or_default();
+    let is_loopback: bool = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    let scheme_ok: bool = match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => is_loopback,
+        _ => false,
+    };
+    if !scheme_ok || host.is_empty() {
+        return Err(format!(
+            "{key} must be an https:// URL, or http:// on a loopback address, got {value:?}"
+        ));
+    }
+    // `http::Uri` drops a fragment silently.
+    if uri.query().is_some() || value.contains('#') {
+        return Err(format!(
+            "{key} must not have a query or a fragment, got {value:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Line format of access logs.
@@ -5230,6 +5375,34 @@ mod default {
         users == admin_users()
     }
 
+    pub fn oidc_scopes() -> Vec<String> {
+        vec![
+            String::from("openid"),
+            String::from("profile"),
+            String::from("email"),
+        ]
+    }
+
+    pub fn is_oidc_scopes(scopes: &[String]) -> bool {
+        scopes == oidc_scopes()
+    }
+
+    pub fn oidc_groups_claim() -> String {
+        String::from("groups")
+    }
+
+    pub fn is_oidc_groups_claim(claim: &str) -> bool {
+        claim == oidc_groups_claim()
+    }
+
+    pub fn oidc_name_claim() -> String {
+        String::from("preferred_username")
+    }
+
+    pub fn is_oidc_name_claim(claim: &str) -> bool {
+        claim == oidc_name_claim()
+    }
+
     pub fn admin_listen() -> super::AdminListen {
         super::AdminListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 2019)))
     }
@@ -5537,6 +5710,181 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("admin: ") && err.contains("users"), "{err}");
+    }
+
+    /// An `[admin]` table with `public_url` and `[admin.oidc]`, `extra`
+    /// appended to the oidc table.
+    fn oidc_config(extra: &str) -> String {
+        format!(
+            "[admin]\npublic_url = \"https://rxh.example.com/\"\n\
+             tls = {{ cert = \"a.pem\", key = \"a.key\" }}\n\
+             [admin.oidc]\nissuer = \"https://id.example.com/\"\nclient_id = \"rxh\"\n\
+             client_secret = \"oidc-secret\"\n{extra}"
+        )
+    }
+
+    fn admin_error(text: &str) -> String {
+        let err: String = Config::from_toml(text).expect_err(text).to_string();
+        assert!(err.contains("admin: "), "{err}");
+        err
+    }
+
+    #[test]
+    fn oidc_parses_with_defaults() {
+        let config = Config::from_toml(&oidc_config("")).unwrap();
+        assert_eq!(
+            config.admin.public_url.as_deref(),
+            Some("https://rxh.example.com")
+        );
+        let oidc = config.admin.oidc.expect("[admin.oidc] is set");
+        assert_eq!(oidc.issuer, "https://id.example.com");
+        assert_eq!(oidc.client_id, "rxh");
+        assert_eq!(oidc.client_secret, "oidc-secret");
+        assert_eq!(oidc.scopes, ["openid", "profile", "email"]);
+        assert_eq!(oidc.groups_claim, "groups");
+        assert_eq!(oidc.name_claim, "preferred_username");
+        assert!(oidc.roles.is_empty());
+
+        let config = Config::from_toml(&oidc_config(
+            "scopes = [\"openid\"]\ngroups_claim = \"roles\"\nname_claim = \"email\"\n\
+             roles = { ops = [\"admin\"], dev = [\"web-team\", \"viewer\"] }\n",
+        ))
+        .unwrap();
+        let oidc = config.admin.oidc.expect("[admin.oidc] is set");
+        assert_eq!(oidc.scopes, ["openid"]);
+        assert_eq!(oidc.groups_claim, "roles");
+        assert_eq!(oidc.name_claim, "email");
+        assert_eq!(oidc.roles["ops"], ["admin"]);
+        assert_eq!(oidc.roles["dev"], ["web-team", "viewer"]);
+
+        // Unset, the new keys add no line to the written configuration.
+        let written: String = toml::to_string(&Config::from_toml("").unwrap().admin).unwrap();
+        assert!(
+            !written.contains("public_url") && !written.contains("oidc"),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn oidc_needs_public_url() {
+        let text: String =
+            oidc_config("").replace("public_url = \"https://rxh.example.com/\"\n", "");
+        let err: String = admin_error(&text);
+        assert!(err.contains("public_url") && err.contains("oidc"), "{err}");
+    }
+
+    #[test]
+    fn public_url_must_be_https_or_loopback() {
+        let public_url = |url: &str| format!("[admin]\npublic_url = \"{url}\"\n");
+        for accepted in [
+            "https://rxh.example.com",
+            "https://rxh.example.com/admin/",
+            "http://127.0.0.1:2019",
+            "http://[::1]:2019",
+        ] {
+            assert!(
+                Config::from_toml(&public_url(accepted)).is_ok(),
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "http://rxh.example.com",
+            "https://rxh.example.com/?a=b",
+            "https://rxh.example.com/#top",
+            "rxh.example.com",
+            "/admin",
+            "ftp://rxh.example.com",
+        ] {
+            let err: String = admin_error(&public_url(rejected));
+            assert!(err.contains("public_url"), "{rejected}: {err}");
+        }
+    }
+
+    #[test]
+    fn oidc_issuer_must_be_https_or_loopback() {
+        let issuer = |url: &str| {
+            oidc_config("").replace(
+                "issuer = \"https://id.example.com/\"",
+                &format!("issuer = \"{url}\""),
+            )
+        };
+        let config = Config::from_toml(&issuer("http://127.0.0.1:9000/realms/rxh/")).unwrap();
+        assert_eq!(
+            config.admin.oidc.unwrap().issuer,
+            "http://127.0.0.1:9000/realms/rxh"
+        );
+        for rejected in ["http://id.example.com", "id.example.com", ""] {
+            let err: String = admin_error(&issuer(rejected));
+            assert!(err.contains("issuer"), "{rejected}: {err}");
+        }
+    }
+
+    #[test]
+    fn oidc_client_id_and_secret_must_not_be_empty() {
+        for key in ["client_id", "client_secret"] {
+            let text: String = oidc_config("").replace(
+                &format!(
+                    "{key} = \"{}\"",
+                    if key == "client_id" {
+                        "rxh"
+                    } else {
+                        "oidc-secret"
+                    }
+                ),
+                &format!("{key} = \"\""),
+            );
+            let err: String = admin_error(&text);
+            assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn oidc_scopes_must_include_openid() {
+        let err: String = admin_error(&oidc_config("scopes = [\"profile\", \"email\"]\n"));
+        assert!(err.contains("scopes") && err.contains("openid"), "{err}");
+    }
+
+    #[test]
+    fn oidc_roles_reject_bad_role_names() {
+        for bad in ["Admin", "", "web team", "-web"] {
+            let err: String =
+                admin_error(&oidc_config(&format!("roles = {{ ops = [\"{bad}\"] }}\n")));
+            assert!(
+                err.contains("roles") && err.contains("ops"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_needs_tls_or_a_loopback_listener() {
+        let without_tls: String =
+            oidc_config("").replace("tls = { cert = \"a.pem\", key = \"a.key\" }\n", "");
+        // The default listener is on loopback.
+        assert!(Config::from_toml(&without_tls).is_ok());
+        let remote: String = without_tls.replace(
+            "[admin]\n",
+            "[admin]\nlisten = \"0.0.0.0:2019\"\ntoken = \"0123456789abcdef\"\n",
+        );
+        let err: String = admin_error(&remote);
+        assert!(
+            err.contains("oidc") && err.contains("tls") && err.contains("listen"),
+            "{err}"
+        );
+        let with_tls: String = remote.replace(
+            "[admin]\n",
+            "[admin]\ntls = { cert = \"a.pem\", key = \"a.key\" }\n",
+        );
+        assert!(Config::from_toml(&with_tls).is_ok());
+    }
+
+    #[test]
+    fn the_client_secret_is_redacted() {
+        let mut admin: Admin = Config::from_toml(&oidc_config("")).unwrap().admin;
+        admin.redact();
+        let oidc = admin.oidc.expect("[admin.oidc] is set");
+        assert_eq!(oidc.client_secret, "***");
+        assert_eq!(oidc.client_id, "rxh");
     }
 
     #[test]

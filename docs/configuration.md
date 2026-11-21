@@ -545,6 +545,8 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
 | `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
 | `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API. A relative path is relative to the directory of the configuration file, like `[acme] storage`, so the daemon and `rxh user` find the same file wherever they run. Must not be empty. Changes need a restart. In the container images the configuration directory is not writable: set an absolute path on the volume, `users = "/var/lib/rxh/users.toml"`. |
+| `public_url` | none | Address where browsers reach the admin API: an `https://` URL, or `http://` on a loopback address (`http://127.0.0.1:2019`), without a query or a fragment; a trailing `/` is removed. Required by `oidc`. Changes need a restart. |
+| `oidc` | none | Sign-in through an OpenID Connect provider, see [OpenID Connect](#openid-connect). Changes need a restart. |
 
 On a unix socket the API is reachable only by the user running the daemon
 (and root): the file is created with mode `0600`, a socket left behind by a
@@ -1172,6 +1174,40 @@ Known limits:
 - **The page reads the session when it opens.** A role given or taken
   away shows in the page at its next load; the daemon applies it at the
   next request.
+
+#### OpenID Connect
+
+`[admin.oidc]` lets users sign in through an OpenID Connect provider
+(Keycloak, Authentik, Dex, Google, ...). The keys are read and checked at
+start; the sign-in flow that uses them is not served yet.
+
+| Key | Default | Description |
+|---|---|---|
+| `issuer` | required | Issuer of the provider: an `https://` URL, or `http://` on a loopback address. A trailing `/` is removed. |
+| `client_id` | required | Client ID registered at the provider. Must not be empty. |
+| `client_secret` | required | Client secret registered at the provider. Must not be empty. `GET /config`, `rxh config show` and the configuration editor show it as `***`; use an `{env.NAME}` or `{file.PATH}` placeholder to keep it out of the file. |
+| `scopes` | `["openid", "profile", "email"]` | Scopes asked for. Must contain `"openid"`. |
+| `groups_claim` | `"groups"` | Claim of the ID token that lists the groups of the user. |
+| `name_claim` | `"preferred_username"` | Claim of the ID token that names the user. |
+| `roles` | `{}` | Roles granted for each value of `groups_claim`: claim value to role names (`admin` or a role of the users file, `[a-z0-9][a-z0-9_-]*`). |
+
+`oidc` needs `public_url` in `[admin]`, and `tls` in `[admin]` or a
+loopback or unix socket `listen`, since a session cookie is only offered
+over TLS or from the machine. Like every `[admin]` key, `[admin.oidc]` is
+read at start only: changes need a restart.
+
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+public_url = "https://rxh.example.com:2019"
+
+[admin.oidc]
+issuer = "https://id.example.com/realms/ops"
+client_id = "rxh"
+client_secret = "{env.RXH_OIDC_SECRET}"
+roles = { ops = ["admin"], web = ["web-editors"] }
+```
 
 ### Dashboard
 

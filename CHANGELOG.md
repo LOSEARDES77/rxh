@@ -535,6 +535,13 @@ Changed.
   first. Servers sharing a listen address must agree on `http3`, and
   `http3 = true` on the UDP port of a `udp` server is a validation error.
   See [HTTP/3](docs/configuration.md#http3).
+- `[admin] public_url` and `[admin.oidc]` (`issuer`, `client_id`,
+  `client_secret`, `scopes`, `groups_claim`, `name_claim`, `roles`), the
+  settings of sign-in through an OpenID Connect provider, read and checked
+  at start: `https` URLs (or `http` on loopback), `openid` among the
+  scopes, valid role names, `public_url` set, and `tls` or a loopback or
+  unix socket `listen`. `client_secret` is shown as `***` like the other
+  secrets. See [OpenID Connect](docs/configuration.md#openid-connect).
 
 ### Deprecated
 

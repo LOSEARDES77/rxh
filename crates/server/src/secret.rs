@@ -14,6 +14,7 @@ pub(crate) const MASK: &str = "***";
 /// `forward` and `subroute` entries nest without limit).
 pub(crate) const PATHS: &[&[&str]] = &[
     &["admin", "token"],
+    &["admin", "oidc", "client_secret"],
     &["consul", "token"],
     &["etcd", "token"],
     &["nomad", "token"],
@@ -218,9 +219,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use rxh_core::config::Config;
-    use serde_json::Value as Json;
+    use serde_json::{Map, Value as Json};
 
     use super::*;
+    use crate::entity::{self, Entity, Kind};
 
     fn parse(text: &str) -> DocumentMut {
         text.parse().unwrap()
@@ -303,6 +305,44 @@ secret = "cookie-hmac"
         let mut edited: DocumentMut = masked(text);
         restore(&mut edited, &stored).unwrap();
         assert_eq!(edited.to_string(), text);
+    }
+
+    #[test]
+    fn the_oidc_client_secret_is_masked_and_restored() {
+        let text: &str = r#"
+[admin]
+public_url = "https://rxh.example.com"
+
+[admin.oidc]
+issuer = "https://id.example.com"
+client_id = "rxh"
+client_secret = "oidc-client-secret" # from the provider
+"#;
+        let stored: DocumentMut = parse(text);
+        let mut document: DocumentMut = masked(text);
+        // The section `admin` as the editing routes list it, sub-table included.
+        let admin: Entity = entity::list(0, &document)
+            .into_iter()
+            .find(|entity| entity.kind == Kind::Section && entity.key == "admin")
+            .expect("the admin section is listed");
+        assert_eq!(admin.value["oidc"]["client_secret"], MASK);
+        assert_eq!(admin.value["oidc"]["client_id"], "rxh");
+        assert!(!admin.toml.contains("oidc-client-secret"), "{}", admin.toml);
+
+        // Saved back as listed, the stored secret is put back.
+        let value: &Map<String, Json> = admin.value.as_object().expect("a section is a table");
+        entity::replace_value(&mut document, Kind::Section, "admin", value).unwrap();
+        restore(&mut document, &stored).unwrap();
+        assert_eq!(document.to_string(), text);
+
+        // Saved as TOML, too.
+        let mut document: DocumentMut = masked(text);
+        entity::replace_toml(&mut document, Kind::Section, "admin", &admin.toml).unwrap();
+        restore(&mut document, &stored).unwrap();
+        assert_eq!(
+            document["admin"]["oidc"]["client_secret"].as_str(),
+            Some("oidc-client-secret")
+        );
     }
 
     #[test]
@@ -451,8 +491,9 @@ match = [
 
     #[test]
     fn every_secret_field_of_the_schema_is_listed() {
-        const SECRET_NAMES: [&str; 6] = [
+        const SECRET_NAMES: [&str; 7] = [
             "token",
+            "client_secret",
             "secret",
             "api_token",
             "secret_access_key",
