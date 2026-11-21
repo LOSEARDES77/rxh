@@ -366,6 +366,7 @@ impl Daemon {
             current: RwLock::new(generation.current()),
             control,
             saving: tokio::sync::Mutex::new(()),
+            hashing: admin::hashing_permits(),
             access,
             sessions,
         });
@@ -389,11 +390,11 @@ impl Daemon {
                     println!("Admin => API listening on unix socket {}", path.display());
                 }
             }
-            // Only where the code works, see `admin::code_opens_setup`.
-            if admin_state.tls.is_some()
-                && admin_state.token.is_none()
-                && admin_state.access.read().user.is_empty()
-            {
+            if admin::announces_setup_code(
+                admin_state.tls.is_some(),
+                admin_state.token.is_some(),
+                !admin_state.access.read().user.is_empty(),
+            ) {
                 println!(
                     "Admin => no user exists yet; to create the first one from another machine \
                      use the setup code {}",
@@ -1026,6 +1027,7 @@ forward = "@api"
                 current: RwLock::new(generation.current()),
                 control,
                 saving: tokio::sync::Mutex::new(()),
+                hashing: admin::hashing_permits(),
                 access: Store::open(PathBuf::new()),
                 sessions: Sessions::new(),
             }

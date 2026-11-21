@@ -103,17 +103,13 @@ impl Sessions {
             .retain(|_, session| session.user != user);
     }
 
-    /// Counts a failed sign-in as `name` from `address`. Called before the
-    /// password is checked, and taken back with [`Sessions::forget`] when it
-    /// was right, so that attempts made at the same time are all counted.
-    pub(crate) fn failed(&self, name: &str, address: Option<IpAddr>) {
-        self.failed_at(name, address, Instant::now());
-    }
-
-    /// Whether `name` is refused from `address`: 5 failures, the last one
-    /// less than a minute ago.
-    pub(crate) fn locked(&self, name: &str, address: Option<IpAddr>) -> bool {
-        self.locked_at(name, address, Instant::now())
+    /// Counts one sign-in as `name` from `address` as failed, unless the
+    /// pair is locked out (5 failures, the last one less than a minute ago),
+    /// which returns false. One step, so that attempts made at the same
+    /// time cannot all pass the check before any of them is counted. A good
+    /// sign-in takes its count back with [`Sessions::forget`].
+    pub(crate) fn attempt(&self, name: &str, address: Option<IpAddr>) -> bool {
+        self.attempt_at(name, address, Instant::now())
     }
 
     /// Forgets the failed sign-ins as `name` from `address`, after a good one.
@@ -163,7 +159,7 @@ impl Sessions {
         tables.sessions.get(id).cloned()
     }
 
-    fn failed_at(&self, name: &str, address: Option<IpAddr>, now: Instant) {
+    fn attempt_at(&self, name: &str, address: Option<IpAddr>, now: Instant) -> bool {
         let mut tables = self.lock();
         // Also what keeps the table from growing with names nobody retries.
         tables
@@ -176,18 +172,12 @@ impl Sessions {
                 count: 0,
                 last: now,
             });
+        if failures.count >= MAX_FAILURES {
+            return false;
+        }
         failures.count += 1;
         failures.last = now;
-    }
-
-    fn locked_at(&self, name: &str, address: Option<IpAddr>, now: Instant) -> bool {
-        self.lock()
-            .failures
-            .get(&(name.to_owned(), address))
-            .is_some_and(|failures| {
-                failures.count >= MAX_FAILURES
-                    && now.saturating_duration_since(failures.last) < LOCKOUT
-            })
+        true
     }
 
     fn lock(&self) -> MutexGuard<'_, Tables> {
@@ -309,29 +299,46 @@ mod tests {
         let start = Instant::now();
         let here = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
         let there = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)));
-        for _ in 0..4 {
-            sessions.failed_at("ana", here, start);
-        }
-        assert!(!sessions.locked_at("ana", here, start), "four are allowed");
-        sessions.failed_at("ana", here, start);
-        assert!(sessions.locked_at("ana", here, start));
-        assert!(!sessions.locked_at("luis", here, start), "another name");
-        assert!(!sessions.locked_at("ana", there, start), "another client");
-        assert!(!sessions.locked_at("ana", None, start), "the unix socket");
-
-        let minute = Duration::from_secs(60);
-        assert!(sessions.locked_at("ana", here, start + minute - Duration::from_secs(1)));
-        assert!(!sessions.locked_at("ana", here, start + minute));
-        // The count starts again after the minute.
-        sessions.failed_at("ana", here, start + minute);
-        assert!(!sessions.locked_at("ana", here, start + minute));
-
         for _ in 0..5 {
-            sessions.failed_at("luis", None, start);
+            assert!(sessions.attempt_at("ana", here, start), "five are allowed");
         }
-        assert!(sessions.locked_at("luis", None, start));
-        sessions.forget("luis", None);
-        assert!(!sessions.locked_at("luis", None, start), "a good sign-in");
+        assert!(!sessions.attempt_at("ana", here, start));
+        assert!(sessions.attempt_at("luis", here, start), "another name");
+        assert!(sessions.attempt_at("ana", there, start), "another client");
+        assert!(sessions.attempt_at("ana", None, start), "the unix socket");
+
+        // A refused attempt does not make the minute longer.
+        let minute = Duration::from_secs(60);
+        assert!(!sessions.attempt_at("ana", here, start + minute - Duration::from_secs(1)));
+        assert!(sessions.attempt_at("ana", here, start + minute));
+        // The count started again.
+        for _ in 0..4 {
+            assert!(sessions.attempt_at("ana", here, start + minute));
+        }
+        assert!(!sessions.attempt_at("ana", here, start + minute));
+
+        // A good sign-in takes the failures back.
+        sessions.forget("ana", here);
+        assert!(sessions.attempt_at("ana", here, start + minute));
+    }
+
+    #[test]
+    fn attempts_at_the_same_time_are_all_counted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let sessions = &Sessions::new();
+        let allowed = &AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for _ in 0..64 {
+                scope.spawn(move || {
+                    if sessions.attempt("ana", None) {
+                        allowed.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(allowed.load(Ordering::Relaxed), 5);
     }
 
     #[test]

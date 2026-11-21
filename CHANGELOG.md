@@ -32,8 +32,10 @@ Changed.
   exists `POST /auth/setup` creates the first administrator: for the token,
   for a request from the machine, or on a `tls` listener without a token
   with the setup code the daemon logs at start. Five failed sign-ins for a
-  name from one address lock that pair for a minute (`429`), and a cookie
-  request that changes something needs an `Origin` equal to its `Host`.
+  name from one address lock that pair for a minute (`429`), at most 4
+  passwords are checked at a time (`429` beyond), a cookie request that
+  changes something needs an `Origin` equal to its `Host`, and sign-in,
+  sign-out and setup refuse an `Origin` that is not their `Host`.
   The token and a request from the machine without a token stay
   administrators. Every route now passes one gate that refuses by default:
   a signed-in user without the `admin` role gets `403` on the admin routes.

@@ -298,6 +298,54 @@ async fn sign_in_sets_a_private_cookie() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_or_a_setup_from_the_page_of_another_site_is_refused() {
+    let refused = json!({ "error": "the Origin of this request is not its Host" });
+    let own = |admin: SocketAddr| format!("http://{admin}");
+
+    // What a form of another site sends: its `Origin`, any content type.
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let login = json!({ "name": "ana", "password": "password-ana" }).to_string();
+    for origin in ["https://evil.example", "null"] {
+        let headers = [
+            (header::ORIGIN, origin),
+            (header::CONTENT_TYPE, "text/plain"),
+        ];
+        let (status, headers, json) =
+            call(closed.admin, Method::POST, "/auth/login", &login, &headers).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}");
+        assert_eq!(json, refused, "{origin}");
+        assert!(!headers.contains_key(header::SET_COOKIE), "{origin}");
+    }
+    // The page sends its own, and `curl` none.
+    let origin = own(closed.admin);
+    let headers = [(header::ORIGIN, origin.as_str())];
+    let (status, _, json) = call(closed.admin, Method::POST, "/auth/login", &login, &headers).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    cookie_of(closed.admin, "ana", "password-ana").await;
+
+    // Setup, with the token too: a browser that holds it is still a browser.
+    let empty = daemon(None, /* token= */ true).await;
+    let setup = json!({ "name": "eva", "password": "password-eva" }).to_string();
+    let bearer = bearer();
+    let headers = [
+        (header::AUTHORIZATION, bearer.as_str()),
+        (header::ORIGIN, "https://evil.example"),
+    ];
+    let (status, _, json) = call(empty.admin, Method::POST, "/auth/setup", &setup, &headers).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json, refused);
+    assert!(!empty.users.exists());
+    let origin = own(empty.admin);
+    let headers = [
+        (header::AUTHORIZATION, bearer.as_str()),
+        (header::ORIGIN, origin.as_str()),
+    ];
+    let (status, _, json) = call(empty.admin, Method::POST, "/auth/setup", &setup, &headers).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert!(empty.users.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_password_and_an_unknown_name_get_the_same_answer() {
     let closed = daemon(Some(&accounts()), /* token= */ true).await;
     let long = "x".repeat(65);
@@ -431,9 +479,10 @@ async fn sign_out_ends_the_session() {
     let (status, _, json) = call_with_cookie(admin, &other, Method::GET, "/status", "").await;
     assert_eq!(status, StatusCode::OK, "{json}");
 
-    // Signed out, there is nothing to sign out of.
-    let (status, _, _) = call(admin, Method::POST, "/auth/logout", "", &[]).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Signed out, there is nothing to end: the cookie is cleared all the same.
+    let (status, headers, _) = call(admin, Method::POST, "/auth/logout", "", &[]).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(headers.contains_key(header::SET_COOKIE));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -591,6 +640,32 @@ async fn a_local_request_still_is_administrator_when_users_exist() {
     let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(json["error"], NEEDS_ADMIN);
+    // A session of a user that was removed is nobody's, also here. Signing
+    // out ends it, and the browser is the machine again.
+    let mut removed = accounts();
+    removed.user.truncate(1);
+    removed.save(&open.users).expect("save");
+    let status_of = async || {
+        let (status, _, _) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+        status
+    };
+    util::eventually(async || status_of().await == StatusCode::UNAUTHORIZED).await;
+    let with_cookie = [(header::COOKIE, cookie.as_str())];
+    let (status, _, _) = call(admin, Method::POST, "/auth/logout", "", &with_cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a cookie write needs its Origin"
+    );
+    let (status, headers, _) =
+        call_with_cookie(admin, &cookie, Method::POST, "/auth/logout", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        headers[header::SET_COOKIE],
+        "rxh_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+    );
+    assert_eq!(status_of().await, StatusCode::OK);
+
     // And a foreign `Host` is still refused, as before the accounts.
     let foreign = [(header::HOST, "evil.example")];
     let (status, _, json) = call(admin, Method::GET, "/status", "", &foreign).await;

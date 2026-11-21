@@ -576,8 +576,8 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 - `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are
   served without the token: the page and its script and style
   hold no data. The page asks for the token and sends it on its requests.
-  So are `GET /auth/session`, `POST /auth/login` and `POST /auth/setup`,
-  the way in for [accounts](#accounts).
+  So are `GET /auth/session`, `POST /auth/login`, `POST /auth/logout` and
+  `POST /auth/setup`, the way in and out for [accounts](#accounts).
 - Without `tls` the admin API speaks plain HTTP: the token is as private as
   the network it crosses. Set `tls`, or use a private network, a VPN or an
   SSH tunnel (`ssh -L 2019:/run/rxh/admin.sock host`), not the open
@@ -599,9 +599,9 @@ request is the first of these that holds:
 
 1. `Authorization: Bearer <token>` equal to `[admin] token`: an
    administrator.
-2. The cookie of a session: that user, with the roles the users file gives
-   the user at that moment. A user that was removed from the file is signed
-   out.
+2. The cookie of a session, over HTTPS or from the machine: that user,
+   with the roles the users file gives the user at that moment. A user that
+   was removed from the file is nobody.
 3. No `token` configured and a request from the machine (the rule above):
    an administrator. This is what `rxh status` and `curl` on the machine
    are.
@@ -624,8 +624,8 @@ users = "/var/lib/rxh/users.toml"   # default: rxh-data/users.toml
 | Route | For | Does |
 |---|---|---|
 | `GET /auth/session` | anyone | Who the caller is, see below. |
-| `POST /auth/login` | anyone | `{"name", "password"}`: `204` and the session cookie. `401 {"error": "wrong name or password"}` for a wrong password and for an unknown name alike; `429` while the name is locked; `403` on plain HTTP from another machine. |
-| `POST /auth/logout` | signed in | Ends the session and clears the cookie: `204`. |
+| `POST /auth/login` | anyone | `{"name", "password"}`: `204` and the session cookie. `401 {"error": "wrong name or password"}` for a wrong password and for an unknown name alike; `429` while the name is locked or too many passwords are being checked; `403` on plain HTTP from another machine. |
+| `POST /auth/logout` | anyone | Ends the session of the cookie and clears the cookie: `204`, also when there is no session. |
 | `POST /auth/setup` | see First run | `{"name", "password", "code"?}`: creates the first user and signs it in, `204`. `409` once a user exists. |
 | `PUT /auth/password` | a signed-in user | `{"current", "new"}`: `204`. Ends every session of the user and gives this browser a new one. `403` when `current` is wrong. |
 
@@ -668,6 +668,17 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   carry an `Origin` equal to its `Host`, port included, as a page of the
   dashboard does: `403` otherwise. `curl` needs `-H 'Origin: ...'` for
   those, as above; requests with the token need nothing.
+- `POST /auth/login`, `/auth/logout` and `/auth/setup` refuse (`403`) an
+  `Origin` that is not their `Host`, with or without a token, so the page
+  of another site cannot sign a browser in as an account of its choice.
+  Without an `Origin`, as `curl` sends them, they are answered.
+- A session exists only over HTTPS or on a connection from the machine. On
+  plain HTTP from another machine a cookie is ignored and none is given:
+  `POST /auth/setup` with the token creates the user there and signs
+  nobody in.
+- At most 4 passwords are hashed or compared at a time. A sign-in, a
+  password change or a setup that comes while 4 are at it gets `429` at
+  once and does not count as a failed sign-in.
 - After 5 failed sign-ins for a name from one client address, that name is
   refused from that address for a minute (`429`), with the right password
   too. A wrong `current` in `PUT /auth/password` counts as one.

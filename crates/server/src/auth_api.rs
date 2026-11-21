@@ -10,6 +10,7 @@ use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::access::{ADMIN_ROLE, Scope};
 use crate::admin::{self, AdminState, Caller, Peer};
@@ -75,7 +76,7 @@ pub(crate) fn session(state: &AdminState, caller: &Caller, peer: Peer) -> Respon
             "creatable_groups": scope.creatable_groups(),
             "setup": setup,
             "setup_needs_code": needs_code,
-            "password_login": password_login(peer),
+            "password_login": peer.may_hold_session(),
             "oidc": false,
         }),
     )
@@ -87,7 +88,7 @@ pub(crate) async fn login(
     peer: Peer,
     request: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
-    if !password_login(peer) {
+    if !peer.may_hold_session() {
         return admin::error(
             StatusCode::FORBIDDEN,
             "signing in with a password needs HTTPS or a connection from this machine",
@@ -119,32 +120,53 @@ pub(crate) async fn login(
     }
 }
 
-/// `POST /auth/logout`: ends the session of the caller.
-pub(crate) fn logout(state: &AdminState, caller: &Caller, peer: Peer) -> Response<Full<Bytes>> {
-    if let Caller::User { name, session, .. } = caller {
-        state.sessions.end(session);
-        println!("Admin => {name} signed out from {}", client(peer));
+/// `POST /auth/logout`: ends the session the cookie names and makes the
+/// browser drop the cookie. For anyone: a session whose user was removed
+/// belongs to nobody and still has to end.
+pub(crate) fn logout<B>(
+    state: &AdminState,
+    request: &Request<B>,
+    peer: Peer,
+) -> Response<Full<Bytes>> {
+    if let Some(id) = session::cookie_of(request) {
+        // The rule of every cookie request that changes something.
+        if !admin::origin_is_host(request) {
+            return admin::error(StatusCode::FORBIDDEN, admin::COOKIE_NEEDS_ORIGIN);
+        }
+        if let Some(session) = state.sessions.get(id) {
+            state.sessions.end(id);
+            println!("Admin => {} signed out from {}", session.user, client(peer));
+        }
     }
-    no_content(session::expired_cookie(peer.tls))
+    no_content(Some(session::expired_cookie(peer.tls)))
 }
 
-/// `POST /auth/setup`: creates the first user, an administrator, and signs
-/// it in. Only while no user exists, and only for an administrator (the
-/// token, or a local request without a token) or for whoever sends the
-/// setup code where [`admin::code_opens_setup`] holds.
+/// `POST /auth/setup`: see [`create_first_user`].
 pub(crate) async fn setup(
     state: &Arc<AdminState>,
     caller: &Caller,
     peer: Peer,
     request: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
+    match admin::read_json(request).await {
+        Ok(body) => create_first_user(state, caller, peer, body).await,
+        Err(response) => *response,
+    }
+}
+
+/// Creates the first user, an administrator, and signs it in. Only while no
+/// user exists, and only for an administrator (the token, or a local
+/// request without a token) or for whoever sends the setup code where
+/// [`admin::code_opens_setup`] holds.
+async fn create_first_user(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    peer: Peer,
+    body: SetupBody,
+) -> Response<Full<Bytes>> {
     if !state.access.read().user.is_empty() {
         return admin::error(StatusCode::CONFLICT, SETUP_DONE);
     }
-    let body: SetupBody = match admin::read_json(request).await {
-        Ok(body) => body,
-        Err(response) => return *response,
-    };
     let has_code = admin::code_opens_setup(peer, state.token.is_some())
         && body.code.as_deref().is_some_and(|code| {
             aws_lc_rs::constant_time::verify_slices_are_equal(
@@ -165,10 +187,13 @@ pub(crate) async fn setup(
     };
 
     let SetupBody { name, password, .. } = body;
+    let permit = match hash_permit(state) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
     let created = {
         let (state, name) = (Arc::clone(state), name.clone());
-        // Hashing takes a quarter of a second: not on an async worker.
-        tokio::task::spawn_blocking(move || {
+        hashed(permit, move || {
             state.access.change(|access| {
                 // Checked again here, where no other change can interleave.
                 if !access.user.is_empty() {
@@ -189,10 +214,7 @@ pub(crate) async fn setup(
         }
         Ok(Err(message)) if message == SETUP_DONE => admin::error(StatusCode::CONFLICT, SETUP_DONE),
         Ok(Err(message)) => admin::error(StatusCode::BAD_REQUEST, &message),
-        Err(_) => admin::error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the user was not created",
-        ),
+        Err(response) => *response,
     }
 }
 
@@ -226,9 +248,13 @@ pub(crate) async fn password(
         }
         Err(response) => return *response,
     }
+    let permit = match hash_permit(state) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
     let changed = {
         let (state, name) = (Arc::clone(state), name.clone());
-        tokio::task::spawn_blocking(move || {
+        hashed(permit, move || {
             state
                 .access
                 .change(|access| access.set_password(&name, &new))
@@ -242,30 +268,58 @@ pub(crate) async fn password(
             signed_in(state, name, peer)
         }
         Ok(Err(message)) => admin::error(StatusCode::BAD_REQUEST, &message),
-        Err(_) => admin::error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the password was not changed",
-        ),
+        Err(response) => *response,
     }
 }
 
-/// Whether a session may start on this connection: a password and the
-/// cookie it buys do not travel in clear text over the network.
-fn password_login(peer: Peer) -> bool {
-    peer.tls || peer.local
+/// The right to hash or compare one password. `Err` with a `429` when as
+/// many as allowed are at it: the request is answered at once, without a
+/// hash and without a thread.
+fn hash_permit(state: &AdminState) -> Result<OwnedSemaphorePermit, Box<Response<Full<Bytes>>>> {
+    Arc::clone(&state.hashing).try_acquire_owned().map_err(|_| {
+        Box::new(admin::error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many passwords are being checked; try again in a moment",
+        ))
+    })
+}
+
+/// Runs `work`, which hashes or compares a password, off the async workers:
+/// bcrypt takes a quarter of a second. The permit is held until the work
+/// ends, also when the request that asked for it is gone. `Err` with a
+/// `500` when the work panicked.
+async fn hashed<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Box<Response<Full<Bytes>>>> {
+    let done = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await;
+    done.map_err(|err| {
+        eprintln!("Admin => A password was not checked: {err}");
+        Box::new(admin::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the password was not checked",
+        ))
+    })
 }
 
 /// Whether `password` is the one of user `name`. `Err` with a `429` while
-/// the name is locked out for this client. The attempt is counted as failed
-/// before the check, which takes long enough for many others to start, and
-/// forgotten when the password is right.
+/// the name is locked out for this client or too many passwords are being
+/// checked. The attempt is counted as failed before the check, which takes
+/// long enough for many others to start, and forgotten when the password is
+/// right.
 async fn check_password(
     state: &Arc<AdminState>,
     name: &str,
     password: String,
     peer: Peer,
 ) -> Result<bool, Box<Response<Full<Bytes>>>> {
-    if state.sessions.locked(name, peer.address) {
+    // First, so that a refusal for lack of a permit is not a failure.
+    let permit = hash_permit(state)?;
+    if !state.sessions.attempt(name, peer.address) {
         println!(
             "Admin => Sign-in as {name:?} refused from {}: too many failures",
             client(peer)
@@ -275,29 +329,32 @@ async fn check_password(
             "too many failed sign-ins for this name; try again in a minute",
         )));
     }
-    state.sessions.failed(name, peer.address);
     let access = state.access.read();
     let user = name.to_owned();
-    // bcrypt takes a quarter of a second: not on an async worker.
-    let right = tokio::task::spawn_blocking(move || access.verify(&user, &password))
-        .await
-        .unwrap_or(false);
+    let right = hashed(permit, move || access.verify(&user, &password)).await?;
     if right {
         state.sessions.forget(name, peer.address);
     }
     Ok(right)
 }
 
-/// `204` with the cookie of a new session of `name`.
+/// `204`, with the cookie of a new session of `name` where a session may
+/// be: the token on plain HTTP from another machine gets none, which would
+/// travel in clear text.
 fn signed_in(state: &AdminState, name: &str, peer: Peer) -> Response<Full<Bytes>> {
+    if !peer.may_hold_session() {
+        return no_content(None);
+    }
     let id = state.sessions.create(name, None);
-    no_content(session::cookie(&id, peer.tls))
+    no_content(Some(session::cookie(&id, peer.tls)))
 }
 
-fn no_content(cookie: HeaderValue) -> Response<Full<Bytes>> {
+fn no_content(cookie: Option<HeaderValue>) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::new()));
     *response.status_mut() = StatusCode::NO_CONTENT;
-    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    if let Some(cookie) = cookie {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
     response
 }
 
@@ -307,4 +364,183 @@ fn client(peer: Peer) -> String {
         || String::from("the unix socket"),
         |address| address.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::access::Access;
+    use crate::admin::tests::{LOCAL, REMOTE, state};
+
+    const TOKEN: &str = "0123456789abcdef";
+
+    /// Plain HTTP from another machine.
+    const PLAIN: Peer = Peer {
+        tls: false,
+        ..REMOTE
+    };
+
+    /// A daemon without users, and the directory of its users file.
+    fn daemon(token: Option<&str>) -> (Arc<AdminState>, TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let users = directory.path().join("users.toml");
+        (Arc::new(state(token, users)), directory)
+    }
+
+    fn body(code: Option<&str>) -> SetupBody {
+        SetupBody {
+            name: String::from("ana"),
+            password: String::from("password-ana"),
+            code: code.map(str::to_owned),
+        }
+    }
+
+    fn users(directory: &Path) -> Access {
+        Access::load(&directory.join("users.toml")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_setup_code_creates_the_first_administrator_over_tls() {
+        let (state, directory) = daemon(None);
+        let code = state.sessions.setup_code().to_owned();
+        let response = create_first_user(&state, &Caller::Nobody, REMOTE, body(Some(&code))).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.ends_with("; Secure"), "{cookie}");
+        let saved = users(directory.path());
+        assert_eq!(saved.user.len(), 1);
+        assert_eq!(saved.user[0].name, "ana");
+        assert_eq!(saved.user[0].roles, [ADMIN_ROLE]);
+        assert!(saved.verify("ana", "password-ana"));
+
+        // The code is of no use once a user exists.
+        let mut second = body(Some(&code));
+        second.name = String::from("eva");
+        let response = create_first_user(&state, &Caller::Nobody, REMOTE, second).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(users(directory.path()).user.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn setup_without_the_right_code_creates_nothing() {
+        let (open, directory) = daemon(None);
+        let code = open.sessions.setup_code().to_owned();
+        let almost = format!("{}x", &code[..code.len() - 1]);
+        for (peer, given) in [
+            (REMOTE, None),
+            (REMOTE, Some("")),
+            (REMOTE, Some(almost.as_str())),
+            (REMOTE, Some(&code[..9])),
+            // The right code, in clear text.
+            (PLAIN, Some(code.as_str())),
+        ] {
+            let response = create_first_user(&open, &Caller::Nobody, peer, body(given)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{given:?}");
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            assert!(users(directory.path()).user.is_empty(), "{given:?}");
+        }
+
+        // With a token the code opens nothing, and the token does.
+        let (closed, directory) = daemon(Some(TOKEN));
+        let code = closed.sessions.setup_code().to_owned();
+        let response = create_first_user(&closed, &Caller::Nobody, REMOTE, body(Some(&code))).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(users(directory.path()).user.is_empty());
+        let response = create_first_user(&closed, &Caller::Token, REMOTE, body(None)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(users(directory.path()).user.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_cookie_is_given_on_plain_http_from_another_machine() {
+        let (closed, directory) = daemon(Some(TOKEN));
+        let response = create_first_user(&closed, &Caller::Token, PLAIN, body(None)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(users(directory.path()).user.len(), 1, "the user is created");
+
+        let response = signed_in(&closed, "ana", PLAIN);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        for peer in [LOCAL, REMOTE] {
+            let response = signed_in(&closed, "ana", peer);
+            assert!(response.headers().contains_key(header::SET_COOKIE));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_four_passwords_are_checked_at_a_time() {
+        let (state, _directory) = daemon(None);
+        state
+            .access
+            .change(|access| access.add_user("ana", "password-ana", &[ADMIN_ROLE.to_owned()]))
+            .unwrap();
+        let check = async |password: &str| {
+            check_password(&state, "ana", password.to_owned(), REMOTE)
+                .await
+                .map_err(|response| response.status())
+        };
+
+        let busy = Arc::clone(&state.hashing)
+            .try_acquire_many_owned(4)
+            .unwrap();
+        // More than the failures that lock a name: none of these is one.
+        for _ in 0..8 {
+            assert_eq!(
+                check("password-ana").await,
+                Err(StatusCode::TOO_MANY_REQUESTS)
+            );
+        }
+        let response = create_first_user(&state, &Caller::Token, REMOTE, body(None)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "a user exists");
+
+        drop(busy);
+        assert_eq!(check("not-the-password").await, Ok(false));
+        assert_eq!(check("password-ana").await, Ok(true));
+        assert_eq!(state.hashing.available_permits(), 4, "each one is returned");
+
+        // A hash that panics is an error, not a wrong password.
+        let permit = hash_permit(&state).unwrap();
+        let failed = hashed(permit, || -> bool { panic!("as a broken hash would") }).await;
+        assert_eq!(
+            failed.map_err(|response| response.status()),
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(state.hashing.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn signing_out_ends_the_session_of_the_cookie_for_anyone() {
+        let (state, _directory) = daemon(None);
+        // No user `eva` in the file: the session is nobody's.
+        let id = state.sessions.create("eva", None);
+        let with = |origin: Option<&str>| {
+            let mut builder = Request::builder()
+                .header(header::HOST, "rxh.example:2019")
+                .header(header::COOKIE, format!("rxh_session={id}"));
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            builder.body(()).unwrap()
+        };
+        for origin in [None, Some("https://evil.example")] {
+            let response = logout(&state, &with(origin), REMOTE);
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin:?}");
+            assert!(state.sessions.get(&id).is_some(), "{origin:?}");
+        }
+        let response = logout(&state, &with(Some("https://rxh.example:2019")), REMOTE);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()[header::SET_COOKIE],
+            "rxh_session=; HttpOnly; SameSite=Strict; Path=/; Secure; Max-Age=0"
+        );
+        assert!(state.sessions.get(&id).is_none());
+
+        // Without a cookie there is nothing to end, and nothing to refuse.
+        let response = logout(&state, &Request::new(()), LOCAL);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
 }

@@ -83,7 +83,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
@@ -142,7 +142,7 @@ pub const ROUTES: &[(&str, &str, Audience)] = &[
     ("GET", "auth/session", Audience::Anyone),
     ("POST", "auth/login", Audience::Anyone),
     ("POST", "auth/setup", Audience::Anyone),
-    ("POST", "auth/logout", Audience::Caller),
+    ("POST", "auth/logout", Audience::Anyone),
     ("PUT", "auth/password", Audience::Caller),
     ("GET", "config", Audience::Admin),
     ("GET", "config/files", Audience::Admin),
@@ -218,6 +218,9 @@ pub(crate) struct AdminState {
     /// Held while a configuration file is saved and reloaded, so two saves
     /// do not write over each other.
     pub(crate) saving: tokio::sync::Mutex<()>,
+    /// One permit for each password that may be hashed or compared at a
+    /// time, see [`hashing_permits`].
+    pub(crate) hashing: Arc<Semaphore>,
     /// The users file, from `[admin] users`.
     pub(crate) access: Store,
     /// Who is signed in.
@@ -234,6 +237,25 @@ pub(crate) struct Peer {
     pub(crate) tls: bool,
     /// Address of a TCP peer.
     pub(crate) address: Option<IpAddr>,
+}
+
+impl Peer {
+    /// Whether a session may start or be used on this connection: over TLS
+    /// or from this machine. A password and the cookie it buys do not
+    /// travel in clear text over the network.
+    pub(crate) fn may_hold_session(self) -> bool {
+        self.tls || self.local
+    }
+}
+
+/// Passwords hashed or compared at a time for the requests of the admin
+/// API. bcrypt takes a quarter of a second of a processor, and anybody can
+/// ask for it by signing in.
+const MAX_HASHES: usize = 4;
+
+/// The permits of [`AdminState::hashing`].
+pub(crate) fn hashing_permits() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(MAX_HASHES))
 }
 
 /// First byte of a TLS connection: the record type of a handshake.
@@ -646,7 +668,7 @@ async fn handle(
         (&Method::POST, ["upgrade"]) => control(&state, Control::Upgrade, "upgraded").await,
         (&Method::GET, ["auth", "session"]) => auth_api::session(&state, &caller, peer),
         (&Method::POST, ["auth", "login"]) => auth_api::login(&state, peer, request).await,
-        (&Method::POST, ["auth", "logout"]) => auth_api::logout(&state, &caller, peer),
+        (&Method::POST, ["auth", "logout"]) => auth_api::logout(&state, &request, peer),
         (&Method::POST, ["auth", "setup"]) => auth_api::setup(&state, &caller, peer, request).await,
         (&Method::PUT, ["auth", "password"]) => {
             auth_api::password(&state, &caller, peer, request).await
@@ -714,14 +736,16 @@ impl Caller {
 /// Who sends `request`. The first that holds: the token, a session cookie,
 /// a local request when no token is configured, nobody. A session comes
 /// before the local rule, so a browser on the machine acts as its user; and
-/// a session whose user is no longer in the users file is nobody's.
+/// a session whose user is no longer in the users file is nobody's. A cookie
+/// counts only where a session may be, see [`Peer::may_hold_session`].
 fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
     if let Some(token) = &state.token
         && has_token(request, token)
     {
         return Caller::Token;
     }
-    if let Some(id) = session::cookie_of(request)
+    if peer.may_hold_session()
+        && let Some(id) = session::cookie_of(request)
         && let Some(session) = state.sessions.get(id)
     {
         let access = state.access.read();
@@ -780,18 +804,24 @@ fn gate<B>(
     caller: &Caller,
     audience: Audience,
 ) -> Option<Response<Full<Bytes>>> {
+    let reads = matches!(*request.method(), Method::GET | Method::HEAD);
+    // A browser sends the cookie by itself; `Origin` tells whose page
+    // asked. `SameSite=Strict` already keeps other sites out.
+    if matches!(caller, Caller::User { .. }) && !reads && !origin_is_host(request) {
+        return Some(error(StatusCode::FORBIDDEN, COOKIE_NEEDS_ORIGIN));
+    }
+    // A sign-in sent by the page of another site would sign the browser in
+    // as the account of that site's choice. `curl` sends no `Origin`.
+    let foreign = request.headers().contains_key(header::ORIGIN) && !origin_is_host(request);
+    if audience == Audience::Anyone && !reads && foreign {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "the Origin of this request is not its Host",
+        ));
+    }
     match caller {
         Caller::Token | Caller::Local => None,
         Caller::User { scope, .. } => {
-            // A browser sends the cookie by itself; `Origin` tells whose
-            // page asked. `SameSite=Strict` already keeps other sites out.
-            let reads = matches!(*request.method(), Method::GET | Method::HEAD);
-            if !reads && !origin_is_host(request) {
-                return Some(error(
-                    StatusCode::FORBIDDEN,
-                    "a request with a session cookie needs an Origin equal to its Host",
-                ));
-            }
             if audience == Audience::Admin && !scope.is_admin() {
                 return Some(error(StatusCode::FORBIDDEN, "this needs the admin role"));
             }
@@ -828,9 +858,14 @@ fn gate<B>(
     }
 }
 
+/// Answer to a request that changes something with a session cookie and
+/// without the `Origin` of a page of this API.
+pub(crate) const COOKIE_NEEDS_ORIGIN: &str =
+    "a request with a session cookie needs an Origin equal to its Host";
+
 /// True if the request has an `Origin` and it is the `Host` the request was
 /// sent to, port included: the page that sent it came from this API.
-fn origin_is_host<B>(request: &Request<B>) -> bool {
+pub(crate) fn origin_is_host<B>(request: &Request<B>) -> bool {
     let text = |name: header::HeaderName| {
         request
             .headers()
@@ -848,6 +883,13 @@ fn origin_is_host<B>(request: &Request<B>) -> bool {
 /// only without a token, whose holder is the one to create the user.
 pub(crate) fn code_opens_setup(peer: Peer, has_token: bool) -> bool {
     peer.tls && !has_token
+}
+
+/// Whether the daemon writes the setup code to its log when it starts: on
+/// a listener where the code can be used, see [`code_opens_setup`], and
+/// while there is no user.
+pub(crate) fn announces_setup_code(has_tls: bool, has_token: bool, has_user: bool) -> bool {
+    has_tls && !has_token && !has_user
 }
 
 /// Sends a request to the daemon loop and answers with its outcome:
@@ -1230,7 +1272,7 @@ pub(crate) fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
@@ -1318,7 +1360,7 @@ mod tests {
     }
 
     /// A connection from this machine.
-    const LOCAL: Peer = Peer {
+    pub(crate) const LOCAL: Peer = Peer {
         local: true,
         tls: false,
         address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -1384,7 +1426,7 @@ mod tests {
     }
 
     /// A TLS connection from another machine.
-    const REMOTE: Peer = Peer {
+    pub(crate) const REMOTE: Peer = Peer {
         local: false,
         tls: true,
         address: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8))),
@@ -1392,7 +1434,7 @@ mod tests {
 
     /// The state of a daemon that listens on every address, with the users
     /// file `users`.
-    fn state(token: Option<&str>, users: PathBuf) -> AdminState {
+    pub(crate) fn state(token: Option<&str>, users: PathBuf) -> AdminState {
         let config = Config::default();
         let registry = Registry::build(&config).unwrap();
         let (control, _) = mpsc::channel(1);
@@ -1409,6 +1451,7 @@ mod tests {
             }),
             control,
             saving: tokio::sync::Mutex::new(()),
+            hashing: hashing_permits(),
             access: Store::open(users),
             sessions: Sessions::new(),
         }
@@ -1505,6 +1548,83 @@ mod tests {
         assert!(caller(&with(None, Some(&carried)), &open, REMOTE).is_admin());
     }
 
+    #[tokio::test]
+    async fn a_sign_in_from_the_page_of_another_site_is_refused() {
+        let closed = state(Some("0123456789abcdef"), PathBuf::new());
+        let post = |origin: Option<&str>| {
+            let mut sent = request("rxh.example:2019", origin);
+            *sent.method_mut() = Method::POST;
+            sent
+        };
+        let answer = |sent: &Request<()>, caller: &Caller| {
+            gate(sent, &closed, REMOTE, caller, Audience::Anyone).map(|refused| refused.status())
+        };
+        for caller in [Caller::Nobody, Caller::Token] {
+            // `curl` sends no `Origin`, the page sends its own.
+            assert_eq!(answer(&post(None), &caller), None);
+            assert_eq!(
+                answer(&post(Some("https://rxh.example:2019")), &caller),
+                None
+            );
+            for origin in ["https://evil.example", "null", "https://rxh.example"] {
+                assert_eq!(
+                    answer(&post(Some(origin)), &caller),
+                    Some(StatusCode::FORBIDDEN),
+                    "{origin}"
+                );
+            }
+        }
+        // Reading the page and the session from anywhere changes nothing.
+        let read = request("rxh.example:2019", Some("https://evil.example"));
+        assert_eq!(answer(&read, &Caller::Nobody), None);
+    }
+
+    #[tokio::test]
+    async fn a_cookie_counts_only_over_tls_or_from_this_machine() {
+        let directory = tempfile::tempdir().unwrap();
+        let closed = state(
+            Some("0123456789abcdef"),
+            directory.path().join("users.toml"),
+        );
+        closed
+            .access
+            .change(|access| access.add_user("ana", "password-ana", &[String::from("admin")]))
+            .unwrap();
+        let id = closed.sessions.create("ana", None);
+        let sent = Request::builder()
+            .header(header::HOST, "rxh.example:2019")
+            .header(header::COOKIE, format!("rxh_session={id}"))
+            .body(())
+            .unwrap();
+        let plain = Peer {
+            tls: false,
+            ..REMOTE
+        };
+        assert!(!plain.may_hold_session());
+        assert!(matches!(caller(&sent, &closed, plain), Caller::Nobody));
+        assert!(matches!(
+            caller(&sent, &closed, REMOTE),
+            Caller::User { .. }
+        ));
+        assert!(matches!(caller(&sent, &closed, LOCAL), Caller::User { .. }));
+    }
+
+    #[test]
+    fn the_setup_code_is_logged_only_where_it_works_and_while_no_user_exists() {
+        for has_tls in [true, false] {
+            for has_token in [true, false] {
+                for has_user in [true, false] {
+                    assert_eq!(
+                        announces_setup_code(has_tls, has_token, has_user),
+                        has_tls && !has_token && !has_user,
+                        "tls {has_tls}, token {has_token}, user {has_user}"
+                    );
+                }
+            }
+        }
+        assert!(announces_setup_code(true, false, false));
+    }
+
     #[test]
     fn setup_with_code_needs_tls_and_no_token() {
         let plain = Peer {
@@ -1526,7 +1646,8 @@ mod tests {
         assert_eq!(of(Method::GET, "dashboard"), Audience::Anyone);
         assert_eq!(of(Method::GET, "auth/session"), Audience::Anyone);
         assert_eq!(of(Method::POST, "auth/login"), Audience::Anyone);
-        assert_eq!(of(Method::POST, "auth/logout"), Audience::Caller);
+        assert_eq!(of(Method::POST, "auth/logout"), Audience::Anyone);
+        assert_eq!(of(Method::PUT, "auth/password"), Audience::Caller);
         assert_eq!(of(Method::GET, "pools/api"), Audience::Admin);
         // Another method, a longer or shorter path, another spelling.
         for (method, path) in [
