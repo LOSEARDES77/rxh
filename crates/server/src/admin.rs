@@ -51,9 +51,12 @@
 //! Every request goes through one gate, which first works out who sends it
 //! (see [`Caller`]): the holder of `[admin] token`, a signed-in user, a
 //! local request when no token is set, or nobody. A request is local when
-//! its connection comes from this machine (see [`connection_is_local`]) and
-//! neither `Host` nor `Origin` is a name other than a loopback one, so web
-//! pages cannot reach the API through DNS rebinding. The gate then lets the
+//! its connection comes from this machine (see [`connection_is_local`]) to
+//! a listener on a unix socket or a loopback address (see
+//! [`trusts_position`]: on any other listener nobody is trusted for where
+//! it connects from), and neither `Host` nor `Origin` is a name other than
+//! a loopback one, so web pages cannot reach the API through DNS
+//! rebinding. The gate then lets the
 //! request through only when [`ROUTES`] says the route is for that caller:
 //! a route that is not listed there is for administrators.
 //!
@@ -84,7 +87,7 @@ use hyper::StatusCode;
 use hyper::body::Incoming;
 use hyper::header;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rxh_core::config::{AdminListen, Backend, Config};
 use rxh_core::pool::{BackendState, PoolError};
 use serde::{Deserialize, Serialize};
@@ -249,8 +252,11 @@ pub(crate) struct AdminState {
 /// Who is at the other end of a connection to the admin API.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Peer {
-    /// The connection comes from this machine: a unix socket, or a TCP peer
-    /// for which [`connection_is_local`] holds.
+    /// The connection is trusted for where it comes from: a unix socket, or
+    /// a TCP peer for which [`connection_is_local`] holds on a listener for
+    /// which [`trusts_position`] does. Always false on a TCP listener that
+    /// is not loopback, where a port forwarder can make every client look
+    /// like this machine.
     pub(crate) local: bool,
     /// The connection is encrypted.
     pub(crate) tls: bool,
@@ -260,8 +266,8 @@ pub(crate) struct Peer {
 
 impl Peer {
     /// Whether a session may start or be used on this connection: over TLS
-    /// or from this machine. A password and the cookie it buys do not
-    /// travel in clear text over the network.
+    /// or where [`Peer::local`] holds. A password and the cookie it buys do
+    /// not travel in clear text over the network.
     pub(crate) fn may_hold_session(self) -> bool {
         self.tls || self.local
     }
@@ -284,6 +290,11 @@ const TLS_HANDSHAKE: u8 = 0x16;
 /// finish the handshake, so a silent peer does not hold a task and a
 /// descriptor.
 const OPENING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time a connection has to send the head of each request, so one that
+/// sends nothing, or a byte now and then, does not hold a task and a
+/// descriptor for ever.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a TLS listener does with a connection, from its first byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,7 +486,8 @@ pub(crate) async fn serve(listener: Listener, state: Arc<AdminState>) {
                         tls: false,
                         address: None,
                     };
-                    tokio::task::spawn(serve_connection(stream, peer, Arc::clone(&state)));
+                    let state = Arc::clone(&state);
+                    tokio::task::spawn(serve_connection(stream, peer, state, HEADER_TIMEOUT));
                 }
             }
         }
@@ -492,37 +504,67 @@ fn connection_is_local(peer: IpAddr, local: IpAddr) -> bool {
     peer.is_loopback() || (peer == local.to_canonical() && !peer.is_unspecified())
 }
 
+/// True if a connection from this machine to the admin listener `listen` is
+/// trusted for that alone: a unix socket, or a loopback TCP address. On any
+/// other address, every address included, a port forwarder in front of a
+/// container can connect from the container's own address or from loopback
+/// for every remote client, so nobody is trusted by position there.
+fn trusts_position(listen: &AdminListen) -> bool {
+    match listen {
+        AdminListen::Tcp(listen) => listen.ip().to_canonical().is_loopback(),
+        AdminListen::Unix(_) => true,
+    }
+}
+
+/// The peer of a plain TCP connection from `address` to the listener
+/// `listen`, and whether the connection comes from this machine (`local` is
+/// its own address, `None` when it cannot be read: not from this machine).
+/// The second is about transport alone: it lets plain HTTP through on a TLS
+/// listener, and gives no trust unless [`trusts_position`] holds.
+fn tcp_peer(listen: &AdminListen, address: IpAddr, local: Option<IpAddr>) -> (Peer, bool) {
+    let from_machine = local.is_some_and(|local| connection_is_local(address, local));
+    let peer = Peer {
+        local: from_machine && trusts_position(listen),
+        tls: false,
+        address: Some(address),
+    };
+    (peer, from_machine)
+}
+
 /// Serves one TCP connection. On a TLS listener a connection that opens
 /// with a handshake is served over TLS, one from this machine that opens
 /// with anything else as plain HTTP, and any other is closed.
 async fn serve_tcp(stream: TcpStream, address: IpAddr, state: Arc<AdminState>) {
-    // A connection whose own address cannot be read is not local.
-    let local = stream
-        .local_addr()
-        .is_ok_and(|local| connection_is_local(address, local.ip()));
-    let peer = Peer {
-        local,
-        tls: false,
-        address: Some(address),
-    };
+    let local: Option<IpAddr> = stream.local_addr().ok().map(|local| local.ip());
+    let (peer, from_machine) = tcp_peer(&state.listen, address, local);
     let Some(acceptor) = state.tls.as_ref().map(|tls| tls.acceptor.clone()) else {
-        return serve_connection(stream, peer, state).await;
+        return serve_connection(stream, peer, state, HEADER_TIMEOUT).await;
     };
-    match open(stream, &acceptor, peer.local, OPENING_TIMEOUT).await {
+    match open(stream, &acceptor, from_machine, OPENING_TIMEOUT).await {
         Some(Opened::Tls(stream)) => {
-            serve_connection(stream, Peer { tls: true, ..peer }, state).await;
+            serve_connection(stream, Peer { tls: true, ..peer }, state, HEADER_TIMEOUT).await;
         }
-        Some(Opened::Plain(stream)) => serve_connection(stream, peer, state).await,
+        Some(Opened::Plain(stream)) => {
+            serve_connection(stream, peer, state, HEADER_TIMEOUT).await;
+        }
         None => {}
     }
 }
 
-async fn serve_connection<S>(stream: S, peer: Peer, state: Arc<AdminState>)
-where
+/// Serves the requests of one connection, each of which has
+/// `header_timeout` to send its head.
+async fn serve_connection<S>(
+    stream: S,
+    peer: Peer,
+    state: Arc<AdminState>,
+    header_timeout: Duration,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |request| handle(request, Arc::clone(&state), peer));
     let _ = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_timeout)
         .serve_connection(TokioIo::new(stream), service)
         .await;
 }
@@ -881,10 +923,12 @@ fn gate<B>(
                 return None;
             }
             if state.token.is_none() {
-                return Some(error(
-                    StatusCode::UNAUTHORIZED,
-                    "sign in to use the admin API",
-                ));
+                let message = if trusts_position(&state.listen) {
+                    "sign in to use the admin API"
+                } else {
+                    NEEDS_SIGN_IN_OR_TOKEN
+                };
+                return Some(error(StatusCode::UNAUTHORIZED, message));
             }
             let mut response = error(
                 StatusCode::UNAUTHORIZED,
@@ -898,6 +942,12 @@ fn gate<B>(
         }
     }
 }
+
+/// Answer to a caller without a session on a listener that is not loopback
+/// and has no token: what the `rxh` commands get there.
+const NEEDS_SIGN_IN_OR_TOKEN: &str = "sign in to use the admin API; on a listen address that is \
+     not loopback nobody is an administrator for where it connects from, and the rxh commands \
+     need [admin] token";
 
 /// Answer to a signed-in user who asks for what only administrators get.
 pub(crate) const NEEDS_ADMIN: &str = "this needs the admin role";
@@ -1264,9 +1314,9 @@ fn has_token<B>(request: &Request<B>, token: &str) -> bool {
 
 /// True if a request without a token comes from this machine and is not one
 /// a web page of another origin can send. The connection must be local, see
-/// [`Peer::local`]: headers say whatever the sender likes. `Host` must name a loopback host, or the address of a TCP
-/// listener: a page that reaches the API through DNS rebinding sends its own
-/// name. `Origin`, which browsers add to every request that can change
+/// [`Peer::local`]: headers say whatever the sender likes. `Host` must name
+/// a loopback host, or the address of a TCP listener: a page that reaches
+/// the API through DNS rebinding sends its own name. `Origin`, which browsers add to every request that can change
 /// something, must be that same `Host`: the port counts, so the page of
 /// another web server on this machine is refused. The comparison is with
 /// `Host` and not with the listen address because a tunnel to the API, or to
@@ -1593,6 +1643,146 @@ pub(crate) mod tests {
             !is_local_request(&Request::new(()), &wide, remote),
             "no Host"
         );
+    }
+
+    /// What every client is behind some port forwarders: plain HTTP to a
+    /// listener on every address, from the address it was accepted on.
+    pub(crate) fn forwarded() -> Peer {
+        let listen = AdminListen::Tcp("0.0.0.0:2019".parse().unwrap());
+        let own: IpAddr = "10.88.0.5".parse().unwrap();
+        tcp_peer(&listen, own, Some(own)).0
+    }
+
+    #[tokio::test]
+    async fn nobody_is_trusted_by_position_on_a_listener_that_is_not_loopback() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut open = state(None, directory.path().join("users.toml"));
+        open.access
+            .change(|access| access.add_user("ana", "password-ana", &[]))
+            .unwrap();
+        let hash = open.access.read().user[0].password.clone();
+        let id = open.sessions.create("ana", None, Some(&hash));
+        // The listener, the peer and the address the connection came to.
+        for (listen, address, local) in [
+            ("0.0.0.0:2019", "127.0.0.1", "127.0.0.1"),
+            ("0.0.0.0:2019", "10.88.0.5", "10.88.0.5"),
+            ("[::]:2019", "::1", "::1"),
+            ("[::]:2019", "::ffff:10.88.0.5", "::ffff:10.88.0.5"),
+            ("192.0.2.7:2019", "192.0.2.7", "192.0.2.7"),
+            ("192.0.2.7:2019", "127.0.0.1", "192.0.2.7"),
+        ] {
+            let case = format!("{address} to {local} on {listen}");
+            let listen = AdminListen::Tcp(listen.parse().unwrap());
+            let local: IpAddr = local.parse().unwrap();
+            let (peer, from_machine) = tcp_peer(&listen, address.parse().unwrap(), Some(local));
+            // Plain HTTP is still served, which is all the position gives.
+            assert!(from_machine, "{case}");
+            assert_eq!(Opening::of(b'G', from_machine), Opening::Plain, "{case}");
+            assert!(!peer.local, "{case}");
+            assert!(!peer.may_hold_session(), "{case}");
+
+            open.listen = listen;
+            for host in ["localhost:2019", "127.0.0.1:2019", "192.0.2.7:2019"] {
+                let sent = request(host, None);
+                assert!(!is_local_request(&sent, &open.listen, peer), "{case}");
+                let nobody = caller(&sent, &open, peer);
+                assert!(matches!(nobody, Caller::Nobody), "{case}");
+                let refused = gate(&sent, &open, peer, &nobody, Audience::Admin).unwrap();
+                assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{case}");
+                assert!(gate(&sent, &open, peer, &nobody, Audience::Anyone).is_none());
+            }
+            // A cookie counts over TLS only.
+            let signed_in = Request::builder()
+                .header(header::HOST, "localhost:2019")
+                .header(header::COOKIE, format!("rxh_session={id}"))
+                .body(())
+                .unwrap();
+            assert!(
+                matches!(caller(&signed_in, &open, peer), Caller::Nobody),
+                "{case}"
+            );
+            let over_tls = Peer { tls: true, ..peer };
+            assert!(
+                matches!(caller(&signed_in, &open, over_tls), Caller::User { .. }),
+                "{case}"
+            );
+            assert!(matches!(
+                caller(&request("localhost:2019", None), &open, over_tls),
+                Caller::Nobody
+            ));
+            assert!(code_opens_setup(over_tls, /* has_token= */ false));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loopback_or_unix_listener_trusts_this_machine() {
+        let mut open = state(None, PathBuf::new());
+        for (listen, address, local) in [
+            ("127.0.0.1:2019", "127.0.0.1", "127.0.0.1"),
+            ("127.0.0.2:2019", "127.0.0.1", "127.0.0.2"),
+            ("[::1]:2019", "::1", "::1"),
+            (
+                "[::ffff:127.0.0.1]:2019",
+                "::ffff:127.0.0.1",
+                "::ffff:127.0.0.1",
+            ),
+        ] {
+            let listen = AdminListen::Tcp(listen.parse().unwrap());
+            let local: IpAddr = local.parse().unwrap();
+            let (peer, from_machine) = tcp_peer(&listen, address.parse().unwrap(), Some(local));
+            assert!(from_machine && peer.local, "{address} on {listen}");
+            assert!(peer.may_hold_session());
+            open.listen = listen;
+            let sent = request("localhost:2019", None);
+            assert!(matches!(caller(&sent, &open, peer), Caller::Local));
+        }
+        assert!(trusts_position(&AdminListen::Unix(PathBuf::from(
+            "/run/rxh.sock"
+        ))));
+
+        // A connection whose own address cannot be read is not local, and
+        // neither is one from another machine: its plain HTTP is closed.
+        let loopback = AdminListen::Tcp("127.0.0.1:2019".parse().unwrap());
+        let (peer, from_machine) = tcp_peer(&loopback, "127.0.0.9".parse().unwrap(), None);
+        assert!(!from_machine && !peer.local);
+        let wide = AdminListen::Tcp("0.0.0.0:2019".parse().unwrap());
+        let own: IpAddr = "192.0.2.7".parse().unwrap();
+        let (peer, from_machine) = tcp_peer(&wide, "192.0.2.8".parse().unwrap(), Some(own));
+        assert!(!from_machine && !peer.local);
+        assert_eq!(Opening::of(b'G', from_machine), Opening::Closed);
+        assert_eq!(Opening::of(TLS_HANDSHAKE, from_machine), Opening::Tls);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_does_not_send_its_request_head_is_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = Arc::new(state(None, PathBuf::new()));
+        let serve = |timeout: Duration| {
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::task::spawn(serve_connection(server, LOCAL, Arc::clone(&state), timeout));
+            client
+        };
+        let mut answer = Vec::new();
+
+        // Half a request head, then nothing.
+        let mut slow = serve(Duration::from_millis(100));
+        slow.write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(10), slow.read_to_end(&mut answer));
+        closed.await.expect("closed in time").unwrap();
+        assert!(!answer.starts_with(b"HTTP/1.1 200"), "no request was sent");
+
+        // A whole one in time is answered.
+        let mut prompt = serve(Duration::from_secs(30));
+        prompt
+            .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        answer.clear();
+        prompt.read_to_end(&mut answer).await.unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 200"));
     }
 
     /// A TLS connection from another machine.
