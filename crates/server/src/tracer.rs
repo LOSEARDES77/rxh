@@ -14,6 +14,7 @@ use rxh_core::VERSION;
 use rxh_core::config::Tracing;
 use serde_json::{Value, json};
 
+use crate::admin_guard::AdminGuard;
 use crate::hooks::Webhook;
 
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
@@ -84,9 +85,9 @@ pub(crate) struct Tracer {
 
 impl Tracer {
     /// Prepares `settings`, which passed configuration validation.
-    pub(crate) fn new(settings: &Tracing) -> Self {
+    pub(crate) fn new(settings: &Tracing, guard: AdminGuard) -> Self {
         Self {
-            collector: Webhook::new(&settings.endpoint),
+            collector: Webhook::new(&settings.endpoint, guard),
             service_name: settings.service_name.clone(),
             sample_ratio: settings.sample_ratio,
             pending: Mutex::default(),
@@ -270,11 +271,14 @@ mod tests {
     const PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
     fn tracer(sample_ratio: f64) -> Tracer {
-        Tracer::new(&Tracing {
-            endpoint: String::from("http://127.0.0.1:4318/v1/traces"),
-            service_name: String::from("rxh"),
-            sample_ratio,
-        })
+        Tracer::new(
+            &Tracing {
+                endpoint: String::from("http://127.0.0.1:4318/v1/traces"),
+                service_name: String::from("rxh"),
+                sample_ratio,
+            },
+            AdminGuard::default(),
+        )
     }
 
     #[test]

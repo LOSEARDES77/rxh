@@ -3,6 +3,8 @@
 
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -26,6 +28,7 @@ use tokio_rustls::rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
 
+use crate::admin_guard::{self, AdminGuard};
 use crate::timeout::Timed;
 
 /// Transport under TLS, or used as is.
@@ -140,11 +143,13 @@ pub(crate) struct Dialer {
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
     tls: Option<Tls>,
+    guard: AdminGuard,
 }
 
 impl Dialer {
-    /// Dialer for `group`, loading its TLS files.
-    pub(crate) fn new(group: &UpstreamGroup) -> io::Result<Self> {
+    /// Dialer for `group`, loading its TLS files. It refuses the connections
+    /// that lead to the admin API `guard` stands for.
+    pub(crate) fn new(group: &UpstreamGroup, guard: AdminGuard) -> io::Result<Self> {
         let tls = if group.uses_tls() {
             let settings = group.tls.clone().unwrap_or_default();
             Some(Tls {
@@ -159,7 +164,13 @@ impl Dialer {
             read_timeout: group.read_timeout,
             write_timeout: group.write_timeout,
             tls,
+            guard,
         })
+    }
+
+    /// What this dialer keeps away from, for the other dialers of its pool.
+    pub(crate) fn guard(&self) -> &AdminGuard {
+        &self.guard
     }
 
     /// True when connections are wrapped in TLS.
@@ -194,12 +205,17 @@ impl Dialer {
 
         let (mut raw, host) = match parsed {
             BackendAddress::Tcp { host, port, .. } => {
-                let stream = TcpStream::connect((host.trim_matches(['[', ']']), port)).await?;
+                let stream = self
+                    .connect_tcp(host.trim_matches(['[', ']']), port)
+                    .await?;
                 stream.set_nodelay(true)?;
                 (Raw::Tcp(stream), host)
             }
             #[cfg(unix)]
             BackendAddress::Unix(path) => {
+                if self.guard.is_socket(Path::new(path)) {
+                    return Err(admin_guard::refused());
+                }
                 (Raw::Unix(UnixStream::connect(path).await?), "localhost")
             }
             #[cfg(not(unix))]
@@ -233,6 +249,43 @@ impl Dialer {
             .connect(name, raw)
             .await?;
         Ok(UpstreamStream::Tls(Box::new(stream)))
+    }
+
+    /// Connects to the first address of `host` that accepts, like
+    /// [`TcpStream::connect`], skipping those that are the guarded admin
+    /// API. Nothing is sent on a connection before it is known not to be.
+    async fn connect_tcp(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+        // Any other port, so nearly every connection, costs this comparison.
+        let Some(admin) = self.guard.tcp_on(port) else {
+            return TcpStream::connect((host, port)).await;
+        };
+        let mut last = None;
+        for address in tokio::net::lookup_host((host, port)).await? {
+            if admin_guard::targets_admin(address, None, admin) {
+                last = Some(admin_guard::refused());
+                continue;
+            }
+            match TcpStream::connect(address).await {
+                // Only a listener on every address is reached through an
+                // address not refused above.
+                Ok(stream) if !admin.ip().is_unspecified() => return Ok(stream),
+                // Whether an address belongs to this machine shows in the
+                // source the kernel picked.
+                Ok(stream) => match stream.local_addr() {
+                    Ok(local) if !admin_guard::targets_admin(address, Some(local.ip()), admin) => {
+                        return Ok(stream);
+                    }
+                    Ok(_) | Err(_) => last = Some(admin_guard::refused()),
+                },
+                Err(err) => last = Some(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any address",
+            )
+        }))
     }
 }
 
@@ -332,5 +385,51 @@ impl ServerCertVerifier for SkipVerify {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, SocketAddr, UdpSocket};
+
+    use rxh_core::config::{Admin, AdminListen};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// An address of this machine other than loopback, if it has one: the
+    /// source it would use for a public address. Sends nothing.
+    fn own_address() -> Option<IpAddr> {
+        let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        let address = socket.local_addr().ok()?.ip();
+        (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+    }
+
+    fn dialer(admin: SocketAddr) -> Dialer {
+        let guard = AdminGuard::new(&Admin {
+            listen: AdminListen::Tcp(admin),
+            ..Admin::default()
+        });
+        Dialer::new(&UpstreamGroup::default(), guard).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_address_of_this_machine_is_refused_for_an_admin_on_every_address() {
+        let Some(own) = own_address() else {
+            eprintln!("skipped: this machine has no address other than loopback");
+            return;
+        };
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = SocketAddr::new(own, port).to_string();
+
+        let everywhere = dialer(SocketAddr::from(([0, 0, 0, 0], port)));
+        let error = everywhere.dial(&target).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+
+        // An admin API on loopback alone is not behind that address.
+        let loopback = dialer(SocketAddr::from(([127, 0, 0, 1], port)));
+        loopback.dial(&target).await.unwrap();
     }
 }

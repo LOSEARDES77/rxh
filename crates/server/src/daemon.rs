@@ -15,7 +15,8 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use rxh_core::config::{
-    AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime, Tls,
+    Admin, AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime,
+    Tls,
 };
 use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
@@ -128,23 +129,31 @@ struct Generation {
     routes: Vec<Route>,
     /// Containers, instances and pools that are not routed, already logged.
     ignored: Vec<String>,
+    /// The `[admin]` table the admin API started with, which the upstream
+    /// connections are guarded against: a reload does not change it.
+    admin: Admin,
 }
 
 impl Generation {
     /// Starts `config` with routes to the Docker `containers`, and hands the
     /// new HTTP/3 connections of `endpoints` to it. Relative `[acme]` paths
-    /// are joined to `base`.
+    /// are joined to `base`. `admin` is the `[admin]` table in force.
     async fn start(
         config: Config,
         previous: Option<&Registry>,
         base: &Path,
         containers: Vec<Container>,
         endpoints: &Endpoints,
+        admin: &Admin,
     ) -> Result<Self, Error> {
         // What runs has the implicit HTTP to HTTPS redirect servers and the
         // Docker routes; what the admin API shows and edits is the
         // configuration as written.
-        let (effective, plan) = docker::plan(&config.with_https_redirects(), &containers);
+        let (mut effective, plan) = docker::plan(&config.with_https_redirects(), &containers);
+        // The admin API that listens is the one of the first configuration,
+        // whatever `[admin]` a reload brings: that is the one to keep the
+        // upstream connections away from.
+        effective.admin = admin.clone();
         let registry = Arc::new(Registry::build(&effective)?);
         // Docker members first, so they keep their drain state too.
         plan.sync(&registry);
@@ -194,6 +203,7 @@ impl Generation {
             containers,
             routes: plan.routes,
             ignored: plan.ignored,
+            admin: admin.clone(),
         })
     }
 
@@ -351,8 +361,15 @@ impl Daemon {
         let access = Store::open(PathBuf::from(&admin_settings.users));
         // QUIC sockets outlive generations, see `http3`.
         let endpoints = Endpoints::default();
-        let mut generation =
-            Generation::start(config, None, self.base_dir(), Vec::new(), &endpoints).await?;
+        let mut generation = Generation::start(
+            config,
+            None,
+            self.base_dir(),
+            Vec::new(),
+            &endpoints,
+            &admin_settings,
+        )
+        .await?;
 
         let (control, mut controls) = mpsc::channel(8);
         let admin_state = Arc::new(AdminState {
@@ -704,6 +721,7 @@ impl Daemon {
         if config.admin.listen != admin.listen || config.admin.token != admin.token {
             eprintln!("Main => [admin] changes take effect after a restart");
         }
+        let in_force = generation.admin.clone();
 
         let previous_registry = Arc::clone(&generation.registry);
         let started = Generation::start(
@@ -712,6 +730,7 @@ impl Daemon {
             self.base_dir(),
             containers.clone(),
             endpoints,
+            &in_force,
         )
         .await;
         let next = match started {
@@ -722,7 +741,7 @@ impl Daemon {
                 // configuration if the new one still fails.
                 let previous = Config::clone(&generation.config);
                 let previous_containers = generation.containers.clone();
-                let old = std::mem::replace(generation, placeholder(endpoints).await?);
+                let old = std::mem::replace(generation, placeholder(endpoints, &in_force).await?);
                 old.stop().await.map_err(|err| err.to_string())?;
                 let base = self.base_dir();
                 let started = Generation::start(
@@ -731,6 +750,7 @@ impl Daemon {
                     base,
                     containers,
                     endpoints,
+                    &in_force,
                 )
                 .await;
                 match started {
@@ -742,6 +762,7 @@ impl Daemon {
                             base,
                             previous_containers,
                             endpoints,
+                            &in_force,
                         )
                         .await
                         .map_err(|err| err.to_string())?;
@@ -786,13 +807,14 @@ fn http3_listeners(servers: &[ServerInfo]) -> Vec<Arc<http3::Listener>> {
 }
 
 /// Empty generation used while swapping.
-async fn placeholder(endpoints: &Endpoints) -> Result<Generation, String> {
+async fn placeholder(endpoints: &Endpoints, admin: &Admin) -> Result<Generation, String> {
     Generation::start(
         Config::default(),
         None,
         Path::new(""),
         Vec::new(),
         endpoints,
+        admin,
     )
     .await
     .map_err(|err| err.to_string())
@@ -1015,7 +1037,9 @@ forward = "@api"
         let daemon = Daemon::from_config(config);
         assert!(daemon.config_path().is_none());
         let endpoints = Endpoints::default();
-        let mut generation = placeholder(&endpoints).await.expect("generation");
+        let mut generation = placeholder(&endpoints, &Admin::default())
+            .await
+            .expect("generation");
         let admin = {
             let (control, _) = mpsc::channel(1);
             AdminState {

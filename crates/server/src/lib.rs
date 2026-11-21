@@ -8,6 +8,7 @@
 pub mod access;
 mod acme;
 mod admin;
+mod admin_guard;
 mod auth_api;
 mod catalog;
 mod change;

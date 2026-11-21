@@ -13,6 +13,7 @@ use rxh_core::config::{HealthHooks, UpstreamGroup, UpstreamTls};
 use serde::Serialize;
 use tokio::process::Command;
 
+use crate::admin_guard::AdminGuard;
 use crate::stream::Dialer;
 
 /// Limit for one command run or one webhook call.
@@ -52,8 +53,11 @@ pub(crate) struct Webhook {
 
 impl Hooks {
     /// Prepares `settings`, which passed configuration validation.
-    pub(crate) fn new(settings: &HealthHooks) -> Self {
-        let webhook = settings.webhook.as_deref().map(Webhook::new);
+    pub(crate) fn new(settings: &HealthHooks, guard: &AdminGuard) -> Self {
+        let webhook = settings
+            .webhook
+            .as_deref()
+            .map(|url| Webhook::new(url, guard.clone()));
         Self {
             command: settings.command.clone(),
             webhook,
@@ -111,7 +115,7 @@ impl Hooks {
 
 impl Webhook {
     /// Prepares `url`, which passed configuration validation.
-    pub(crate) fn new(url: &str) -> Self {
+    pub(crate) fn new(url: &str, guard: AdminGuard) -> Self {
         let uri: Uri = url.parse().expect("validated URL");
         let https = uri.scheme_str() == Some("https");
         let host = uri.host().expect("validated URL has a host");
@@ -123,7 +127,7 @@ impl Webhook {
         };
         Self {
             address: format!("{host}:{port}"),
-            dialer: Dialer::new(&group).expect("default TLS settings read no files"),
+            dialer: Dialer::new(&group, guard).expect("default TLS settings read no files"),
             uri,
         }
     }

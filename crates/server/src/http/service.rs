@@ -221,7 +221,10 @@ impl Site {
     ) -> Result<(), Error> {
         let by = server.name.clone().unwrap_or_else(|| local.to_string());
         let forward_auth = |settings: &Option<config::ForwardAuth>, label: &str| {
-            let built = settings.as_ref().map(ForwardAuth::new).transpose();
+            let built = settings
+                .as_ref()
+                .map(|settings| ForwardAuth::new(settings, registry.guard().clone()))
+                .transpose();
             built.map_err(|err| {
                 Error::Config(ConfigError::Invalid(format!("{label}forward_auth: {err}")))
             })

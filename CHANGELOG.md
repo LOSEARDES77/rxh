@@ -618,6 +618,20 @@ Changed.
   reported its shutdown while its sessions still held the socket. The
   sessions now end before the listener reports that it has stopped.
 
+### Security
+
+- Without `[admin] token` the proxy no longer connects to the admin API of
+  its own process. A request from the machine is an administrator there, so
+  a forward target, pool member, health check, mirror, `forward_auth`,
+  webhook or tracing endpoint that led to the admin API (its `listen`
+  address, a loopback address or a name resolving to one with the admin
+  port, an address of the machine when the API listens on `0.0.0.0` or
+  `::`, or the admin unix socket under any name) gave administrator access
+  to whoever reached that host. Such a connection is now refused like one
+  the backend refuses (`502`, failed member) and logged once a minute at
+  most. With a `token` nothing changes: the admin API can still be
+  published through a host.
+
 ## 0.2.0 (unreleased)
 
 RXH grows from an HTTP reverse proxy into a general reverse proxy and load

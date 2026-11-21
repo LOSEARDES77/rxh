@@ -394,10 +394,9 @@ impl Server {
                         Handler::Http {
                             routes: routes.into(),
                             http2: server.http2,
-                            tracer: config
-                                .tracing
-                                .as_ref()
-                                .map(|tracing| Arc::new(Tracer::new(tracing))),
+                            tracer: config.tracing.as_ref().map(|tracing| {
+                                Arc::new(Tracer::new(tracing, registry.guard().clone()))
+                            }),
                         }
                     }
                 };

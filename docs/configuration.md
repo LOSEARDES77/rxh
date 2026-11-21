@@ -550,6 +550,30 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
     machine forwards to the API.
   - A proxy on another machine, or a port forwarder that connects from
     another address (a published Docker port), makes every request remote.
+  - RXH itself is such a proxy, so without a `token` it does not connect to
+    its own admin API for anybody: a `forward`, pool member, health check,
+    mirror, `forward_auth`, webhook or tracing endpoint that leads there is
+    a backend that refuses connections (`502` for HTTP, a closed connection
+    for TCP, an unhealthy member), and the log says `refused to proxy to
+    the admin API of this process; set [admin] token to allow it` once a
+    minute at most. What counts is the address the connection goes to, not
+    how it is written: the `listen` address, any loopback address with the
+    admin port (a name that resolves to one too), any address of the
+    machine when `listen` is `0.0.0.0` or `::`, and the admin unix socket
+    under any name. Other ports and other machines are not concerned. With
+    a `token` the API can be published through a host, since every request
+    then needs the token or a session:
+
+    ```toml
+    [admin]
+    listen = "127.0.0.1:2019"
+    token = "kq3Zp0uX7mV9cR2tLw8yHs4d"
+
+    [[server]]
+    name = "admin"
+    listen = "0.0.0.0:8080"
+    forward = "127.0.0.1:2019"
+    ```
 - On a `tls` listener a connection has 10 seconds to send its first byte
   and finish the TLS handshake, then it is closed.
 - Without a token, on TCP and on a unix socket alike, a request from the
@@ -819,6 +843,11 @@ grant = [
 | Set any other key of a host, a value with an `{env.NAME}` or `{file.PATH}` placeholder, a unix socket as a forward target, or a new `listen` address | the `admin` role |
 | Delete a host | `view` and `delete` |
 | Anything else: pools, sections, whole files, certificates, `GET /config`, `/metrics`, reload, load, patch, upgrade, stop, users and roles | the `admin` role |
+
+A forward target is free text, so a user with `modify` may write the address
+of the admin API itself. Without `[admin] token` RXH refuses to connect
+there (see [`[admin]`](#admin)): such a host answers `502` and gives nobody
+the rights of a request from the machine.
 
 What a signed-in user without the `admin` role gets from each route
 (`401` when signed out, as on every route):

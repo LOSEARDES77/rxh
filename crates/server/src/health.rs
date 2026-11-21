@@ -32,7 +32,7 @@ pub(crate) async fn run(group: Arc<Group>) {
 
     // One worker per pool keeps hook runs in event order without delaying checks.
     let hooks = settings.hooks.as_ref().map(|hooks| {
-        let hooks = Hooks::new(hooks);
+        let hooks = Hooks::new(hooks, group.dialer.guard());
         let (sender, mut receiver) = mpsc::unbounded_channel::<Event>();
         tokio::task::spawn(async move {
             while let Some(event) = receiver.recv().await {
