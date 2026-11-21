@@ -49,6 +49,10 @@ pub(crate) struct Session {
     /// (OIDC). `None` for a local user, whose roles are read from the file
     /// on every request.
     pub(crate) roles: Option<Vec<String>>,
+    /// bcrypt hash of the password the user had in the users file at
+    /// sign-in. The session ends once the file holds another one, whoever
+    /// changed it. `None` for a session that carries its roles.
+    pub(crate) password: Option<String>,
 }
 
 /// Failed sign-ins of one name from one address.
@@ -87,10 +91,15 @@ impl Sessions {
         }
     }
 
-    /// Starts a session of `user` and returns its id: 32 random bytes in
-    /// base64url.
-    pub(crate) fn create(&self, user: &str, roles: Option<Vec<String>>) -> String {
-        self.create_at(user, roles, Instant::now())
+    /// Starts a session of `user`, whose password hash is `password`, and
+    /// returns its id: 32 random bytes in base64url.
+    pub(crate) fn create(
+        &self,
+        user: &str,
+        roles: Option<Vec<String>>,
+        password: Option<&str>,
+    ) -> String {
+        self.create_at(user, roles, password, Instant::now())
     }
 
     /// The session with this id, until it is 12 hours old.
@@ -139,7 +148,13 @@ impl Sessions {
         &self.setup_code
     }
 
-    fn create_at(&self, user: &str, roles: Option<Vec<String>>, now: Instant) -> String {
+    fn create_at(
+        &self,
+        user: &str,
+        roles: Option<Vec<String>>,
+        password: Option<&str>,
+        now: Instant,
+    ) -> String {
         use base64::Engine;
 
         let mut bytes = [0_u8; 32];
@@ -161,6 +176,7 @@ impl Sessions {
             user: user.to_owned(),
             created: now,
             roles,
+            password: password.map(str::to_owned),
         };
         tables.sessions.insert(id.clone(), session);
         id
@@ -291,7 +307,7 @@ mod tests {
     fn a_session_ends_after_twelve_hours() {
         let sessions = Sessions::new();
         let start = Instant::now();
-        let id = sessions.create_at("ana", None, start);
+        let id = sessions.create_at("ana", None, None, start);
         let almost = start + LIFETIME - Duration::from_secs(1);
         let session = sessions.get_at(&id, almost).expect("still valid");
         assert_eq!(session.user, "ana");
@@ -311,12 +327,12 @@ mod tests {
         let start = Instant::now();
         let second = Duration::from_secs(1);
         let ids: Vec<String> = (0..1000_u32)
-            .map(|index| sessions.create_at("ana", None, start + second * index))
+            .map(|index| sessions.create_at("ana", None, None, start + second * index))
             .collect();
         let now = start + second * 1000;
         assert!(sessions.get_at(&ids[0], now).is_some(), "a thousand fit");
 
-        let newest = sessions.create_at("luis", None, now);
+        let newest = sessions.create_at("luis", None, None, now);
         assert!(sessions.get_at(&ids[0], now).is_none(), "the oldest went");
         assert!(sessions.get_at(&ids[1], now).is_some());
         assert!(sessions.get_at(&newest, now).is_some());
@@ -324,15 +340,18 @@ mod tests {
 
         // Sessions that ended make room first.
         let later = start + LIFETIME + second * 500;
-        sessions.create_at("eva", None, later);
+        sessions.create_at("eva", None, None, later);
         assert_eq!(sessions.lock().sessions.len(), 501);
     }
 
     #[test]
     fn ending_a_user_ends_all_its_sessions_and_no_other() {
         let sessions = Sessions::new();
-        let (first, second) = (sessions.create("ana", None), sessions.create("ana", None));
-        let other = sessions.create("luis", Some(vec![String::from("web")]));
+        let (first, second) = (
+            sessions.create("ana", None, None),
+            sessions.create("ana", None, None),
+        );
+        let other = sessions.create("luis", Some(vec![String::from("web")]), None);
         sessions.end_user("ana");
         assert!(sessions.get(&first).is_none());
         assert!(sessions.get(&second).is_none());
@@ -430,7 +449,9 @@ mod tests {
     #[test]
     fn ids_are_43_base64url_characters_and_differ() {
         let sessions = Sessions::new();
-        let ids: HashSet<String> = (0..100).map(|_| sessions.create("ana", None)).collect();
+        let ids: HashSet<String> = (0..100)
+            .map(|_| sessions.create("ana", None, None))
+            .collect();
         assert_eq!(ids.len(), 100);
         for id in &ids {
             assert_eq!(id.len(), 43, "{id}");

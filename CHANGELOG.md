@@ -53,6 +53,12 @@ Changed.
   its reason, an unknown name `404`. Removing a user or setting its
   password ends its sessions, a role change applies to the next request,
   and every change is logged with who made it.
+- `rxh user list|add|passwd|rm` edits the accounts of `[admin] users`
+  directly, with or without a running daemon: the way back in when every
+  password is lost. The first user added gets the `admin` role; passwords
+  are asked twice without echo on a terminal, or read from standard input.
+  A password changed outside the daemon (`rxh user passwd`, a hand edit)
+  now ends the sessions of that user too.
 - Grants on hosts: a signed-in user without the `admin` role now reads and
   changes the hosts its roles reach. `GET /config/files` gives it the
   servers it has `view` on, the names of the pools and the revision of each

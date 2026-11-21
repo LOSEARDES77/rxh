@@ -625,7 +625,8 @@ request is the first of these that holds:
    administrator.
 2. The cookie of a session, over HTTPS or from the machine: that user,
    with the roles the users file gives the user at that moment. A user that
-   was removed from the file is nobody.
+   was removed from the file, or whose password in the file is not the one
+   it signed in with, is nobody, and the session ends.
 3. No `token` configured and a request from the machine (the rule above):
    an administrator. This is what `rxh status` and `curl` on the machine
    are.
@@ -754,6 +755,30 @@ answered:
 
 Anybody else gets `403`, and once a user exists everybody gets `409`: the
 code is of no use any more. There are no default credentials.
+
+#### From the command line
+
+`rxh user` edits the users file directly, with or without a running
+daemon, so it is also the way back in when every password is lost. It
+reads `[admin] users` from the configuration file (`-c`, default
+`rxh.toml`) and, like the daemon, takes a relative path from the working
+directory: run it where the daemon runs. The rules are the ones of the
+routes below, and their refusals are printed as they are.
+
+```sh
+rxh user add ana                    # the first user gets the admin role
+rxh user add luis --role web-editors --role shop
+rxh user list                       # "ana admin", "luis web-editors,shop"
+rxh user passwd ana
+rxh user rm luis                    # never the last administrator
+echo 'correct horse' | rxh user passwd ana
+```
+
+`add` and `passwd` ask the password twice, without showing it, on a
+terminal, and read one line of standard input otherwise. A new password
+written by `rxh user passwd`, by hand or by any other process ends the
+sessions of that user in a running daemon at their next request, as
+`PUT /users/{name}` does.
 
 #### Users and roles
 

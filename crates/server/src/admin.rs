@@ -769,8 +769,10 @@ impl Caller {
 /// Who sends `request`. The first that holds: the token, a session cookie,
 /// a local request when no token is configured, nobody. A session comes
 /// before the local rule, so a browser on the machine acts as its user; and
-/// a session whose user is no longer in the users file is nobody's. A cookie
-/// counts only where a session may be, see [`Peer::may_hold_session`].
+/// a session whose user is no longer in the users file, or has another
+/// password there now, is nobody's and ends: a password changed with
+/// `rxh user passwd` or by hand signs the user out too. A cookie counts only
+/// where a session may be, see [`Peer::may_hold_session`].
 fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
     if let Some(token) = &state.token
         && has_token(request, token)
@@ -788,7 +790,10 @@ fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
                 scope: access.scope(&roles),
                 session: id.to_owned(),
             },
-            None => Caller::Nobody,
+            None => {
+                state.sessions.end(id);
+                Caller::Nobody
+            }
         };
     }
     if state.token.is_none() && is_local_request(request, &state.listen, peer) {
@@ -798,14 +803,17 @@ fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
 }
 
 /// The roles of a session: its own when it carries them, else the ones its
-/// user has in the users file now. `None` when that user is not there.
+/// user has in the users file now. `None` when that user is not there, or
+/// has another password than at sign-in.
 pub(crate) fn roles(access: &Access, session: &Session) -> Option<Vec<String>> {
     match &session.roles {
         Some(roles) => Some(roles.clone()),
         None => access
             .user
             .iter()
-            .find(|user| user.name == session.user)
+            .find(|user| {
+                user.name == session.user && session.password.as_ref() == Some(&user.password)
+            })
             .map(|user| user.roles.clone()),
     }
 }
@@ -1664,7 +1672,8 @@ pub(crate) mod tests {
             .access
             .change(|access| access.add_user("luis", "password-luis", &[]))
             .unwrap();
-        let id = closed.sessions.create("luis", None);
+        let hash = closed.access.read().user[0].password.clone();
+        let id = closed.sessions.create("luis", None, Some(&hash));
         let bearer = Some("Bearer 0123456789abcdef");
         assert!(matches!(
             caller(&with(bearer, Some(&id)), &closed, REMOTE),
@@ -1687,7 +1696,7 @@ pub(crate) mod tests {
 
         // Without a token a session still comes before the local rule.
         let open = state(None, users);
-        let id = open.sessions.create("luis", None);
+        let id = open.sessions.create("luis", None, Some(&hash));
         assert!(matches!(
             caller(&with(None, Some(&id)), &open, LOCAL),
             Caller::User { .. }
@@ -1698,7 +1707,7 @@ pub(crate) mod tests {
         ));
         // A session of a user that is not in the file is nobody's, also on
         // the machine.
-        let gone = open.sessions.create("eva", None);
+        let gone = open.sessions.create("eva", None, None);
         assert!(matches!(
             caller(&with(None, Some(&gone)), &open, LOCAL),
             Caller::Nobody
@@ -1706,8 +1715,37 @@ pub(crate) mod tests {
         // Roles a session carries need no user in the file.
         let carried = open
             .sessions
-            .create("eva", Some(vec![String::from("admin")]));
+            .create("eva", Some(vec![String::from("admin")]), None);
         assert!(caller(&with(None, Some(&carried)), &open, REMOTE).is_admin());
+    }
+
+    #[tokio::test]
+    async fn a_password_changed_outside_the_daemon_ends_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let users = directory.path().join("users.toml");
+        let closed = state(Some("0123456789abcdef"), users.clone());
+        closed
+            .access
+            .change(|access| access.add_user("luis", "password-luis", &[]))
+            .unwrap();
+        let hash = closed.access.read().user[0].password.clone();
+        let id = closed.sessions.create("luis", None, Some(&hash));
+        let sent = Request::builder()
+            .header(header::HOST, "localhost:2019")
+            .header(header::COOKIE, format!("rxh_session={id}"))
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            caller(&sent, &closed, REMOTE),
+            Caller::User { .. }
+        ));
+
+        // Another process, `rxh user passwd` say, writes the file.
+        Store::open(users)
+            .change(|access| access.set_password("luis", "another-password"))
+            .unwrap();
+        assert!(matches!(caller(&sent, &closed, REMOTE), Caller::Nobody));
+        assert!(closed.sessions.get(&id).is_none(), "the session ended");
     }
 
     #[tokio::test]
@@ -1752,7 +1790,8 @@ pub(crate) mod tests {
             .access
             .change(|access| access.add_user("ana", "password-ana", &[String::from("admin")]))
             .unwrap();
-        let id = closed.sessions.create("ana", None);
+        let hash = closed.access.read().user[0].password.clone();
+        let id = closed.sessions.create("ana", None, Some(&hash));
         let sent = Request::builder()
             .header(header::HOST, "rxh.example:2019")
             .header(header::COOKIE, format!("rxh_session={id}"))

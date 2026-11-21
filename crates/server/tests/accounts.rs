@@ -435,7 +435,8 @@ async fn a_session_cookie_identifies_the_user() {
     assert_eq!(json["error"], NEEDS_ADMIN);
 
     // The roles are read on every request: a change applies to the session.
-    let mut promoted = accounts();
+    // From the file on disk: new hashes would be new passwords, which end it.
+    let mut promoted = accounts_on_disk(&closed);
     promoted.user[1].roles = vec!["admin".to_owned()];
     promoted.save(&closed.users).expect("save");
     util::eventually(async || session().await["admin"] == true).await;
@@ -446,7 +447,7 @@ async fn a_session_cookie_identifies_the_user() {
     assert_eq!(status, StatusCode::OK, "{json}");
 
     // A session of a user that was removed is nobody's.
-    let mut removed = accounts();
+    let mut removed = accounts_on_disk(&closed);
     removed.user.truncate(1);
     removed.save(&closed.users).expect("save");
     util::eventually(async || session().await["user"] == Value::Null).await;

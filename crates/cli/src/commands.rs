@@ -52,6 +52,7 @@ pub(crate) async fn execute(cli: &Cli, command: Command) -> Result<(), String> {
         | Command::FileServer { .. }
         | Command::ReverseProxy { .. }
         | Command::HashPassword
+        | Command::User(_)
         | Command::Fmt { .. }
         | Command::Adapt { .. }
         | Command::Schema

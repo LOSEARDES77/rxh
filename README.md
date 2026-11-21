@@ -248,6 +248,7 @@ and [layer 4 (TCP and UDP)](docs/guides/layer4.md).
 | `rxh cert reload` | Read the certificate files again now (the daemon also does it within seconds of a change). |
 | `rxh policies` | List load balancing policies. |
 | `rxh hash-password` | Hash the password read from standard input, for `basic_auth` users. |
+| `rxh user list\|add\|passwd\|rm` | Manage admin API accounts in `[admin] users`, with or without a daemon: the way back in when every password is lost. |
 
 Global flags: `-c/--config` (`RXH_CONFIG`), `--admin` (`RXH_ADMIN`),
 `--pid-file`.

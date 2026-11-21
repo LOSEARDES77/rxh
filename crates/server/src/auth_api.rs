@@ -692,7 +692,7 @@ fn signed_in_with(
     if !peer.may_hold_session() {
         return holds(&state.access.read(), name, hash).then(|| no_content(None));
     }
-    let id = state.sessions.create(name, None);
+    let id = state.sessions.create(name, None, Some(hash));
     if !holds(&state.access.read(), name, hash) {
         state.sessions.end(&id);
         return None;
@@ -707,7 +707,8 @@ fn signed_in(state: &AdminState, name: &str, peer: Peer) -> Response<Full<Bytes>
     if !peer.may_hold_session() {
         return no_content(None);
     }
-    let id = state.sessions.create(name, None);
+    let hash = stored_hash(&state.access.read(), name).map(str::to_owned);
+    let id = state.sessions.create(name, None, hash.as_deref());
     no_content(Some(session::cookie(&id, peer.tls)))
 }
 
@@ -914,7 +915,8 @@ mod tests {
 
         // Password change: the password and the sessions stay.
         let (state, directory) = daemon_with_ana();
-        let session = state.sessions.create("ana", None);
+        let hash = stored_hash(&state.access.read(), "ana").unwrap().to_owned();
+        let session = state.sessions.create("ana", None, Some(&hash));
         let ana = Caller::User {
             name: String::from("ana"),
             scope: Scope::Admin,
@@ -1063,7 +1065,7 @@ mod tests {
     async fn signing_out_ends_the_session_of_the_cookie_for_anyone() {
         let (state, _directory) = daemon(None);
         // No user `eva` in the file: the session is nobody's.
-        let id = state.sessions.create("eva", None);
+        let id = state.sessions.create("eva", None, None);
         let with = |origin: Option<&str>| {
             let mut builder = Request::builder()
                 .header(header::HOST, "rxh.example:2019")

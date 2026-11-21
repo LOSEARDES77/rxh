@@ -148,6 +148,11 @@ pub(crate) enum Command {
     /// Hash the password read from standard input, for `basic_auth` users.
     HashPassword,
 
+    /// Manage the accounts of the admin API in the users file, with or
+    /// without a running daemon.
+    #[command(subcommand)]
+    User(UserCommand),
+
     /// Print the shell completion script for SHELL to standard output.
     Completions {
         /// Shell to complete for.
@@ -208,6 +213,39 @@ pub(crate) enum Command {
         /// Only answer requests for this host name (http only).
         #[arg(long, value_name = "NAME")]
         host: Option<String>,
+    },
+}
+
+/// Commands on `[admin] users`. A password is asked twice on a terminal,
+/// or read as one line from standard input.
+#[derive(Debug, Subcommand)]
+pub(crate) enum UserCommand {
+    /// List the users with their roles.
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Add a user. The first user of the file is an administrator.
+    Add {
+        /// User name.
+        name: String,
+
+        /// Role, repeatable. Defaults to `admin` for the first user, else
+        /// none.
+        #[arg(short, long = "role", value_name = "ROLE")]
+        roles: Vec<String>,
+    },
+
+    /// Set the password of a user. Ends its sessions in a running daemon.
+    Passwd {
+        /// User name.
+        name: String,
+    },
+
+    /// Remove a user. The last administrator cannot be removed.
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// User name.
+        name: String,
     },
 }
 
