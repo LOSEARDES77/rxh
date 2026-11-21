@@ -599,7 +599,8 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   ```
 - `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are
   served without the token: the page and its script and style
-  hold no data. The page asks for the token and sends it on its requests.
+  hold no data. The page asks who it is, shows a sign-in form to nobody, and
+  sends the cookie of the session or the token on its requests.
   So are `GET /auth/session`, `POST /auth/login`, `POST /auth/logout` and
   `POST /auth/setup`, the way in and out for [accounts](#accounts).
 - Without `tls` the admin API speaks plain HTTP: the token is as private as
@@ -1055,12 +1056,45 @@ Five tabs:
 
 On a remote host, tunnel the admin address
 (`ssh -L 2019:127.0.0.1:2019 host`) and open the same URL. With `token`
-set, the page asks for the token once per browser tab, keeps it in
-`sessionStorage` (gone when the tab is closed) and sends it on its requests;
-a wrong token is asked again. The admin API is plain HTTP: the token and
-everything the page saves cross the network as sent, so keep the tunnel. A
-browser cannot open a unix socket: forward it to a local port
+set, the page shows its sign-in form; "Use the admin token" there asks for
+the token once per browser tab, keeps it in `sessionStorage` (gone when the
+tab is closed) and sends it on its requests; a wrong token is asked again.
+Without `tls` the admin API is plain HTTP: the token and everything the
+page saves cross the network as sent, so keep the tunnel. A browser cannot
+open a unix socket: forward it to a local port
 (`ssh -L 2019:/run/rxh/admin.sock host`).
+
+The page and [accounts](#accounts):
+
+- It reads `GET /auth/session` when it opens. A caller that is nobody (no
+  session, and no token or request from the machine that makes it an
+  administrator) gets the sign-in form and nothing else: name and
+  password, or the token where `password_login` is `false`. The password
+  is sent to `POST /auth/login` and kept nowhere; signing in with a
+  password drops a token kept for the tab, which would outrank the session.
+- While no user exists (`setup`), a caller that may create the first one
+  gets the form for it, with a "Setup code" field when `setup_needs_code`
+  says so. An administrator (the machine without a token, or the token)
+  can answer "Not now": the choice is kept in the `localStorage` of the
+  browser and the API works without accounts as before.
+- A signed-in user has its name, "Change password" (`PUT /auth/password`)
+  and "Sign out" in the header. A caller that is an administrator without
+  being a user, as a browser of the machine is by default, has none of
+  them and sees no form.
+- Without the `admin` role the page has the Overview and Hosts tabs. The
+  overview shows the servers the user views, without pools and
+  certificates. Hosts lists them with their groups, and follows the
+  `permissions` of each: "Edit" with `modify`, "View" (a form that takes
+  no input, without the TOML view) otherwise, "Delete" with `delete`, and
+  "New host" for a user with a group to create in, whose form starts with
+  the first of its `creatable_groups` in `groups`. The paths of the files
+  are not shown. What the daemon refuses, a key the user may not set for
+  example, is shown next to the form with the path of the key, and the
+  form keeps what was typed.
+- A session ends after 12 hours, or when the password of the user changes:
+  the next call is answered `401` and the sign-in form comes over the
+  page. An open form stays behind it with what was typed, to be saved
+  after signing in.
 
 Differences from the design of the page
 ([`docs/superpowers/specs/2026-11-20-webui-design.md`](superpowers/specs/2026-11-20-webui-design.md)):

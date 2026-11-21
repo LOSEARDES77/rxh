@@ -1,3 +1,5 @@
+import type { Permission } from "./session";
+
 /** A node of the configuration JSON schema (`GET schema`), as schemars writes it. */
 export type Node = {
   $ref?: string;
@@ -26,12 +28,17 @@ export type Entity = {
   file: number;
   value: Record<string, unknown>;
   toml: string;
+  /** Of a server: what the caller may do with it. */
+  permissions?: Permission[];
 };
 
-/** The answer of `GET config/files`. */
+/**
+ * The answer of `GET config/files`. Without the `admin` role a file has no
+ * `path` and no `text`, and a pool is its `kind` and `key` only.
+ */
 export type Files = {
   editable: boolean;
-  files: { index: number; path: string; revision: string; text: string }[];
+  files: { index: number; path?: string; revision: string; text?: string }[];
   entities: Entity[];
 };
 

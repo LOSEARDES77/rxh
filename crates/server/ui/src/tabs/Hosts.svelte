@@ -4,6 +4,7 @@
   import EntityEditor from "../lib/EntityEditor.svelte";
   import { poll } from "../lib/poll";
   import { isTable, type Entity, type Files, type Schema } from "../lib/schema";
+  import { can, session } from "../lib/session";
 
   type Live = { listen: string; protocol: string; name: string | null; state: string };
 
@@ -15,8 +16,16 @@
   // Of the last change asked for: it stays until the next one.
   let refused = $state("");
   let notice = $state("");
-  let editing: Entity | { kind: "server"; file: number } | undefined = $state.raw();
+  let editing:
+    | Entity
+    | { kind: "server"; file: number; initial?: Record<string, unknown> }
+    | undefined = $state.raw();
   let file = $state(0);
+
+  // Alone, as in a test, the tab is an administrator's: the page draws it once it knows who asks.
+  const admin = $derived($session?.admin ?? true);
+  // A user creates a host only in a group a role lets it create in.
+  const creatable = $derived($session?.creatable_groups ?? []);
 
   const entities = $derived(files?.entities ?? []);
   const hosts = $derived(
@@ -130,9 +139,14 @@
     refresh();
   }
 
+  function create() {
+    // An administrator starts from nothing; anybody else needs a group, and the first is a start.
+    open({ kind: "server", file, ...(admin ? {} : { initial: { groups: creatable.slice(0, 1) } }) });
+  }
+
   async function remove(entity: Entity) {
     const path = fileOf(entity.file)?.path;
-    if (!confirm(`Delete host ${title(entity.value)} from ${path}?`)) return;
+    if (!confirm(`Delete host ${title(entity.value)}${path ? ` from ${path}` : ""}?`)) return;
     notice = "";
     refused = "";
     // The revision is that of the list on screen: if the file changed since,
@@ -186,21 +200,19 @@
     />
   {/key}
 {:else}
-  {#if files?.editable}
+  {#if files?.editable && (admin || creatable.length > 0)}
     <div class="toolbar">
-      <button type="button" class="button" onclick={() => open({ kind: "server", file })}>
-        New host
-      </button>
+      <button type="button" class="button" onclick={create}>New host</button>
       {#if files.files.length > 1}
         <label for="host-file">in file</label>
         <select id="host-file" aria-label="File of a new host" bind:value={file}>
           {#each files.files as other (other.index)}
-            <option value={other.index}>{other.path}</option>
+            <option value={other.index}>{other.path ?? `file ${other.index + 1}`}</option>
           {/each}
         </select>
       {/if}
     </div>
-  {:else if files}
+  {:else if files && !files.editable}
     <p class="notice">No configuration file: read only</p>
   {/if}
 
@@ -210,6 +222,7 @@
         <tr>
           <th scope="col">Name</th>
           <th scope="col">Host names</th>
+          <th scope="col">Groups</th>
           <th scope="col">Listen</th>
           <th scope="col">Protocol</th>
           <th scope="col">Target</th>
@@ -223,9 +236,11 @@
         {#each hosts as host (host.entity.key)}
           {@const { entity, value } = host}
           {@const text = stateOf(host)}
+          {@const verb = can(entity, "modify") ? "Edit" : "View"}
           <tr>
             <th scope="row">{value.name ?? "—"}</th>
             <td>{list(value.host).join(", ") || "any"}</td>
+            <td>{list(value.groups).join(", ") || "—"}</td>
             <td><code>{list(value.listen).join(", ")}</code></td>
             <td>{value.protocol ?? "http"}</td>
             <td>{target(value)}</td>
@@ -243,19 +258,21 @@
               <button
                 type="button"
                 class="button"
-                aria-label="Edit {title(value)}"
+                aria-label="{verb} {title(value)}"
                 onclick={() => open(entity)}
               >
-                Edit
+                {verb}
               </button>
-              <button
-                type="button"
-                class="button danger"
-                aria-label="Delete {title(value)}"
-                onclick={() => remove(entity)}
-              >
-                Delete
-              </button>
+              {#if can(entity, "delete")}
+                <button
+                  type="button"
+                  class="button danger"
+                  aria-label="Delete {title(value)}"
+                  onclick={() => remove(entity)}
+                >
+                  Delete
+                </button>
+              {/if}
             </td>
           </tr>
         {/each}
@@ -264,6 +281,7 @@
             <th scope="row">{server.name ?? "—"}</th>
             <td>—</td>
             <td><code>{server.listen}</code></td>
+            <td>—</td>
             <td>{server.protocol}</td>
             <td>—</td>
             <td>—</td>
@@ -286,7 +304,7 @@
           </tr>
         {/each}
         {#if files && hosts.length + others.length === 0}
-          <tr><td colspan="9" class="muted">No host.</td></tr>
+          <tr><td colspan="10" class="muted">No host.</td></tr>
         {/if}
       </tbody>
     </table>

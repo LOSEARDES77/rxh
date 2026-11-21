@@ -158,7 +158,7 @@
       <h2 id="acme-title">ACME</h2>
       <code class="muted">[acme]</code>
       {#if files}
-        <span class="badge">{acme ? fileOf(acme.file)?.path.split("/").pop() : "not set"}</span>
+        <span class="badge">{acme ? fileOf(acme.file)?.path?.split("/").pop() : "not set"}</span>
       {/if}
       {#if files?.editable}
         <button

@@ -62,3 +62,8 @@ test("a_401_asks_for_the_token_and_rejects", async () => {
   setToken("fresh");
   expect(get(needsToken)).toBe(false);
 });
+
+test("an_answer_without_a_body_is_not_parsed", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+  await expect(api("auth/logout", { method: "POST" })).resolves.toBeUndefined();
+});

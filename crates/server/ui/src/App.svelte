@@ -1,15 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, needsToken, setToken, stopped } from "./lib/api";
+  import { api, loadWithToken, needsToken, stopped } from "./lib/api";
+  import { refresh as readSession, session, signedIn, signOut } from "./lib/session";
+  import SignIn from "./lib/SignIn.svelte";
   import Certificates from "./tabs/Certificates.svelte";
   import Hosts from "./tabs/Hosts.svelte";
   import Overview from "./tabs/Overview.svelte";
   import Pools from "./tabs/Pools.svelte";
   import Settings from "./tabs/Settings.svelte";
 
-  type Status = { version: string; uptime_seconds: number; config_path: string | null };
+  // Without the `admin` role the daemon does not say where its configuration is.
+  type Status = { version: string; uptime_seconds: number; config_path?: string | null };
 
-  const tabs = [
+  const SKIPPED_KEY = "rxh-setup-skipped";
+
+  const all = [
     { id: "overview", label: "Overview", component: Overview },
     { id: "hosts", label: "Hosts", component: Hosts },
     { id: "pools", label: "Pools", component: Pools },
@@ -17,25 +22,57 @@
     { id: "settings", label: "Settings", component: Settings },
   ];
 
-  function tabOfHash(): number {
-    return Math.max(0, tabs.findIndex((tab) => `#${tab.id}` === location.hash));
-  }
-
-  let selected = $state(tabOfHash());
+  // The other tabs read what only an administrator is answered.
+  const tabs = $derived($session?.admin ? all : all.slice(0, 2));
+  let hash = $state(location.hash);
+  const selected = $derived(Math.max(0, tabs.findIndex((tab) => `#${tab.id}` === hash)));
   const Current = $derived(tabs[selected].component);
   let status: Status | undefined = $state();
   let failure = $state("");
-  let token = $state("");
+  let changing = $state(false);
+  let skipped = $state(localStorage.getItem(SKIPPED_KEY) !== null);
   let dialog: HTMLDialogElement;
+
+  // The first user can be created by this caller, who has not said "not now".
+  const firstRun = $derived(
+    $session !== undefined && $session.setup && ($session.admin || $session.setup_needs_code) && !skipped,
+  );
+  // The form the page asks for, over whatever is open: a 401 comes at any time.
+  const form = $derived.by(() => {
+    if (firstRun && !$needsToken) return "setup";
+    if ($needsToken || ($session !== undefined && !signedIn($session))) return "sign-in";
+    return changing ? "password" : undefined;
+  });
+  // The API answers an administrator without accounts, and a password can stay as it is.
+  const leavable = $derived(form === "password" || (form === "setup" && $session?.admin));
 
   async function refresh() {
     if ($stopped) return;
     try {
-      status = await api<Status>("status");
+      if (!$session) await readSession();
+      status = signedIn($session) ? await api<Status>("status") : undefined;
       failure = "";
     } catch (err) {
       failure = err instanceof Error ? err.message : String(err);
     }
+  }
+
+  async function leave() {
+    try {
+      await signOut();
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    refresh();
+  }
+
+  function dismiss() {
+    if (!leavable) return;
+    if (form === "setup") {
+      skipped = true;
+      localStorage.setItem(SKIPPED_KEY, "1");
+    }
+    changing = false;
   }
 
   function uptime(seconds: number): string {
@@ -65,26 +102,23 @@
     document.getElementById(`tab-${tabs[next].id}`)?.focus();
   }
 
-  function submitToken(event: SubmitEvent) {
-    event.preventDefault();
-    setToken(token);
-    token = "";
-    refresh();
-  }
-
   $effect(() => {
-    if ($needsToken && !dialog.open) dialog.showModal();
-    if (!$needsToken && dialog.open) dialog.close();
+    if (form && !dialog.open) dialog.showModal();
+    if (!form && dialog.open) dialog.close();
   });
 
   onMount(() => {
-    refresh();
+    // Now, and again as soon as somebody signs in.
+    const forget = loadWithToken(refresh);
     const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
+    return () => {
+      forget();
+      clearInterval(timer);
+    };
   });
 </script>
 
-<svelte:window onhashchange={() => (selected = tabOfHash())} />
+<svelte:window onhashchange={() => (hash = location.hash)} />
 
 <header>
   <h1>RXH</h1>
@@ -92,11 +126,20 @@
     <dl>
       <div><dt>Version</dt><dd>{status.version}</dd></div>
       <div><dt>Uptime</dt><dd>{uptime(status.uptime_seconds)}</dd></div>
-      <div><dt>Configuration</dt><dd><code>{status.config_path ?? "none"}</code></dd></div>
+      {#if status.config_path !== undefined}
+        <div><dt>Configuration</dt><dd><code>{status.config_path ?? "none"}</code></dd></div>
+      {/if}
     </dl>
   {/if}
   {#if failure && !$stopped}
     <p class="failure" role="alert">{failure}</p>
+  {/if}
+  {#if $session?.user}
+    <div class="user">
+      <span>{$session.user}</span>
+      <button type="button" class="button" onclick={() => (changing = true)}>Change password</button>
+      <button type="button" class="button" onclick={leave}>Sign out</button>
+    </div>
   {/if}
 </header>
 
@@ -108,7 +151,7 @@
       on its machine, then reload this page.
     </p>
   </main>
-{:else}
+{:else if signedIn($session)}
   <div class="tabs" role="tablist" aria-label="Sections">
     {#each tabs as tab, index (tab.id)}
       <button
@@ -131,20 +174,24 @@
   </main>
 {/if}
 
-<!-- Without a token every call fails: the dialog stays until one is given. -->
+<!--
+  Nothing works until the caller is somebody: the dialog stays until then,
+  over an open form, which keeps what was typed.
+-->
 <dialog
   bind:this={dialog}
-  aria-labelledby="token-title"
-  oncancel={(event) => event.preventDefault()}
-  onclose={() => $needsToken && dialog.showModal()}
+  aria-labelledby="sign-in-title"
+  oncancel={(event) => {
+    event.preventDefault();
+    dismiss();
+  }}
+  onclose={() => form && dialog.showModal()}
 >
-  <form onsubmit={submitToken}>
-    <h2 id="token-title">Admin token</h2>
-    <p>This admin API asks for the <code>[admin] token</code> of the configuration.</p>
-    <!-- svelte-ignore a11y_autofocus -->
-    <input type="password" bind:value={token} aria-label="Token" autocomplete="off" required autofocus />
-    <button type="submit">Use token</button>
-  </form>
+  {#if form}
+    {#key form}
+      <SignIn {form} ondone={() => (changing = false)} oncancel={leavable ? dismiss : undefined} />
+    {/key}
+  {/if}
 </dialog>
 
 <style>
@@ -189,6 +236,14 @@
     color: var(--danger);
   }
 
+  .user {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-left: auto;
+  }
+
   .tabs {
     display: flex;
     gap: 0.25rem;
@@ -220,7 +275,8 @@
   }
 
   dialog {
-    max-width: min(28rem, calc(100vw - 2rem));
+    width: 24rem;
+    max-width: calc(100vw - 2rem);
     border: 1px solid var(--border);
     border-radius: 6px;
     background: var(--background);
@@ -229,37 +285,5 @@
 
   dialog::backdrop {
     background: rgb(0 0 0 / 40%);
-  }
-
-  dialog h2 {
-    margin-top: 0;
-    font-size: 1.1rem;
-  }
-
-  dialog form {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-
-  dialog p {
-    margin: 0;
-  }
-
-  dialog input {
-    padding: 0.4rem 0.5rem;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--surface);
-  }
-
-  dialog button {
-    align-self: flex-end;
-    padding: 0.4rem 0.9rem;
-    border: none;
-    border-radius: 4px;
-    background: var(--accent);
-    color: var(--background);
-    cursor: pointer;
   }
 </style>

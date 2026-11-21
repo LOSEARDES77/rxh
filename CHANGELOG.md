@@ -60,6 +60,20 @@ Changed.
   are asked twice without echo on a terminal, or read from standard input.
   A password changed outside the daemon (`rxh user passwd`, a hand edit)
   now ends the sessions of that user too.
+- The dashboard signs in. It reads `GET /auth/session` first: where the
+  caller is nobody it shows a sign-in form (name and password, or the admin
+  token behind "Use the admin token"), and while no user exists the form
+  that creates the first one, with the setup code where the daemon asks for
+  it; an administrator of the machine or of the token can leave that form
+  for later. A signed-in user has its name, "Change password" and "Sign
+  out" in the header. Without the `admin` role the page shows the Overview
+  and Hosts tabs only, without pools and certificates, and in Hosts what
+  the permissions of each host allow: "New host" with a group to create in
+  (the form starts in the first one), saving and the TOML view with
+  `modify`, "Delete" with `delete`; a host that is only viewed opens as a
+  read-only form. The hosts list has a Groups column. A `401` at any time
+  brings the sign-in form over the page and keeps what is typed in an open
+  form; a refused key of a save shows its path next to the form.
 - Grants on hosts: a signed-in user without the `admin` role now reads and
   changes the hosts its roles reach. `GET /config/files` gives it the
   servers it has `view` on, the names of the pools and the revision of each
@@ -127,7 +141,7 @@ Changed.
   ready; reload, certificate reload, upgrade and stop have a control. With
   `[admin] token` the page and its two assets are served without the token
   and ask for it before reading any data. `/dashboard/` redirects to
-  `/dashboard`. No certificate upload and no accounts.
+  `/dashboard`. No certificate upload.
 - Admin routes behind the page: `GET /schema`, `GET /stats/history` (one
   sample every 5 seconds, 720 kept, in memory; `?since=<unix seconds>`
   sends only the newer ones, which is what the page polls), `GET /config/files`,

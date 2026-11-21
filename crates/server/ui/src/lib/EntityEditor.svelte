@@ -4,6 +4,7 @@
   import Action, { ACTIONS } from "./controls/Action.svelte";
   import { arrange, helpOf, human } from "./layout";
   import SchemaField from "./SchemaField.svelte";
+  import { can } from "./session";
   import {
     control,
     entitySchema,
@@ -17,8 +18,9 @@
   let {
     schema,
     // One entity of `GET config/files`, or where to write a new one (with
-    // `key`, its name is fixed and not asked for). The editor reads it once:
-    // draw it under `{#key}` to edit another entity.
+    // `key`, its name is fixed and not asked for; with `initial`, the table
+    // it starts from). The editor reads it once: draw it under `{#key}` to
+    // edit another entity.
     entity,
     // Of the file of the entity: `files[entity.file].revision`.
     revision,
@@ -29,7 +31,7 @@
     onreread = undefined,
   }: {
     schema: Schema;
-    entity: Entity | { kind: Kind; file: number; key?: string };
+    entity: Entity | { kind: Kind; file: number; key?: string; initial?: Record<string, unknown> };
     revision: string;
     onsaved: () => void;
     oncancel: () => void;
@@ -45,7 +47,7 @@
   // What the file holds, to tell edits from it and to go back to it.
   let stored = $state.raw(
     untrack(() => ({
-      value: "value" in entity ? entity.value : {},
+      value: "value" in entity ? entity.value : (entity.initial ?? {}),
       toml: "toml" in entity ? entity.toml : "",
       revision,
     })),
@@ -58,6 +60,10 @@
   let generation = $state(0);
   let failure: { status: number; message: string } | undefined = $state();
   let busy = $state(false);
+
+  // What the daemon lets this caller do with the entity; a new one is the caller's to write.
+  const writable = untrack(() => !("value" in entity) || can(entity, "modify"));
+  const removable = untrack(() => "value" in entity && can(entity, "delete"));
 
   const noun = { server: "server", upstream: "pool", section: "section" }[kind];
   // The key of a server is its position, which says nothing to a person.
@@ -223,7 +229,7 @@
     <div class="failure" role="alert">
       <p>{failure.message}</p>
       {#if failure.status === 401}
-        <p>Enter the admin token, then save again: nothing typed here is lost.</p>
+        <p>Sign in, then save again: nothing typed here is lost.</p>
       {/if}
       {#if failure.status === 409 && key !== undefined}
         <p>Reading again replaces what is typed here with what the file holds now.</p>
@@ -232,26 +238,28 @@
     </div>
   {/if}
 
-  <div class="mode" role="radiogroup" aria-label="Edit as">
-    <label>
-      <input
-        type="radio"
-        name="{id}-mode"
-        checked={mode === "form"}
-        onclick={(event) => switchTo(event, "form")}
-      />
-      Form
-    </label>
-    <label>
-      <input
-        type="radio"
-        name="{id}-mode"
-        checked={mode === "toml"}
-        onclick={(event) => switchTo(event, "toml")}
-      />
-      TOML
-    </label>
-  </div>
+  {#if writable}
+    <div class="mode" role="radiogroup" aria-label="Edit as">
+      <label>
+        <input
+          type="radio"
+          name="{id}-mode"
+          checked={mode === "form"}
+          onclick={(event) => switchTo(event, "form")}
+        />
+        Form
+      </label>
+      <label>
+        <input
+          type="radio"
+          name="{id}-mode"
+          checked={mode === "toml"}
+          onclick={(event) => switchTo(event, "toml")}
+        />
+        TOML
+      </label>
+    </div>
+  {/if}
 
   {#if key === undefined && kind !== "server" && named === undefined}
     <div class="name">
@@ -260,32 +268,37 @@
     </div>
   {/if}
 
-  {#if mode === "form"}
-    {#key generation}
-      {#if groups.common.length > 0}
-        <fieldset>
-          <legend>{groups.groups.length > 0 ? "Common" : "Settings"}</legend>
-          {#each groups.common as fieldKey (fieldKey)}{@render draw(fieldKey)}{/each}
-        </fieldset>
-      {/if}
-      {#each groups.groups as group (group.title)}
-        <details class="group">
-          <summary>{group.title}{setCount(group.keys)}</summary>
-          {#each group.keys as fieldKey (fieldKey)}{@render draw(fieldKey)}{/each}
-        </details>
-      {/each}
-    {/key}
-  {:else}
-    <div class="toml">
-      <label for="{id}-toml">TOML of the table</label>
-      <textarea id="{id}-toml" rows="20" spellcheck="false" bind:value={toml}></textarea>
-    </div>
-  {/if}
+  <!-- Without `modify` the form is for reading: nothing in it takes input. -->
+  <fieldset class="all" disabled={!writable}>
+    {#if mode === "form"}
+      {#key generation}
+        {#if groups.common.length > 0}
+          <fieldset>
+            <legend>{groups.groups.length > 0 ? "Common" : "Settings"}</legend>
+            {#each groups.common as fieldKey (fieldKey)}{@render draw(fieldKey)}{/each}
+          </fieldset>
+        {/if}
+        {#each groups.groups as group (group.title)}
+          <details class="group">
+            <summary>{group.title}{setCount(group.keys)}</summary>
+            {#each group.keys as fieldKey (fieldKey)}{@render draw(fieldKey)}{/each}
+          </details>
+        {/each}
+      {/key}
+    {:else}
+      <div class="toml">
+        <label for="{id}-toml">TOML of the table</label>
+        <textarea id="{id}-toml" rows="20" spellcheck="false" bind:value={toml}></textarea>
+      </div>
+    {/if}
+  </fieldset>
 
   <div class="actions">
-    <button type="button" class="primary" disabled={busy} onclick={save}>Save and reload</button>
-    <button type="button" disabled={busy} onclick={cancel}>Cancel</button>
-    {#if key !== undefined && !(kind === "section" && key === "top")}
+    {#if writable}
+      <button type="button" class="primary" disabled={busy} onclick={save}>Save and reload</button>
+    {/if}
+    <button type="button" disabled={busy} onclick={cancel}>{writable ? "Cancel" : "Close"}</button>
+    {#if removable && !(kind === "section" && key === "top")}
       <button type="button" class="danger" disabled={busy} onclick={remove}>Delete</button>
     {/if}
   </div>
@@ -352,6 +365,12 @@
     padding: 0.25rem 0.75rem 0.5rem;
     border: 1px solid var(--border);
     border-radius: 6px;
+  }
+
+  .all {
+    margin: 0;
+    padding: 0;
+    border: none;
   }
 
   summary {

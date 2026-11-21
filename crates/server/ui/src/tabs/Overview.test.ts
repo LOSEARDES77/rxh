@@ -1,7 +1,9 @@
 import { render, screen } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
+import { session } from "../lib/session";
 import type { History, Sample } from "../lib/stats";
 import Overview from "./Overview.svelte";
+import { who } from "./serve";
 
 function sample(time: number, ok: number, failed: number, active: number): Sample {
   const buckets = Array(11).fill(0);
@@ -57,6 +59,7 @@ function asked(fetch: ReturnType<typeof serve>): string[] {
 }
 
 afterEach(() => {
+  session.set(undefined);
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -126,4 +129,17 @@ test("later_polls_ask_for_the_new_samples_and_append_them", async () => {
   expect(asked(fetch)[4]).toBe(`stats/history?since=${1015 + 7200}`);
   expect(value("Requests per second")).toBe("10.0");
   expect(screen.getByText("Pool api").parentElement?.querySelector("svg")).toBeNull();
+});
+
+test("without_admin_no_pool_is_drawn_and_no_certificate_is_asked", async () => {
+  session.set(who({ user: "luis", roles: ["web-editors"] }));
+  const fetch = serve();
+  render(Overview);
+  expect(await screen.findByText("Server web")).toBeTruthy();
+  expect(value("Requests per second")).toBe("10.0");
+  expect(screen.queryByText("In flight")).toBeNull();
+  expect(screen.queryByText("Healthy backends")).toBeNull();
+  expect(screen.queryByText(/pool/i)).toBeNull();
+  // `GET certificates` is an administrator's: asking would only show a refusal.
+  expect(fetch.mock.calls.map(([url]) => url)).toEqual(["stats/history"]);
 });
