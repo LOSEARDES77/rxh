@@ -101,6 +101,14 @@ pub fn config_files(path: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(read_merged(path, /* expand= */ false)?.1)
 }
 
+/// Whether the `[admin]` table `next` of a reload differs in any key from
+/// `in_force`, the one the admin API started with. None of its keys changes
+/// in a running daemon.
+fn admin_differs(next: &Admin, in_force: &Admin) -> bool {
+    // As JSON, which holds every key of the table, the ones added later too.
+    serde_json::to_value(next).ok() != serde_json::to_value(in_force).ok()
+}
+
 /// Daemon bound to a configuration file, or to a configuration without one.
 #[derive(Debug, Clone)]
 pub struct Daemon {
@@ -721,10 +729,10 @@ impl Daemon {
         // be able to bind it.
         acme::release_challenge_port(&config.with_https_redirects()).await;
 
-        if config.admin.listen != admin.listen || config.admin.token != admin.token {
+        let in_force = generation.admin.clone();
+        if admin_differs(&config.admin, &in_force) {
             eprintln!("Main => [admin] changes take effect after a restart");
         }
-        let in_force = generation.admin.clone();
 
         let previous_registry = Arc::clone(&generation.registry);
         let started = Generation::start(
@@ -897,6 +905,44 @@ forward = "@api"
 
     fn server(name: &str) -> String {
         format!("[[server]]\nname = \"{name}\"\nlisten = \"127.0.0.1:0\"\nforward = \"@api\"\n")
+    }
+
+    #[test]
+    fn a_reload_that_changes_any_admin_key_asks_for_a_restart() {
+        let admin = |table: &str| {
+            Config::from_toml(&format!("[admin]\n{table}\n"))
+                .expect("valid configuration")
+                .admin
+        };
+        let in_force = admin("tls = { cert = \"admin.pem\", key = \"admin.key\" }");
+        assert!(!admin_differs(&in_force.clone(), &in_force));
+        for changed in [
+            "",
+            "tls = { cert = \"other.pem\", key = \"admin.key\" }",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\nusers = \"other.toml\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\nlisten = \"127.0.0.1:2020\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\ntoken = \"0123456789abcdef\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\nenabled = false",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\n\
+             public_url = \"https://rxh.example\"",
+            "tls = { cert = \"admin.pem\", key = \"admin.key\" }\n\
+             public_url = \"https://rxh.example\"\n\
+             oidc = { issuer = \"https://id.example\", client_id = \"rxh\", \
+             client_secret = \"secret\" }",
+        ] {
+            assert!(admin_differs(&admin(changed), &in_force), "{changed}");
+        }
+        let with_oidc = admin(
+            "public_url = \"https://rxh.example\"\n\
+             oidc = { issuer = \"https://id.example\", client_id = \"rxh\", \
+             client_secret = \"secret\" }",
+        );
+        let other_client = admin(
+            "public_url = \"https://rxh.example\"\n\
+             oidc = { issuer = \"https://id.example\", client_id = \"other\", \
+             client_secret = \"secret\" }",
+        );
+        assert!(admin_differs(&other_client, &with_oidc));
     }
 
     #[test]
