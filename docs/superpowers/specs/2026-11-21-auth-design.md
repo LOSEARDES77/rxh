@@ -85,6 +85,14 @@ token. From now on a request is local when both hold:
 - today's header rule passes (loopback or listen address `Host`, `Origin`
   equal to `Host`), which is what stops a web page in a local browser.
 
+Found in the final review: some port forwarders in front of a container
+make every remote client arrive from the container's own address or from
+loopback. So being local gives trust (administrator without credentials, a
+session cookie on plain HTTP, first-run setup without a code) only when the
+admin listener itself is a unix socket or a loopback TCP address. On a
+listener that is not loopback nobody is trusted by position: every caller
+needs the token or a session, and the CLI there needs `token`.
+
 A `tls` admin listener still answers plain HTTP on the same port, to local
 connections only: the first byte of a connection tells a TLS handshake from
 HTTP, and a plain connection that is not local is closed. So the CLI needs no
