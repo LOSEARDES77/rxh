@@ -1408,15 +1408,15 @@ How a sign-in goes:
    authorization endpoint, with a new `state`, `nonce` and PKCE challenge
    (`S256`), and a cookie (`rxh_oidc`, `HttpOnly`, `SameSite=Lax`, 10
    minutes, `Secure` over TLS) that ties the sign-in to this browser.
-   Two requests go no further, and neither counts as a sign-in attempt:
-   one whose `Host` is not the host and port of `public_url` (the page was
-   opened as `localhost:2019` and `public_url` says `127.0.0.1:2019`, for
-   example) answers `302` to `{public_url}/auth/oidc/login`, since the
-   cookie has to belong to the name the provider sends the browser back
-   to; and one that the page of another site made the browser send
+   A request that the page of another site made the browser send
    (`Sec-Fetch-Site: cross-site`, or a `Sec-Fetch-Dest` other than
-   `document`: an image, a frame, a script) answers `403`. A client that
-   sends neither header, like `curl`, passes.
+   `document`: an image, a frame, a script) goes no further: it answers
+   `403` and does not count as a sign-in attempt. A client that sends
+   neither header, like `curl`, passes. Open the page under the host name
+   of `public_url`: under another name of the same listener (for example
+   `localhost` instead of `127.0.0.1`) the provider sends the browser back
+   to `public_url`, where the cookie of the other name is not sent, and
+   the sign-in is refused as "not started in this browser".
 2. The user signs in at the provider, which sends the browser back to
    `GET /auth/oidc/callback?code=...&state=...`.
 3. rxh checks that the `state` is one it gave to this browser less than 10
@@ -1501,10 +1501,6 @@ Known limits:
   admin API, so to every other service under that name. Give the admin
   API a host name of its own (`rxh.example.com`, not a port of a name
   other services share).
-- **A forwarder in front must keep `Host`.** A proxy between the browser
-  and the admin API that replaces `Host` with its own target makes
-  `GET /auth/oidc/login` answer `302` to `public_url` again and again;
-  the session rules (`Origin` equal to `Host`) need the same.
 - **Names come from the provider.** With a `name_claim` users can edit
   at the provider, two people can show under one name in the log; roles
   never depend on the name.

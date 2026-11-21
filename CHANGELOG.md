@@ -590,10 +590,7 @@ Changed.
   browser send (`Sec-Fetch-Site: cross-site`, or a `Sec-Fetch-Dest` other
   than `document`) with `403`, before it counts as a sign-in attempt or
   starts a flow: another site could spend the 10 attempts a minute of the
-  address, passwords included. Opened under another name of the listener
-  (`localhost` for `127.0.0.1`), it answers `302` to
-  `{public_url}/auth/oidc/login`, so the cookie of the flow belongs to the
-  name the provider sends the browser back to. An `http://` `public_url`
+  address, passwords included. An `http://` `public_url`
   with a `listen` that is not loopback or a unix socket is a validation
   error: use `https://`. The log names a user of the provider as
   `"name" (oidc)`, escaped, in the sign-out line too.

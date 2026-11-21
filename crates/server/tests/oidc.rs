@@ -882,25 +882,10 @@ async fn the_provider_cannot_be_the_admin_api_of_this_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn another_name_of_the_listener_is_sent_to_public_url() {
+async fn the_redirect_uri_comes_from_public_url_and_not_from_host() {
     let fixture = daemon().await;
-    // The cookie of a flow started here would be one of `localhost`, and
-    // the callback goes to `public_url`. More than the attempts of a minute.
-    let host = format!("localhost:{}", fixture.admin.port());
-    for _ in 0..11 {
-        let page = browse_as(fixture.admin, &host, "/auth/oidc/login", &[]).await;
-        assert_eq!(page.status, StatusCode::FOUND, "{}", page.body);
-        assert_eq!(
-            page.location(),
-            format!("http://{}/auth/oidc/login", fixture.admin)
-        );
-        assert_eq!(page.headers.get(header::SET_COOKIE), None);
-    }
-    assert_eq!(fixture.provider.discovery_requests(), 0, "nothing started");
-
-    // Under the name of `public_url` the flow starts, and it was not
-    // counted before.
-    let (page, _binding) = fixture.login().await;
+    let page = browse_as(fixture.admin, "localhost:1", "/auth/oidc/login", &[]).await;
+    assert_eq!(page.status, StatusCode::FOUND, "{}", page.body);
     assert_eq!(
         query_value(page.location(), "redirect_uri"),
         format!(

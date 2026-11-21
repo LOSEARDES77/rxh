@@ -88,13 +88,6 @@ pub(crate) struct Client {
     redirect_uri: String,
     /// `{public_url}/dashboard`.
     dashboard: String,
-    /// Where a flow starts, under `public_url`.
-    login: String,
-    /// Authority of `public_url`: the host the cookies of a flow belong to.
-    authority: String,
-    /// The port a browser leaves out of `Host` for the scheme of
-    /// `public_url`, with its `:`.
-    default_port: &'static str,
     issuer_host: String,
     /// Connections to `https` endpoints, and to `http` ones on loopback.
     tls: Dialer,
@@ -153,21 +146,10 @@ impl Client {
             Dialer::new(&group, guard.clone())
         };
         let issuer: Uri = settings.issuer.parse().map_err(io::Error::other)?;
-        let public: Uri = public_url.parse().map_err(io::Error::other)?;
         Ok(Self {
             settings: settings.clone(),
             redirect_uri: format!("{public_url}/auth/oidc/callback"),
             dashboard: format!("{public_url}/dashboard"),
-            login: format!("{public_url}/auth/oidc/login"),
-            authority: public
-                .authority()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-            default_port: if public.scheme_str() == Some("http") {
-                ":80"
-            } else {
-                ":443"
-            },
             issuer_host: issuer.host().unwrap_or_default().to_owned(),
             tls: dialer(Some(UpstreamTls {
                 ca: settings.ca.clone(),
@@ -307,18 +289,6 @@ impl Client {
             roles,
             groups,
         })
-    }
-
-    /// Whether `host`, the `Host` of a request, is the authority of
-    /// `public_url`, letter case and the default port aside.
-    fn is_at(&self, host: &str) -> bool {
-        let bare = |authority: &str| {
-            authority
-                .strip_suffix(self.default_port)
-                .unwrap_or(authority)
-                .to_ascii_lowercase()
-        };
-        bare(host) == bare(&self.authority)
     }
 
     /// Host of the issuer, for the page to say where the sign-in goes.
@@ -868,35 +838,6 @@ fn is_sent_by_another_page<B>(request: &Request<B>) -> bool {
         || value("sec-fetch-dest").is_some_and(|destination| destination != b"document")
 }
 
-/// The answer to the start of a flow that goes no further, before anything
-/// is counted or kept: `403` for what another site made the browser send,
-/// which would spend the sign-in attempts of the address and replace the
-/// cookie of a flow under way, and `302` to `public_url` for a browser that
-/// came under another name of this API, whose cookie the callback would
-/// not get.
-fn turned_away<B>(client: &Client, request: &Request<B>) -> Option<Response<Full<Bytes>>> {
-    if is_sent_by_another_page(request) {
-        return Some(page(
-            StatusCode::FORBIDDEN,
-            "Not signed in",
-            "The sign-in was refused: it has to be started from the dashboard, not from the \
-             page of another site.",
-            &client.dashboard,
-            false,
-        ));
-    }
-    let host = request.headers().get(header::HOST)?.to_str().ok()?;
-    if client.is_at(host) {
-        return None;
-    }
-    let mut response = Response::new(Full::new(Bytes::new()));
-    *response.status_mut() = StatusCode::FOUND;
-    let headers = response.headers_mut();
-    headers.insert(header::LOCATION, HeaderValue::from_str(&client.login).ok()?);
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Some(response)
-}
-
 /// `GET /auth/oidc/login`: sends the browser to the provider, with the
 /// cookie that binds the flow to it.
 pub(crate) async fn login<B>(
@@ -908,8 +849,18 @@ pub(crate) async fn login<B>(
         Ok(client) => client,
         Err(response) => return *response,
     };
-    if let Some(response) = turned_away(client, request) {
-        return response;
+    // Before anything is counted or kept: what another site made the
+    // browser send would spend the sign-in attempts of the address and
+    // replace the cookie of a flow under way.
+    if is_sent_by_another_page(request) {
+        return page(
+            StatusCode::FORBIDDEN,
+            "Not signed in",
+            "The sign-in was refused: it has to be started from the dashboard, not from the \
+             page of another site.",
+            &client.dashboard,
+            false,
+        );
     }
     let client = match counted(state, client, peer).map(|()| client) {
         Ok(client) => client,
@@ -1464,31 +1415,6 @@ mod tests {
             assert!(message.starts_with("[admin.oidc]: "), "{message}");
             assert!(message.contains(path.to_str().unwrap()), "{message}");
         }
-    }
-
-    #[test]
-    fn the_host_of_a_request_is_compared_with_public_url() {
-        let client =
-            |public_url: &str| Client::new(&settings(), public_url, AdminGuard::default()).unwrap();
-        let named = client("https://rxh.example.com/admin");
-        for host in ["rxh.example.com", "RXH.Example.com", "rxh.example.com:443"] {
-            assert!(named.is_at(host), "{host}");
-        }
-        for host in [
-            "rxh.example.com:80",
-            "rxh.example.com:2019",
-            "example.com",
-            "127.0.0.1",
-        ] {
-            assert!(!named.is_at(host), "{host}");
-        }
-        assert_eq!(named.login, "https://rxh.example.com/admin/auth/oidc/login");
-        let local = client("http://127.0.0.1:2019");
-        assert!(local.is_at("127.0.0.1:2019"));
-        for host in ["localhost:2019", "127.0.0.1", "127.0.0.1:443", "[::1]:2019"] {
-            assert!(!local.is_at(host), "{host}");
-        }
-        assert!(client("http://[::1]:80").is_at("[::1]"));
     }
 
     #[test]

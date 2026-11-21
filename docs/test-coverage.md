@@ -232,8 +232,7 @@ written against an older snapshot: their line numbers and percentages are stale,
     Sign-in through a provider: `server/tests/oidc.rs` against the stand-in provider of
     `util/src/oidc_provider.rs` (plain HTTP and HTTPS with `ca`: the flow, every claim check, the binding
     cookie, limits, timeouts, oversized and redirected answers, no secret in answers or `GET /config`,
-    the refusal of a login sent by another site, the redirect to `public_url` under another `Host`, the admin
-    guard on its dialers; the log was checked by hand),
+    the refusal of a login sent by another site, the admin guard on its dialers; the log was checked by hand),
     unit tests in `oidc.rs` and `config.rs`, the page in Vitest (`SignIn.test.ts`, `Users.test.ts`). Not
     tested by automation: a real provider (none was used, by hand either), and the `Secure` attribute of
     the binding cookie (unit test only); the flow in a browser over a `tls` admin listener was checked by
