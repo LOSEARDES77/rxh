@@ -1467,7 +1467,7 @@
           "type": "string"
         },
         "issuer": {
-          "description": "Issuer of the provider, without a trailing `/`: an `https` URL, or\n`http` on a loopback address.",
+          "description": "Issuer of the provider, exactly as the provider publishes it, a\ntrailing `/` included: an `https` URL, or `http` on a loopback\naddress. The `iss` of every ID token must equal it.",
           "type": "string"
         },
         "name_claim": {

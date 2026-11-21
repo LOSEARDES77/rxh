@@ -8,6 +8,7 @@ mod free_address;
 mod http3_client;
 mod ocsp_certificate;
 mod ocsp_response;
+mod oidc_provider;
 
 pub use catalog_api::*;
 pub use dns_server::*;
@@ -17,3 +18,4 @@ pub use free_address::*;
 pub use http3_client::*;
 pub use ocsp_certificate::*;
 pub use ocsp_response::*;
+pub use oidc_provider::*;

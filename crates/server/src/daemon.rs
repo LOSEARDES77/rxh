@@ -25,12 +25,14 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::access::{self, Store};
 use crate::acme;
 use crate::admin::{self, AdminState, Control, Current};
+use crate::admin_guard::AdminGuard;
 use crate::catalog;
 use crate::docker::{self, Container, Provider, Route};
 use crate::error::Error;
 use crate::http3::{self, Endpoints};
 use crate::include;
 use crate::master::{Master, ServerInfo};
+use crate::oidc;
 use crate::per_core;
 use crate::registry::Registry;
 use crate::session::Sessions;
@@ -370,6 +372,16 @@ impl Daemon {
             self.config_path(),
             &admin_settings.users,
         ));
+        let oidc = match (&admin_settings.oidc, &admin_settings.public_url) {
+            (Some(settings), Some(public_url)) if admin_settings.enabled => {
+                let guard = AdminGuard::new(&admin_settings);
+                let client = oidc::Client::new(settings, public_url, guard)
+                    .map_err(|err| io::Error::new(err.kind(), format!("[admin.oidc]: {err}")))?;
+                Some(client)
+            }
+            // Validation refuses `oidc` without `public_url`.
+            _ => None,
+        };
         // QUIC sockets outlive generations, see `http3`.
         let endpoints = Endpoints::default();
         let mut generation = Generation::start(
@@ -397,6 +409,7 @@ impl Daemon {
             hashing: admin::hashing_permits(),
             access,
             sessions,
+            oidc,
         });
 
         let admin_listener: Option<(AbortOnDrop, Lease)> = if admin_settings.enabled {
@@ -1103,6 +1116,7 @@ forward = "@api"
                 hashing: admin::hashing_permits(),
                 access: Store::open(PathBuf::new()),
                 sessions: Sessions::new(),
+                oidc: None,
             }
         };
         let err = daemon

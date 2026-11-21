@@ -1053,9 +1053,9 @@ impl Admin {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Oidc {
-    /// Issuer of the provider, without a trailing `/`: an `https` URL, or
-    /// `http` on a loopback address.
-    #[serde(deserialize_with = "without_trailing_slash")]
+    /// Issuer of the provider, exactly as the provider publishes it, a
+    /// trailing `/` included: an `https` URL, or `http` on a loopback
+    /// address. The `iss` of every ID token must equal it.
     pub issuer: String,
 
     /// Client ID registered at the provider.
@@ -1124,11 +1124,19 @@ where
 }
 
 /// Checks that the `value` of `key` is an `https://` URL, or `http://` on a
-/// loopback address, without a query or a fragment.
+/// loopback address, without a user, a password, a query or a fragment.
 fn validate_secure_url(key: &str, value: &str) -> Result<(), String> {
     let uri: http::Uri = value
         .parse()
         .map_err(|err| format!("{key} {value:?}: {err}"))?;
+    // Credentials in a URL end up in logs and in the pages that show it:
+    // refused first, without repeating them.
+    if uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return Err(format!("{key} must not hold a user or a password"));
+    }
     let host: &str = uri.host().unwrap_or_default();
     let is_loopback: bool = host
         .trim_start_matches('[')
@@ -5737,7 +5745,8 @@ mod tests {
             Some("https://rxh.example.com")
         );
         let oidc = config.admin.oidc.expect("[admin.oidc] is set");
-        assert_eq!(oidc.issuer, "https://id.example.com");
+        // Kept as written: the `iss` of the provider has to equal it.
+        assert_eq!(oidc.issuer, "https://id.example.com/");
         assert_eq!(oidc.client_id, "rxh");
         assert_eq!(oidc.client_secret, "oidc-secret");
         assert_eq!(oidc.scopes, ["openid", "profile", "email"]);
@@ -5811,11 +5820,34 @@ mod tests {
         let config = Config::from_toml(&issuer("http://127.0.0.1:9000/realms/rxh/")).unwrap();
         assert_eq!(
             config.admin.oidc.unwrap().issuer,
-            "http://127.0.0.1:9000/realms/rxh"
+            "http://127.0.0.1:9000/realms/rxh/"
         );
+        let config = Config::from_toml(&issuer("https://id.example.com")).unwrap();
+        assert_eq!(config.admin.oidc.unwrap().issuer, "https://id.example.com");
         for rejected in ["http://id.example.com", "id.example.com", ""] {
             let err: String = admin_error(&issuer(rejected));
             assert!(err.contains("issuer"), "{rejected}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_url_with_a_user_or_a_password_is_rejected() {
+        for url in [
+            "https://ana:secret@rxh.example.com",
+            "https://ana@rxh.example.com",
+            "http://ana:secret@127.0.0.1:2019",
+            "http://ana:secret@rxh.example.com",
+        ] {
+            let err: String = admin_error(&format!("[admin]\npublic_url = \"{url}\"\n"));
+            assert!(
+                err.contains("public_url") && err.contains("password"),
+                "{err}"
+            );
+            assert!(!err.contains("secret"), "{err}");
+            let text: String = oidc_config("").replace("https://id.example.com/", url);
+            let err: String = admin_error(&text);
+            assert!(err.contains("issuer") && err.contains("password"), "{err}");
+            assert!(!err.contains("secret"), "{err}");
         }
     }
 

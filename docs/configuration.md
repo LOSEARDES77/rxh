@@ -106,7 +106,9 @@ include = ["conf.d/*.toml", "extra.toml"]
   the main file, or to `--file PATH` (relative to the main file directory),
   which is created if missing and added to `include` if not already covered.
 - `rxh config show [--json]` prints the effective merged configuration, from
-  the running daemon when reachable, else from the files.
+  the running daemon when reachable, else from the files. Either way
+  `[admin] token`, the `client_secret` of `[admin.oidc]` and the DNS
+  provider credentials are printed as `***`.
 
 ## Watching the files
 
@@ -175,7 +177,9 @@ forward = "@api"
   request placeholders and stay as they are.
 - `POST /load` and `PATCH` bodies are taken as sent, without placeholders.
 - `GET /config` and `rxh config show` print the replaced values. `[admin]
-  token` and the DNS provider credentials are shown as `***`; other secrets
+  token`, the `client_secret` of `[admin.oidc]` and the DNS provider
+  credentials are shown as `***`, also when `rxh config show` reads the
+  files because no daemon answers; other secrets
   placed in the configuration this way are visible to whoever can read the
   admin API.
 - The CLI commands that edit the files (`rxh upstream`, `rxh pool`,
@@ -550,7 +554,7 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
 | `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
 | `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API. A relative path is relative to the directory of the configuration file, like `[acme] storage`, so the daemon and `rxh user` find the same file wherever they run. Must not be empty. Changes need a restart. In the container images the configuration directory is not writable: set an absolute path on the volume, `users = "/var/lib/rxh/users.toml"`. |
-| `public_url` | none | Address where browsers reach the admin API: an `https://` URL, or `http://` on a loopback address (`http://127.0.0.1:2019`), without a query or a fragment; a trailing `/` is removed. Required by `oidc`. Changes need a restart. |
+| `public_url` | none | Address where browsers reach the admin API: an `https://` URL, or `http://` on a loopback address (`http://127.0.0.1:2019`), without a user, a password, a query or a fragment; a trailing `/` is removed. Required by `oidc`. Changes need a restart. |
 | `oidc` | none | Sign-in through an OpenID Connect provider, see [OpenID Connect](#openid-connect). Changes need a restart. |
 
 On a unix socket the API is reachable only by the user running the daemon
@@ -741,7 +745,8 @@ users = "/var/lib/rxh/users.toml"   # default: rxh-data/users.toml
 | `POST /auth/login` | anyone | `{"name", "password"}`: `204` and the session cookie. `401 {"error": "wrong name or password"}` for a wrong password and for an unknown name alike; `429` after too many attempts, see below; `403` on plain HTTP from another machine. |
 | `POST /auth/logout` | anyone | Ends the session of the cookie and clears the cookie: `204`, also when there is no session. |
 | `POST /auth/setup` | see First run | `{"name", "password", "code"?}`: creates the first user and signs it in, `204`. `409` once a user exists. |
-| `PUT /auth/password` | a signed-in user | `{"current", "new"}`: `204`. Ends every session of the user and gives this browser a new one. `403` when `current` is wrong. |
+| `PUT /auth/password` | a signed-in user | `{"current", "new"}`: `204`. Ends every session of the user and gives this browser a new one. `403` when `current` is wrong, and `403 {"error": "this account signs in through the provider"}` for a user who signed in through the provider. |
+| `GET /auth/oidc/login`, `GET /auth/oidc/callback` | anyone | The two steps of [signing in through a provider](#signing-in-through-a-provider). `404` without `[admin.oidc]`. |
 
 ```sh
 curl -c jar -d '{"name": "ana", "password": "correct horse"}' https://rxh.example.com:2019/auth/login
@@ -760,7 +765,9 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   "setup": false,
   "setup_needs_code": false,
   "password_login": true,
-  "oidc": false
+  "oidc": false,
+  "oidc_issuer": null,
+  "local": true
 }
 ```
 
@@ -797,6 +804,10 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   turn, and gets `429` when none came within 5 seconds. A sign-in that
   waited and was refused is not a failed one for its name, whose password
   was never compared; it is one of the attempts of its address.
+- `oidc` is `true` with `[admin.oidc]`, and `oidc_issuer` is then the host
+  of the provider, for the page to name it. `local` is `true` for a user of
+  the users file, who has a password to change, and `false` for a user of
+  the provider and for a caller that is not signed in.
 - After 5 failed sign-ins for a name from one client address, that name is
   refused from that address for a minute (`429`), with the right password
   too. For both limits an IPv6 client is its /64 network, not one address
@@ -806,8 +817,9 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   the same time under one name from one address are refused as well.
 - One client address gets 10 sign-in attempts a minute, right or wrong and
   whatever the names: the eleventh is `429` until the oldest is a minute
-  old. A password change and a `POST /auth/setup` that sends a `code`
-  count as attempts. A unix socket has no such limit, and requests with
+  old. A password change, a `POST /auth/setup` that sends a `code`, and
+  each `GET /auth/oidc/login` and `GET /auth/oidc/callback` count as
+  attempts, so a sign-in through the provider takes two of the ten. A unix socket has no such limit, and requests with
   the token or with a session are not sign-ins. Clients behind one address
   (a NAT, a reverse proxy) share its ten.
 - A password has at least 8 characters and at most 72 bytes. Hashes never
@@ -1174,11 +1186,10 @@ manages its own hosts and nothing else.
 
 What is not there:
 
-- **OIDC.** Sign-in through an identity provider (`[admin.oidc]`,
-  `public_url`) is the next step and does not exist yet: `oidc` in
-  `GET /auth/session` is always `false`. Until then, accounts are local
-  passwords only. No two-factor codes, no passkeys, no password reset by
-  e-mail: an administrator or `rxh user passwd` sets a new one.
+- **More than a password, here.** No two-factor codes, no passkeys, no
+  password reset by e-mail: an administrator or `rxh user passwd` sets a
+  new one. An identity provider that has those can be the way in, see
+  [OpenID Connect](#openid-connect).
 - **Sessions that outlive the daemon.** Sessions are kept in memory: a
   restart, and a hot upgrade (`rxh upgrade`), sign everybody out. A
   reload does not.
@@ -1232,12 +1243,12 @@ Known limits:
 #### OpenID Connect
 
 `[admin.oidc]` lets users sign in through an OpenID Connect provider
-(Keycloak, Authentik, Dex, Google, ...). The keys are read and checked at
-start; the sign-in flow that uses them is not served yet.
+(Keycloak, Authentik, Dex, Auth0, ...), next to the users of the users file
+or instead of them.
 
 | Key | Default | Description |
 |---|---|---|
-| `issuer` | required | Issuer of the provider: an `https://` URL, or `http://` on a loopback address. A trailing `/` is removed. |
+| `issuer` | required | Issuer of the provider, written exactly as the provider publishes it, a trailing `/` included when it has one (Auth0): an `https://` URL, or `http://` on a loopback address, without a user or a password. The discovery document is read from `{issuer}/.well-known/openid-configuration`, and its `issuer` and the `iss` of every ID token must be equal to this value, character by character. |
 | `client_id` | required | Client ID registered at the provider. Must not be empty. |
 | `client_secret` | required | Client secret registered at the provider. Must not be empty. `GET /config`, `rxh config show` and the configuration editor show it as `***`; use an `{env.NAME}` or `{file.PATH}` placeholder to keep it out of the file. |
 | `scopes` | `["openid", "profile", "email"]` | Scopes asked for. Must contain `"openid"`. |
@@ -1262,6 +1273,87 @@ client_id = "rxh"
 client_secret = "{env.RXH_OIDC_SECRET}"
 roles = { ops = ["admin"], web = ["web-editors"] }
 ```
+
+##### Signing in through a provider
+
+At the provider, register rxh as a client:
+
+- **A confidential client** (one with a secret) for the authorization
+  code flow. Its ID and secret are `client_id` and `client_secret`. The
+  secret is sent to the token endpoint with HTTP Basic, both values encoded
+  as RFC 6749 section 2.3.1 says (`client_secret_basic`).
+- **Redirect URI**: `{public_url}/auth/oidc/callback`, exactly, for
+  example `https://rxh.example.com:2019/auth/oidc/callback`.
+- **The groups in the ID token**: a claim (`groups_claim`, `groups` by
+  default) that is the name of one group or a list of names. Most
+  providers add it only when asked: a "groups" mapper or scope on the
+  client. Add that scope to `scopes` when the provider wants it asked for.
+  `roles` gives roles to those names; a group that is not there gives
+  nothing.
+
+How a sign-in goes:
+
+1. The browser opens `GET /auth/oidc/login`. rxh reads the discovery
+   document of the provider (kept for an hour) and answers `302` to its
+   authorization endpoint, with a new `state`, `nonce` and PKCE challenge
+   (`S256`), and a cookie (`rxh_oidc`, `HttpOnly`, `SameSite=Lax`, 10
+   minutes, `Secure` over TLS) that ties the sign-in to this browser.
+2. The user signs in at the provider, which sends the browser back to
+   `GET /auth/oidc/callback?code=...&state=...`.
+3. rxh checks that the `state` is one it gave to this browser less than 10
+   minutes ago (the cookie), and uses it up. It sends the code, with the
+   PKCE verifier and the client secret, to the token endpoint, and reads
+   the ID token of the answer.
+4. The claims are checked, all of them: `iss` is `issuer` exactly; `aud`
+   is `client_id`, or a list with it (and then `azp` is `client_id` when
+   the list has more than one entry); an `azp`, when there is one, is
+   `client_id`; `exp` is not past, with a minute of margin for clocks;
+   `nonce` is the one of step 1.
+5. The name is the claim `name_claim`, or `sub` without it. The roles are
+   those `roles` gives to the groups, all together. The session lasts 12
+   hours, like any other, with the cookie `rxh_session`. The answer is a
+   small page that goes on to `{public_url}/dashboard`.
+
+What the user may do is worked out on every request from the roles of the
+session and the users file as it is then: a role edited or removed with
+`PUT`/`DELETE /roles/{name}` applies at once. The groups are those of the
+sign-in: a user taken out of a group at the provider keeps its roles until
+the session ends, 12 hours at most. Signing out ends the rxh session only,
+not the one at the provider.
+
+A user of the provider is not a user of the users file, even under the same
+name: it has only the roles its groups give, it is not listed in
+`GET /users`, it has no password here (`PUT /auth/password` answers `403`),
+and what ends the sessions of the local user of that name leaves its own.
+In the log it is `name (oidc)`. A user keeps at most 10 sessions.
+
+A sign-in that does not happen answers with a small page that says why in
+one sentence, and starts no session:
+
+| Answer | When |
+|---|---|
+| `403` | The callback is not of a sign-in this browser started: no cookie or another one, an unknown or used `state`, or more than 10 minutes. Start again. |
+| `403` | The provider sent an error instead of a code (the user said no, for example), or no code. |
+| `403` | A claim of the ID token is wrong or missing, or the token does not name the user (the name is at most 256 bytes). |
+| `403` | None of the groups of the user gives a role. The page names the user and the groups received. |
+| `502` | The provider could not be reached, took more than 10 seconds, answered more than 1 MiB, answered an error, or sent no ID token; or its discovery document is of another issuer, or names an endpoint that is not `https` (`http` is taken on a loopback address only). |
+| `429` | The client address used up its 10 sign-in attempts of the minute, which these two routes share with `POST /auth/login`: each of them is one attempt. |
+| `404` (JSON) | `[admin.oidc]` is not set. |
+| `403` (JSON) | The connection is one where no session may be: plain HTTP from another machine. |
+
+Known limits:
+
+- **The signature of the ID token is not checked.** The token is read
+  only from the answer of the token endpoint, over TLS checked against the
+  same roots as upstream TLS, which OpenID Connect Core 3.1.3.7 allows. A
+  token from anywhere else is never accepted.
+- **One sign-in at a time for a browser.** Starting a second one (another
+  tab) replaces the cookie of the first, whose callback is then refused.
+- **The provider is reached directly.** No proxy setting, no redirects
+  followed, HTTP/1.1.
+- **Names come from the provider.** With a `name_claim` users can edit
+  at the provider, two people can show under one name in the log; roles
+  never depend on the name.
 
 ### Dashboard
 

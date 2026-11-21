@@ -1,18 +1,21 @@
 [package]
 name = "rxh-test-util"
-description = "Test helpers shared by the RXH crates: misbehaving backends, a DNS server, a Docker API, a Consul, etcd and Nomad API, OCSP fixtures and free addresses"
+description = "Test helpers shared by the RXH crates: misbehaving backends, a DNS server, a Docker API, a Consul, etcd and Nomad API, an OpenID Connect provider, OCSP fixtures and free addresses"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 http.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [lints]

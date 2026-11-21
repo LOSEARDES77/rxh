@@ -237,6 +237,7 @@ mod tests {
             hashing: admin::hashing_permits(),
             access: crate::access::Store::open(std::path::PathBuf::new()),
             sessions: crate::session::Sessions::new(),
+            oidc: None,
         })
     }
 

@@ -155,11 +155,13 @@ impl Sessions {
         self.lock().sessions.remove(id);
     }
 
-    /// Ends every session of `user`.
+    /// Ends every session of the user `user` of the users file. A session
+    /// that carries its roles is of a user of the provider, who is somebody
+    /// else under the same name: it stays.
     pub(crate) fn end_user(&self, user: &str) {
         self.lock()
             .sessions
-            .retain(|_, session| session.user != user);
+            .retain(|_, session| session.user != user || session.roles.is_some());
     }
 
     /// Counts one sign-in as `name` from `address`, unless it is refused,
@@ -216,17 +218,21 @@ impl Sessions {
         let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let mut tables = self.lock();
         tables.sessions.retain(|_, session| !expired(session, now));
+        // A user of the provider and one of the users file with the same
+        // name are two users.
+        let is_own =
+            |session: &Session| session.user == user && session.roles.is_some() == roles.is_some();
         let own = tables
             .sessions
             .values()
-            .filter(|session| session.user == user)
+            .filter(|session| is_own(session))
             .count();
         let full = tables.sessions.len() >= MAX_SESSIONS;
         if own >= MAX_SESSIONS_PER_USER || full {
             let oldest = tables
                 .sessions
                 .iter()
-                .filter(|(_, session)| own < MAX_SESSIONS_PER_USER || session.user == user)
+                .filter(|(_, session)| own < MAX_SESSIONS_PER_USER || is_own(session))
                 .min_by_key(|(_, session)| session.created)
                 .map(|(id, _)| id.clone());
             if let Some(oldest) = oldest {
@@ -349,6 +355,14 @@ fn set_cookie(id: &str, secure: bool, rest: &str) -> HeaderValue {
 
 /// The session id a request carries in its cookie.
 pub(crate) fn cookie_of<B>(request: &Request<B>) -> Option<&str> {
+    cookie_named(request, COOKIE)
+}
+
+/// The value of the cookie `name` of a request.
+pub(crate) fn cookie_named<'request, B>(
+    request: &'request Request<B>,
+    name: &str,
+) -> Option<&'request str> {
     for value in request.headers().get_all(header::COOKIE) {
         let Ok(value) = value.to_str() else {
             continue;
@@ -356,7 +370,7 @@ pub(crate) fn cookie_of<B>(request: &Request<B>) -> Option<&str> {
         for pair in value.split(';') {
             let id = pair
                 .trim()
-                .strip_prefix(COOKIE)
+                .strip_prefix(name)
                 .and_then(|rest| rest.strip_prefix('='));
             if id.is_some() {
                 return id;
@@ -468,6 +482,35 @@ mod tests {
         assert_eq!(kept.roles, Some(vec![String::from("web")]));
         sessions.end(&other);
         assert!(sessions.get(&other).is_none());
+    }
+
+    #[test]
+    fn a_user_of_the_provider_is_not_the_local_user_of_the_same_name() {
+        let sessions = Sessions::new();
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let roles = || Some(vec![String::from("web")]);
+        let local = sessions.create_at("ana", None, None, start);
+        let provided: Vec<String> = (1..=10_u32)
+            .map(|index| sessions.create_at("ana", roles(), None, start + second * index))
+            .collect();
+        let now = start + second * 11;
+        // Ten of one and one of the other: each counts its own.
+        assert!(sessions.get_at(&local, now).is_some());
+        assert!(sessions.get_at(&provided[0], now).is_some(), "ten fit");
+        let newest = sessions.create_at("ana", roles(), None, now);
+        assert!(
+            sessions.get_at(&provided[0], now).is_none(),
+            "its own oldest"
+        );
+        assert!(sessions.get_at(&local, now).is_some(), "of the local user");
+        assert!(sessions.get_at(&newest, now).is_some());
+
+        // Removing the local user, or its new password, ends its sessions.
+        sessions.end_user("ana");
+        assert!(sessions.get_at(&local, now).is_none());
+        assert!(sessions.get_at(&newest, now).is_some());
+        assert_eq!(sessions.lock().sessions.len(), 10);
     }
 
     #[test]
@@ -721,5 +764,8 @@ mod tests {
         assert_eq!(cookie_of(&with(&["rxh_session_old=abc; theme=dark"])), None);
         assert_eq!(cookie_of(&with(&["not_rxh_session=abc"])), None);
         assert_eq!(cookie_of(&with(&[])), None);
+        let both = with(&["rxh_oidc=xyz; rxh_session=abc"]);
+        assert_eq!(cookie_named(&both, "rxh_oidc"), Some("xyz"));
+        assert_eq!(cookie_of(&both), Some("abc"));
     }
 }

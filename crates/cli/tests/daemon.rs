@@ -1200,6 +1200,33 @@ async fn cert_commands_list_and_reload() {
     assert!(stderr.contains("key.pem"), "{stderr}");
 }
 
+#[test]
+fn config_show_without_a_daemon_masks_the_admin_secrets() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let admin = free_address();
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\ntoken = \"file-token-0123456789\"\n\
+             public_url = \"http://{admin}\"\n\
+             [admin.oidc]\nissuer = \"https://id.example.com/\"\nclient_id = \"rxh\"\n\
+             client_secret = \"oidc-client-secret\"\n"
+        ),
+    )
+    .expect("write");
+    // Nothing listens on `admin`: the command reads the file.
+    for args in [&["config", "show"][..], &["config", "show", "--json"]] {
+        let shown = assert_success(&rxh_bare(dir, args));
+        assert!(shown.contains("id.example.com/"), "{shown}");
+        assert!(shown.contains("***"), "{shown}");
+        assert!(
+            !shown.contains("file-token-0123456789") && !shown.contains("oidc-client-secret"),
+            "{shown}"
+        );
+    }
+}
+
 /// Runs a CLI command with nothing but the configuration file of `directory`.
 fn rxh_bare(directory: &Path, args: &[&str]) -> Output {
     Command::new(RXH)

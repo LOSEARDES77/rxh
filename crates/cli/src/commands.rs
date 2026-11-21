@@ -499,7 +499,12 @@ async fn config_show(cli: &Cli, client: &AdminClient, json: bool) -> Result<(), 
         Ok(config) => config,
         Err(ClientError::Unreachable(_)) => {
             let path = editable_config(cli, client).await;
-            let config = rxh_server::load_config(&path).map_err(|err| err.to_string())?;
+            let mut config = rxh_server::load_config(&path).map_err(|err| err.to_string())?;
+            // The secrets the daemon masks in `GET /config`.
+            config.admin.redact();
+            if let Some(dns) = &mut config.acme.dns {
+                dns.redact();
+            }
             serde_json::to_value(config).map_err(|err| err.to_string())?
         }
         Err(err) => return Err(err.to_string()),

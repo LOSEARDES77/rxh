@@ -552,7 +552,24 @@ Changed.
   at start: `https` URLs (or `http` on loopback), `openid` among the
   scopes, valid role names, `public_url` set, and `tls` or a loopback or
   unix socket `listen`. `client_secret` is shown as `***` like the other
-  secrets. See [OpenID Connect](docs/configuration.md#openid-connect).
+  secrets. `issuer` is kept as it is written, a trailing `/` included,
+  since the `iss` of the provider has to equal it; `issuer` and
+  `public_url` with a user or a password in them are rejected. See
+  [OpenID Connect](docs/configuration.md#openid-connect).
+- Sign-in through an OpenID Connect provider: `GET /auth/oidc/login` sends
+  the browser to the provider (authorization code flow with PKCE `S256`,
+  `state`, `nonce`, and a cookie that ties the flow to the browser that
+  started it), and `GET /auth/oidc/callback` exchanges the code, checks
+  `iss`, `aud` (and `azp`), `exp` and `nonce` of the ID token, gives the
+  roles `[admin.oidc] roles` maps the groups of the user to, and starts a
+  12 hour session. A user without a mapped role is refused with a page that
+  names it and its groups. Every request to the provider has 10 seconds and
+  1 MiB, goes over TLS (plain HTTP on a loopback address only), and both
+  routes count against the 10 sign-in attempts a minute of a client
+  address. A user of the provider is not the local user of the same name:
+  it has only its mapped roles and no password here (`PUT /auth/password`
+  answers `403`). `GET /auth/session` gains `oidc_issuer` and `local`. See
+  [Signing in through a provider](docs/configuration.md#signing-in-through-a-provider).
 
 ### Deprecated
 
@@ -694,6 +711,10 @@ Changed.
   the backend refuses (`502`, failed member) and logged once a minute at
   most. With a `token` nothing changes: the admin API can still be
   published through a host.
+- `rxh config show` masks `[admin] token`, the `client_secret` of
+  `[admin.oidc]` and the DNS provider credentials as `***` also when it
+  reads the files because no daemon answers. It printed them as written
+  there.
 
 ## 0.2.0 (unreleased)
 

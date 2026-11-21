@@ -2,6 +2,7 @@
 //! creating the first user and changing one's password; and the `/users`
 //! and `/roles` routes, with which an administrator manages the accounts.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::access::{ADMIN_ROLE, Access, Grant, Role, Scope};
 use crate::admin::{self, AdminState, Caller, Peer};
+use crate::oidc;
 use crate::session;
 
 /// Longest name a user can have, in bytes. A longer one is no user: it is
@@ -104,6 +106,7 @@ pub(crate) fn session(state: &AdminState, caller: &Caller, peer: Peer) -> Respon
     };
     let needs_code =
         setup && !caller.is_admin() && admin::code_opens_setup(peer, state.token.is_some());
+    let issuer = state.oidc.as_ref().map(oidc::Client::issuer_host);
     admin::json_response(
         StatusCode::OK,
         &json!({
@@ -115,7 +118,10 @@ pub(crate) fn session(state: &AdminState, caller: &Caller, peer: Peer) -> Respon
             "setup": setup,
             "setup_needs_code": needs_code,
             "password_login": peer.may_hold_session(),
-            "oidc": false,
+            "oidc": issuer.is_some(),
+            "oidc_issuer": issuer,
+            // A user of the users file, who has a password to change.
+            "local": matches!(caller, Caller::User { oidc: false, .. }),
         }),
     )
 }
@@ -225,7 +231,7 @@ async fn create_first_user(
         });
     let creator = match (caller.is_admin(), has_code) {
         (true, _) => caller.label(),
-        (false, true) => "the setup code",
+        (false, true) => Cow::Borrowed("the setup code"),
         (false, false) => {
             return admin::error(
                 StatusCode::FORBIDDEN,
@@ -287,12 +293,20 @@ async fn change_password(
     peer: Peer,
     body: PasswordBody,
 ) -> Response<Full<Bytes>> {
-    let Caller::User { name, .. } = caller else {
+    let Caller::User { name, oidc, .. } = caller else {
         return admin::error(
             StatusCode::FORBIDDEN,
             "only a signed-in user changes its password",
         );
     };
+    // Its name may be the one of a user of the users file, who is somebody
+    // else: refused before anything is compared or counted under that name.
+    if *oidc {
+        return admin::error(
+            StatusCode::FORBIDDEN,
+            "this account signs in through the provider",
+        );
+    }
     if let Err(response) = count_attempt(state, name, peer) {
         return *response;
     }
@@ -642,11 +656,11 @@ fn count_attempt(
     Err(Box::new(too_many_attempts()))
 }
 
+/// Answer to a client that tried to sign in too often in the last minute.
+pub(crate) const TOO_MANY_ATTEMPTS: &str = "too many sign-in attempts; try again in a minute";
+
 fn too_many_attempts() -> Response<Full<Bytes>> {
-    admin::error(
-        StatusCode::TOO_MANY_REQUESTS,
-        "too many sign-in attempts; try again in a minute",
-    )
+    admin::error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY_ATTEMPTS)
 }
 
 /// Whether `password` is the one of user `name`: `Some` with the hash it
@@ -737,7 +751,7 @@ fn no_content(cookie: Option<HeaderValue>) -> Response<Full<Bytes>> {
 }
 
 /// The client of a connection, for the log.
-fn client(peer: Peer) -> String {
+pub(crate) fn client(peer: Peer) -> String {
     peer.address.map_or_else(
         || String::from("the unix socket"),
         |address| address.to_string(),
@@ -1007,6 +1021,7 @@ mod tests {
             name: String::from("ana"),
             scope: Scope::Admin,
             session: session.clone(),
+            oidc: false,
         };
         let change = async |current: &str, new: &str| {
             let body = PasswordBody {

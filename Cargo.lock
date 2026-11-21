@@ -2373,12 +2373,15 @@ dependencies = [
 name = "rxh-test-util"
 version = "0.3.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "h3",
  "h3-quinn",
  "http",
  "quinn",
  "rcgen",
+ "serde_json",
+ "sha2",
  "tokio",
 ]
 

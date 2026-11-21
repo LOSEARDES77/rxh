@@ -158,6 +158,8 @@ async fn session_reports_setup_while_no_user_exists() {
             "setup_needs_code": false,
             "password_login": true,
             "oidc": false,
+            "oidc_issuer": null,
+            "local": false,
         })
     );
 
@@ -428,6 +430,8 @@ async fn a_session_cookie_identifies_the_user() {
             "setup_needs_code": false,
             "password_login": true,
             "oidc": false,
+            "oidc_issuer": null,
+            "local": true,
         })
     );
     let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/pools", "").await;

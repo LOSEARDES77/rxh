@@ -30,6 +30,7 @@
 //! | `POST`   | `/auth/login`, `/auth/logout` | Sign in and out with a session      |
 //! | `POST`   | `/auth/setup`                 | Create the first user               |
 //! | `PUT`    | `/auth/password`              | Change one's own password           |
+//! | `GET`    | `/auth/oidc/login`, `/auth/oidc/callback` | Sign in through a provider |
 //! | `GET`    | `/users`, `/roles`            | Users and roles of the users file   |
 //! | `POST`   | `/users`, `/roles`            | Add a user or a role                |
 //! | `PUT`    | `/users/{name}`, `/roles/{name}` | Change a user, replace a role    |
@@ -68,6 +69,7 @@
 //! the browser. It holds no data, so those three paths are served without
 //! the token, which the page asks for and sends on its requests.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::io;
@@ -107,6 +109,7 @@ use crate::config_api;
 use crate::files;
 use crate::history::Sample;
 use crate::master::ServerInfo;
+use crate::oidc;
 use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
 use crate::session::{self, Session, Sessions};
@@ -158,6 +161,8 @@ pub const ROUTES: &[(&str, &str, Audience)] = &[
     ("POST", "auth/setup", Audience::Anyone),
     ("POST", "auth/logout", Audience::Anyone),
     ("PUT", "auth/password", Audience::Caller),
+    ("GET", "auth/oidc/login", Audience::Anyone),
+    ("GET", "auth/oidc/callback", Audience::Anyone),
     ("GET", "users", Audience::Admin),
     ("POST", "users", Audience::Admin),
     ("PUT", "users/{}", Audience::Admin),
@@ -247,6 +252,8 @@ pub(crate) struct AdminState {
     pub(crate) access: Store,
     /// Who is signed in.
     pub(crate) sessions: Sessions,
+    /// The provider users sign in through, from `[admin.oidc]`.
+    pub(crate) oidc: Option<oidc::Client>,
 }
 
 /// Who is at the other end of a connection to the admin API.
@@ -736,6 +743,12 @@ async fn handle(
         (&Method::PUT, ["auth", "password"]) => {
             auth_api::password(&state, &caller, peer, request).await
         }
+        (&Method::GET, ["auth", "oidc", "login"]) => oidc::login(&state, peer).await,
+        (&Method::GET, ["auth", "oidc", "callback"]) => {
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let binding = oidc::binding_of(&request).map(str::to_owned);
+            oidc::callback(&state, peer, &query, binding.as_deref()).await
+        }
         (&Method::GET, ["users"]) => auth_api::list_users(&state),
         (&Method::POST, ["users"]) => auth_api::create_user(&state, &caller, request).await,
         (&Method::PUT, ["users", name]) => {
@@ -774,6 +787,9 @@ pub(crate) enum Caller {
         scope: Scope,
         /// Id of the session.
         session: String,
+        /// The user signed in through the provider: it is not the user of
+        /// the users file with that name, if there is one.
+        oidc: bool,
     },
     /// Anybody else.
     Nobody,
@@ -798,12 +814,15 @@ impl Caller {
     }
 
     /// The name that stands for the caller in the log.
-    pub(crate) fn label(&self) -> &str {
+    pub(crate) fn label(&self) -> Cow<'_, str> {
         match self {
-            Self::Token => "token",
-            Self::Local => "local",
-            Self::User { name, .. } => name,
-            Self::Nobody => "nobody",
+            Self::Token => Cow::Borrowed("token"),
+            Self::Local => Cow::Borrowed("local"),
+            Self::User {
+                name, oidc: true, ..
+            } => Cow::Owned(format!("{name} (oidc)")),
+            Self::User { name, .. } => Cow::Borrowed(name),
+            Self::Nobody => Cow::Borrowed("nobody"),
         }
     }
 }
@@ -828,9 +847,10 @@ fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
         let access = state.access.read();
         return match roles(&access, &session) {
             Some(roles) => Caller::User {
-                name: session.user,
                 scope: access.scope(&roles),
                 session: id.to_owned(),
+                oidc: session.roles.is_some(),
+                name: session.user,
             },
             None => {
                 state.sessions.end(id);
@@ -844,9 +864,10 @@ fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
     Caller::Nobody
 }
 
-/// The roles of a session: its own when it carries them, else the ones its
-/// user has in the users file now. `None` when that user is not there, or
-/// has another password than at sign-in.
+/// The roles of a session: its own when it carries them (a user of the
+/// provider, whatever the users file says about its name), else the ones
+/// its user has in the users file now. `None` when that user is not there,
+/// or has another password than at sign-in.
 pub(crate) fn roles(access: &Access, session: &Session) -> Option<Vec<String>> {
     match &session.roles {
         Some(roles) => Some(roles.clone()),
@@ -1814,6 +1835,7 @@ pub(crate) mod tests {
             hashing: hashing_permits(),
             access: Store::open(users),
             sessions: Sessions::new(),
+            oidc: None,
         }
     }
 
@@ -1879,8 +1901,10 @@ pub(crate) mod tests {
             Caller::Nobody
         ));
         let user = caller(&with(Some("Bearer wrong"), Some(&id)), &closed, REMOTE);
-        assert!(matches!(&user, Caller::User { name, scope, session }
-                if name == "luis" && !scope.is_admin() && *session == id));
+        assert!(
+            matches!(&user, Caller::User { name, scope, session, oidc: false }
+                if name == "luis" && !scope.is_admin() && *session == id)
+        );
         assert_eq!(user.label(), "luis");
         assert!(!user.is_admin());
 
@@ -1907,6 +1931,19 @@ pub(crate) mod tests {
             .sessions
             .create("eva", Some(vec![String::from("admin")]), None);
         assert!(caller(&with(None, Some(&carried)), &open, REMOTE).is_admin());
+
+        // A user of the provider named like a user of the file is not that
+        // user: it has the roles its session carries, and its own label.
+        open.access
+            .change(|access| access.set_roles("luis", &[String::from("admin")]))
+            .unwrap();
+        let provided = open
+            .sessions
+            .create("luis", Some(vec![String::from("viewer")]), None);
+        let user = caller(&with(None, Some(&provided)), &open, REMOTE);
+        assert!(matches!(&user, Caller::User { name, oidc: true, .. } if name == "luis"));
+        assert!(!user.is_admin());
+        assert_eq!(user.label(), "luis (oidc)");
     }
 
     #[tokio::test]
