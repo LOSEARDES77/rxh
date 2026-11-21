@@ -729,6 +729,55 @@ answered:
 Anybody else gets `403`, and once a user exists everybody gets `409`: the
 code is of no use any more. There are no default credentials.
 
+#### Users and roles
+
+An administrator manages the users file through these routes, which
+answer nobody else. They change the file the way an edit by hand does, and
+a change applies to the next request, of a signed-in user too.
+
+| Route | Does |
+|---|---|
+| `GET /users` | `[{"name", "roles"}]`, in the order of the file. Never a hash. |
+| `POST /users` | `{"name", "password", "roles"?}`: adds a user, `201` with `{"name", "roles"}`. |
+| `PUT /users/{name}` | `{"roles"?, "password"?}`, at least one: replaces them, `204`. A new password ends every session of the user. |
+| `DELETE /users/{name}` | Removes the user and ends its sessions, `204`. |
+| `GET /roles` | The built-in role first, as `{"name": "admin", "builtin": true}`, then every `[[role]]` as `{"name", "grant"}`. |
+| `POST /roles` | `{"name", "grant"?}`: defines a role whose name is free, `201` with the role. |
+| `PUT /roles/{name}` | `{"name"?, "grant"}`: replaces the grants of a defined role, `204`. A `name` in the body must be the one of the path. |
+| `DELETE /roles/{name}` | Removes a role that no user has, `204`. |
+
+- What the rules of the users file refuse is `409` with their reason: a
+  name that is taken or not valid, a password shorter than 8 characters or
+  longer than 72 bytes, a role that is not defined, `create` on a host
+  grant, the last administrator removed or without `admin`, the `admin`
+  role defined or removed, a role some user has (the reason names them).
+- A name in the path that names no user or role is `404`; a body that is
+  not JSON, lacks a field or has an unknown one is `400`.
+- Names in the path are percent-decoded: `/users/ana%40example.com` is the
+  user `ana@example.com`.
+- Adding a user or setting a password hashes it, and waits for its turn
+  with the sign-ins (at most 4 at a time, `429` after 5 seconds).
+- Each change is a line in the log of the daemon with who made it (the
+  user, `token` or `local`), never a password or a hash.
+
+```sh
+H='Authorization: Bearer s3cret-admin-token'
+API=https://rxh.example.com:2019
+curl -H "$H" $API/users
+curl -H "$H" -d '{"name": "web-editors", "grant": [{"group": "web", "allow": ["view", "modify", "create"]}]}' $API/roles
+curl -H "$H" -d '{"name": "luis", "password": "luis-password", "roles": ["web-editors"]}' $API/users
+curl -H "$H" -X PUT -d '{"roles": ["admin"]}' $API/users/luis
+curl -H "$H" -X PUT -d '{"grant": [{"host": "shop", "allow": ["view"]}]}' $API/roles/web-editors
+curl -H "$H" -X DELETE $API/users/luis
+curl -H "$H" -X DELETE $API/roles/web-editors
+```
+
+```text
+Admin => Role web-editors created by token
+Admin => User luis created by token
+Admin => User luis changed by ana
+```
+
 ### Dashboard
 
 `GET /dashboard` on the admin API is a web page that shows what the daemon

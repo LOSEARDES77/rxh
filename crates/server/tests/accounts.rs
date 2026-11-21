@@ -702,7 +702,7 @@ async fn a_user_without_admin_is_forbidden_on_every_admin_route() {
     // What the router does not know is for administrators too.
     let unknown = [
         (Method::GET, "/nope".to_owned()),
-        (Method::GET, "/users".to_owned()),
+        (Method::GET, "/users/x/y".to_owned()),
         (Method::DELETE, "/auth/session".to_owned()),
         (Method::GET, "/dashboard/x".to_owned()),
     ];
@@ -797,4 +797,432 @@ fn accounts_on_disk(fixture: &Fixture) -> Access {
 async fn send_setup(admin: SocketAddr) -> (StatusCode, HeaderMap, Value) {
     let body = json!({ "name": "eva", "password": "password-eva" }).to_string();
     call(admin, Method::POST, "/auth/setup", &body, &[]).await
+}
+
+/// A request to the admin API with the token: status and JSON body.
+async fn with_token(
+    admin: SocketAddr,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let bearer = bearer();
+    let body = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
+    let (status, _, json) = call(
+        admin,
+        method,
+        uri,
+        &body,
+        &[(header::AUTHORIZATION, bearer.as_str())],
+    )
+    .await;
+    (status, json)
+}
+
+/// The names and roles of the users on disk.
+fn users_on_disk(fixture: &Fixture) -> Vec<(String, Vec<String>)> {
+    accounts_on_disk(fixture)
+        .user
+        .into_iter()
+        .map(|user| (user.name, user.roles))
+        .collect()
+}
+
+fn names(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_administrator_creates_lists_changes_and_removes_users() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let ana = cookie_of(admin, "ana", "password-ana").await;
+    let as_ana = async |method: Method, uri: &str, body: Value| {
+        let (status, _, json) = call_with_cookie(admin, &ana, method, uri, &body.to_string()).await;
+        (status, json)
+    };
+
+    let eva = json!({ "name": "eva", "password": "password-eva", "roles": ["web-editors"] });
+    let (status, json) = as_ana(Method::POST, "/users", eva.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    assert_eq!(json, json!({ "name": "eva", "roles": ["web-editors"] }));
+    assert!(accounts_on_disk(&closed).verify("eva", "password-eva"));
+    let (status, json) = as_ana(Method::GET, "/users", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json,
+        json!([
+            { "name": "ana", "roles": ["admin"] },
+            { "name": "luis", "roles": ["web-editors"] },
+            { "name": "eva", "roles": ["web-editors"] },
+        ])
+    );
+
+    // Refused by the rules of the users file: `409` with their reason.
+    let (status, json) = as_ana(Method::POST, "/users", eva).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "user \"eva\" exists");
+    let short = json!({ "name": "rosa", "password": "short", "roles": [] });
+    let (status, json) = as_ana(Method::POST, "/users", short).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        json["error"],
+        "a password has at least 8 characters and at most 72 bytes"
+    );
+    let unknown_role = json!({ "roles": ["nope"] });
+    let (status, json) = as_ana(Method::PUT, "/users/eva", unknown_role).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "user \"eva\": no role \"nope\"");
+    // Invalid bodies.
+    for body in [
+        json!({ "name": "rosa", "roles": [] }),
+        json!({ "name": "rosa", "password": "password-rosa", "role": ["admin"] }),
+        json!("rosa"),
+    ] {
+        let (status, json) = as_ana(Method::POST, "/users", body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+    }
+    let (status, _) = as_ana(Method::PUT, "/users/eva", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(users_on_disk(&closed).len(), 3, "nothing was added");
+
+    let (status, json) = as_ana(Method::PUT, "/users/eva", json!({ "roles": ["admin"] })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(
+        users_on_disk(&closed)[2],
+        ("eva".to_owned(), names(&["admin"]))
+    );
+    let both = json!({ "roles": [], "password": "another-password" });
+    let (status, json) = as_ana(Method::PUT, "/users/eva", both).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    let saved = accounts_on_disk(&closed);
+    assert!(saved.verify("eva", "another-password"));
+    assert!(saved.user[2].roles.is_empty());
+
+    // Unknown names.
+    let (status, json) = as_ana(Method::PUT, "/users/rosa", json!({ "roles": [] })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"], "no user \"rosa\"");
+    let (status, _) = as_ana(Method::DELETE, "/users/rosa", Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, json) = as_ana(Method::DELETE, "/users/eva", Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(
+        users_on_disk(&closed),
+        [
+            ("ana".to_owned(), names(&["admin"])),
+            ("luis".to_owned(), names(&["web-editors"]))
+        ]
+    );
+    let (status, _) = as_ana(Method::DELETE, "/users/eva", Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_user_can_sign_in_and_has_its_grants_in_the_session() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let eva = json!({ "name": "eva", "password": "password-eva", "roles": ["web-editors"] });
+    let (status, json) = with_token(admin, Method::POST, "/users", eva).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+
+    let cookie = cookie_of(admin, "eva", "password-eva").await;
+    let (status, _, json) =
+        call_with_cookie(admin, &cookie, Method::GET, "/auth/session", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["user"], "eva");
+    assert_eq!(json["admin"], false);
+    assert_eq!(json["roles"], json!(["web-editors"]));
+    assert_eq!(
+        json["grants"],
+        json!([{ "group": "web", "allow": ["view", "create"] }])
+    );
+    let (status, _, _) = call_with_cookie(admin, &cookie, Method::GET, "/users", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_user_ends_its_sessions() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let session_user = async |cookie: &str| {
+        let (_, _, json) = call_with_cookie(admin, cookie, Method::GET, "/auth/session", "").await;
+        json["user"].clone()
+    };
+
+    // Removed and created again with the same name: the old session stays
+    // ended.
+    let old = cookie_of(admin, "luis", "password-luis").await;
+    assert_eq!(session_user(&old).await, "luis");
+    let (status, json) = with_token(admin, Method::DELETE, "/users/luis", Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    let luis = json!({ "name": "luis", "password": "password-luis", "roles": ["web-editors"] });
+    let (status, json) = with_token(admin, Method::POST, "/users", luis).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    assert_eq!(session_user(&old).await, Value::Null);
+
+    // A new password ends the sessions too; new roles do not.
+    let cookie = cookie_of(admin, "luis", "password-luis").await;
+    let (status, _) = with_token(admin, Method::PUT, "/users/luis", json!({ "roles": [] })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(session_user(&cookie).await, "luis");
+    let password = json!({ "password": "another-password" });
+    let (status, _) = with_token(admin, Method::PUT, "/users/luis", password).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(session_user(&cookie).await, Value::Null);
+    let (status, _, _) = sign_in(admin, "luis", "another-password").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_administrator_cannot_be_removed_through_the_api() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let before = users_on_disk(&closed);
+    let (status, json) = with_token(admin, Method::DELETE, "/users/ana", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "\"ana\" is the last administrator");
+    let demoted = json!({ "roles": ["web-editors"] });
+    let (status, json) = with_token(admin, Method::PUT, "/users/ana", demoted.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "\"ana\" is the last administrator");
+    assert_eq!(users_on_disk(&closed), before);
+
+    // With a second administrator the first one may go.
+    let (status, _) = with_token(
+        admin,
+        Method::PUT,
+        "/users/luis",
+        json!({ "roles": ["admin"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, json) = with_token(admin, Method::PUT, "/users/ana", demoted).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn roles_are_created_replaced_and_removed() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let roles_on_disk = || accounts_on_disk(&closed).role;
+
+    let (status, json) = with_token(admin, Method::GET, "/roles", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json,
+        json!([
+            { "name": "admin", "builtin": true },
+            { "name": "web-editors", "grant": [{ "group": "web", "allow": ["view", "create"] }] },
+        ])
+    );
+
+    let ops = json!({ "name": "ops", "grant": [{ "host": "shop", "allow": ["view", "modify"] }] });
+    let (status, json) = with_token(admin, Method::POST, "/roles", ops.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    assert_eq!(json, ops);
+    assert_eq!(roles_on_disk()[1].name, "ops");
+    assert_eq!(
+        roles_on_disk()[1].grant,
+        [Grant {
+            target: Target::Host("shop".to_owned()),
+            allow: vec![Permission::View, Permission::Modify],
+        }]
+    );
+
+    // Refusals of the users file, and invalid bodies.
+    for (body, message) in [
+        (ops, "role \"ops\" exists"),
+        (
+            json!({ "name": "admin" }),
+            "role \"admin\" is built in and cannot be defined",
+        ),
+        (
+            json!({ "name": "x", "grant": [{ "host": "shop", "allow": ["create"] }] }),
+            "role \"x\": `create` is for groups, not for host \"shop\"",
+        ),
+    ] {
+        let (status, json) = with_token(admin, Method::POST, "/roles", body.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(json["error"], message, "{body}");
+    }
+    for body in [
+        json!({ "grant": [] }),
+        json!({ "name": "x", "grant": [{ "group": "web", "host": "shop", "allow": [] }] }),
+        json!({ "name": "x", "grant": [{ "group": "web", "allow": ["own"] }] }),
+        json!({ "name": "x", "grants": [] }),
+    ] {
+        let (status, json) = with_token(admin, Method::POST, "/roles", body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+    }
+    assert_eq!(roles_on_disk().len(), 2);
+
+    // Replaced: the name in the body is optional and must match the path.
+    let api = json!({ "grant": [{ "group": "api", "allow": ["view"] }] });
+    let (status, json) = with_token(admin, Method::PUT, "/roles/ops", api).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(
+        roles_on_disk()[1].grant,
+        [Grant {
+            target: Target::Group("api".to_owned()),
+            allow: vec![Permission::View],
+        }]
+    );
+    let renamed = json!({ "name": "other", "grant": [] });
+    let (status, _) = with_token(admin, Method::PUT, "/roles/ops", renamed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let empty = json!({ "name": "ops", "grant": [] });
+    let (status, _) = with_token(admin, Method::PUT, "/roles/ops", empty.clone()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(roles_on_disk()[1].grant.is_empty());
+    let (status, json) = with_token(admin, Method::PUT, "/roles/nope", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"], "no role \"nope\"");
+    let (status, _) = with_token(admin, Method::PUT, "/roles/admin", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, json) = with_token(admin, Method::DELETE, "/roles/ops", Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(roles_on_disk().len(), 1);
+    let (status, _) = with_token(admin, Method::DELETE, "/roles/ops", Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, json) = with_token(admin, Method::DELETE, "/roles/admin", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        json["error"],
+        "role \"admin\" is built in and cannot be removed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_role_in_use_is_not_removed() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let (status, json) = with_token(admin, Method::DELETE, "/roles/web-editors", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"], "role \"web-editors\" is in use by luis");
+    assert_eq!(accounts_on_disk(&closed).role, accounts().role);
+
+    // Free once nobody has it.
+    let (status, _) = with_token(admin, Method::PUT, "/users/luis", json!({ "roles": [] })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = with_token(admin, Method::DELETE, "/roles/web-editors", Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_role_change_applies_to_a_signed_in_user_at_once() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let cookie = cookie_of(admin, "luis", "password-luis").await;
+    let session = async || {
+        let (_, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/auth/session", "").await;
+        json
+    };
+    assert_eq!(
+        session().await["grants"],
+        json!([{ "group": "web", "allow": ["view", "create"] }])
+    );
+
+    // No wait: the next request sees the change.
+    let api = json!({ "grant": [{ "group": "api", "allow": ["view"] }] });
+    let (status, _) = with_token(admin, Method::PUT, "/roles/web-editors", api).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let changed = session().await;
+    assert_eq!(
+        changed["grants"],
+        json!([{ "group": "api", "allow": ["view"] }])
+    );
+    assert_eq!(changed["creatable_groups"], json!([]));
+
+    let (status, _, _) = call_with_cookie(admin, &cookie, Method::GET, "/users", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let promoted = json!({ "roles": ["admin"] });
+    let (status, _) = with_token(admin, Method::PUT, "/users/luis", promoted).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/users", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn user_and_role_names_are_percent_decoded_and_validated() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+
+    let eva = json!({ "name": "eva@example.com", "password": "password-eva", "roles": [] });
+    let (status, json) = with_token(admin, Method::POST, "/users", eva).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let editor = json!({ "roles": ["web-editors"] });
+    let (status, json) = with_token(admin, Method::PUT, "/users/eva%40example.com", editor).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(
+        users_on_disk(&closed)[2],
+        ("eva@example.com".to_owned(), names(&["web-editors"]))
+    );
+    let (status, json) = with_token(
+        admin,
+        Method::DELETE,
+        "/users/eva%40example.com",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(users_on_disk(&closed).len(), 2);
+
+    let (status, json) =
+        with_token(admin, Method::POST, "/roles", json!({ "name": "web_ops" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let (status, json) = with_token(admin, Method::PUT, "/roles/web%5Fops", json!({})).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    let (status, json) = with_token(admin, Method::DELETE, "/roles/web%5fops", Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+
+    // A slash, encoded, is part of the name, which then names nobody.
+    let (status, json) = with_token(admin, Method::DELETE, "/users/a%2Fb", Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"], "no user \"a/b\"");
+
+    // Invalid names are refused with the rule they break.
+    let bad = json!({ "name": "Eva Example", "password": "password-eva", "roles": [] });
+    let (status, json) = with_token(admin, Method::POST, "/users", bad).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        json["error"].as_str().expect("text").contains("a name is"),
+        "{json}"
+    );
+    let (status, json) =
+        with_token(admin, Method::POST, "/roles", json!({ "name": "web ops" })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        json["error"].as_str().expect("text").contains("a name is"),
+        "{json}"
+    );
+    assert_eq!(users_on_disk(&closed).len(), 2);
+    assert_eq!(accounts_on_disk(&closed).role, accounts().role);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_added_by_editing_the_file_can_sign_in_without_a_restart() {
+    let closed = daemon(Some(&accounts()), /* token= */ true).await;
+    let admin = closed.admin;
+    let mut edited = accounts();
+    edited
+        .user
+        .push(user("eva", "password-eva", &["web-editors"]));
+    edited.save(&closed.users).expect("save");
+
+    util::eventually(async || {
+        let (_, json) = with_token(admin, Method::GET, "/users", Value::Null).await;
+        json.as_array().is_some_and(|users| users.len() == 3)
+    })
+    .await;
+    let cookie = cookie_of(admin, "eva", "password-eva").await;
+    let (_, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/auth/session", "").await;
+    assert_eq!(json["user"], "eva");
+    assert_eq!(json["roles"], json!(["web-editors"]));
 }

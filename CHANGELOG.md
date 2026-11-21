@@ -40,6 +40,13 @@ Changed.
   The token and a request from the machine without a token stay
   administrators. Every route now passes one gate that refuses by default:
   a signed-in user without the `admin` role gets `403` on the admin routes.
+- Managing accounts through the admin API, for administrators: `GET`,
+  `POST /users`, `PUT`, `DELETE /users/{name}`, and `GET`, `POST /roles`,
+  `PUT`, `DELETE /roles/{name}`. A refusal of the users file rules (the
+  last administrator, a role in use, a taken or invalid name) is `409` with
+  its reason, an unknown name `404`. Removing a user or setting its
+  password ends its sessions, a role change applies to the next request,
+  and every change is logged with who made it.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on

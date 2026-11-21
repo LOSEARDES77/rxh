@@ -30,6 +30,10 @@
 //! | `POST`   | `/auth/login`, `/auth/logout` | Sign in and out with a session      |
 //! | `POST`   | `/auth/setup`                 | Create the first user               |
 //! | `PUT`    | `/auth/password`              | Change one's own password           |
+//! | `GET`    | `/users`, `/roles`            | Users and roles of the users file   |
+//! | `POST`   | `/users`, `/roles`            | Add a user or a role                |
+//! | `PUT`    | `/users/{name}`, `/roles/{name}` | Change a user, replace a role    |
+//! | `DELETE` | `/users/{name}`, `/roles/{name}` | Remove a user or a role          |
 //!
 //! `/load` takes a whole configuration and the `PATCH` routes a JSON merge
 //! patch (RFC 7396), as JSON or TOML. Both validate and swap like a reload,
@@ -144,6 +148,14 @@ pub const ROUTES: &[(&str, &str, Audience)] = &[
     ("POST", "auth/setup", Audience::Anyone),
     ("POST", "auth/logout", Audience::Anyone),
     ("PUT", "auth/password", Audience::Caller),
+    ("GET", "users", Audience::Admin),
+    ("POST", "users", Audience::Admin),
+    ("PUT", "users/{}", Audience::Admin),
+    ("DELETE", "users/{}", Audience::Admin),
+    ("GET", "roles", Audience::Admin),
+    ("POST", "roles", Audience::Admin),
+    ("PUT", "roles/{}", Audience::Admin),
+    ("DELETE", "roles/{}", Audience::Admin),
     ("GET", "config", Audience::Admin),
     ("GET", "config/files", Audience::Admin),
     ("GET", "schema", Audience::Admin),
@@ -673,6 +685,18 @@ async fn handle(
         (&Method::PUT, ["auth", "password"]) => {
             auth_api::password(&state, &caller, peer, request).await
         }
+        (&Method::GET, ["users"]) => auth_api::list_users(&state),
+        (&Method::POST, ["users"]) => auth_api::create_user(&state, &caller, request).await,
+        (&Method::PUT, ["users", name]) => {
+            auth_api::change_user(&state, &caller, name, request).await
+        }
+        (&Method::DELETE, ["users", name]) => auth_api::remove_user(&state, &caller, name).await,
+        (&Method::GET, ["roles"]) => auth_api::list_roles(&state),
+        (&Method::POST, ["roles"]) => auth_api::create_role(&state, &caller, request).await,
+        (&Method::PUT, ["roles", name]) => {
+            auth_api::replace_role(&state, &caller, name, request).await
+        }
+        (&Method::DELETE, ["roles", name]) => auth_api::remove_role(&state, &caller, name).await,
         (&Method::POST, ["stop"]) => {
             let _ = state.control.send(Control::Stop).await;
             json_response(StatusCode::OK, &json!({ "stopping": true }))

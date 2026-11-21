@@ -1,5 +1,6 @@
 //! The `/auth` routes of the admin API: who the caller is, sign-in, sign-out,
-//! creating the first user and changing one's password.
+//! creating the first user and changing one's password; and the `/users`
+//! and `/roles` routes, with which an administrator manages the accounts.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::access::{ADMIN_ROLE, Scope};
+use crate::access::{ADMIN_ROLE, Access, Grant, Role, Scope};
 use crate::admin::{self, AdminState, Caller, Peer};
 use crate::session;
 
@@ -50,6 +51,34 @@ struct SetupBody {
 struct PasswordBody {
     current: String,
     new: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewUserBody {
+    name: String,
+    password: String,
+    #[serde(default)]
+    roles: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserChangeBody {
+    #[serde(default)]
+    roles: Option<Vec<String>>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// A role as `PUT /roles/{name}` takes it: the name is the one of the path.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    grant: Vec<Grant>,
 }
 
 /// `GET /auth/session`: who the caller is and what the page may offer.
@@ -309,6 +338,220 @@ async fn change_password(
     }
 }
 
+/// A response, or the one that ended the request early.
+type Answer = Result<Response<Full<Bytes>>, Box<Response<Full<Bytes>>>>;
+
+/// `GET /users`: every user with its roles.
+pub(crate) fn list_users(state: &AdminState) -> Response<Full<Bytes>> {
+    let users: Vec<_> = state
+        .access
+        .read()
+        .user
+        .iter()
+        .map(|user| json!({ "name": user.name, "roles": user.roles }))
+        .collect();
+    admin::json_response(StatusCode::OK, &users)
+}
+
+/// `POST /users`: adds a user with a password and roles.
+pub(crate) async fn create_user(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let created = async {
+        let NewUserBody {
+            name,
+            password,
+            roles,
+        } = admin::read_json(request).await?;
+        let permit = hash_permit(state).await?;
+        let (added, added_roles) = (name.clone(), roles.clone());
+        change_access(state, Some(permit), None, move |access| {
+            access.add_user(&added, &password, &added_roles)
+        })
+        .await?;
+        println!("Admin => User {name} created by {}", caller.label());
+        let user = json!({ "name": name, "roles": roles });
+        Answer::Ok(admin::json_response(StatusCode::CREATED, &user))
+    };
+    created.await.unwrap_or_else(|response| *response)
+}
+
+/// `PUT /users/{name}`: replaces the roles of a user, its password or both.
+/// A new password ends the sessions of the user.
+pub(crate) async fn change_user(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    name: &str,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let changed = async {
+        let UserChangeBody { roles, password } = admin::read_json(request).await?;
+        if roles.is_none() && password.is_none() {
+            return Err(Box::new(admin::error(
+                StatusCode::BAD_REQUEST,
+                "the body names roles, a password or both",
+            )));
+        }
+        let new_password = password.is_some();
+        let permit = if new_password {
+            Some(hash_permit(state).await?)
+        } else {
+            None
+        };
+        let user = name.to_owned();
+        change_access(state, permit, Some(missing_user(name)), move |access| {
+            if let Some(roles) = &roles {
+                access.set_roles(&user, roles)?;
+            }
+            if let Some(password) = &password {
+                access.set_password(&user, password)?;
+            }
+            Ok(())
+        })
+        .await?;
+        if new_password {
+            state.sessions.end_user(name);
+        }
+        println!("Admin => User {name} changed by {}", caller.label());
+        Answer::Ok(no_content(None))
+    };
+    changed.await.unwrap_or_else(|response| *response)
+}
+
+/// `DELETE /users/{name}`: removes a user and ends its sessions.
+pub(crate) async fn remove_user(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    name: &str,
+) -> Response<Full<Bytes>> {
+    let user = name.to_owned();
+    let removed = change_access(state, None, Some(missing_user(name)), move |access| {
+        access.remove_user(&user)
+    })
+    .await;
+    if let Err(response) = removed {
+        return *response;
+    }
+    state.sessions.end_user(name);
+    println!("Admin => User {name} removed by {}", caller.label());
+    no_content(None)
+}
+
+/// `GET /roles`: the built-in `admin` role, then every defined role.
+pub(crate) fn list_roles(state: &AdminState) -> Response<Full<Bytes>> {
+    let mut roles = vec![json!({ "name": ADMIN_ROLE, "builtin": true })];
+    for role in state.access.read().role {
+        roles.push(json!(role));
+    }
+    admin::json_response(StatusCode::OK, &roles)
+}
+
+/// `POST /roles`: defines a role whose name is not taken.
+pub(crate) async fn create_role(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let created = async {
+        let role: Role = admin::read_json(request).await?;
+        let added = role.clone();
+        change_access(state, None, None, move |access| {
+            if access.role.iter().any(|other| other.name == added.name) {
+                return Err(format!("role {:?} exists", added.name));
+            }
+            access.put_role(added)
+        })
+        .await?;
+        println!("Admin => Role {} created by {}", role.name, caller.label());
+        Answer::Ok(admin::json_response(StatusCode::CREATED, &role))
+    };
+    created.await.unwrap_or_else(|response| *response)
+}
+
+/// `PUT /roles/{name}`: replaces the grants of a defined role.
+pub(crate) async fn replace_role(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    name: &str,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let replaced = async {
+        let RoleBody { name: named, grant } = admin::read_json(request).await?;
+        if named.is_some_and(|named| named != name) {
+            return Err(Box::new(admin::error(
+                StatusCode::BAD_REQUEST,
+                "the name in the body is not the one in the path",
+            )));
+        }
+        let role = Role {
+            name: name.to_owned(),
+            grant,
+        };
+        change_access(state, None, Some(missing_role(name)), move |access| {
+            // `admin` goes on to the rules, which say it is built in.
+            if role.name != ADMIN_ROLE && !access.role.iter().any(|other| other.name == role.name) {
+                return Err(missing_role(&role.name));
+            }
+            access.put_role(role)
+        })
+        .await?;
+        println!("Admin => Role {name} replaced by {}", caller.label());
+        Answer::Ok(no_content(None))
+    };
+    replaced.await.unwrap_or_else(|response| *response)
+}
+
+/// `DELETE /roles/{name}`: removes a role that no user has.
+pub(crate) async fn remove_role(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    name: &str,
+) -> Response<Full<Bytes>> {
+    let role = name.to_owned();
+    let removed = change_access(state, None, Some(missing_role(name)), move |access| {
+        access.remove_role(&role)
+    })
+    .await;
+    if let Err(response) = removed {
+        return *response;
+    }
+    println!("Admin => Role {name} removed by {}", caller.label());
+    no_content(None)
+}
+
+/// The reason [`Access`] gives for a user that does not exist.
+fn missing_user(name: &str) -> String {
+    format!("no user {name:?}")
+}
+
+/// The reason [`Access`] gives for a role that does not exist.
+fn missing_role(name: &str) -> String {
+    format!("no role {name:?}")
+}
+
+/// Applies `edit` to the users file off the async workers, where it may
+/// wait for a change that hashes, holding `permit` when `edit` hashes a
+/// password. A refusal is `404` when its reason is `missing`, else `409`.
+async fn change_access(
+    state: &Arc<AdminState>,
+    permit: Option<OwnedSemaphorePermit>,
+    missing: Option<String>,
+    edit: impl FnOnce(&mut Access) -> Result<(), String> + Send + 'static,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    let store = Arc::clone(state);
+    let changed = off_workers(permit, move || store.access.change(edit)).await?;
+    changed.map_err(|reason| {
+        let status = if missing.as_deref() == Some(reason.as_str()) {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::CONFLICT
+        };
+        Box::new(admin::error(status, &reason))
+    })
+}
+
 /// The right to hash or compare one password, waited for up to
 /// [`HASH_WAIT`]. `Err` with a `429` when none came free in that time.
 async fn hash_permit(
@@ -326,11 +569,19 @@ async fn hash_permit(
 }
 
 /// Runs `work`, which hashes or compares a password, off the async workers:
-/// bcrypt takes a quarter of a second. The permit is held until the work
-/// ends, also when the request that asked for it is gone. `Err` with a
-/// `500` when the work panicked.
+/// bcrypt takes a quarter of a second. See [`off_workers`].
 async fn hashed<T: Send + 'static>(
     permit: OwnedSemaphorePermit,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Box<Response<Full<Bytes>>>> {
+    off_workers(Some(permit), work).await
+}
+
+/// Runs `work` on a thread that may block, holding `permit` until the work
+/// ends, also when the request that asked for it is gone. `Err` with a
+/// `500` when the work panicked.
+async fn off_workers<T: Send + 'static>(
+    permit: Option<OwnedSemaphorePermit>,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Box<Response<Full<Bytes>>>> {
     let done = tokio::task::spawn_blocking(move || {
@@ -339,10 +590,10 @@ async fn hashed<T: Send + 'static>(
     })
     .await;
     done.map_err(|err| {
-        eprintln!("Admin => A password was not checked: {err}");
+        eprintln!("Admin => A request was not completed: {err}");
         Box::new(admin::error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "the password was not checked",
+            "the request was not completed",
         ))
     })
 }
