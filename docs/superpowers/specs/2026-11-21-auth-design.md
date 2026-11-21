@@ -244,6 +244,10 @@ webhooks) and open sockets. So Modify and Create do not mean "any table".
   daemon enforces for everybody: while no `token` is set, the proxy refuses
   to connect to its own admin API, because such a connection would arrive
   as a local administrator.
+- One more exception: when the stored table of a host holds a `{env.` or
+  `{file.` placeholder in any string (an administrator put a secret there),
+  a user without `admin` may not change any forward target of that host,
+  or the expanded value would be sent to a target of the user's choosing.
 - Claiming a host name nobody uses yet on a shared listener is what Create
   is for; taking over a name another host already answers is refused when
   the configuration validation refuses it, and is otherwise a matter of
