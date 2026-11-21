@@ -375,9 +375,7 @@ impl Daemon {
         let oidc = match (&admin_settings.oidc, &admin_settings.public_url) {
             (Some(settings), Some(public_url)) if admin_settings.enabled => {
                 let guard = AdminGuard::new(&admin_settings);
-                let client = oidc::Client::new(settings, public_url, guard)
-                    .map_err(|err| io::Error::new(err.kind(), format!("[admin.oidc]: {err}")))?;
-                Some(client)
+                Some(oidc::Client::new(settings, public_url, guard)?)
             }
             // Validation refuses `oidc` without `public_url`.
             _ => None,

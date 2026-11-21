@@ -88,6 +88,13 @@ pub(crate) struct Client {
     redirect_uri: String,
     /// `{public_url}/dashboard`.
     dashboard: String,
+    /// Where a flow starts, under `public_url`.
+    login: String,
+    /// Authority of `public_url`: the host the cookies of a flow belong to.
+    authority: String,
+    /// The port a browser leaves out of `Host` for the scheme of
+    /// `public_url`, with its `:`.
+    default_port: &'static str,
     issuer_host: String,
     /// Connections to `https` endpoints, and to `http` ones on loopback.
     tls: Dialer,
@@ -125,12 +132,18 @@ pub(crate) enum Failure {
 
 impl Client {
     /// The client for `settings`, whose callback is under `public_url`.
-    /// Fails when the TLS settings cannot be built.
+    /// Fails when the TLS settings cannot be built, with an error that
+    /// names `[admin.oidc]`.
     pub(crate) fn new(
         settings: &config::Oidc,
         public_url: &str,
         guard: AdminGuard,
     ) -> io::Result<Self> {
+        Self::build(settings, public_url, guard)
+            .map_err(|err| io::Error::new(err.kind(), format!("[admin.oidc]: {err}")))
+    }
+
+    fn build(settings: &config::Oidc, public_url: &str, guard: AdminGuard) -> io::Result<Self> {
         let dialer = |tls: Option<UpstreamTls>| {
             let group = UpstreamGroup {
                 dial_timeout: REQUEST_TIMEOUT,
@@ -140,10 +153,21 @@ impl Client {
             Dialer::new(&group, guard.clone())
         };
         let issuer: Uri = settings.issuer.parse().map_err(io::Error::other)?;
+        let public: Uri = public_url.parse().map_err(io::Error::other)?;
         Ok(Self {
             settings: settings.clone(),
             redirect_uri: format!("{public_url}/auth/oidc/callback"),
             dashboard: format!("{public_url}/dashboard"),
+            login: format!("{public_url}/auth/oidc/login"),
+            authority: public
+                .authority()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            default_port: if public.scheme_str() == Some("http") {
+                ":80"
+            } else {
+                ":443"
+            },
             issuer_host: issuer.host().unwrap_or_default().to_owned(),
             tls: dialer(Some(UpstreamTls {
                 ca: settings.ca.clone(),
@@ -283,6 +307,18 @@ impl Client {
             roles,
             groups,
         })
+    }
+
+    /// Whether `host`, the `Host` of a request, is the authority of
+    /// `public_url`, letter case and the default port aside.
+    fn is_at(&self, host: &str) -> bool {
+        let bare = |authority: &str| {
+            authority
+                .strip_suffix(self.default_port)
+                .unwrap_or(authority)
+                .to_ascii_lowercase()
+        };
+        bare(host) == bare(&self.authority)
     }
 
     /// Host of the issuer, for the page to say where the sign-in goes.
@@ -821,13 +857,61 @@ fn refused(client: &Client, peer: Peer, failure: &Failure) -> Response<Full<Byte
     page(status, "Not signed in", &sentence, &client.dashboard, false)
 }
 
+/// True if the browser that sends `request` says it is not a person going
+/// to a page of this API: `Sec-Fetch-Site` says the page of another site
+/// asked for it, or `Sec-Fetch-Dest` that it is for an image, a frame or a
+/// script. A client that sends neither header (`curl`) is not one a foreign
+/// page can drive.
+fn is_sent_by_another_page<B>(request: &Request<B>) -> bool {
+    let value = |name: &str| request.headers().get(name).map(HeaderValue::as_bytes);
+    value("sec-fetch-site") == Some(b"cross-site")
+        || value("sec-fetch-dest").is_some_and(|destination| destination != b"document")
+}
+
+/// The answer to the start of a flow that goes no further, before anything
+/// is counted or kept: `403` for what another site made the browser send,
+/// which would spend the sign-in attempts of the address and replace the
+/// cookie of a flow under way, and `302` to `public_url` for a browser that
+/// came under another name of this API, whose cookie the callback would
+/// not get.
+fn turned_away<B>(client: &Client, request: &Request<B>) -> Option<Response<Full<Bytes>>> {
+    if is_sent_by_another_page(request) {
+        return Some(page(
+            StatusCode::FORBIDDEN,
+            "Not signed in",
+            "The sign-in was refused: it has to be started from the dashboard, not from the \
+             page of another site.",
+            &client.dashboard,
+            false,
+        ));
+    }
+    let host = request.headers().get(header::HOST)?.to_str().ok()?;
+    if client.is_at(host) {
+        return None;
+    }
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::FOUND;
+    let headers = response.headers_mut();
+    headers.insert(header::LOCATION, HeaderValue::from_str(&client.login).ok()?);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Some(response)
+}
+
 /// `GET /auth/oidc/login`: sends the browser to the provider, with the
 /// cookie that binds the flow to it.
-pub(crate) async fn login(state: &AdminState, peer: Peer) -> Response<Full<Bytes>> {
-    let client = match offered(state, peer).and_then(|client| {
-        counted(state, client, peer)?;
-        Ok(client)
-    }) {
+pub(crate) async fn login<B>(
+    state: &AdminState,
+    peer: Peer,
+    request: &Request<B>,
+) -> Response<Full<Bytes>> {
+    let client = match offered(state, peer) {
+        Ok(client) => client,
+        Err(response) => return *response,
+    };
+    if let Some(response) = turned_away(client, request) {
+        return response;
+    }
+    let client = match counted(state, client, peer).map(|()| client) {
         Ok(client) => client,
         Err(response) => return *response,
     };
@@ -946,6 +1030,20 @@ mod tests {
 
     fn check(claims: &Value) -> Result<(), String> {
         check_claims(claims, ISSUER, "rxh", "the-nonce", NOW)
+    }
+
+    /// Settings for a provider that is not there.
+    fn settings() -> config::Oidc {
+        config::Oidc {
+            issuer: String::from("http://127.0.0.1:1"),
+            client_id: String::from("rxh"),
+            client_secret: String::from("secret"),
+            scopes: vec![String::from("openid")],
+            groups_claim: String::from("groups"),
+            name_claim: String::from("sub"),
+            roles: BTreeMap::new(),
+            ca: None,
+        }
     }
 
     fn flow(binding: &str, created: Instant) -> Flow {
@@ -1318,29 +1416,24 @@ mod tests {
             tls: false,
             address: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
         };
+        let request = Request::new(());
         let mut state = admin::tests::state(None, PathBuf::new());
         for response in [
-            login(&state, plain).await,
+            login(&state, plain, &request).await,
             callback(&state, plain, "code=a&state=b", Some("binding")).await,
         ] {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "no [admin.oidc]");
         }
 
         // The provider is not there: an answer other than 403 would be 502.
-        let settings = config::Oidc {
-            issuer: String::from("http://127.0.0.1:1"),
-            client_id: String::from("rxh"),
-            client_secret: String::from("secret"),
-            scopes: vec![String::from("openid")],
-            groups_claim: String::from("groups"),
-            name_claim: String::from("sub"),
-            roles: BTreeMap::new(),
-            ca: None,
-        };
-        let client = Client::new(&settings, "https://rxh.example.com", AdminGuard::default());
+        let client = Client::new(
+            &settings(),
+            "https://rxh.example.com",
+            AdminGuard::default(),
+        );
         state.oidc = Some(client.unwrap());
         for response in [
-            login(&state, plain).await,
+            login(&state, plain, &request).await,
             callback(&state, plain, "code=a&state=b", Some("binding")).await,
         ] {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -1349,8 +1442,53 @@ mod tests {
         }
         assert!(state.oidc.as_ref().unwrap().pending().is_empty());
         // Where a session may be, the flow goes on, to the provider.
-        let response = login(&state, admin::tests::LOCAL).await;
+        let response = login(&state, admin::tests::LOCAL, &request).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn a_ca_file_that_cannot_be_read_stops_the_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("no-such-ca.pem");
+        // A directory is there and is not a file to read.
+        for path in [missing.as_path(), directory.path()] {
+            let settings = config::Oidc {
+                ca: Some(path.to_str().unwrap().to_owned()),
+                ..settings()
+            };
+            let Err(err) = Client::new(&settings, "https://rxh.example.com", AdminGuard::default())
+            else {
+                panic!("a client with the ca {}", path.display());
+            };
+            let message = err.to_string();
+            assert!(message.starts_with("[admin.oidc]: "), "{message}");
+            assert!(message.contains(path.to_str().unwrap()), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_host_of_a_request_is_compared_with_public_url() {
+        let client =
+            |public_url: &str| Client::new(&settings(), public_url, AdminGuard::default()).unwrap();
+        let named = client("https://rxh.example.com/admin");
+        for host in ["rxh.example.com", "RXH.Example.com", "rxh.example.com:443"] {
+            assert!(named.is_at(host), "{host}");
+        }
+        for host in [
+            "rxh.example.com:80",
+            "rxh.example.com:2019",
+            "example.com",
+            "127.0.0.1",
+        ] {
+            assert!(!named.is_at(host), "{host}");
+        }
+        assert_eq!(named.login, "https://rxh.example.com/admin/auth/oidc/login");
+        let local = client("http://127.0.0.1:2019");
+        assert!(local.is_at("127.0.0.1:2019"));
+        for host in ["localhost:2019", "127.0.0.1", "127.0.0.1:443", "[::1]:2019"] {
+            assert!(!local.is_at(host), "{host}");
+        }
+        assert!(client("http://[::1]:80").is_at("[::1]"));
     }
 
     #[test]

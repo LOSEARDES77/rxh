@@ -576,7 +576,8 @@ Changed.
   provider, and a note in the Users tab that those users are not listed.
   Over plain HTTP where no password is taken, the sign-in form says to
   open the page over https, with the link, instead of a form that would be
-  refused; `GET /auth/session` says `setup_needs_code: true` there too.
+  refused (only where the listener has `tls`: without it there is no https
+  to open); `GET /auth/session` says `setup_needs_code: true` there too.
 - Documentation of sign-in through a provider: a worked example for a
   self-hosted provider (confidential client, redirect URI, a `groups`
   claim, `ca` for a private authority) and what is not there (one
@@ -584,7 +585,18 @@ Changed.
   sign-out, no refresh, roles of sign-in time for 12 hours). The admin
   section says that `kubectl port-forward` reaches a loopback listener
   without a token as an administrator, and that a token sent to `http://`
-  through a forwarder travels in clear.
+  through a forwarder that crosses the network travels in clear.
+- `GET /auth/oidc/login` refuses what the page of another site makes a
+  browser send (`Sec-Fetch-Site: cross-site`, or a `Sec-Fetch-Dest` other
+  than `document`) with `403`, before it counts as a sign-in attempt or
+  starts a flow: another site could spend the 10 attempts a minute of the
+  address, passwords included. Opened under another name of the listener
+  (`localhost` for `127.0.0.1`), it answers `302` to
+  `{public_url}/auth/oidc/login`, so the cookie of the flow belongs to the
+  name the provider sends the browser back to. An `http://` `public_url`
+  with a `listen` that is not loopback or a unix socket is a validation
+  error: use `https://`. The log names a user of the provider as
+  `"name" (oidc)`, escaped, in the sign-out line too.
 
 ### Deprecated
 

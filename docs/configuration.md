@@ -554,7 +554,7 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
 | `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
 | `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API. A relative path is relative to the directory of the configuration file, like `[acme] storage`, so the daemon and `rxh user` find the same file wherever they run. Must not be empty. Changes need a restart. In the container images the configuration directory is not writable: set an absolute path on the volume, `users = "/var/lib/rxh/users.toml"`. |
-| `public_url` | none | Address where browsers reach the admin API: an `https://` URL, or `http://` on a loopback address (`http://127.0.0.1:2019`), without a user, a password, a query or a fragment; a trailing `/` is removed. Required by `oidc`. Changes need a restart. |
+| `public_url` | none | Address where browsers reach the admin API: an `https://` URL, or `http://` on a loopback address (`http://127.0.0.1:2019`), without a user, a password, a query or a fragment; a trailing `/` is removed. `http://` is accepted only with a `listen` that is a loopback address or a unix socket: on any other listener nobody signs in over plain HTTP, so use `https://` there. Required by `oidc`. Changes need a restart. |
 | `oidc` | none | Sign-in through an OpenID Connect provider, see [OpenID Connect](#openid-connect). Changes need a restart. |
 
 On a unix socket the API is reachable only by the user running the daemon
@@ -1249,6 +1249,14 @@ manages its own hosts and nothing else.
    signed in with no permission at all. The flow is described in
    [Signing in through a provider](#signing-in-through-a-provider).
 
+   Keep the local administrator of step 3 (`ana`): with an empty users
+   file the setup code is written to the log at every start and stays
+   valid, and a local administrator is the way back in when the provider
+   is down. A provider session ends after 12 hours, at sign-out, or when
+   the daemon restarts or is upgraded; removing the person at the provider
+   does not end one already made. To take someone's access at once, remove
+   or empty the role in the users file (`web-editors` here).
+
 What is not there:
 
 - **More than a password, here.** No two-factor codes, no passkeys, no
@@ -1334,7 +1342,7 @@ A worked example is step 6 of
 
 | Key | Default | Description |
 |---|---|---|
-| `issuer` | required | Issuer of the provider, written exactly as the provider publishes it, a trailing `/` included when it has one (Auth0): an `https://` URL, or `http://` on a loopback address, without a user or a password. The discovery document is read from `{issuer}/.well-known/openid-configuration`, and its `issuer` and the `iss` of every ID token must be equal to this value, character by character. |
+| `issuer` | required | Issuer of the provider, written exactly as the provider publishes it, a trailing `/` included when it has one (Auth0): an `https://` URL, or `http://` on a loopback address, without a user, a password, a query or a fragment. The discovery document is read from `{issuer}/.well-known/openid-configuration`, and its `issuer` and the `iss` of every ID token must be equal to this value, character by character. |
 | `client_id` | required | Client ID registered at the provider. Must not be empty. |
 | `client_secret` | required | Client secret registered at the provider. Must not be empty. `GET /config`, `rxh config show` and the configuration editor show it as `***`; use an `{env.NAME}` or `{file.PATH}` placeholder to keep it out of the file. |
 | `scopes` | `["openid", "profile", "email"]` | Scopes asked for. Must contain `"openid"`. |
@@ -1345,7 +1353,10 @@ A worked example is step 6 of
 
 `oidc` needs `public_url` in `[admin]`, and `tls` in `[admin]` or a
 loopback or unix socket `listen`, since a session cookie is only offered
-over TLS or from the machine. Like every `[admin]` key, `[admin.oidc]` is
+over TLS or from the machine. For the same reason an `http://`
+`public_url` is refused unless `listen` is a loopback address or a unix
+socket: the browser would come back from the provider over plain HTTP,
+where no session starts. Like every `[admin]` key, `[admin.oidc]` is
 read at start only: changes need a restart.
 
 ```toml
@@ -1397,6 +1408,15 @@ How a sign-in goes:
    authorization endpoint, with a new `state`, `nonce` and PKCE challenge
    (`S256`), and a cookie (`rxh_oidc`, `HttpOnly`, `SameSite=Lax`, 10
    minutes, `Secure` over TLS) that ties the sign-in to this browser.
+   Two requests go no further, and neither counts as a sign-in attempt:
+   one whose `Host` is not the host and port of `public_url` (the page was
+   opened as `localhost:2019` and `public_url` says `127.0.0.1:2019`, for
+   example) answers `302` to `{public_url}/auth/oidc/login`, since the
+   cookie has to belong to the name the provider sends the browser back
+   to; and one that the page of another site made the browser send
+   (`Sec-Fetch-Site: cross-site`, or a `Sec-Fetch-Dest` other than
+   `document`: an image, a frame, a script) answers `403`. A client that
+   sends neither header, like `curl`, passes.
 2. The user signs in at the provider, which sends the browser back to
    `GET /auth/oidc/callback?code=...&state=...`.
 3. rxh checks that the `state` is one it gave to this browser less than 10
@@ -1420,12 +1440,28 @@ sign-in: a user taken out of a group at the provider keeps its roles until
 the session ends, 12 hours at most. Signing out ends the rxh session only,
 not the one at the provider.
 
+A session of a provider user ends in three ways: after its 12 hours, when
+the user signs out, and when the daemon restarts or is upgraded
+(`rxh upgrade`), which ends every session. Removing the person at the
+provider, or from a group there, does not end a session already made. To
+take the access of such a user now, remove its role from the users file
+or empty it (`DELETE` or `PUT /roles/{name}`): that applies at the next
+request, to everybody who has the role. For a user whose groups give
+`admin`, which is not a role of the file, restart the daemon.
+
+With only provider users the users file stays empty. On a `tls` listener
+without a `token` the daemon then writes the setup code to its log at
+every start, and the code stays valid: whoever reads the log can create
+the first local user, an administrator. Create one local administrator
+yourself (`rxh user add`, or the form of the dashboard): it closes the
+setup, and it is the way back in when the provider is down.
+
 A user of the provider is not a user of the users file, even under the same
 name: it has only the roles its groups give, it is not listed in
 `GET /users`, it has no password here (`PUT /auth/password` answers `403`),
 and what ends the sessions of the local user of that name leaves its own.
 Its sign-in is logged as `"name" signed in through the provider`, with its
-roles and groups, and the changes it makes as made by `name (oidc)`. A user
+roles and groups, and the changes it makes, and its sign-out, as `"name" (oidc)`. A user
 keeps at most 10 sessions. Provider users are not stored anywhere: the
 session is all rxh knows of them.
 
@@ -1434,6 +1470,7 @@ one sentence, and starts no session:
 
 | Answer | When |
 |---|---|
+| `403` | `GET /auth/oidc/login` was sent by the page of another site, or for something that is not a page (see step 1). Not counted as an attempt. |
 | `403` | The callback is not of a sign-in this browser started: no cookie or another one, an unknown or used `state`, or more than 10 minutes. Start again. |
 | `403` | The provider sent an error instead of a code (the user said no, for example), or no code. |
 | `403` | A claim of the ID token is wrong or missing, or the token does not name the user, or names it with control characters or more than 256 bytes. |
@@ -1441,7 +1478,7 @@ one sentence, and starts no session:
 | `502` | The provider could not be reached (the log says why), took more than 10 seconds, answered more than 1 MiB, answered an error or a redirect, or sent no ID token; or its discovery document is of another issuer, or names an endpoint that is not `https` (an `http` endpoint on a loopback address is taken only from an issuer that is itself `http` on a loopback address). |
 | `429` | The client address used up its 10 sign-in attempts of the minute, which `GET /auth/oidc/login` shares with `POST /auth/login`. The callback is not an attempt: it does nothing without a sign-in that was started. |
 | `404` (JSON) | `[admin.oidc]` is not set. |
-| `403` (JSON) | The connection is one where no session may be: plain HTTP from another machine. |
+| `403` (JSON) | The connection is one where no session may be: plain HTTP from another machine, and also plain HTTP from the machine itself on a `tls` listener that is not loopback, where the position of a client is not trusted. |
 
 Known limits:
 
@@ -1454,6 +1491,20 @@ Known limits:
   tab) replaces the cookie of the first, whose callback is then refused.
 - **The provider is reached directly.** No proxy setting, no redirects
   followed, HTTP/1.1.
+- **Sign-ins under way live in one process.** Several rxh instances
+  behind one `public_url` need the balancer to send a browser to the same
+  instance for the whole sign-in (stickiness): the callback is refused by
+  an instance that did not start it. A sign-in under way when the daemon
+  restarts or is upgraded answers "start again".
+- **Cookies belong to a host name, not to a port.** A browser sends
+  `rxh_session` and `rxh_oidc` to every port of the host name of the
+  admin API, so to every other service under that name. Give the admin
+  API a host name of its own (`rxh.example.com`, not a port of a name
+  other services share).
+- **A forwarder in front must keep `Host`.** A proxy between the browser
+  and the admin API that replaces `Host` with its own target makes
+  `GET /auth/oidc/login` answer `302` to `public_url` again and again;
+  the session rules (`Origin` equal to `Host`) need the same.
 - **Names come from the provider.** With a `name_claim` users can edit
   at the provider, two people can show under one name in the log; roles
   never depend on the name.

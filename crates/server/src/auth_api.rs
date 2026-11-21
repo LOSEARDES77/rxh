@@ -18,7 +18,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use crate::access::{ADMIN_ROLE, Access, Grant, Role, Scope};
 use crate::admin::{self, AdminState, Caller, Peer};
 use crate::oidc;
-use crate::session;
+use crate::session::{self, Session};
 
 /// Longest name a user can have, in bytes. A longer one is no user: it is
 /// refused before it costs a hash or a place among the failed sign-ins.
@@ -185,10 +185,16 @@ pub(crate) fn logout<B>(
         }
         if let Some(session) = state.sessions.get(id) {
             state.sessions.end(id);
-            println!("Admin => {} signed out from {}", session.user, client(peer));
+            println!("{}", signed_out(&session, peer));
         }
     }
     no_content(Some(session::expired_cookie(peer.tls)))
+}
+
+/// The log line of a sign-out, with the user named as in every other line.
+fn signed_out(session: &Session, peer: Peer) -> String {
+    let user = admin::user_label(&session.user, session.roles.is_some());
+    format!("Admin => {user} signed out from {}", client(peer))
 }
 
 /// `POST /auth/setup`: see [`create_first_user`].
@@ -786,6 +792,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let users = directory.path().join("users.toml");
         (Arc::new(state(token, users)), directory)
+    }
+
+    #[test]
+    fn a_sign_out_names_a_user_of_the_provider_escaped_and_marked() {
+        let sessions = session::Sessions::new();
+        let line = |name: &str, roles: Option<Vec<String>>| {
+            let id = sessions.create(name, roles, None);
+            signed_out(&sessions.get(&id).unwrap(), REMOTE)
+        };
+        assert_eq!(line("ana", None), "Admin => ana signed out from 192.0.2.8");
+        // Not the local `ana`, and nothing that breaks or reorders the line.
+        assert_eq!(
+            line("ana", Some(Vec::new())),
+            "Admin => \"ana\" (oidc) signed out from 192.0.2.8"
+        );
+        assert_eq!(
+            line("eve\u{2028}Admin => ana\u{202e}", Some(Vec::new())),
+            "Admin => \"eve\\u{2028}Admin => ana\\u{202e}\" (oidc) signed out from 192.0.2.8"
+        );
     }
 
     fn body(code: Option<&str>) -> SetupBody {

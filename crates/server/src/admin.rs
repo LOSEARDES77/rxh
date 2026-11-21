@@ -743,7 +743,7 @@ async fn handle(
         (&Method::PUT, ["auth", "password"]) => {
             auth_api::password(&state, &caller, peer, request).await
         }
-        (&Method::GET, ["auth", "oidc", "login"]) => oidc::login(&state, peer).await,
+        (&Method::GET, ["auth", "oidc", "login"]) => oidc::login(&state, peer, &request).await,
         (&Method::GET, ["auth", "oidc", "callback"]) => {
             let query = request.uri().query().unwrap_or_default().to_owned();
             let binding = oidc::binding_of(&request).map(str::to_owned);
@@ -818,12 +818,22 @@ impl Caller {
         match self {
             Self::Token => Cow::Borrowed("token"),
             Self::Local => Cow::Borrowed("local"),
-            Self::User {
-                name, oidc: true, ..
-            } => Cow::Owned(format!("{name} (oidc)")),
-            Self::User { name, .. } => Cow::Borrowed(name),
+            Self::User { name, oidc, .. } => user_label(name, *oidc),
             Self::Nobody => Cow::Borrowed("nobody"),
         }
+    }
+}
+
+/// The name that stands in the log for the user `name`, who signed in
+/// through the provider when `oidc`. A name of the users file is
+/// `[a-z0-9._-]`; one of the provider is anything without control
+/// characters, so it is written escaped, and marked: it is not the local
+/// user of that name.
+pub(crate) fn user_label(name: &str, oidc: bool) -> Cow<'_, str> {
+    if oidc {
+        Cow::Owned(format!("{name:?} (oidc)"))
+    } else {
+        Cow::Borrowed(name)
     }
 }
 
@@ -1943,7 +1953,12 @@ pub(crate) mod tests {
         let user = caller(&with(None, Some(&provided)), &open, REMOTE);
         assert!(matches!(&user, Caller::User { name, oidc: true, .. } if name == "luis"));
         assert!(!user.is_admin());
-        assert_eq!(user.label(), "luis (oidc)");
+        assert_eq!(user.label(), "\"luis\" (oidc)");
+        // A name of the provider may hold what a log line should not.
+        assert_eq!(
+            user_label("eve\u{2028}\u{202e}\"", /* oidc= */ true),
+            "\"eve\\u{2028}\\u{202e}\\\"\" (oidc)"
+        );
     }
 
     #[tokio::test]

@@ -143,9 +143,21 @@ async fn browse(admin: SocketAddr, uri: &str, cookies: &[&str]) -> Page {
 
 /// [`browse`] with another `Host`.
 async fn browse_as(admin: SocketAddr, host: &str, uri: &str, cookies: &[&str]) -> Page {
+    let cookies = cookies.join("; ");
+    let headers = [("cookie", cookies.as_str())];
+    let headers = if cookies.is_empty() {
+        &[][..]
+    } else {
+        &headers
+    };
+    browse_with(admin, host, uri, headers).await
+}
+
+/// `GET uri` with `host` as its `Host` and with `headers`.
+async fn browse_with(admin: SocketAddr, host: &str, uri: &str, headers: &[(&str, &str)]) -> Page {
     let mut request = Request::get(uri).header(header::HOST, host);
-    if !cookies.is_empty() {
-        request = request.header(header::COOKIE, cookies.join("; "));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
     }
     let request = request.body(Empty::<Bytes>::new()).expect("valid request");
     let (status, headers, body) = util::send(admin, request).await;
@@ -786,10 +798,109 @@ async fn a_name_with_control_characters_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_redirect_uri_comes_from_public_url_and_not_from_host() {
+async fn a_sign_in_started_by_another_site_is_refused_and_not_counted() {
     let fixture = daemon().await;
-    let page = browse_as(fixture.admin, "localhost:1", "/auth/oidc/login", &[]).await;
-    assert_eq!(page.status, StatusCode::FOUND, "{}", page.body);
+    fixture.provider.set_claims(marta());
+    let host = fixture.admin.to_string();
+    let login = |headers: &'static [(&'static str, &'static str)]| {
+        browse_with(fixture.admin, &host, "/auth/oidc/login", headers)
+    };
+    let (flow_under_way, binding) = fixture.login().await;
+
+    // What the page of another site makes a browser send: a link, an
+    // image, a frame, a `fetch`. More of them than the attempts of a minute.
+    let link: &[_] = &[
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+    let image: &[_] = &[
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-dest", "image"),
+    ];
+    let same_site_image: &[_] = &[("sec-fetch-site", "same-site"), ("sec-fetch-dest", "image")];
+    let frame: &[_] = &[
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-dest", "iframe"),
+    ];
+    let fetch: &[_] = &[("sec-fetch-dest", "empty")];
+    let only_site: &[_] = &[("sec-fetch-site", "cross-site")];
+    for headers in [link, image, same_site_image, frame, fetch, only_site].repeat(2) {
+        let page = login(headers).await;
+        fixture.assert_refused(&page, StatusCode::FORBIDDEN, "page of another site");
+        assert_eq!(page.cookie("rxh_oidc"), None, "{headers:?}");
+        assert_eq!(page.headers.get(header::LOCATION), None, "{headers:?}");
+    }
+    // Nothing was started: the provider was asked once, for the first flow.
+    assert_eq!(fixture.provider.discovery_requests(), 1);
+
+    // The flow that was under way is still the one of its browser, and
+    // what a person does starts one: the link of the dashboard, a link of
+    // another service of the same site, the address bar, `curl`.
+    let callback = fixture.provider.authorize(flow_under_way.location());
+    let page = browse(fixture.admin, fixture.path(&callback), &[&binding]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let same_origin: &[_] = &[
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-dest", "document"),
+    ];
+    let same_site: &[_] = &[
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-dest", "document"),
+    ];
+    let typed: &[_] = &[("sec-fetch-site", "none"), ("sec-fetch-dest", "document")];
+    for headers in [same_origin, same_site, typed, &[]] {
+        let page = login(headers).await;
+        assert_eq!(page.status, StatusCode::FOUND, "{headers:?}: {}", page.body);
+        assert!(page.cookie("rxh_oidc").is_some(), "{headers:?}");
+    }
+
+    // The ten attempts of the minute are those five and five more: none of
+    // the twelve refused ones took any.
+    for _ in 0..5 {
+        fixture.login().await;
+    }
+    let page = browse(fixture.admin, "/auth/oidc/login", &[]).await;
+    assert_eq!(page.status, StatusCode::TOO_MANY_REQUESTS, "{}", page.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_provider_cannot_be_the_admin_api_of_this_daemon() {
+    // Without a token a request from this machine is an administrator: the
+    // daemon must not be made to send one to itself.
+    let (admin, _directory, _daemon) = start_daemon(
+        "public_url = \"http://ADMIN\"\n\n\
+         [admin.oidc]\nissuer = \"http://ADMIN\"\nclient_id = \"rxh\"\n\
+         client_secret = \"a-secret\"\n",
+    )
+    .await;
+    let page = browse(admin, "/auth/oidc/login", &[]).await;
+    assert_eq!(page.status, StatusCode::BAD_GATEWAY, "{}", page.body);
+    assert!(page.body.contains("could not be reached"), "{}", page.body);
+    // The admin API would have answered `404` to the discovery request.
+    assert!(!page.body.contains("answered"), "{}", page.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_name_of_the_listener_is_sent_to_public_url() {
+    let fixture = daemon().await;
+    // The cookie of a flow started here would be one of `localhost`, and
+    // the callback goes to `public_url`. More than the attempts of a minute.
+    let host = format!("localhost:{}", fixture.admin.port());
+    for _ in 0..11 {
+        let page = browse_as(fixture.admin, &host, "/auth/oidc/login", &[]).await;
+        assert_eq!(page.status, StatusCode::FOUND, "{}", page.body);
+        assert_eq!(
+            page.location(),
+            format!("http://{}/auth/oidc/login", fixture.admin)
+        );
+        assert_eq!(page.headers.get(header::SET_COOKIE), None);
+    }
+    assert_eq!(fixture.provider.discovery_requests(), 0, "nothing started");
+
+    // Under the name of `public_url` the flow starts, and it was not
+    // counted before.
+    let (page, _binding) = fixture.login().await;
     assert_eq!(
         query_value(page.location(), "redirect_uri"),
         format!(
