@@ -10,10 +10,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// A wrong answer of the provider, see [`OidcProvider::fail_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,9 @@ pub enum OidcFault {
     /// The discovery document names a token endpoint over plain HTTP on a
     /// host that is not loopback.
     HttpEndpoint,
+    /// The discovery document and the token endpoint answer `302` to the
+    /// same path on this address.
+    Redirect(SocketAddr),
 }
 
 /// What the authorization endpoint remembers for a code.
@@ -51,13 +58,16 @@ struct State {
     /// Every code and token issued.
     secrets: Mutex<Vec<String>>,
     token_requests: AtomicUsize,
+    discovery_requests: AtomicUsize,
+    /// PEM of the authority that signed the certificate, over TLS.
+    authority_pem: Option<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// An OpenID Connect provider over plain HTTP on a local TCP address, with
+/// An OpenID Connect provider over plain HTTP or HTTPS on a local TCP address, with
 /// one client: [`OidcProvider::CLIENT_ID`] and
 /// [`OidcProvider::CLIENT_SECRET`].
 #[derive(Debug)]
@@ -80,12 +90,48 @@ impl OidcProvider {
     ///
     /// Panics if no socket can be bound to localhost.
     pub async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// [`OidcProvider::start`] over HTTPS, with a certificate for
+    /// `127.0.0.1` signed by a throwaway authority: see
+    /// [`OidcProvider::authority_pem`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if no socket can be bound to localhost.
+    pub async fn start_tls() -> Self {
+        let authority_key = KeyPair::generate().expect("key pair");
+        let mut authority = CertificateParams::new(Vec::new()).expect("valid parameters");
+        authority.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let authority_cert = authority
+            .self_signed(&authority_key)
+            .expect("self-signed authority");
+        let authority_pem = authority_cert.pem();
+        let key = KeyPair::generate().expect("key pair");
+        let cert = CertificateParams::new(vec![String::from("127.0.0.1")])
+            .expect("valid parameters")
+            .signed_by(&key, &Issuer::new(authority, authority_key))
+            .expect("signed certificate");
+        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key.serialize_der()));
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .expect("a certificate and its key");
+        Self::start_with(Some((TlsAcceptor::from(Arc::new(config)), authority_pem))).await
+    }
+
+    async fn start_with(tls: Option<(TlsAcceptor, String)>) -> Self {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .expect("bind");
         let address = listener.local_addr().expect("address");
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let (acceptor, authority_pem) = tls.unzip();
         let state = Arc::new(State {
-            issuer: format!("http://{address}"),
+            authority_pem,
+            discovery_requests: AtomicUsize::new(0),
+            issuer: format!("{scheme}://{address}"),
             claims: Mutex::new(json!({})),
             token_error: Mutex::new(None),
             fault: Mutex::new(None),
@@ -96,7 +142,17 @@ impl OidcProvider {
         let shared = Arc::clone(&state);
         tokio::task::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::task::spawn(serve(stream, Arc::clone(&shared)));
+                let (shared, acceptor) = (Arc::clone(&shared), acceptor.clone());
+                tokio::task::spawn(async move {
+                    match acceptor {
+                        Some(acceptor) => {
+                            if let Ok(stream) = acceptor.accept(stream).await {
+                                serve(stream, shared).await;
+                            }
+                        }
+                        None => serve(stream, shared).await,
+                    }
+                });
             }
         });
         Self { state }
@@ -122,6 +178,24 @@ impl OidcProvider {
     /// Makes the provider answer wrongly from now on.
     pub fn fail_with(&self, fault: OidcFault) {
         *lock(&self.state.fault) = Some(fault);
+    }
+
+    /// Ends [`OidcProvider::fail_with`].
+    pub fn recover(&self) {
+        *lock(&self.state.fault) = None;
+    }
+
+    /// PEM of the authority a client has to trust, for a provider started
+    /// with [`OidcProvider::start_tls`].
+    #[must_use]
+    pub fn authority_pem(&self) -> Option<&str> {
+        self.state.authority_pem.as_deref()
+    }
+
+    /// Requests the discovery document has received.
+    #[must_use]
+    pub fn discovery_requests(&self) -> usize {
+        self.state.discovery_requests.load(Ordering::Relaxed)
     }
 
     /// Plays the browser of a user who signs in at the provider: takes the
@@ -326,7 +400,13 @@ fn token(state: &State, authorization: Option<&str>, body: &str) -> (u16, Value)
             answer["id_token"].take();
         }
         Some(OidcFault::Huge) => answer["padding"] = Value::from("x".repeat(2 * 1024 * 1024)),
-        Some(OidcFault::Slow | OidcFault::OtherIssuer | OidcFault::HttpEndpoint) | None => {}
+        Some(
+            OidcFault::Slow
+            | OidcFault::OtherIssuer
+            | OidcFault::HttpEndpoint
+            | OidcFault::Redirect(_),
+        )
+        | None => {}
     }
     (200, answer)
 }
@@ -351,7 +431,10 @@ fn discovery(state: &State) -> Value {
     })
 }
 
-async fn serve(mut stream: TcpStream, state: Arc<State>) {
+async fn serve<S>(mut stream: S, state: Arc<State>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut request: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 1024];
     let head_end = loop {
@@ -387,8 +470,19 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) {
     );
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
+    let fault = *lock(&state.fault);
+    let redirected = |answer: String| match fault {
+        Some(OidcFault::Redirect(address)) => format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{address}{target}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        ),
+        _ => answer,
+    };
     let response = match (method, path) {
-        ("GET", "/.well-known/openid-configuration") => json_answer(200, &discovery(&state)),
+        ("GET", "/.well-known/openid-configuration") => {
+            state.discovery_requests.fetch_add(1, Ordering::Relaxed);
+            redirected(json_answer(200, &discovery(&state)))
+        }
         ("GET", "/authorize") => match grant(&state, query) {
             Ok(callback) => format!(
                 "HTTP/1.1 302 Found\r\nLocation: {callback}\r\nContent-Length: 0\r\n\
@@ -398,15 +492,16 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) {
         },
         ("POST", "/token") => {
             state.token_requests.fetch_add(1, Ordering::Relaxed);
-            if *lock(&state.fault) == Some(OidcFault::Slow) {
+            if fault == Some(OidcFault::Slow) {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             let (status, answer) = token(&state, header("authorization"), &body);
-            json_answer(status, &answer)
+            redirected(json_answer(status, &answer))
         }
         _ => json_answer(404, &json!({ "error": "not found" })),
     };
     let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 fn json_answer(status: u16, body: &Value) -> String {

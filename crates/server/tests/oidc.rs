@@ -82,11 +82,16 @@ fn web_editors() -> Role {
 /// and `ghosts` of the provider give the roles `admin`, `web-editors` and
 /// one that is not defined.
 async fn daemon() -> Fixture {
-    let provider = OidcProvider::start().await;
+    daemon_of(OidcProvider::start().await, "").await
+}
+
+/// [`daemon`] for `provider`, with `keys` at the end of `[admin.oidc]`.
+async fn daemon_of(provider: OidcProvider, keys: &str) -> Fixture {
     let oidc = format!(
         "public_url = \"http://ADMIN\"\n\n\
          [admin.oidc]\nissuer = \"{}\"\nclient_id = \"{}\"\nclient_secret = \"{}\"\n\
-         roles = {{ ops = [\"admin\"], web = [\"web-editors\"], ghosts = [\"no-such-role\"] }}\n",
+         roles = {{ ops = [\"admin\"], web = [\"web-editors\"], ghosts = [\"no-such-role\"] }}\n\
+         {keys}",
         provider.issuer(),
         OidcProvider::CLIENT_ID,
         OidcProvider::CLIENT_SECRET,
@@ -133,7 +138,12 @@ async fn start_daemon(
 
 /// `GET uri` as a browser that holds `cookies` (`name=value` each).
 async fn browse(admin: SocketAddr, uri: &str, cookies: &[&str]) -> Page {
-    let mut request = Request::get(uri).header(header::HOST, admin.to_string());
+    browse_as(admin, &admin.to_string(), uri, cookies).await
+}
+
+/// [`browse`] with another `Host`.
+async fn browse_as(admin: SocketAddr, host: &str, uri: &str, cookies: &[&str]) -> Page {
+    let mut request = Request::get(uri).header(header::HOST, host);
     if !cookies.is_empty() {
         request = request.header(header::COOKIE, cookies.join("; "));
     }
@@ -591,6 +601,10 @@ async fn a_provider_that_is_down_is_a_bad_gateway() {
     let page = browse(admin, "/auth/oidc/login", &[]).await;
     assert_eq!(page.status, StatusCode::BAD_GATEWAY, "{}", page.body);
     assert!(page.body.contains("could not be reached"), "{}", page.body);
+    // What the system said about it is for the log, not for anybody.
+    for detail in ["os error", "refused", "Refused", "("] {
+        assert!(!page.body.contains(detail), "{detail} in {}", page.body);
+    }
     assert!(!page.body.contains("a-secret"), "{}", page.body);
 }
 
@@ -684,22 +698,137 @@ async fn removing_the_role_takes_the_access_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_flow_shares_the_attempt_limit_with_sign_in() {
+async fn starting_a_flow_shares_the_attempt_limit_with_sign_in() {
     let fixture = daemon().await;
-    for _ in 0..10 {
+    fixture.provider.set_claims(marta());
+    let (login, binding) = fixture.login().await;
+    for _ in 0..9 {
         fixture.login().await;
     }
-    for uri in ["/auth/oidc/login", "/auth/oidc/callback?code=a&state=b"] {
-        let page = browse(fixture.admin, uri, &[]).await;
-        fixture.assert_refused(
-            &page,
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many sign-in attempts",
-        );
-        assert_eq!(page.cookie("rxh_oidc"), None);
-    }
+    let page = browse(fixture.admin, "/auth/oidc/login", &[]).await;
+    fixture.assert_refused(
+        &page,
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many sign-in attempts",
+    );
+    assert_eq!(page.cookie("rxh_oidc"), None);
     let (status, _, json) = sign_in(fixture.admin, "ana", "password-ana").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{json}");
+
+    // The callback is not an attempt: a flow that was started ends, and
+    // one that was not does nothing.
+    let page = browse(fixture.admin, "/auth/oidc/callback?code=a&state=b", &[]).await;
+    fixture.assert_refused(&page, StatusCode::FORBIDDEN, "not started in this browser");
+    let callback = fixture.provider.authorize(login.location());
+    let page = browse(fixture.admin, fixture.path(&callback), &[&binding]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_discovery_document_is_read_once_and_a_failure_is_not_kept() {
+    let fixture = daemon().await;
+    fixture.provider.fail_with(OidcFault::OtherIssuer);
+    for requests in 1..=2 {
+        let page = browse(fixture.admin, "/auth/oidc/login", &[]).await;
+        assert_eq!(page.status, StatusCode::BAD_GATEWAY, "{}", page.body);
+        assert_eq!(fixture.provider.discovery_requests(), requests);
+    }
+    fixture.provider.recover();
+    fixture.login().await;
+    assert_eq!(fixture.provider.discovery_requests(), 3);
+
+    // A good one is kept: neither a login nor a callback reads it again.
+    fixture.provider.set_claims(marta());
+    let page = fixture.flow().await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    fixture.login().await;
+    assert_eq!(fixture.provider.discovery_requests(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_from_the_provider_is_not_followed() {
+    // Where the provider sends: another provider that would answer well.
+    let elsewhere = OidcProvider::start().await;
+    let address: SocketAddr = elsewhere.issuer()["http://".len()..]
+        .parse()
+        .expect("an address");
+
+    // From the token endpoint, with the code and the client secret.
+    let fixture = daemon().await;
+    fixture.provider.set_claims(marta());
+    let (login, binding) = fixture.login().await;
+    let callback = fixture.provider.authorize(login.location());
+    fixture.provider.fail_with(OidcFault::Redirect(address));
+    let page = browse(fixture.admin, fixture.path(&callback), &[&binding]).await;
+    fixture.assert_refused(&page, StatusCode::BAD_GATEWAY, "302");
+    assert_eq!(fixture.provider.token_requests(), 1);
+    assert_eq!(elsewhere.token_requests(), 0);
+
+    // From the discovery document.
+    let fixture = daemon().await;
+    fixture.provider.fail_with(OidcFault::Redirect(address));
+    let page = browse(fixture.admin, "/auth/oidc/login", &[]).await;
+    fixture.assert_refused(&page, StatusCode::BAD_GATEWAY, "302");
+    assert_eq!(fixture.provider.discovery_requests(), 1);
+    assert_eq!(elsewhere.discovery_requests(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_with_control_characters_is_refused() {
+    let fixture = daemon().await;
+    fixture.provider.set_claims(json!({
+        "preferred_username": "eve\nAdmin => ana signed in from 192.0.2.1",
+        "groups": ["ops"],
+    }));
+    let page = fixture.flow().await;
+    fixture.assert_refused(&page, StatusCode::FORBIDDEN, "control characters");
+    assert!(!page.body.contains("eve"), "{}", page.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_redirect_uri_comes_from_public_url_and_not_from_host() {
+    let fixture = daemon().await;
+    let page = browse_as(fixture.admin, "localhost:1", "/auth/oidc/login", &[]).await;
+    assert_eq!(page.status, StatusCode::FOUND, "{}", page.body);
+    assert_eq!(
+        query_value(page.location(), "redirect_uri"),
+        format!(
+            "http%3A%2F%2F{}%3A{}%2Fauth%2Foidc%2Fcallback",
+            fixture.admin.ip(),
+            fixture.admin.port()
+        )
+    );
+    assert!(
+        !page.location().contains("localhost"),
+        "{}",
+        page.location()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_behind_a_private_authority_needs_ca() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let ca = directory.path().join("provider-ca.pem");
+
+    // With `ca`, the whole flow over HTTPS.
+    let provider = OidcProvider::start_tls().await;
+    assert!(provider.issuer().starts_with("https://127.0.0.1:"));
+    fs::write(&ca, provider.authority_pem().expect("over TLS")).expect("write the authority");
+    let fixture = daemon_of(provider, &format!("ca = {ca:?}\n")).await;
+    let cookie = fixture.sign_in(marta()).await;
+    assert_eq!(fixture.session(&cookie).await["user"], "marta");
+    assert_eq!(fixture.provider.token_requests(), 1);
+
+    // Without it the certificate is of nobody the daemon trusts.
+    let fixture = daemon_of(OidcProvider::start_tls().await, "").await;
+    let page = browse(fixture.admin, "/auth/oidc/login", &[]).await;
+    fixture.assert_refused(&page, StatusCode::BAD_GATEWAY, "could not be reached");
+    assert_eq!(fixture.provider.discovery_requests(), 0);
+
+    // Nor with the authority of another provider.
+    let fixture = daemon_of(OidcProvider::start_tls().await, &format!("ca = {ca:?}\n")).await;
+    let page = browse(fixture.admin, "/auth/oidc/login", &[]).await;
+    fixture.assert_refused(&page, StatusCode::BAD_GATEWAY, "could not be reached");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -52,6 +52,10 @@ const CLOCK_SKEW: f64 = 60.0;
 /// Longest name a user of the provider can have, in bytes.
 const MAX_NAME_BYTES: usize = 256;
 
+/// Groups of a user that a page or a log line names, and the bytes of each.
+const MAX_GROUPS_SHOWN: usize = 20;
+const MAX_GROUP_BYTES: usize = 64;
+
 /// Name of the cookie that binds a flow to the browser that started it.
 const BINDING_COOKIE: &str = "rxh_oidc";
 
@@ -141,7 +145,10 @@ impl Client {
             redirect_uri: format!("{public_url}/auth/oidc/callback"),
             dashboard: format!("{public_url}/dashboard"),
             issuer_host: issuer.host().unwrap_or_default().to_owned(),
-            tls: dialer(Some(UpstreamTls::default()))?,
+            tls: dialer(Some(UpstreamTls {
+                ca: settings.ca.clone(),
+                ..UpstreamTls::default()
+            }))?,
             plain: dialer(None)?,
             discovery: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
@@ -259,8 +266,13 @@ impl Client {
         .map_err(Failure::Refused)?;
 
         let name = name_of(&claims, &settings.name_claim)
-            .filter(|name| name.len() <= MAX_NAME_BYTES)
             .ok_or_else(|| Failure::Refused(String::from("the ID token does not name the user")))?;
+        if !is_shown_as_it_is(&name) {
+            return Err(Failure::Refused(String::from(
+                "the name of the user in the ID token has control characters or more than 256 \
+                 bytes",
+            )));
+        }
         let groups = groups_of(&claims, &settings.groups_claim);
         let roles = roles_of(&groups, &settings.roles);
         if roles.is_empty() {
@@ -366,7 +378,11 @@ impl Client {
         match tokio::time::timeout(REQUEST_TIMEOUT, exchange).await {
             Ok(Ok(Some(answer))) => Ok(answer),
             Ok(Ok(None)) => Err(format!("the answer of {host} is too long")),
-            Ok(Err(err)) => Err(format!("{host} could not be reached ({err})")),
+            // The page is for anybody: what went wrong stays in the log.
+            Ok(Err(err)) => {
+                eprintln!("Admin => The provider at {host} could not be reached: {err}");
+                Err(format!("{host} could not be reached"))
+            }
             Err(_) => Err(format!("{host} did not answer in time")),
         }
     }
@@ -453,7 +469,9 @@ fn is_secure(url: &str) -> bool {
 
 /// The endpoints a discovery document names, for the provider configured
 /// as `issuer`: the document must be of that issuer, exactly, and its
-/// endpoints `https`, or `http` on a loopback address.
+/// endpoints `https`. Only a provider that is itself `http` on a loopback
+/// address may name such endpoints: one over `https` does not get the
+/// client secret sent in clear to a port of this machine.
 fn endpoints_of(document: &[u8], issuer: &str) -> Result<Endpoints, String> {
     let document: Value = serde_json::from_slice(document)
         .map_err(|_| String::from("the discovery document of the provider is not JSON"))?;
@@ -462,10 +480,11 @@ fn endpoints_of(document: &[u8], issuer: &str) -> Result<Endpoints, String> {
             "the discovery document of the provider is of another issuer than the configured one",
         ));
     }
+    let plain_issuer = issuer.starts_with("http://");
     let endpoint = |name: &str| {
         document[name]
             .as_str()
-            .filter(|url| is_secure(url))
+            .filter(|url| is_secure(url) && (plain_issuer || url.starts_with("https://")))
             .map(str::to_owned)
             .ok_or_else(|| {
                 format!("the discovery document of the provider has a {name} that is not https")
@@ -585,6 +604,35 @@ fn check_claims(
     Ok(())
 }
 
+/// True for a name that can go to a page and to the log as it is: no
+/// control character, which would start a line of its own in the log, and
+/// at most [`MAX_NAME_BYTES`].
+fn is_shown_as_it_is(name: &str) -> bool {
+    name.len() <= MAX_NAME_BYTES && !name.chars().any(char::is_control)
+}
+
+/// `groups` for a page or the log: the first [`MAX_GROUPS_SHOWN`], each cut
+/// at [`MAX_GROUP_BYTES`], and how many more there are.
+fn shown(groups: &[String]) -> String {
+    let cut = |group: &String| {
+        if group.len() <= MAX_GROUP_BYTES {
+            return group.clone();
+        }
+        let mut end = MAX_GROUP_BYTES;
+        while !group.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\u{2026}", &group[..end])
+    };
+    let first: Vec<String> = groups.iter().take(MAX_GROUPS_SHOWN).map(cut).collect();
+    let more = groups.len().saturating_sub(MAX_GROUPS_SHOWN);
+    if more == 0 {
+        first.join(", ")
+    } else {
+        format!("{} and {more} more", first.join(", "))
+    }
+}
+
 /// The name of the user: the claim `name_claim`, else `sub`.
 fn name_of(claims: &Value, name_claim: &str) -> Option<String> {
     [name_claim, "sub"]
@@ -690,9 +738,9 @@ fn page(
     response
 }
 
-/// The page that says why a sign-in did not happen.
-fn failure_page(failure: &Failure, dashboard: &str) -> Response<Full<Bytes>> {
-    let (status, sentence) = match failure {
+/// The status and the sentence that say why a sign-in did not happen.
+fn described(failure: &Failure) -> (StatusCode, String) {
+    match failure {
         Failure::Provider(reason) => (
             StatusCode::BAD_GATEWAY,
             format!("The sign-in could not be completed: {reason}."),
@@ -705,7 +753,7 @@ fn failure_page(failure: &Failure, dashboard: &str) -> Response<Full<Bytes>> {
             let groups = if groups.is_empty() {
                 String::from("it has none")
             } else {
-                groups.join(", ")
+                shown(groups)
             };
             (
                 StatusCode::FORBIDDEN,
@@ -715,8 +763,7 @@ fn failure_page(failure: &Failure, dashboard: &str) -> Response<Full<Bytes>> {
                 ),
             )
         }
-    };
-    page(status, "Not signed in", &sentence, dashboard, false)
+    }
 }
 
 /// The client of the provider, where the flow is offered: `404` without
@@ -737,9 +784,11 @@ fn offered(state: &AdminState, peer: Peer) -> Result<&Client, Box<Response<Full<
     Ok(client)
 }
 
-/// Counts a request of the flow among the sign-in attempts of its client:
-/// each can make this process call the provider or keep a flow. `Err` with
-/// the `429` page once the client has made too many in the last minute.
+/// Counts the start of a flow among the sign-in attempts of its client:
+/// each makes this process keep a flow and may make it call the provider.
+/// `Err` with the `429` page once the client has made too many in the last
+/// minute. The callback is not counted: it does nothing without a flow
+/// that was.
 fn counted(
     state: &AdminState,
     client: &Client,
@@ -763,12 +812,13 @@ fn counted(
 
 /// Logs a sign-in that did not happen and answers with its page.
 fn refused(client: &Client, peer: Peer, failure: &Failure) -> Response<Full<Bytes>> {
+    let (status, sentence) = described(failure);
     // Names and groups are the provider's to choose: logged escaped.
     println!(
-        "Admin => Sign-in through the provider refused from {}: {failure:?}",
+        "Admin => Sign-in through the provider refused from {}: {sentence:?}",
         auth_api::client(peer)
     );
-    failure_page(failure, &client.dashboard)
+    page(status, "Not signed in", &sentence, &client.dashboard, false)
 }
 
 /// `GET /auth/oidc/login`: sends the browser to the provider, with the
@@ -816,10 +866,7 @@ pub(crate) async fn callback(
     query: &str,
     binding: Option<&str>,
 ) -> Response<Full<Bytes>> {
-    let client = match offered(state, peer).and_then(|client| {
-        counted(state, client, peer)?;
-        Ok(client)
-    }) {
+    let client = match offered(state, peer) {
         Ok(client) => client,
         Err(response) => return *response,
     };
@@ -832,8 +879,9 @@ pub(crate) async fn callback(
             } = identity;
             println!(
                 "Admin => {name:?} signed in through the provider from {} with the roles \
-                 {roles:?} of the groups {groups:?}",
-                auth_api::client(peer)
+                 {roles:?} of the groups {:?}",
+                auth_api::client(peer),
+                shown(&groups)
             );
             let id = state.sessions.create(&name, Some(roles), None);
             let mut response = page(
@@ -1196,12 +1244,59 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_page_has_its_status_and_policy() {
+    fn a_failure_has_its_status_and_names_few_groups() {
         let failure = Failure::NoRole {
-            name: String::from("<script>alert(1)</script>"),
-            groups: vec![String::from("\"><img src=x>")],
+            name: String::from("pat"),
+            groups: vec![String::from("sales"), String::from("staff")],
         };
-        let response = failure_page(&failure, "https://rxh.example.com/dashboard");
+        let (status, sentence) = described(&failure);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            sentence.contains("pat") && sentence.contains("(sales, staff)"),
+            "{sentence}"
+        );
+        let failure = Failure::Provider(String::from("it is down"));
+        assert_eq!(described(&failure).0, StatusCode::BAD_GATEWAY);
+
+        // Twenty groups at most, of 64 bytes at most, cut between characters.
+        let many: Vec<String> = (0..25).map(|index| format!("group{index}")).collect();
+        let text = shown(&many);
+        assert!(text.ends_with("group19 and 5 more"), "{text}");
+        assert!(!text.contains("group20"), "{text}");
+        assert_eq!(shown(&many[..20]), many[..20].join(", "));
+        let long = format!("{}\u{e9}{}", "a".repeat(63), "b".repeat(500));
+        assert_eq!(shown(&[long]), format!("{}\u{2026}", "a".repeat(63)));
+        assert_eq!(shown(&["b".repeat(64)]), "b".repeat(64));
+        let huge: Vec<String> = (0..10_000).map(|_| "c".repeat(10_000)).collect();
+        assert!(shown(&huge).len() < 2000);
+    }
+
+    #[test]
+    fn a_name_with_control_characters_or_too_long_is_not_shown() {
+        assert!(is_shown_as_it_is("olga@example.com"));
+        assert!(is_shown_as_it_is("Olga Mart\u{ed}nez <ops>"));
+        assert!(is_shown_as_it_is(&"a".repeat(256)));
+        assert!(!is_shown_as_it_is(&"a".repeat(257)));
+        for forged in [
+            "eve\nAdmin => ana signed in",
+            "eve\r",
+            "e\u{1b}[2Jve",
+            "eve\0",
+            "eve\u{85}",
+        ] {
+            assert!(!is_shown_as_it_is(forged), "{forged:?}");
+        }
+    }
+
+    #[test]
+    fn a_page_has_its_policy() {
+        let response = page(
+            StatusCode::FORBIDDEN,
+            "Title",
+            "Text",
+            "https://rxh.example.com/dashboard",
+            false,
+        );
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let headers = response.headers();
         assert_eq!(
@@ -1210,8 +1305,51 @@ mod tests {
         );
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
         assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
-        let failure = Failure::Provider(String::from("it is down"));
-        let response = failure_page(&failure, "https://rxh.example.com/dashboard");
+    }
+
+    #[tokio::test]
+    async fn the_flow_is_refused_where_no_session_may_be_held() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::path::PathBuf;
+
+        // Plain HTTP from another machine.
+        let plain = Peer {
+            local: false,
+            tls: false,
+            address: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+        };
+        let mut state = admin::tests::state(None, PathBuf::new());
+        for response in [
+            login(&state, plain).await,
+            callback(&state, plain, "code=a&state=b", Some("binding")).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "no [admin.oidc]");
+        }
+
+        // The provider is not there: an answer other than 403 would be 502.
+        let settings = config::Oidc {
+            issuer: String::from("http://127.0.0.1:1"),
+            client_id: String::from("rxh"),
+            client_secret: String::from("secret"),
+            scopes: vec![String::from("openid")],
+            groups_claim: String::from("groups"),
+            name_claim: String::from("sub"),
+            roles: BTreeMap::new(),
+            ca: None,
+        };
+        let client = Client::new(&settings, "https://rxh.example.com", AdminGuard::default());
+        state.oidc = Some(client.unwrap());
+        for response in [
+            login(&state, plain).await,
+            callback(&state, plain, "code=a&state=b", Some("binding")).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            assert!(!response.headers().contains_key(header::LOCATION));
+        }
+        assert!(state.oidc.as_ref().unwrap().pending().is_empty());
+        // Where a session may be, the flow goes on, to the provider.
+        let response = login(&state, admin::tests::LOCAL).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1300,6 +1438,13 @@ mod tests {
             let reason = endpoints_of(document(ISSUER, bad, token).as_bytes(), ISSUER).unwrap_err();
             assert!(reason.contains("authorization_endpoint"), "{bad}: {reason}");
         }
+        // What a provider on loopback may name, one over `https` may not:
+        // the client secret would go in clear to a port of this machine.
+        let mixed = document(ISSUER, authorize, "http://127.0.0.1:6379/token");
+        let reason = endpoints_of(mixed.as_bytes(), ISSUER).unwrap_err();
+        assert!(reason.contains("token_endpoint"), "{reason}");
+        let mixed = document(ISSUER, "http://[::1]:9000/a", token);
+        assert!(endpoints_of(mixed.as_bytes(), ISSUER).is_err());
         assert!(endpoints_of(b"<html>", ISSUER).is_err());
         assert!(endpoints_of(b"{}", ISSUER).is_err());
     }

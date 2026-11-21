@@ -1088,6 +1088,11 @@ pub struct Oidc {
     /// Roles granted for each value of `groups_claim`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, Vec<String>>,
+
+    /// Path to a PEM file with extra root certificates trusted for the
+    /// connections to the provider, for one behind a private authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
 }
 
 impl Oidc {
@@ -1101,6 +1106,9 @@ impl Oidc {
         }
         if !self.scopes.iter().any(|scope| scope == "openid") {
             return Err(String::from("scopes must contain \"openid\""));
+        }
+        if self.ca.as_deref() == Some("") {
+            return Err(String::from("ca must not be empty"));
         }
         for (value, roles) in &self.roles {
             if let Some(role) = roles.iter().find(|role| !is_group_name(role)) {
@@ -5753,6 +5761,7 @@ mod tests {
         assert_eq!(oidc.groups_claim, "groups");
         assert_eq!(oidc.name_claim, "preferred_username");
         assert!(oidc.roles.is_empty());
+        assert_eq!(oidc.ca, None);
 
         let config = Config::from_toml(&oidc_config(
             "scopes = [\"openid\"]\ngroups_claim = \"roles\"\nname_claim = \"email\"\n\
@@ -5868,6 +5877,26 @@ mod tests {
             let err: String = admin_error(&text);
             assert!(err.contains(key), "{err}");
         }
+    }
+
+    #[test]
+    fn oidc_ca_is_a_path_and_not_empty() {
+        let config =
+            Config::from_toml(&oidc_config("ca = \"/etc/rxh/provider-ca.pem\"\n")).unwrap();
+        let oidc = config.admin.oidc.expect("[admin.oidc] is set");
+        assert_eq!(oidc.ca.as_deref(), Some("/etc/rxh/provider-ca.pem"));
+        let written: String = toml::to_string(&oidc).unwrap();
+        assert!(
+            written.contains("ca = \"/etc/rxh/provider-ca.pem\""),
+            "{written}"
+        );
+
+        let err: String = admin_error(&oidc_config("ca = \"\"\n"));
+        assert!(err.contains("oidc") && err.contains("ca"), "{err}");
+        let err: String = Config::from_toml(&oidc_config("ca = 7\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ca"), "{err}");
     }
 
     #[test]

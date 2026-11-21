@@ -817,9 +817,9 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   the same time under one name from one address are refused as well.
 - One client address gets 10 sign-in attempts a minute, right or wrong and
   whatever the names: the eleventh is `429` until the oldest is a minute
-  old. A password change, a `POST /auth/setup` that sends a `code`, and
-  each `GET /auth/oidc/login` and `GET /auth/oidc/callback` count as
-  attempts, so a sign-in through the provider takes two of the ten. A unix socket has no such limit, and requests with
+  old. A password change, a `POST /auth/setup` that sends a `code`, and a
+  `GET /auth/oidc/login` count as attempts; `GET /auth/oidc/callback` does
+  not, so a sign-in through the provider takes one of the ten. A unix socket has no such limit, and requests with
   the token or with a session are not sign-ins. Clients behind one address
   (a NAT, a reverse proxy) share its ten.
 - A password has at least 8 characters and at most 72 bytes. Hashes never
@@ -1255,6 +1255,7 @@ or instead of them.
 | `groups_claim` | `"groups"` | Claim of the ID token that lists the groups of the user. |
 | `name_claim` | `"preferred_username"` | Claim of the ID token that names the user. |
 | `roles` | `{}` | Roles granted for each value of `groups_claim`: claim value to role names (`admin` or a role of the users file, `[a-z0-9][a-z0-9_-]*`). |
+| `ca` | none | Path to a PEM file with root certificates trusted for the connections to the provider, besides the public ones: for a provider whose certificate comes from a private authority. Read at start; a file that cannot be read stops the start. |
 
 `oidc` needs `public_url` in `[admin]`, and `tls` in `[admin]` or a
 loopback or unix socket `listen`, since a session cookie is only offered
@@ -1272,6 +1273,18 @@ issuer = "https://id.example.com/realms/ops"
 client_id = "rxh"
 client_secret = "{env.RXH_OIDC_SECRET}"
 roles = { ops = ["admin"], web = ["web-editors"] }
+```
+
+A provider inside the network, with a certificate of the company's own
+authority:
+
+```toml
+[admin.oidc]
+issuer = "https://id.internal.example/realms/ops"
+client_id = "rxh"
+client_secret = "{file./run/secrets/rxh-oidc}"
+ca = "/etc/rxh/internal-ca.pem"
+roles = { ops = ["admin"] }
 ```
 
 ##### Signing in through a provider
@@ -1334,10 +1347,10 @@ one sentence, and starts no session:
 |---|---|
 | `403` | The callback is not of a sign-in this browser started: no cookie or another one, an unknown or used `state`, or more than 10 minutes. Start again. |
 | `403` | The provider sent an error instead of a code (the user said no, for example), or no code. |
-| `403` | A claim of the ID token is wrong or missing, or the token does not name the user (the name is at most 256 bytes). |
-| `403` | None of the groups of the user gives a role. The page names the user and the groups received. |
-| `502` | The provider could not be reached, took more than 10 seconds, answered more than 1 MiB, answered an error, or sent no ID token; or its discovery document is of another issuer, or names an endpoint that is not `https` (`http` is taken on a loopback address only). |
-| `429` | The client address used up its 10 sign-in attempts of the minute, which these two routes share with `POST /auth/login`: each of them is one attempt. |
+| `403` | A claim of the ID token is wrong or missing, or the token does not name the user, or names it with control characters or more than 256 bytes. |
+| `403` | None of the groups of the user gives a role. The page names the user and the groups received: the first 20, each up to 64 bytes. |
+| `502` | The provider could not be reached (the log says why), took more than 10 seconds, answered more than 1 MiB, answered an error or a redirect, or sent no ID token; or its discovery document is of another issuer, or names an endpoint that is not `https` (an `http` endpoint on a loopback address is taken only from an issuer that is itself `http` on a loopback address). |
+| `429` | The client address used up its 10 sign-in attempts of the minute, which `GET /auth/oidc/login` shares with `POST /auth/login`. The callback is not an attempt: it does nothing without a sign-in that was started. |
 | `404` (JSON) | `[admin.oidc]` is not set. |
 | `403` (JSON) | The connection is one where no session may be: plain HTTP from another machine. |
 
@@ -1345,7 +1358,8 @@ Known limits:
 
 - **The signature of the ID token is not checked.** The token is read
   only from the answer of the token endpoint, over TLS checked against the
-  same roots as upstream TLS, which OpenID Connect Core 3.1.3.7 allows. A
+  public roots upstream TLS uses and those of `ca`, which OpenID Connect
+  Core 3.1.3.7 allows. A
   token from anywhere else is never accepted.
 - **One sign-in at a time for a browser.** Starting a second one (another
   tab) replaces the cookie of the first, whose callback is then refused.

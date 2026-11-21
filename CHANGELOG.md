@@ -564,9 +564,10 @@ Changed.
   roles `[admin.oidc] roles` maps the groups of the user to, and starts a
   12 hour session. A user without a mapped role is refused with a page that
   names it and its groups. Every request to the provider has 10 seconds and
-  1 MiB, goes over TLS (plain HTTP on a loopback address only), and both
-  routes count against the 10 sign-in attempts a minute of a client
-  address. A user of the provider is not the local user of the same name:
+  1 MiB, goes over TLS (plain HTTP on a loopback address only) and follows
+  no redirect; `[admin.oidc] ca` names a PEM file of root certificates for
+  a provider behind a private authority. Starting a flow counts against
+  the 10 sign-in attempts a minute of a client address. A user of the provider is not the local user of the same name:
   it has only its mapped roles and no password here (`PUT /auth/password`
   answers `403`). `GET /auth/session` gains `oidc_issuer` and `local`. See
   [Signing in through a provider](docs/configuration.md#signing-in-through-a-provider).

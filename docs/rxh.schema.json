@@ -1454,6 +1454,13 @@
       "description": "Sign-in through an OpenID Connect provider (`[admin.oidc]`).",
       "type": "object",
       "properties": {
+        "ca": {
+          "description": "Path to a PEM file with extra root certificates trusted for the\nconnections to the provider, for one behind a private authority.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "client_id": {
           "description": "Client ID registered at the provider.",
           "type": "string"
