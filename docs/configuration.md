@@ -678,7 +678,29 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   nobody in.
 - At most 4 passwords are hashed or compared at a time. A sign-in, a
   password change or a setup that comes while 4 are at it waits for its
-  turn, and gets `429` when none came within 5 seconds.
+  turn, and gets `429` when none came within 5 seconds. A sign-in that
+  waited and was refused counts as a failed one for its name.
+- After 5 failed sign-ins for a name from one client address, that name is
+  refused from that address for a minute (`429`), with the right password
+  too. A wrong `current` in `PUT /auth/password` counts as one. A sign-in
+  counts as failed until its password is found right, so more than five at
+  the same time under one name from one address are refused as well.
+- One client address gets 10 sign-in attempts a minute, right or wrong and
+  whatever the names: the eleventh is `429` until the oldest is a minute
+  old. A password change and a `POST /auth/setup` that sends a `code`
+  count as attempts. A unix socket has no such limit, and requests with
+  the token or with a session are not sign-ins. Clients behind one address
+  (a NAT, a reverse proxy) share its ten.
+- A password has at least 8 characters and at most 72 bytes. Hashes never
+  leave the daemon.
+- Each sign-in, failed or refused sign-in, sign-out, password change and
+  the creation of the first user is a line in the log of the daemon, with
+  the name and the address of the client.
+- Behind a reverse proxy on the same machine every request comes from the
+  machine under the name of the proxy, which without a token is refused
+  (`403`) before it can sign in: set `token` there, as said above, and
+  people sign in with their accounts all the same. They then all count as
+  one client address for the two limits above.
 
 #### First run
 
