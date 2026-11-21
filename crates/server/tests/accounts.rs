@@ -380,20 +380,29 @@ async fn five_failures_lock_the_name_for_that_client() {
     assert!(!headers.contains_key(header::SET_COOKIE));
     assert_eq!(
         json["error"],
-        "too many failed sign-ins for this name; try again in a minute"
+        "too many sign-in attempts; try again in a minute"
     );
     // Another name from the same client is not locked.
     cookie_of(closed.admin, "ana", "password-ana").await;
 
-    // A good sign-in before the fifth failure starts the count again.
-    for _ in 0..4 {
-        sign_in(closed.admin, "ana", "not-the-password").await;
+    // Ten attempts a minute for one client, whatever the names: three are
+    // left, and the eleventh is refused with the right password too.
+    for name in ["eva", "noa", "teo"] {
+        let (status, _, _) = sign_in(closed.admin, name, "not-the-password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{name}");
     }
-    cookie_of(closed.admin, "ana", "password-ana").await;
-    for _ in 0..4 {
-        sign_in(closed.admin, "ana", "not-the-password").await;
-    }
-    cookie_of(closed.admin, "ana", "password-ana").await;
+    let (status, headers, json) = sign_in(closed.admin, "ana", "password-ana").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    assert_eq!(
+        json["error"],
+        "too many sign-in attempts; try again in a minute"
+    );
+    // The token is not a sign-in.
+    let bearer = bearer();
+    let authorized = [(header::AUTHORIZATION, bearer.as_str())];
+    let (status, _, json) = call(closed.admin, Method::GET, "/status", "", &authorized).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

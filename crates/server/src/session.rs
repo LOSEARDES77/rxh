@@ -2,7 +2,7 @@
 //! lock a name out, and the setup code of the first run. All of it lives in
 //! memory: a restart signs everybody out and makes a new code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,6 +25,11 @@ const MAX_FAILURES: u32 = 5;
 /// Time a name stays locked for an address after its last failure, and time
 /// after which older failures no longer count.
 const LOCKOUT: Duration = Duration::from_secs(60);
+
+/// Sign-ins, right or wrong and under any name, one client address may try
+/// within [`LOCKOUT`]. Each can cost a hash, and the per name count does
+/// not stop a client that changes the name every time.
+const MAX_ATTEMPTS_PER_ADDRESS: usize = 10;
 
 /// Characters of the setup code: no `i`, `l`, `0` or `1`, which read alike.
 /// Their number divides 256, so a random byte picks one without bias.
@@ -58,6 +63,8 @@ struct Tables {
     sessions: HashMap<String, Session>,
     /// Failed sign-ins by name and client address (`None` on a unix socket).
     failures: HashMap<(String, Option<IpAddr>), Failures>,
+    /// When each client address tried to sign in, within the last minute.
+    attempts: HashMap<IpAddr, VecDeque<Instant>>,
 }
 
 /// The sessions, the failed sign-ins and the setup code of one daemon.
@@ -103,13 +110,22 @@ impl Sessions {
             .retain(|_, session| session.user != user);
     }
 
-    /// Counts one sign-in as `name` from `address` as failed, unless the
-    /// pair is locked out (5 failures, the last one less than a minute ago),
-    /// which returns false. One step, so that attempts made at the same
-    /// time cannot all pass the check before any of them is counted. A good
-    /// sign-in takes its count back with [`Sessions::forget`].
+    /// Counts one sign-in as `name` from `address`, unless it is refused,
+    /// which returns false: the address tried 10 times in the last minute,
+    /// whatever the names, or the pair is locked out (5 failures, the last
+    /// one less than a minute ago). The sign-in counts as failed until a
+    /// good one takes that back with [`Sessions::forget`]. One step, so
+    /// that attempts made at the same time cannot all pass the check before
+    /// any of them is counted.
     pub(crate) fn attempt(&self, name: &str, address: Option<IpAddr>) -> bool {
         self.attempt_at(name, address, Instant::now())
+    }
+
+    /// Counts one guess of the setup code from `address` among its
+    /// sign-ins. False when the address has tried 10 times in the last
+    /// minute.
+    pub(crate) fn guess(&self, address: Option<IpAddr>) -> bool {
+        self.guess_at(address, Instant::now())
     }
 
     /// Forgets the failed sign-ins as `name` from `address`, after a good one.
@@ -159,8 +175,15 @@ impl Sessions {
         tables.sessions.get(id).cloned()
     }
 
+    fn guess_at(&self, address: Option<IpAddr>, now: Instant) -> bool {
+        address_may_try(&mut self.lock().attempts, address, now)
+    }
+
     fn attempt_at(&self, name: &str, address: Option<IpAddr>, now: Instant) -> bool {
         let mut tables = self.lock();
+        if !address_may_try(&mut tables.attempts, address, now) {
+            return false;
+        }
         // Also what keeps the table from growing with names nobody retries.
         tables
             .failures
@@ -185,6 +208,32 @@ impl Sessions {
             .lock()
             .expect("no code panics while holding the sessions lock")
     }
+}
+
+/// Counts one attempt from `address`, unless it made
+/// [`MAX_ATTEMPTS_PER_ADDRESS`] in the last minute, which returns false. A
+/// connection without an address (the unix socket) is not limited: only the
+/// owner of the daemon reaches it.
+fn address_may_try(
+    attempts: &mut HashMap<IpAddr, VecDeque<Instant>>,
+    address: Option<IpAddr>,
+    now: Instant,
+) -> bool {
+    let Some(address) = address else {
+        return true;
+    };
+    let is_recent = |at: &Instant| now.saturating_duration_since(*at) < LOCKOUT;
+    // Addresses that stopped trying leave the table.
+    attempts.retain(|_, times| times.back().is_some_and(is_recent));
+    let times = attempts.entry(address).or_default();
+    while times.front().is_some_and(|at| !is_recent(at)) {
+        times.pop_front();
+    }
+    if times.len() >= MAX_ATTEMPTS_PER_ADDRESS {
+        return false;
+    }
+    times.push_back(now);
+    true
 }
 
 fn expired(session: &Session, now: Instant) -> bool {
@@ -320,6 +369,43 @@ mod tests {
         // A good sign-in takes the failures back.
         sessions.forget("ana", here);
         assert!(sessions.attempt_at("ana", here, start + minute));
+    }
+
+    #[test]
+    fn an_address_tries_ten_times_a_minute_whatever_the_name() {
+        let sessions = Sessions::new();
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let here = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
+        let there = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)));
+        // A name each time, one attempt a second, one of them a setup code.
+        for index in 0..9_u32 {
+            let name = format!("user{index}");
+            assert!(sessions.attempt_at(&name, here, start + second * index));
+        }
+        assert!(sessions.guess_at(here, start + second * 9));
+        let now = start + second * 10;
+        assert!(!sessions.attempt_at("ana", here, now), "the eleventh");
+        assert!(!sessions.guess_at(here, now));
+        assert!(sessions.attempt_at("ana", there, now), "another client");
+        assert!(sessions.guess_at(there, now));
+        // A good sign-in takes back the failure of its name, not the attempt.
+        sessions.forget("user0", here);
+        assert!(!sessions.attempt_at("user0", here, now));
+
+        // Each attempt leaves the count a minute after it was made, and the
+        // refused ones were never in it.
+        let minute = Duration::from_secs(60);
+        assert!(!sessions.attempt_at("ana", here, start + minute - second));
+        assert!(sessions.attempt_at("ana", here, start + minute));
+        assert!(!sessions.attempt_at("ana", here, start + minute));
+        assert!(sessions.attempt_at("ana", here, start + minute + second));
+
+        // The unix socket has no address to count.
+        for index in 0..30 {
+            assert!(sessions.attempt_at(&format!("user{index}"), None, start));
+            assert!(sessions.guess_at(None, start));
+        }
     }
 
     #[test]

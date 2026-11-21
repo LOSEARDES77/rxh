@@ -1611,18 +1611,23 @@ pub(crate) mod tests {
 
     #[test]
     fn the_setup_code_is_logged_only_where_it_works_and_while_no_user_exists() {
-        for has_tls in [true, false] {
-            for has_token in [true, false] {
-                for has_user in [true, false] {
-                    assert_eq!(
-                        announces_setup_code(has_tls, has_token, has_user),
-                        has_tls && !has_token && !has_user,
-                        "tls {has_tls}, token {has_token}, user {has_user}"
-                    );
-                }
-            }
+        // TLS, a token, a user: is the code written to the log?
+        for (has_tls, has_token, has_user, logged) in [
+            (true, false, false, true),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, false),
+        ] {
+            assert_eq!(
+                announces_setup_code(has_tls, has_token, has_user),
+                logged,
+                "tls {has_tls}, token {has_token}, user {has_user}"
+            );
         }
-        assert!(announces_setup_code(true, false, false));
     }
 
     #[test]

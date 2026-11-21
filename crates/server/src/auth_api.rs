@@ -2,6 +2,7 @@
 //! creating the first user and changing one's password.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -19,6 +20,14 @@ use crate::session;
 /// Longest name a user can have, in bytes. A longer one is no user: it is
 /// refused before it costs a hash or a place among the failed sign-ins.
 const MAX_NAME_BYTES: usize = 64;
+
+/// Time a request waits for its turn to hash or compare a password, so that
+/// a burst delays the others instead of refusing them.
+#[cfg(not(test))]
+const HASH_WAIT: Duration = Duration::from_secs(5);
+/// Short, so that the tests of a wait that ends in a refusal stay fast.
+#[cfg(test)]
+const HASH_WAIT: Duration = Duration::from_millis(300);
 
 /// Answer of `POST /auth/setup` once a user exists.
 const SETUP_DONE: &str = "a user exists already; sign in";
@@ -167,6 +176,14 @@ async fn create_first_user(
     if !state.access.read().user.is_empty() {
         return admin::error(StatusCode::CONFLICT, SETUP_DONE);
     }
+    // A guess of the code is a sign-in attempt of its address.
+    if body.code.is_some() && !state.sessions.guess(peer.address) {
+        println!(
+            "Admin => Setup refused from {}: too many attempts",
+            client(peer)
+        );
+        return too_many_attempts();
+    }
     let has_code = admin::code_opens_setup(peer, state.token.is_some())
         && body.code.as_deref().is_some_and(|code| {
             aws_lc_rs::constant_time::verify_slices_are_equal(
@@ -187,7 +204,7 @@ async fn create_first_user(
     };
 
     let SetupBody { name, password, .. } = body;
-    let permit = match hash_permit(state) {
+    let permit = match hash_permit(state).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -218,13 +235,26 @@ async fn create_first_user(
     }
 }
 
-/// `PUT /auth/password`: a signed-in user replaces its own password, which
-/// ends its sessions and starts a new one for this browser.
+/// `PUT /auth/password`: see [`change_password`].
 pub(crate) async fn password(
     state: &Arc<AdminState>,
     caller: &Caller,
     peer: Peer,
     request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    match admin::read_json(request).await {
+        Ok(body) => change_password(state, caller, peer, body).await,
+        Err(response) => *response,
+    }
+}
+
+/// A signed-in user replaces its own password, which ends its sessions and
+/// starts a new one for this browser.
+async fn change_password(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    peer: Peer,
+    body: PasswordBody,
 ) -> Response<Full<Bytes>> {
     let Caller::User { name, .. } = caller else {
         return admin::error(
@@ -232,56 +262,67 @@ pub(crate) async fn password(
             "only a signed-in user changes its password",
         );
     };
-    let PasswordBody { current, new } = match admin::read_json(request).await {
-        Ok(body) => body,
-        Err(response) => return *response,
-    };
-    match check_password(state, name, current, peer).await {
-        Ok(true) => {}
-        // Not `401`, which tells the page that the session ended.
-        Ok(false) => {
-            println!(
-                "Admin => {name} gave a wrong current password from {}",
-                client(peer)
-            );
-            return admin::error(StatusCode::FORBIDDEN, "the current password is wrong");
-        }
-        Err(response) => return *response,
+    if let Err(response) = count_attempt(state, name, peer) {
+        return *response;
     }
-    let permit = match hash_permit(state) {
+    let permit = match hash_permit(state).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
+    let PasswordBody { current, new } = body;
+    // The comparison and the new hash, one after the other on one permit.
+    // `Ok(false)` when `current` is wrong.
     let changed = {
         let (state, name) = (Arc::clone(state), name.clone());
         hashed(permit, move || {
+            if !state.access.read().verify(&name, &current) {
+                return Ok(false);
+            }
             state
                 .access
                 .change(|access| access.set_password(&name, &new))
+                .map(|()| true)
         })
         .await
     };
     match changed {
-        Ok(Ok(())) => {
+        Ok(Ok(true)) => {
+            state.sessions.forget(name, peer.address);
             state.sessions.end_user(name);
             println!("Admin => {name} changed its password from {}", client(peer));
             signed_in(state, name, peer)
         }
-        Ok(Err(message)) => admin::error(StatusCode::BAD_REQUEST, &message),
+        // Not `401`, which tells the page that the session ended.
+        Ok(Ok(false)) => {
+            println!(
+                "Admin => {name} gave a wrong current password from {}",
+                client(peer)
+            );
+            admin::error(StatusCode::FORBIDDEN, "the current password is wrong")
+        }
+        // The current password was right, the new one is not accepted.
+        Ok(Err(message)) => {
+            state.sessions.forget(name, peer.address);
+            admin::error(StatusCode::BAD_REQUEST, &message)
+        }
         Err(response) => *response,
     }
 }
 
-/// The right to hash or compare one password. `Err` with a `429` when as
-/// many as allowed are at it: the request is answered at once, without a
-/// hash and without a thread.
-fn hash_permit(state: &AdminState) -> Result<OwnedSemaphorePermit, Box<Response<Full<Bytes>>>> {
-    Arc::clone(&state.hashing).try_acquire_owned().map_err(|_| {
-        Box::new(admin::error(
+/// The right to hash or compare one password, waited for up to
+/// [`HASH_WAIT`]. `Err` with a `429` when none came free in that time.
+async fn hash_permit(
+    state: &AdminState,
+) -> Result<OwnedSemaphorePermit, Box<Response<Full<Bytes>>>> {
+    let permit = Arc::clone(&state.hashing).acquire_owned();
+    match tokio::time::timeout(HASH_WAIT, permit).await {
+        Ok(Ok(permit)) => Ok(permit),
+        // The semaphore is never closed: this is the wait that ran out.
+        Ok(Err(_)) | Err(_) => Err(Box::new(admin::error(
             StatusCode::TOO_MANY_REQUESTS,
             "too many passwords are being checked; try again in a moment",
-        ))
-    })
+        ))),
+    }
 }
 
 /// Runs `work`, which hashes or compares a password, off the async workers:
@@ -306,10 +347,35 @@ async fn hashed<T: Send + 'static>(
     })
 }
 
-/// Whether `password` is the one of user `name`. `Err` with a `429` while
-/// the name is locked out for this client or too many passwords are being
-/// checked. The attempt is counted as failed before the check, which takes
-/// long enough for many others to start, and forgotten when the password is
+/// Counts a sign-in as `name` from the client of `peer` before anything is
+/// hashed for it. `Err` with a `429` when the client tried too often in the
+/// last minute, or failed too often under this name.
+fn count_attempt(
+    state: &AdminState,
+    name: &str,
+    peer: Peer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    if state.sessions.attempt(name, peer.address) {
+        return Ok(());
+    }
+    println!(
+        "Admin => Sign-in as {name:?} refused from {}: too many attempts",
+        client(peer)
+    );
+    Err(Box::new(too_many_attempts()))
+}
+
+fn too_many_attempts() -> Response<Full<Bytes>> {
+    admin::error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many sign-in attempts; try again in a minute",
+    )
+}
+
+/// Whether `password` is the one of user `name`. `Err` with a `429` when
+/// the attempt is refused, see [`count_attempt`], or no permit came free.
+/// The attempt is counted as failed before the check, which takes long
+/// enough for many others to start, and forgotten when the password is
 /// right.
 async fn check_password(
     state: &Arc<AdminState>,
@@ -317,18 +383,8 @@ async fn check_password(
     password: String,
     peer: Peer,
 ) -> Result<bool, Box<Response<Full<Bytes>>>> {
-    // First, so that a refusal for lack of a permit is not a failure.
-    let permit = hash_permit(state)?;
-    if !state.sessions.attempt(name, peer.address) {
-        println!(
-            "Admin => Sign-in as {name:?} refused from {}: too many failures",
-            client(peer)
-        );
-        return Err(Box::new(admin::error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed sign-ins for this name; try again in a minute",
-        )));
-    }
+    count_attempt(state, name, peer)?;
+    let permit = hash_permit(state).await?;
     let access = state.access.read();
     let user = name.to_owned();
     let right = hashed(permit, move || access.verify(&user, &password)).await?;
@@ -429,7 +485,9 @@ mod tests {
     async fn setup_without_the_right_code_creates_nothing() {
         let (open, directory) = daemon(None);
         let code = open.sessions.setup_code().to_owned();
-        let almost = format!("{}x", &code[..code.len() - 1]);
+        // The code with another last character.
+        let last = if code.ends_with('x') { 'y' } else { 'x' };
+        let almost = format!("{}{last}", &code[..code.len() - 1]);
         for (peer, given) in [
             (REMOTE, None),
             (REMOTE, Some("")),
@@ -471,45 +529,186 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn only_four_passwords_are_checked_at_a_time() {
-        let (state, _directory) = daemon(None);
+    /// A daemon with the user `ana`, an administrator.
+    fn daemon_with_ana() -> (Arc<AdminState>, TempDir) {
+        let (state, directory) = daemon(None);
         state
             .access
             .change(|access| access.add_user("ana", "password-ana", &[ADMIN_ROLE.to_owned()]))
             .unwrap();
-        let check = async |password: &str| {
-            check_password(&state, "ana", password.to_owned(), REMOTE)
-                .await
-                .map_err(|response| response.status())
-        };
+        (state, directory)
+    }
 
-        let busy = Arc::clone(&state.hashing)
+    /// Takes every hashing permit, as four slow sign-ins would.
+    fn keep_busy(state: &AdminState) -> OwnedSemaphorePermit {
+        Arc::clone(&state.hashing)
             .try_acquire_many_owned(4)
-            .unwrap();
-        // More than the failures that lock a name: none of these is one.
-        for _ in 0..8 {
-            assert_eq!(
-                check("password-ana").await,
-                Err(StatusCode::TOO_MANY_REQUESTS)
-            );
-        }
-        let response = create_first_user(&state, &Caller::Token, REMOTE, body(None)).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT, "a user exists");
+            .unwrap()
+    }
 
-        drop(busy);
-        assert_eq!(check("not-the-password").await, Ok(false));
-        assert_eq!(check("password-ana").await, Ok(true));
+    async fn check(
+        state: &Arc<AdminState>,
+        password: &str,
+        peer: Peer,
+    ) -> Result<bool, StatusCode> {
+        check_password(state, "ana", password.to_owned(), peer)
+            .await
+            .map_err(|response| response.status())
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_waits_for_its_turn_to_hash() {
+        let (state, _directory) = daemon_with_ana();
+
+        // Four at it, and the fifth comes: it waits, then is answered.
+        let busy = keep_busy(&state);
+        let release = tokio::task::spawn(async move {
+            tokio::time::sleep(HASH_WAIT / 6).await;
+            drop(busy);
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(check(&state, "password-ana", REMOTE).await, Ok(true));
+        assert!(started.elapsed() >= HASH_WAIT / 6, "it waited");
+        release.await.unwrap();
+        assert_eq!(check(&state, "not-the-password", REMOTE).await, Ok(false));
         assert_eq!(state.hashing.available_permits(), 4, "each one is returned");
 
+        // Nothing frees in time: refused, after the wait.
+        let busy = keep_busy(&state);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            check(&state, "password-ana", REMOTE).await,
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert!(started.elapsed() >= HASH_WAIT);
+        drop(busy);
+
         // A hash that panics is an error, not a wrong password.
-        let permit = hash_permit(&state).unwrap();
+        let permit = hash_permit(&state).await.unwrap();
         let failed = hashed(permit, || -> bool { panic!("as a broken hash would") }).await;
         assert_eq!(
             failed.map_err(|response| response.status()),
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         );
         assert_eq!(state.hashing.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn setup_and_password_change_wait_for_their_turn_too() {
+        // Setup: no hash, no user.
+        let (empty, directory) = daemon(Some(TOKEN));
+        let busy = keep_busy(&empty);
+        let response = create_first_user(&empty, &Caller::Token, REMOTE, body(None)).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(users(directory.path()).user.is_empty());
+        drop(busy);
+        let response = create_first_user(&empty, &Caller::Token, REMOTE, body(None)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Password change: the password and the sessions stay.
+        let (state, directory) = daemon_with_ana();
+        let session = state.sessions.create("ana", None);
+        let ana = Caller::User {
+            name: String::from("ana"),
+            scope: Scope::Admin,
+            session: session.clone(),
+        };
+        let change = async |current: &str, new: &str| {
+            let body = PasswordBody {
+                current: current.to_owned(),
+                new: new.to_owned(),
+            };
+            change_password(&state, &ana, REMOTE, body).await
+        };
+        let busy = keep_busy(&state);
+        let response = change("password-ana", "another-password").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert!(users(directory.path()).verify("ana", "password-ana"));
+        assert!(state.sessions.get(&session).is_some());
+        drop(busy);
+
+        let response = change("not-the-password", "another-password").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = change("password-ana", "short").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(users(directory.path()).verify("ana", "password-ana"));
+        let response = change("password-ana", "another-password").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.headers().contains_key(header::SET_COOKIE));
+        assert!(users(directory.path()).verify("ana", "another-password"));
+        assert!(state.sessions.get(&session).is_none(), "the old session");
+        assert_eq!(state.hashing.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn an_address_that_changes_names_is_refused_from_the_eleventh_attempt() {
+        let (state, _directory) = daemon_with_ana();
+        let other = Peer {
+            address: Some("192.0.2.9".parse().unwrap()),
+            ..REMOTE
+        };
+        let socket = Peer {
+            local: true,
+            tls: false,
+            address: None,
+        };
+        for index in 0..10 {
+            let name = format!("user{index}");
+            let answer = check_password(&state, &name, String::from("a-password"), REMOTE).await;
+            assert!(matches!(answer, Ok(false)), "attempt {index}");
+        }
+        // Whatever the name now, and with the right password too, without
+        // a hash: no permit is free and it does not wait for one.
+        let busy = keep_busy(&state);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            check(&state, "password-ana", REMOTE).await,
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert!(started.elapsed() < HASH_WAIT, "refused at once");
+        drop(busy);
+        let unknown = check_password(&state, "user10", String::from("a-password"), REMOTE).await;
+        assert_eq!(
+            unknown.map_err(|response| response.status()),
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
+
+        // Another address signs in, and the unix socket has no limit.
+        assert_eq!(check(&state, "password-ana", other).await, Ok(true));
+        for index in 0..12 {
+            let name = format!("user{index}");
+            let answer = check_password(&state, &name, String::from("a-password"), socket).await;
+            assert!(matches!(answer, Ok(false)), "attempt {index}");
+        }
+        assert_eq!(check(&state, "password-ana", socket).await, Ok(true));
+    }
+
+    #[tokio::test]
+    async fn guesses_of_the_setup_code_count_as_attempts_of_the_address() {
+        let (state, directory) = daemon(None);
+        let code = state.sessions.setup_code().to_owned();
+        for attempt in 0..10 {
+            let wrong = body(Some("aaaaaaaaaa"));
+            let response = create_first_user(&state, &Caller::Nobody, REMOTE, wrong).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "attempt {attempt}"
+            );
+        }
+        // The right code now is not even compared.
+        let response = create_first_user(&state, &Caller::Nobody, REMOTE, body(Some(&code))).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(users(directory.path()).user.is_empty());
+
+        let other = Peer {
+            address: Some("192.0.2.9".parse().unwrap()),
+            ..REMOTE
+        };
+        let response = create_first_user(&state, &Caller::Nobody, other, body(Some(&code))).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(users(directory.path()).user.len(), 1);
     }
 
     #[tokio::test]

@@ -32,8 +32,9 @@ Changed.
   exists `POST /auth/setup` creates the first administrator: for the token,
   for a request from the machine, or on a `tls` listener without a token
   with the setup code the daemon logs at start. Five failed sign-ins for a
-  name from one address lock that pair for a minute (`429`), at most 4
-  passwords are checked at a time (`429` beyond), a cookie request that
+  name from one address lock that pair for a minute and an address gets 10
+  attempts a minute whatever the names (`429`), at most 4 passwords are
+  checked at a time (the others wait up to 5 seconds), a cookie request that
   changes something needs an `Origin` equal to its `Host`, and sign-in,
   sign-out and setup refuse an `Origin` that is not their `Host`.
   The token and a request from the machine without a token stay

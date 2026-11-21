@@ -624,7 +624,7 @@ users = "/var/lib/rxh/users.toml"   # default: rxh-data/users.toml
 | Route | For | Does |
 |---|---|---|
 | `GET /auth/session` | anyone | Who the caller is, see below. |
-| `POST /auth/login` | anyone | `{"name", "password"}`: `204` and the session cookie. `401 {"error": "wrong name or password"}` for a wrong password and for an unknown name alike; `429` while the name is locked or too many passwords are being checked; `403` on plain HTTP from another machine. |
+| `POST /auth/login` | anyone | `{"name", "password"}`: `204` and the session cookie. `401 {"error": "wrong name or password"}` for a wrong password and for an unknown name alike; `429` after too many attempts, see below; `403` on plain HTTP from another machine. |
 | `POST /auth/logout` | anyone | Ends the session of the cookie and clears the cookie: `204`, also when there is no session. |
 | `POST /auth/setup` | see First run | `{"name", "password", "code"?}`: creates the first user and signs it in, `204`. `409` once a user exists. |
 | `PUT /auth/password` | a signed-in user | `{"current", "new"}`: `204`. Ends every session of the user and gives this browser a new one. `403` when `current` is wrong. |
@@ -677,20 +677,8 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   `POST /auth/setup` with the token creates the user there and signs
   nobody in.
 - At most 4 passwords are hashed or compared at a time. A sign-in, a
-  password change or a setup that comes while 4 are at it gets `429` at
-  once and does not count as a failed sign-in.
-- After 5 failed sign-ins for a name from one client address, that name is
-  refused from that address for a minute (`429`), with the right password
-  too. A wrong `current` in `PUT /auth/password` counts as one.
-- A password has at least 8 characters and at most 72 bytes. Hashes never
-  leave the daemon.
-- Each sign-in, failed sign-in, sign-out, password change and the creation
-  of the first user is a line in the log of the daemon, with the name and
-  the address of the client.
-- Behind a reverse proxy on the same machine every request comes from the
-  machine under the name of the proxy, which without a token is refused
-  (`403`) before it can sign in: set `token` there, as said above, and
-  people sign in with their accounts all the same.
+  password change or a setup that comes while 4 are at it waits for its
+  turn, and gets `429` when none came within 5 seconds.
 
 #### First run
 
