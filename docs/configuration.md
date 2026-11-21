@@ -884,7 +884,8 @@ What a signed-in user without the `admin` role gets from each route
   or the address of a host the user does not view shows there.
 - `GET /status` and `GET /stats/history` go by the `name` and the `groups`
   of the running configuration, hosts made by a provider (Docker, Consul,
-  Kubernetes...) included. A series is shown only when every running
+  Kubernetes...) included; those take their groups from the `rxh.groups`
+  option and no editing route reaches them. A series is shown only when every running
   server that counts under it is viewed: two servers with the same name, or
   the requests that match no server of a shared listener, are shown to who
   views them all. A series is kept under its name for an hour, whatever
@@ -1693,6 +1694,7 @@ Labels of a container:
 | `rxh.tcp.port` | Container port of the TCP route, with the same default as `rxh.http.port`. |
 | `rxh.pool` | Name of the pool. Containers with the same pool are load balanced. Defaults to `PROJECT-SERVICE` for Docker Compose containers, so the replicas of a service share a pool, else to the container name. Letters, digits, `-`, `_` and `.`. |
 | `rxh.policy` | Load balancing policy of the pool, see [Policies](#policies). Default `weighted_round_robin`. |
+| `rxh.groups` | `groups` of the server, comma separated: the admin API users whose roles grant View on one of them see it in `rxh status` and the dashboard (see [Permissions](#permissions)). Each name matches `[a-z0-9][a-z0-9_-]*`, 64 bytes at most. The server stays read only for them: it is not in a file. |
 
 ```yaml
 # compose.yaml
@@ -1706,6 +1708,7 @@ services:
       rxh.http.host: app.example.com
       rxh.http.port: "8080"
       rxh.policy: least_conn
+      rxh.groups: web, customers
   db:
     image: postgres:16
     labels:
@@ -1718,7 +1721,7 @@ the containers, at their IP address on the Docker network and the container
 port (published ports are not needed). Both show in `rxh status` and in the
 metrics, not in `rxh config`. A replica that starts or stops only changes the
 members of its pool; when a pool appears, disappears or changes its hosts,
-address or policy the listeners are swapped as a reload does, without
+groups, address or policy the listeners are swapped as a reload does, without
 dropping connections.
 
 - rxh must reach the container addresses: run it on the Docker host or in a
@@ -1727,9 +1730,9 @@ dropping connections.
   `network_mode: host` at `127.0.0.1`.
 - A container is HTTP or TCP: `rxh.http.host` and `rxh.tcp.listen` cannot be
   combined. The containers of a pool must agree on `rxh.policy` and
-  `rxh.tcp.listen`; their hosts are merged.
+  `rxh.tcp.listen`; their hosts and groups are merged.
 - A container whose labels are wrong (unknown `rxh.*` label, missing port,
-  invalid host or policy), whose pool has the name of an `[upstream.NAME]`
+  invalid host, policy or group name), whose pool has the name of an `[upstream.NAME]`
   of the file, or whose server would make the configuration invalid is
   ignored and reported once on standard error. The other containers are
   not affected.
@@ -1815,7 +1818,9 @@ Each table makes the daemon list a service catalog every `refresh` and
 route to its service instances with the options of the
 [`[docker]` labels](#docker-routes-to-containers-from-their-labels)
 (`rxh.enable`, `rxh.http.host`, `rxh.http.port`, `rxh.tcp.listen`,
-`rxh.tcp.port`, `rxh.pool`, `rxh.policy`). An instance is reached at its
+`rxh.tcp.port`, `rxh.pool`, `rxh.policy`, `rxh.groups`): a tag
+`rxh.groups=web,customers` for Consul and Nomad, a key
+`PREFIX/SERVICE/INSTANCE/groups` for etcd. An instance is reached at its
 address and port, so `rxh.http.port` and `rxh.tcp.port` are rarely needed.
 The pool defaults to the service name, and the server of a pool is named
 after the section: `consul-web`. Instances that come and go change the
@@ -1902,6 +1907,8 @@ shared by every Ingress and HTTPRoute that points at it; pods that come and
 go only change its members. It behaves like the
 [service catalogs](#consul-etcd-nomad-routes-from-a-service-catalog)
 otherwise: while the API cannot be reached or read, the last routes stay.
+Ingresses and HTTPRoutes carry no `rxh.*` options, so their servers have no
+`groups` and only administrators see them in the admin API.
 
 | Key | Default | Description |
 |---|---|---|

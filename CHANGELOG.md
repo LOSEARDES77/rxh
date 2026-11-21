@@ -14,6 +14,12 @@ Changed.
   (default `"rxh-data/users.toml"`), and `groups` on a `[[server]]`, the
   groups admin API roles grant permissions on. A non-loopback admin
   `listen` now accepts `tls` in place of `token`.
+- `rxh.groups=web,customers` on a Docker container (label), a Consul or
+  Nomad service (tag) or an etcd instance (`groups` key) sets the `groups`
+  of its server, so the users whose roles grant View on one of them see
+  the host in the admin API; the replicas of a pool merge their groups. An
+  invalid group name ignores the container and reports it, like any bad
+  label. Kubernetes hosts have no such option.
 - The admin listener speaks TLS with `[admin] tls`: HTTPS and plain HTTP on
   one port, told apart by the first byte of the connection. Plain HTTP is
   answered only to connections from the machine itself, so the CLI works

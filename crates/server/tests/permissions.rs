@@ -1485,3 +1485,87 @@ async fn a_host_with_a_placeholder_keeps_its_targets() {
         .await;
     assert_eq!(status, StatusCode::OK, "{json}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_host_is_visible_through_its_group_and_read_only() {
+    let docker = rxh_test_util::DockerApi::start().await;
+    let (admin, web, tcp) = (free_address(), free_address(), free_address());
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let users = directory.path().join("users.toml");
+    accounts().save(&users).expect("write the users file");
+    let config_path = directory.path().join("rxh.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[admin]\nlisten = \"{admin}\"\nusers = {users:?}\ntoken = \"{TOKEN}\"\n\n\
+             [docker]\nendpoint = \"{}\"\nlisten = \"{web}\"\n",
+            docker.endpoint()
+        ),
+    )
+    .expect("write the configuration");
+    let container = |id: &str, labels: Value| {
+        json!({
+            "Id": id,
+            "Names": [format!("/{id}")],
+            "Labels": labels,
+            "Ports": [{ "PrivatePort": 9, "Type": "tcp" }],
+            "NetworkSettings": { "Networks": { "bridge": { "IPAddress": "127.0.0.1" } } },
+        })
+    };
+    let shop = container(
+        "shop",
+        json!({ "rxh.enable": "true", "rxh.http.host": "shop.test", "rxh.groups": "customers, web" }),
+    );
+    let intra = container(
+        "intra",
+        json!({ "rxh.enable": "true", "rxh.tcp.listen": tcp.to_string(), "rxh.groups": "internal" }),
+    );
+    docker.publish(&json!([shop, intra]).to_string(), "start", "shop");
+    let daemon = start(&config_path, admin).await;
+    let fixture = Fixture {
+        admin,
+        config_path,
+        // The four hosts of `daemon()` do not exist here.
+        listens: [web; 4],
+        _directory: directory,
+        _daemon: daemon,
+    };
+
+    // The token sees both provider hosts once the containers are planned.
+    let names = |status: &Value| -> Vec<String> {
+        let rows = status["servers"].as_array().expect("servers");
+        rows.iter()
+            .map(|row| row["name"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+    util::eventually(async || {
+        let (_, status) = fixture.token(Method::GET, "/status", &Value::Null).await;
+        names(&status).len() == 2
+    })
+    .await;
+
+    // `vera` views the group `web`: the shop, not the internal host.
+    let vera = fixture.cookie("vera").await;
+    let status = fixture.get(&vera, "/status").await;
+    assert_eq!(names(&status), ["docker-shop"], "{status}");
+    assert!(!status.to_string().contains("intra"), "{status}");
+    // `pia` views nothing in `web`.
+    let pia = fixture.cookie("pia").await;
+    let status = fixture.get(&pia, "/status").await;
+    assert_eq!(status["servers"], json!([]));
+
+    // There is no table for it in a file, so no route edits it, even for a
+    // user who may change everything in its group.
+    let eva = fixture.cookie("eva").await;
+    let files = fixture.get(&eva, "/config/files").await;
+    assert_eq!(keys(&files, "server"), [] as [&str; 0]);
+    assert!(!files.to_string().contains("docker-shop"), "{files}");
+    let before = fixture.text();
+    let value = json!({ "name": "docker-shop", "listen": web.to_string(),
+                        "groups": ["web"], "forward": "127.0.0.1:10" });
+    let (status, json) = fixture.put(&eva, "0:0", json!({ "value": value })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    let (status, json) = fixture.delete(&eva, "0:0").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(fixture.text(), before);
+}

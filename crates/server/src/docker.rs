@@ -16,12 +16,14 @@
 //! | `rxh.tcp.port`    | Container port of the TCP route                           |
 //! | `rxh.pool`        | Pool name, shared by the replicas of a service            |
 //! | `rxh.policy`      | Load balancing policy of the pool                         |
+//! | `rxh.groups`      | Groups of the server, comma separated                     |
 //!
 //! Each pool becomes an upstream group without static backends plus one
 //! server named `docker-POOL`. The containers are its dynamic members, so a
 //! replica that starts or stops only changes the members; the listeners are
 //! rebuilt, like a reload, only when a pool appears, disappears or changes
-//! its hosts, address or policy.
+//! its hosts, groups, address or policy. The hosts and groups of a pool are
+//! those of all its containers.
 //!
 //! The service catalogs (`[consul]`, `[etcd]`, `[nomad]`, see the `catalog`
 //! module) turn their service instances into [`Container`]s with the same
@@ -42,6 +44,7 @@ use hyper::{Request, Response, header};
 use hyper_util::rt::TokioIo;
 use rxh_core::config::{
     Backend, CatalogKind, Config, ContainerProvider, Docker, Policy, Server, UpstreamGroup,
+    is_group_name,
 };
 use rxh_core::matcher::HostPattern;
 use serde::Deserialize;
@@ -402,6 +405,7 @@ struct Target {
     pool: String,
     policy: Option<Policy>,
     hosts: Vec<String>,
+    groups: Vec<String>,
     tcp_listen: Option<SocketAddr>,
     backend: Backend,
 }
@@ -414,6 +418,7 @@ impl Container {
         let mut pool: Option<&str> = None;
         let mut policy: Option<Policy> = None;
         let mut hosts: Vec<String> = Vec::new();
+        let mut groups: Vec<String> = Vec::new();
         let mut tcp_listen: Option<SocketAddr> = None;
         let mut http_port: Option<u16> = None;
         let mut tcp_port: Option<u16> = None;
@@ -443,6 +448,19 @@ impl Container {
                     // would fail every listener.
                     for host in &hosts {
                         HostPattern::new(host)?;
+                    }
+                }
+                "groups" => {
+                    groups = value
+                        .split(',')
+                        .map(|group| group.trim().to_owned())
+                        .filter(|group| !group.is_empty())
+                        .collect();
+                    if let Some(group) = groups.iter().find(|group| !is_group_name(group)) {
+                        return Err(format!(
+                            "{key} has {group:?}, a group must match [a-z0-9][a-z0-9_-]* \
+                             and have at most 64 bytes"
+                        ));
                     }
                 }
                 "http.port" => http_port = port(key, value)?,
@@ -512,6 +530,7 @@ impl Container {
             pool,
             policy,
             hosts,
+            groups,
             tcp_listen,
             backend: Backend::new(backend.to_string()),
         })
@@ -543,6 +562,7 @@ pub(crate) struct Route {
     policy: Option<Policy>,
     /// Hosts of the HTTP server; unused with `tcp_listen`.
     hosts: Vec<String>,
+    groups: Vec<String>,
     /// Address of the TCP server, or `None` for an HTTP route.
     tcp_listen: Option<SocketAddr>,
 }
@@ -567,13 +587,16 @@ impl Route {
 
         let name = format!("{}-{pool}", self.source.name());
         let forward = format!("@{pool}");
+        let groups = &self.groups;
         let server = match self.tcp_listen {
-            Some(listen) => {
-                json!({ "name": name, "listen": [listen], "protocol": "tcp", "forward": forward })
-            }
-            None => {
-                json!({ "name": name, "listen": [http_listen], "host": self.hosts, "forward": forward })
-            }
+            Some(listen) => json!({
+                "name": name, "listen": [listen], "protocol": "tcp", "forward": forward,
+                "groups": groups,
+            }),
+            None => json!({
+                "name": name, "listen": [http_listen], "host": self.hosts, "forward": forward,
+                "groups": groups,
+            }),
         };
         let server: Server = serde_json::from_value(server).map_err(|err| err.to_string())?;
         config.servers.push(server);
@@ -656,6 +679,7 @@ pub(crate) fn plan(config: &Config, containers: &[Container]) -> (Config, Plan) 
                 pool: target.pool,
                 policy: target.policy,
                 hosts: target.hosts,
+                groups: target.groups,
                 tcp_listen: target.tcp_listen,
             });
             continue;
@@ -679,6 +703,11 @@ pub(crate) fn plan(config: &Config, containers: &[Container]) -> (Config, Plan) 
         for host in target.hosts {
             if !route.hosts.contains(&host) {
                 route.hosts.push(host);
+            }
+        }
+        for group in target.groups {
+            if !route.groups.contains(&group) {
+                route.groups.push(group);
             }
         }
         plan.members
@@ -978,6 +1007,105 @@ mod tests {
         assert_eq!(web.listen, ["127.0.0.1:8080".parse().unwrap()]);
         assert_eq!(web.host, ["app.example.com", "www.example.com"]);
         effective.validate().unwrap();
+    }
+
+    #[test]
+    fn docker_groups_label_sets_the_groups() {
+        let containers = [
+            container(
+                "web-1",
+                "10.0.0.1",
+                &[80],
+                &[
+                    ("rxh.http.host", "app.test"),
+                    ("rxh.pool", "web"),
+                    ("rxh.groups", " web , customers,"),
+                ],
+            ),
+            container(
+                "web-2",
+                "10.0.0.2",
+                &[80],
+                &[
+                    ("rxh.http.host", "app.test"),
+                    ("rxh.pool", "web"),
+                    ("rxh.groups", "web,ops"),
+                ],
+            ),
+            container(
+                "db",
+                "10.0.0.9",
+                &[5432],
+                &[("rxh.tcp.listen", ":5432"), ("rxh.groups", "data")],
+            ),
+            container("bare", "10.0.0.5", &[80], &[("rxh.http.host", "bare.test")]),
+        ];
+        let (effective, planned) = plan(&config(""), &containers);
+        assert_eq!(planned.ignored, [""; 0]);
+        let groups = |name: &str| -> &[String] {
+            let server = effective
+                .servers
+                .iter()
+                .find(|server| server.name.as_deref() == Some(name));
+            &server.expect("the server is planned").groups
+        };
+        // The groups of a pool are those of all its replicas.
+        assert_eq!(groups("docker-web"), ["web", "customers", "ops"]);
+        assert_eq!(groups("docker-db"), ["data"]);
+        assert!(groups("docker-bare").is_empty());
+
+        // A change of groups is a change of route: the listeners are rebuilt.
+        let regrouped = container(
+            "db",
+            "10.0.0.9",
+            &[5432],
+            &[("rxh.tcp.listen", ":5432"), ("rxh.groups", "other")],
+        );
+        let db = plan(&config(""), &containers[2..3]).1;
+        assert_ne!(db.routes, plan(&config(""), &[regrouped]).1.routes);
+    }
+
+    #[test]
+    fn docker_groups_label_with_an_invalid_name_is_reported() {
+        for value in ["Web", "web,-x", "a b", &"x".repeat(65)] {
+            let bad = container(
+                "bad",
+                "10.0.0.1",
+                &[80],
+                &[("rxh.http.host", "bad.test"), ("rxh.groups", value)],
+            );
+            let good = container("good", "10.0.0.2", &[80], &[("rxh.http.host", "good.test")]);
+            let (effective, planned) = plan(&config(""), &[bad, good]);
+            assert_eq!(planned.ignored.len(), 1, "{value}: {:?}", planned.ignored);
+            assert!(
+                planned.ignored[0].starts_with("Docker => ignored container bad: rxh.groups has"),
+                "{value}: {:?}",
+                planned.ignored
+            );
+            let names: Vec<Option<&str>> = effective
+                .servers
+                .iter()
+                .map(|server| server.name.as_deref())
+                .collect();
+            assert_eq!(names, [Some("docker-good")], "{value}");
+        }
+
+        // A group listed twice makes the whole pool invalid, like any
+        // invalid server.
+        let twice = container(
+            "twice",
+            "10.0.0.1",
+            &[80],
+            &[("rxh.http.host", "twice.test"), ("rxh.groups", "web,web")],
+        );
+        let (effective, planned) = plan(&config(""), &[twice]);
+        assert!(effective.servers.is_empty());
+        assert_eq!(planned.ignored.len(), 1, "{:?}", planned.ignored);
+        assert!(
+            planned.ignored[0].contains("listed more than once"),
+            "{:?}",
+            planned.ignored
+        );
     }
 
     #[test]

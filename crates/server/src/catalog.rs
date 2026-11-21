@@ -564,6 +564,64 @@ mod tests {
     }
 
     #[test]
+    fn catalog_groups_tag_or_key_sets_the_groups() {
+        use base64::Engine;
+
+        let consul = br#"[{"Node":{"Node":"n1","Address":"10.0.0.1"},
+           "Service":{"ID":"web-1","Service":"web","Tags":["rxh.enable=true",
+             "rxh.http.host=app.test","rxh.groups=web, customers"],"Address":"","Port":80}}]"#;
+        let nomad = br#"[{"ServiceName":"api","AllocID":"0123456789abcdef",
+           "Tags":["rxh.enable=true","rxh.http.host=api.test","rxh.groups=web,customers"],
+           "Address":"10.0.2.1","Port":80}]"#;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let pair = |key: &str, value: &str| json!({ "key": engine.encode(key), "value": engine.encode(value) });
+        let etcd = json!({ "kvs": [
+            pair("rxh/shop/a/address", "10.0.3.1:80"),
+            pair("rxh/shop/a/http.host", "shop.test"),
+            pair("rxh/shop/a/groups", " web , customers "),
+        ]})
+        .to_string();
+        let cases = [
+            (
+                "[consul]\n",
+                parse_consul_instances(consul).unwrap(),
+                "consul-web",
+            ),
+            (
+                "[nomad]\n",
+                parse_nomad_instances(nomad).unwrap(),
+                "nomad-api",
+            ),
+            (
+                "[etcd]\n",
+                parse_etcd(etcd.as_bytes(), "rxh/").unwrap(),
+                "etcd-shop",
+            ),
+        ];
+        for (section, instances, name) in cases {
+            let config = Config::from_toml(section).unwrap();
+            let (effective, plan) = docker::plan(&config, &instances);
+            assert_eq!(plan.ignored, [""; 0], "{name}");
+            assert_eq!(effective.servers[0].name.as_deref(), Some(name));
+            assert_eq!(effective.servers[0].groups, ["web", "customers"], "{name}");
+        }
+
+        // An invalid name leaves the instance out, as any bad option does.
+        let bad = br#"[{"Node":{"Node":"n1","Address":"10.0.0.1"},
+           "Service":{"ID":"web-1","Service":"web","Tags":["rxh.enable=true",
+             "rxh.http.host=app.test","rxh.groups=Web"],"Address":"","Port":80}}]"#;
+        let config = Config::from_toml("[consul]\n").unwrap();
+        let (effective, plan) = docker::plan(&config, &parse_consul_instances(bad).unwrap());
+        assert!(effective.servers.is_empty());
+        assert_eq!(plan.ignored.len(), 1, "{:?}", plan.ignored);
+        assert!(
+            plan.ignored[0].starts_with("Consul => ignored instance n1/web-1: rxh.groups has"),
+            "{:?}",
+            plan.ignored
+        );
+    }
+
+    #[test]
     fn etcd_range_covers_the_prefix() {
         let body =
             |prefix: &str| -> serde_json::Value { serde_json::from_slice(&range(prefix)).unwrap() };
