@@ -293,7 +293,7 @@ test("a_provider_administrator_gets_no_first_run_form", async () => {
 });
 
 test("over_plain_http_setup_points_to_https", async () => {
-  daemon(who({ setup: true, setup_needs_code: true, password_login: false }));
+  daemon(who({ setup: true, setup_needs_code: true, password_login: false, tls: true }));
   render(App);
   expect(await screen.findByText("Open this page over https to sign in.")).toBeTruthy();
   expect(screen.queryByLabelText("Setup code")).toBeNull();

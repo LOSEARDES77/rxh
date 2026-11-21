@@ -27,9 +27,10 @@
 
   // Where no password is taken, or no user exists to have one, the token is the only way in.
   const byPassword = $derived($session !== undefined && $session.password_login && !$session.setup);
-  // No session is given on plain HTTP off this machine: the same page over HTTPS can have one.
+  // No session is given on plain HTTP off this machine: the same page over HTTPS, where the
+  // listener has it, can have one.
   const overHttp = $derived(
-    $session !== undefined && !$session.password_login && location.protocol === "http:",
+    $session !== undefined && !$session.password_login && $session.tls && location.protocol === "http:",
   );
   const httpsUrl = $derived(overHttp ? location.href.replace(/^http:/, "https:") : "");
   let byToken = $state(untrack(() => !byPassword && !overHttp));
@@ -38,9 +39,12 @@
     if (form === "sign-in" && overHttp) return "https";
     return form;
   });
-  // The provider's sign-in needs a session cookie, which this connection takes.
+  // The provider's sign-in needs a session cookie, which this connection takes. The sign-in
+  // form comes with a 401, while the session read before may still name a user.
   const byProvider = $derived(
-    $session?.oidc === true && $session.password_login && !signedIn($session) && view !== "password",
+    $session?.oidc === true &&
+      $session.password_login &&
+      (form === "sign-in" || (form === "setup" && !signedIn($session))),
   );
 
   // Kept here only: they go away with the form.
@@ -175,7 +179,7 @@
   <div class="actions">
     {#if form === "sign-in" && (!byToken || byPassword || overHttp)}
       <button type="button" class="link" onclick={swap}>
-        {byToken ? "Sign in with a password" : "Use the admin token"}
+        {byToken ? (overHttp ? "Back" : "Sign in with a password") : "Use the admin token"}
       </button>
     {/if}
     {#if oncancel}

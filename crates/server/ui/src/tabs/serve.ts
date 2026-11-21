@@ -17,6 +17,7 @@ export function who(changes: Partial<Session> = {}): Session {
     oidc_issuer: null,
     // A user is one of the users file unless said otherwise, as most are.
     local: (changes.user ?? null) !== null,
+    tls: false,
     ...changes,
   };
 }

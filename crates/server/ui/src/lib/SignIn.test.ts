@@ -69,7 +69,7 @@ test("the_token_entry_is_still_reachable", async () => {
 
 test("over_plain_http_without_password_sign_in_the_page_points_to_https", async () => {
   // jsdom serves the page over http:, as a plain HTTP admin listener would.
-  session.set(who({ password_login: false, oidc: true, oidc_issuer: "id.example.com" }));
+  session.set(who({ password_login: false, tls: true, oidc: true, oidc_issuer: "id.example.com" }));
   render(SignIn, { form: "sign-in" });
   expect(screen.getByText("Open this page over https to sign in.")).toBeTruthy();
   const https = location.href.replace(/^http:/, "https:");
@@ -82,6 +82,27 @@ test("over_plain_http_without_password_sign_in_the_page_points_to_https", async 
   await fireEvent.click(screen.getByRole("button", { name: "Use the admin token" }));
   expect(screen.getByLabelText("Token")).toBeTruthy();
   expect(screen.queryByText("Open this page over https to sign in.")).toBeNull();
+  // No password form is behind it: the way back is to the sentence.
+  expect(screen.queryByRole("button", { name: "Sign in with a password" })).toBeNull();
+  await fireEvent.click(screen.getByRole("button", { name: "Back" }));
+  expect(screen.getByText("Open this page over https to sign in.")).toBeTruthy();
+});
+
+test("without_tls_on_the_listener_only_the_token_is_asked", () => {
+  // Plain HTTP with no HTTPS to go to: a link there would lead nowhere.
+  session.set(who({ password_login: false, tls: false }));
+  render(SignIn, { form: "sign-in" });
+  expect(screen.getByLabelText("Token")).toBeTruthy();
+  expect(screen.queryByText("Open this page over https to sign in.")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Sign in with a password" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+});
+
+test("the_provider_button_shows_on_a_401_with_a_stale_session", () => {
+  // The cookie ended, but the page has not read the session again: it still names the user.
+  session.set(who({ user: "ana", oidc: true, oidc_issuer: "id.example.com" }));
+  render(SignIn, { form: "sign-in" });
+  expect(screen.getByRole("link", { name: "Sign in with id.example.com" })).toBeTruthy();
 });
 
 test("the_provider_button_shows_when_oidc_is_on", () => {

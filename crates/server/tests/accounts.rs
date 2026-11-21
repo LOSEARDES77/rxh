@@ -160,6 +160,7 @@ async fn session_reports_setup_while_no_user_exists() {
             "oidc": false,
             "oidc_issuer": null,
             "local": false,
+            "tls": false,
         })
     );
 
@@ -432,6 +433,7 @@ async fn a_session_cookie_identifies_the_user() {
             "oidc": false,
             "oidc_issuer": null,
             "local": true,
+            "tls": false,
         })
     );
     let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/pools", "").await;

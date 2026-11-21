@@ -123,6 +123,9 @@ pub(crate) fn session(state: &AdminState, caller: &Caller, peer: Peer) -> Respon
             "oidc_issuer": issuer,
             // A user of the users file, who has a password to change.
             "local": matches!(caller, Caller::User { oidc: false, .. }),
+            // Whether `[admin] tls` is set: HTTPS exists on this listener, whatever this
+            // request came over.
+            "tls": state.tls.is_some(),
         }),
     )
 }
@@ -768,6 +771,7 @@ mod tests {
     use super::*;
     use crate::access::Access;
     use crate::admin::tests::{LOCAL, REMOTE, state};
+    use crate::tls::AdminTls;
 
     const TOKEN: &str = "0123456789abcdef";
 
@@ -864,6 +868,34 @@ mod tests {
             let response = signed_in(&closed, "ana", peer);
             assert!(response.headers().contains_key(header::SET_COOKIE));
         }
+    }
+
+    #[tokio::test]
+    async fn the_session_says_whether_the_listener_has_tls() {
+        use http_body_util::BodyExt;
+
+        let tls_of = async |state: &AdminState| {
+            let response = session(state, &Caller::Nobody, PLAIN);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            json["tls"].clone()
+        };
+        let (plain, directory) = daemon(None);
+        assert_eq!(tls_of(&plain).await, false);
+
+        let generated =
+            rcgen::generate_simple_self_signed(vec![String::from("localhost")]).unwrap();
+        let (cert, key) = (
+            directory.path().join("admin.pem"),
+            directory.path().join("admin.key"),
+        );
+        std::fs::write(&cert, generated.cert.pem()).unwrap();
+        std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+        let mut with_tls = state(None, directory.path().join("users.toml"));
+        with_tls.tls =
+            Some(AdminTls::from_files(cert.to_str().unwrap(), key.to_str().unwrap()).unwrap());
+        // Asked over plain HTTP all the same: it is the listener that says.
+        assert_eq!(tls_of(&with_tls).await, true);
     }
 
     #[tokio::test]

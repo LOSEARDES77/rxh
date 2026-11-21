@@ -27,6 +27,8 @@ export type Session = {
   oidc_issuer: string | null;
   /** A user of the users file, who has a password here; false for one of the provider. */
   local: boolean;
+  /** Whether the admin listener has `[admin] tls`, whatever this page was loaded over. */
+  tls: boolean;
 };
 
 /** Undefined until the daemon answered. Passwords never get here. */

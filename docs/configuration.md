@@ -767,7 +767,8 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   "password_login": true,
   "oidc": false,
   "oidc_issuer": null,
-  "local": true
+  "local": true,
+  "tls": true
 }
 ```
 
@@ -783,6 +784,9 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   of its `issuer`, to name it. `local` is `true` for a user of the users
   file and `false` for one signed in through the provider, which has no
   password here.
+- `tls` says whether the admin listener has `[admin] tls`, whatever this
+  request came over. On plain HTTP to such a listener the page links to
+  the same address over HTTPS; without it, it asks for the token.
 - `password_login` says whether `POST /auth/login` works on this
   connection: over HTTPS, or from the machine on a loopback or unix socket
   `listen`. A password does not travel in clear text over the network, so
