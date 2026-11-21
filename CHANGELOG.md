@@ -17,7 +17,8 @@ Changed.
 - The admin listener speaks TLS with `[admin] tls`: HTTPS and plain HTTP on
   one port, told apart by the first byte of the connection. Plain HTTP is
   answered only to connections from the machine itself, so the CLI works
-  unchanged. `POST /certificates/reload` reads the admin certificate again
+  unchanged, and a connection has 10 seconds to send its first byte and
+  finish the handshake. `POST /certificates/reload` reads the admin certificate again
   too, and a certificate file that cannot be read stops the start. A request
   without a token is local, and served, only when its connection comes from
   the machine (unix socket, loopback peer, or the machine calling its own

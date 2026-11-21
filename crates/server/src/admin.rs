@@ -56,7 +56,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -77,6 +77,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 
 use crate::change::{self, Change, Section};
 use crate::config_api;
@@ -171,6 +173,65 @@ pub(crate) struct Peer {
 
 /// First byte of a TLS connection: the record type of a handshake.
 const TLS_HANDSHAKE: u8 = 0x16;
+
+/// Time a connection to a TLS listener has to send its first byte and
+/// finish the handshake, so a silent peer does not hold a task and a
+/// descriptor.
+const OPENING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a TLS listener does with a connection, from its first byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    /// A handshake: served over TLS, wherever it comes from.
+    Tls,
+    /// Plain HTTP from this machine: served as it is.
+    Plain,
+    /// Plain HTTP from another machine: closed, so nothing travels in
+    /// clear text over the network, a token least of all.
+    Closed,
+}
+
+impl Opening {
+    fn of(first: u8, local: bool) -> Self {
+        match (first, local) {
+            (TLS_HANDSHAKE, _) => Self::Tls,
+            (_, true) => Self::Plain,
+            (_, false) => Self::Closed,
+        }
+    }
+}
+
+/// A connection to a TLS listener that is ready for HTTP.
+enum Opened {
+    Tls(Box<TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
+
+/// Reads how a connection to a TLS listener opens and finishes its
+/// handshake, within `limit`. `None` when the connection is to be closed:
+/// see [`Opening::Closed`], a failed handshake, or a peer that is too slow.
+async fn open(
+    stream: TcpStream,
+    acceptor: &TlsAcceptor,
+    local: bool,
+    limit: Duration,
+) -> Option<Opened> {
+    let opening = async {
+        let mut first = [0_u8; 1];
+        if stream.peek(&mut first).await.ok()? == 0 {
+            return None;
+        }
+        match Opening::of(first[0], local) {
+            Opening::Tls => {
+                let stream = acceptor.accept(stream).await.ok()?;
+                Some(Opened::Tls(Box::new(stream)))
+            }
+            Opening::Plain => Some(Opened::Plain(stream)),
+            Opening::Closed => None,
+        }
+    };
+    tokio::time::timeout(limit, opening).await.ok().flatten()
+}
 
 #[derive(Deserialize)]
 struct UpstreamBody {
@@ -341,15 +402,12 @@ async fn serve_tcp(stream: TcpStream, address: IpAddr, state: Arc<AdminState>) {
     let Some(acceptor) = state.tls.as_ref().map(|tls| tls.acceptor.clone()) else {
         return serve_connection(stream, peer, state).await;
     };
-    let mut first = [0_u8; 1];
-    match stream.peek(&mut first).await {
-        Ok(1) if first[0] == TLS_HANDSHAKE => {
-            if let Ok(stream) = acceptor.accept(stream).await {
-                serve_connection(stream, Peer { tls: true, ..peer }, state).await;
-            }
+    match open(stream, &acceptor, peer.local, OPENING_TIMEOUT).await {
+        Some(Opened::Tls(stream)) => {
+            serve_connection(stream, Peer { tls: true, ..peer }, state).await;
         }
-        Ok(1) if peer.local => serve_connection(stream, peer, state).await,
-        _ => {}
+        Some(Opened::Plain(stream)) => serve_connection(stream, peer, state).await,
+        None => {}
     }
 }
 
@@ -391,10 +449,7 @@ async fn handle(
             return Ok(response);
         }
     } else if !is_local_request(&request, &state.listen, peer) {
-        return Ok(error(
-            StatusCode::FORBIDDEN,
-            "admin API only accepts a loopback Host and its own Origin",
-        ));
+        return Ok(error(StatusCode::FORBIDDEN, refusal(peer)));
     }
 
     let method = request.method().clone();
@@ -855,6 +910,15 @@ fn is_local_request<B>(request: &Request<B>, listen: &AdminListen, peer: Peer) -
     host.is_none_or(is_loopback) && origin.is_none_or(is_same_origin)
 }
 
+/// Why a request that failed [`is_local_request`] is refused.
+fn refusal(peer: Peer) -> &'static str {
+    if peer.local {
+        "admin API only accepts a loopback Host and its own Origin"
+    } else {
+        "admin API without a token only accepts connections from this machine"
+    }
+}
+
 async fn read_json<T: for<'de> Deserialize<'de>>(
     request: Request<Incoming>,
 ) -> Result<T, Box<Response<Full<Bytes>>>> {
@@ -1082,6 +1146,79 @@ mod tests {
             !is_local_request(&Request::new(()), &wide, remote),
             "no Host"
         );
+        // The answer names the cause that applies.
+        assert!(refusal(remote).contains("from this machine"));
+        assert!(refusal(LOCAL).contains("loopback Host"));
+    }
+
+    #[test]
+    fn plain_http_from_another_machine_is_closed_on_a_tls_listener() {
+        for local in [true, false] {
+            assert_eq!(Opening::of(0x16, local), Opening::Tls);
+        }
+        // `G` of `GET`, and a byte that starts neither protocol.
+        for first in [b'G', 0x00, 0x15, 0x17, 0x80] {
+            assert_eq!(Opening::of(first, /* local= */ true), Opening::Plain);
+            assert_eq!(Opening::of(first, /* local= */ false), Opening::Closed);
+        }
+    }
+
+    /// The acceptor of a new certificate, and an accepted connection to it
+    /// with its client end.
+    async fn tls_listener() -> (TlsAcceptor, TcpStream, TcpStream) {
+        let generated =
+            rcgen::generate_simple_self_signed(vec![String::from("localhost")]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("admin.pem"), dir.path().join("admin.key"));
+        std::fs::write(&cert, generated.cert.pem()).unwrap();
+        std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+        let tls = AdminTls::from_files(cert.to_str().unwrap(), key.to_str().unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        (tls.acceptor, accepted, client)
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_to_a_tls_listener_is_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let limit = Duration::from_millis(100);
+        // Nothing sent, then a handshake that stops after its first byte.
+        for sent in [&b""[..], &[0x16][..]] {
+            let (acceptor, accepted, mut client) = tls_listener().await;
+            client.write_all(sent).await.unwrap();
+            let started = Instant::now();
+            let opened = open(accepted, &acceptor, /* local= */ true, limit).await;
+            assert!(opened.is_none(), "{sent:?}");
+            assert!(
+                started.elapsed() >= limit,
+                "{sent:?}: closed before the limit"
+            );
+            let mut rest = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+                .await
+                .expect("the daemon closes the connection");
+            assert!(matches!(read, Ok(0) | Err(_)), "{sent:?}: {read:?}");
+        }
+
+        // A client that speaks in time is served.
+        let (acceptor, accepted, mut client) = tls_listener().await;
+        client
+            .write_all(b"GET /status HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let opened = open(accepted, &acceptor, /* local= */ true, limit).await;
+        assert!(matches!(opened, Some(Opened::Plain(_))));
+        let (acceptor, accepted, mut client) = tls_listener().await;
+        client
+            .write_all(b"GET /status HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let opened = open(accepted, &acceptor, /* local= */ false, limit).await;
+        assert!(opened.is_none(), "plain HTTP from another machine");
     }
 
     #[test]

@@ -540,11 +540,21 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 - A connection is from the machine when it comes over the unix socket, or
   over TCP from a loopback address or from the very address it connected to
   (the machine calling its own address). The address is the one of the
-  connection, not one a header claims, so a reverse proxy or a port
-  forwarder in front of the API (a published Docker port) makes every
-  request remote.
+  connection, not one a header claims. So what stands in front of the API
+  decides, not the caller behind it:
+  - A reverse proxy or a tunnel on the same machine connects from loopback,
+    which makes every request it forwards a request from the machine,
+    wherever the caller is; most proxies also send the address they
+    connect to as `Host`. Without a token that is administrator access for
+    everybody who reaches the proxy: set `token` whenever a proxy on the
+    machine forwards to the API.
+  - A proxy on another machine, or a port forwarder that connects from
+    another address (a published Docker port), makes every request remote.
+- On a `tls` listener a connection has 10 seconds to send its first byte
+  and finish the TLS handshake, then it is closed.
 - Without a token, on TCP and on a unix socket alike, a request is refused
-  with `403` unless it comes from the machine and its `Host` is `localhost`, `127.0.0.1` or `::1` (or the
+  with `403` unless it comes from the machine and its `Host` is
+  `localhost`, `127.0.0.1` or `::1` (or the
   `listen` address of a TCP listener) and its `Origin`, when it has one, is
   that same `Host`, port included. The first stops a page of another site
   that reaches the API through DNS rebinding; the second stops a form or a
