@@ -1226,3 +1226,29 @@ async fn a_user_added_by_editing_the_file_can_sign_in_without_a_restart() {
     assert_eq!(json["user"], "eva");
     assert_eq!(json["roles"], json!(["web-editors"]));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_demoted_administrator_is_refused_at_once() {
+    let mut access = accounts();
+    access.user[1].roles = names(&["admin"]);
+    let closed = daemon(Some(&access), /* token= */ true).await;
+    let admin = closed.admin;
+    let luis = cookie_of(admin, "luis", "password-luis").await;
+    let ana = cookie_of(admin, "ana", "password-ana").await;
+    let (status, _, json) = call_with_cookie(admin, &luis, Method::GET, "/users", "").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    // ana, an administrator too, takes `admin` away from luis.
+    let demoted = json!({ "roles": ["web-editors"] }).to_string();
+    let (status, _, json) =
+        call_with_cookie(admin, &ana, Method::PUT, "/users/luis", &demoted).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    for (method, uri) in [(Method::GET, "/users"), (Method::GET, "/status")] {
+        let (status, _, json) = call_with_cookie(admin, &luis, method, uri, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(json["error"], NEEDS_ADMIN, "{uri}");
+    }
+    let (status, _, json) = call_with_cookie(admin, &luis, Method::DELETE, "/users/ana", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert_eq!(users_on_disk(&closed).len(), 2);
+}

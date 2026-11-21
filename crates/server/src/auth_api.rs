@@ -144,13 +144,15 @@ pub(crate) async fn login(
         );
         return wrong();
     }
-    match check_password(state, &name, password, peer).await {
-        Ok(true) => {
+    let checked = check_password(state, &name, password, peer).await;
+    match checked.map(|hash| hash.and_then(|hash| signed_in_with(state, &name, &hash, peer))) {
+        Ok(Some(response)) => {
             println!("Admin => {name} signed in from {}", client(peer));
-            signed_in(state, &name, peer)
+            response
         }
-        // An unknown name and a wrong password get the same answer.
-        Ok(false) => {
+        // An unknown name and a wrong password get the same answer, and so
+        // does a password changed or a user removed during the check.
+        Ok(None) => {
             println!("Admin => Failed sign-in as {name:?} from {}", client(peer));
             wrong()
         }
@@ -300,29 +302,38 @@ async fn change_password(
     };
     let PasswordBody { current, new } = body;
     // The comparison and the new hash, one after the other on one permit.
-    // `Ok(false)` when `current` is wrong.
+    // `Ok(Some(new hash))` once changed, `Ok(None)` when `current` is wrong
+    // or the password changed since it was compared.
     let changed = {
         let (state, name) = (Arc::clone(state), name.clone());
         hashed(permit, move || {
-            if !state.access.read().verify(&name, &current) {
-                return Ok(false);
+            let compared = state.access.read();
+            if !compared.verify(&name, &current) {
+                return Ok(None);
             }
-            state
-                .access
-                .change(|access| access.set_password(&name, &new))
-                .map(|()| true)
+            let Some(hash) = stored_hash(&compared, &name).map(str::to_owned) else {
+                return Ok(None);
+            };
+            state.access.change(|access| {
+                if !holds(access, &name, &hash) {
+                    return Ok(None);
+                }
+                access.set_password(&name, &new)?;
+                Ok(stored_hash(access, &name).map(str::to_owned))
+            })
         })
         .await
     };
     match changed {
-        Ok(Ok(true)) => {
+        Ok(Ok(Some(hash))) => {
             state.sessions.forget(name, peer.address);
             state.sessions.end_user(name);
             println!("Admin => {name} changed its password from {}", client(peer));
-            signed_in(state, name, peer)
+            // Changed again or removed since: no new session.
+            signed_in_with(state, name, &hash, peer).unwrap_or_else(|| no_content(None))
         }
         // Not `401`, which tells the page that the session ended.
-        Ok(Ok(false)) => {
+        Ok(Ok(None)) => {
             println!(
                 "Admin => {name} gave a wrong current password from {}",
                 client(peer)
@@ -623,26 +634,70 @@ fn too_many_attempts() -> Response<Full<Bytes>> {
     )
 }
 
-/// Whether `password` is the one of user `name`. `Err` with a `429` when
-/// the attempt is refused, see [`count_attempt`], or no permit came free.
-/// The attempt is counted as failed before the check, which takes long
-/// enough for many others to start, and forgotten when the password is
-/// right.
+/// Whether `password` is the one of user `name`: `Some` with the hash it
+/// matched, `None` when it is wrong. `Err` with a `429` when the attempt is
+/// refused, see [`count_attempt`], or no permit came free. The attempt is
+/// counted as failed before the check, which takes long enough for many
+/// others to start, and forgotten when the password is right.
 async fn check_password(
     state: &Arc<AdminState>,
     name: &str,
     password: String,
     peer: Peer,
-) -> Result<bool, Box<Response<Full<Bytes>>>> {
+) -> Result<Option<String>, Box<Response<Full<Bytes>>>> {
     count_attempt(state, name, peer)?;
     let permit = hash_permit(state).await?;
     let access = state.access.read();
     let user = name.to_owned();
-    let right = hashed(permit, move || access.verify(&user, &password)).await?;
-    if right {
+    // `verify` first: an unknown name costs a comparison too.
+    let matched = hashed(permit, move || {
+        let right = access.verify(&user, &password);
+        right
+            .then(|| stored_hash(&access, &user).map(str::to_owned))
+            .flatten()
+    })
+    .await?;
+    if matched.is_some() {
         state.sessions.forget(name, peer.address);
     }
-    Ok(right)
+    Ok(matched)
+}
+
+/// The password hash of user `name` in `access`.
+fn stored_hash<'access>(access: &'access Access, name: &str) -> Option<&'access str> {
+    access
+        .user
+        .iter()
+        .find(|user| user.name == name)
+        .map(|user| user.password.as_str())
+}
+
+/// Whether user `name` still has the password `hash` in `access`: neither
+/// changed nor removed since a password was compared with it.
+fn holds(access: &Access, name: &str, hash: &str) -> bool {
+    stored_hash(access, name) == Some(hash)
+}
+
+/// [`signed_in`] for a password that matched `hash`, or `None` when the
+/// users file no longer gives `name` that hash. A new password or a removal
+/// saved while the password was compared ended the sessions of the user
+/// before this one existed, so the file is read after the session is made:
+/// a change saved later ends it in turn.
+fn signed_in_with(
+    state: &AdminState,
+    name: &str,
+    hash: &str,
+    peer: Peer,
+) -> Option<Response<Full<Bytes>>> {
+    if !peer.may_hold_session() {
+        return holds(&state.access.read(), name, hash).then(|| no_content(None));
+    }
+    let id = state.sessions.create(name, None);
+    if !holds(&state.access.read(), name, hash) {
+        state.sessions.end(&id);
+        return None;
+    }
+    Some(no_content(Some(session::cookie(&id, peer.tls))))
 }
 
 /// `204`, with the cookie of a new session of `name` where a session may
@@ -804,6 +859,7 @@ mod tests {
     ) -> Result<bool, StatusCode> {
         check_password(state, "ana", password.to_owned(), peer)
             .await
+            .map(|hash| hash.is_some())
             .map_err(|response| response.status())
     }
 
@@ -907,7 +963,7 @@ mod tests {
         for index in 0..10 {
             let name = format!("user{index}");
             let answer = check_password(&state, &name, String::from("a-password"), REMOTE).await;
-            assert!(matches!(answer, Ok(false)), "attempt {index}");
+            assert!(matches!(answer, Ok(None)), "attempt {index}");
         }
         // Whatever the name now, and with the right password too, without
         // a hash: no permit is free and it does not wait for one.
@@ -930,7 +986,7 @@ mod tests {
         for index in 0..12 {
             let name = format!("user{index}");
             let answer = check_password(&state, &name, String::from("a-password"), socket).await;
-            assert!(matches!(answer, Ok(false)), "attempt {index}");
+            assert!(matches!(answer, Ok(None)), "attempt {index}");
         }
         assert_eq!(check(&state, "password-ana", socket).await, Ok(true));
     }
@@ -960,6 +1016,47 @@ mod tests {
         let response = create_first_user(&state, &Caller::Nobody, other, body(Some(&code))).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(users(directory.path()).user.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_password_changed_or_a_user_removed_during_the_check_starts_no_session() {
+        let (state, _directory) = daemon_with_ana();
+        let compared = state.access.read();
+        let hash = stored_hash(&compared, "ana").unwrap().to_owned();
+        assert!(holds(&compared, "ana", &hash));
+        let response = signed_in_with(&state, "ana", &hash, LOCAL).unwrap();
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        let id = cookie["rxh_session=".len()..].split(';').next().unwrap();
+        assert!(state.sessions.get(id).is_some());
+
+        // An administrator sets a new password while the old one is compared.
+        state
+            .access
+            .change(|access| access.set_password("ana", "another-password"))
+            .unwrap();
+        assert!(!holds(&state.access.read(), "ana", &hash));
+        for peer in [LOCAL, REMOTE, PLAIN] {
+            assert!(signed_in_with(&state, "ana", &hash, peer).is_none());
+        }
+
+        // Removed, then created again with the old password: another hash.
+        let current = stored_hash(&state.access.read(), "ana").unwrap().to_owned();
+        state
+            .access
+            .change(|access| {
+                access.add_user("eva", "password-eva", &[ADMIN_ROLE.to_owned()])?;
+                access.remove_user("ana")
+            })
+            .unwrap();
+        assert!(!holds(&state.access.read(), "ana", &current));
+        assert!(signed_in_with(&state, "ana", &current, REMOTE).is_none());
+        state
+            .access
+            .change(|access| access.add_user("ana", "password-ana", &[]))
+            .unwrap();
+        assert!(signed_in_with(&state, "ana", &hash, REMOTE).is_none());
+        let current = stored_hash(&state.access.read(), "ana").unwrap().to_owned();
+        assert!(signed_in_with(&state, "ana", &current, REMOTE).is_some());
     }
 
     #[tokio::test]
