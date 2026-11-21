@@ -458,7 +458,7 @@ pub fn restore(files: &[&ConfigFile]) -> Result<(), String> {
 /// Replaces `path` with `text` through a temporary file and a rename, so a
 /// reader sees the old text or the new one. The text is on disk before the
 /// rename: a power loss cannot leave an empty file under the name.
-fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     // A link stays a link: the file it points to is the one replaced.
     let resolved = fs::canonicalize(path);
     let path = resolved.as_deref().unwrap_or(path);

@@ -5,6 +5,7 @@
 //! [`rxh_core`]. This crate puts them on the network with [`tokio`] and
 //! [`hyper`].
 
+pub mod access;
 mod acme;
 mod admin;
 mod catalog;
