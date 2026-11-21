@@ -296,7 +296,7 @@ async fn change_password(
     if let Err(response) = count_attempt(state, name, peer) {
         return *response;
     }
-    let permit = match hash_permit(state).await {
+    let permit = match attempt_permit(state, name, peer).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -579,6 +579,21 @@ async fn hash_permit(
     }
 }
 
+/// [`hash_permit`] for a sign-in as `name` that [`count_attempt`] counted.
+/// A wait that runs out takes the failure of the name back: no password was
+/// compared, and whoever keeps the permits busy would lock the name out.
+async fn attempt_permit(
+    state: &AdminState,
+    name: &str,
+    peer: Peer,
+) -> Result<OwnedSemaphorePermit, Box<Response<Full<Bytes>>>> {
+    let permit = hash_permit(state).await;
+    if permit.is_err() {
+        state.sessions.uncount(name, peer.address);
+    }
+    permit
+}
+
 /// Runs `work`, which hashes or compares a password, off the async workers:
 /// bcrypt takes a quarter of a second. See [`off_workers`].
 async fn hashed<T: Send + 'static>(
@@ -646,7 +661,7 @@ async fn check_password(
     peer: Peer,
 ) -> Result<Option<String>, Box<Response<Full<Bytes>>>> {
     count_attempt(state, name, peer)?;
-    let permit = hash_permit(state).await?;
+    let permit = attempt_permit(state, name, peer).await?;
     let access = state.access.read();
     let user = name.to_owned();
     // `verify` first: an unknown name costs a comparison too.
@@ -836,6 +851,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn behind_a_port_forwarder_setup_needs_the_code_and_tls() {
+        use http_body_util::BodyExt;
+
+        let (open, directory) = daemon(None);
+        let code = open.sessions.setup_code().to_owned();
+        // Every client looks like this machine there, and is nobody.
+        let plain = admin::tests::forwarded();
+        let over_tls = Peer { tls: true, ..plain };
+        for (peer, password_login, needs_code) in [(plain, false, false), (over_tls, true, true)] {
+            let response = session(&open, &Caller::Nobody, peer);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["setup"], true);
+            assert_eq!(json["admin"], false);
+            assert_eq!(json["password_login"], password_login);
+            assert_eq!(json["setup_needs_code"], needs_code);
+        }
+        for (peer, given) in [
+            (plain, None),
+            (over_tls, None),
+            // The right code, in clear text.
+            (plain, Some(code.as_str())),
+        ] {
+            let response = create_first_user(&open, &Caller::Nobody, peer, body(given)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{given:?}");
+            assert!(users(directory.path()).user.is_empty(), "{given:?}");
+        }
+        let response = create_first_user(&open, &Caller::Nobody, over_tls, body(Some(&code))).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(users(directory.path()).user.len(), 1);
+
+        // No session starts in clear text, even with the right password.
+        let response = signed_in(&open, "ana", plain);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        let hash = stored_hash(&open.access.read(), "ana").unwrap().to_owned();
+        let response = signed_in_with(&open, "ana", &hash, plain).unwrap();
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+    }
+
     /// A daemon with the user `ana`, an administrator.
     fn daemon_with_ana() -> (Arc<AdminState>, TempDir) {
         let (state, directory) = daemon(None);
@@ -899,6 +955,36 @@ mod tests {
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         );
         assert_eq!(state.hashing.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_runs_out_is_not_a_failed_sign_in_of_the_name() {
+        let (state, _directory) = daemon_with_ana();
+        // Five sign-ins while every permit is taken: none compares anything.
+        let busy = keep_busy(&state);
+        let refused = tokio::join!(
+            check(&state, "password-ana", REMOTE),
+            check(&state, "password-ana", REMOTE),
+            check(&state, "password-ana", REMOTE),
+            check(&state, "password-ana", REMOTE),
+            check(&state, "password-ana", REMOTE),
+        );
+        let too_many = Err(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.0, too_many);
+        assert_eq!(refused.4, too_many);
+        drop(busy);
+        // The name is not locked out: five failures would have done that.
+        assert_eq!(check(&state, "password-ana", REMOTE).await, Ok(true));
+
+        // A wrong password is still a failure of the name.
+        let other = Peer {
+            address: Some("192.0.2.9".parse().unwrap()),
+            ..REMOTE
+        };
+        for _ in 0..5 {
+            assert_eq!(check(&state, "not-the-password", other).await, Ok(false));
+        }
+        assert_eq!(check(&state, "password-ana", other).await, too_many);
     }
 
     #[tokio::test]

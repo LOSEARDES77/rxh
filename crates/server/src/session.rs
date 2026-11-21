@@ -3,7 +3,7 @@
 //! memory: a restart signs everybody out and makes a new code.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,14 @@ const LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Sessions kept at most; the oldest goes when one more is created.
 const MAX_SESSIONS: usize = 1000;
+
+/// Sessions one user keeps at most; its own oldest goes when it starts one
+/// more, so that signing in again and again ends nobody else's.
+const MAX_SESSIONS_PER_USER: usize = 10;
+
+/// Entries the tables of failed sign-ins and of attempts hold before the
+/// stale ones are looked for. Below it nothing is scanned.
+const PRUNE_ABOVE: usize = 1024;
 
 /// Failed sign-ins for a name from one address that lock the pair out.
 const MAX_FAILURES: u32 = 5;
@@ -61,14 +69,49 @@ struct Failures {
     last: Instant,
 }
 
-#[derive(Default)]
 struct Tables {
     /// Sessions by id.
     sessions: HashMap<String, Session>,
-    /// Failed sign-ins by name and client address (`None` on a unix socket).
+    /// Failed sign-ins by name and client (`None` on a unix socket), see
+    /// [`client`].
     failures: HashMap<(String, Option<IpAddr>), Failures>,
-    /// When each client address tried to sign in, within the last minute.
+    /// Size of `failures` from which its stale entries are removed.
+    prune_failures_at: usize,
+    /// When each client tried to sign in, within the last minute.
     attempts: HashMap<IpAddr, VecDeque<Instant>>,
+    /// Size of `attempts` from which its stale entries are removed.
+    prune_attempts_at: usize,
+}
+
+impl Default for Tables {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            failures: HashMap::new(),
+            prune_failures_at: PRUNE_ABOVE,
+            attempts: HashMap::new(),
+            prune_attempts_at: PRUNE_ABOVE,
+        }
+    }
+}
+
+/// What the limits count as one client: an IPv4 address, also when it comes
+/// mapped in an IPv6 one, or the /64 of an IPv6 address, since one host
+/// usually has all of its /64 to send from.
+fn client(address: Option<IpAddr>) -> Option<IpAddr> {
+    address.map(|address| match address.to_canonical() {
+        IpAddr::V6(address) => {
+            let network = u128::from(address) & !u128::from(u64::MAX);
+            IpAddr::V6(Ipv6Addr::from(network))
+        }
+        v4 @ IpAddr::V4(_) => v4,
+    })
+}
+
+/// The size a table is next pruned at, once it holds `len` live entries:
+/// twice that, so the scans cost little per entry however many clients try.
+fn next_prune(len: usize) -> usize {
+    PRUNE_ABOVE.max(len * 2)
 }
 
 /// The sessions, the failed sign-ins and the setup code of one daemon.
@@ -139,7 +182,18 @@ impl Sessions {
 
     /// Forgets the failed sign-ins as `name` from `address`, after a good one.
     pub(crate) fn forget(&self, name: &str, address: Option<IpAddr>) {
-        self.lock().failures.remove(&(name.to_owned(), address));
+        let key = (name.to_owned(), client(address));
+        self.lock().failures.remove(&key);
+    }
+
+    /// Takes back the failure that [`Sessions::attempt`] counted for a
+    /// sign-in whose password was never compared. The attempt of the address
+    /// stays counted.
+    pub(crate) fn uncount(&self, name: &str, address: Option<IpAddr>) {
+        let key = (name.to_owned(), client(address));
+        if let Some(failures) = self.lock().failures.get_mut(&key) {
+            failures.count = failures.count.saturating_sub(1);
+        }
     }
 
     /// The code that lets a remote caller create the first user: 10
@@ -162,10 +216,17 @@ impl Sessions {
         let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let mut tables = self.lock();
         tables.sessions.retain(|_, session| !expired(session, now));
-        if tables.sessions.len() >= MAX_SESSIONS {
+        let own = tables
+            .sessions
+            .values()
+            .filter(|session| session.user == user)
+            .count();
+        let full = tables.sessions.len() >= MAX_SESSIONS;
+        if own >= MAX_SESSIONS_PER_USER || full {
             let oldest = tables
                 .sessions
                 .iter()
+                .filter(|(_, session)| own < MAX_SESSIONS_PER_USER || session.user == user)
                 .min_by_key(|(_, session)| session.created)
                 .map(|(id, _)| id.clone());
             if let Some(oldest) = oldest {
@@ -192,18 +253,23 @@ impl Sessions {
     }
 
     fn guess_at(&self, address: Option<IpAddr>, now: Instant) -> bool {
-        address_may_try(&mut self.lock().attempts, address, now)
+        address_may_try(&mut self.lock(), client(address), now)
     }
 
     fn attempt_at(&self, name: &str, address: Option<IpAddr>, now: Instant) -> bool {
+        let address = client(address);
         let mut tables = self.lock();
-        if !address_may_try(&mut tables.attempts, address, now) {
+        if !address_may_try(&mut tables, address, now) {
             return false;
         }
-        // Also what keeps the table from growing with names nobody retries.
-        tables
-            .failures
-            .retain(|_, failures| now.saturating_duration_since(failures.last) < LOCKOUT);
+        let is_stale =
+            |failures: &Failures| now.saturating_duration_since(failures.last) >= LOCKOUT;
+        // Names nobody retries leave once the table has grown, not on every
+        // attempt: all of them wait on this lock.
+        if tables.failures.len() >= tables.prune_failures_at {
+            tables.failures.retain(|_, failures| !is_stale(failures));
+            tables.prune_failures_at = next_prune(tables.failures.len());
+        }
         let failures = tables
             .failures
             .entry((name.to_owned(), address))
@@ -211,6 +277,9 @@ impl Sessions {
                 count: 0,
                 last: now,
             });
+        if is_stale(failures) {
+            failures.count = 0;
+        }
         if failures.count >= MAX_FAILURES {
             return false;
         }
@@ -226,22 +295,23 @@ impl Sessions {
     }
 }
 
-/// Counts one attempt from `address`, unless it made
-/// [`MAX_ATTEMPTS_PER_ADDRESS`] in the last minute, which returns false. A
-/// connection without an address (the unix socket) is not limited: only the
-/// owner of the daemon reaches it.
-fn address_may_try(
-    attempts: &mut HashMap<IpAddr, VecDeque<Instant>>,
-    address: Option<IpAddr>,
-    now: Instant,
-) -> bool {
+/// Counts one attempt from the client `address` (see [`client`]), unless it
+/// made [`MAX_ATTEMPTS_PER_ADDRESS`] in the last minute, which returns
+/// false. A connection without an address (the unix socket) is not limited:
+/// only the owner of the daemon reaches it.
+fn address_may_try(tables: &mut Tables, address: Option<IpAddr>, now: Instant) -> bool {
     let Some(address) = address else {
         return true;
     };
     let is_recent = |at: &Instant| now.saturating_duration_since(*at) < LOCKOUT;
-    // Addresses that stopped trying leave the table.
-    attempts.retain(|_, times| times.back().is_some_and(is_recent));
-    let times = attempts.entry(address).or_default();
+    // Clients that stopped trying leave once the table has grown.
+    if tables.attempts.len() >= tables.prune_attempts_at {
+        tables
+            .attempts
+            .retain(|_, times| times.back().is_some_and(is_recent));
+        tables.prune_attempts_at = next_prune(tables.attempts.len());
+    }
+    let times = tables.attempts.entry(address).or_default();
     while times.front().is_some_and(|at| !is_recent(at)) {
         times.pop_front();
     }
@@ -327,7 +397,10 @@ mod tests {
         let start = Instant::now();
         let second = Duration::from_secs(1);
         let ids: Vec<String> = (0..1000_u32)
-            .map(|index| sessions.create_at("ana", None, None, start + second * index))
+            .map(|index| {
+                let user = format!("user{index}");
+                sessions.create_at(&user, None, None, start + second * index)
+            })
             .collect();
         let now = start + second * 1000;
         assert!(sessions.get_at(&ids[0], now).is_some(), "a thousand fit");
@@ -342,6 +415,42 @@ mod tests {
         let later = start + LIFETIME + second * 500;
         sessions.create_at("eva", None, None, later);
         assert_eq!(sessions.lock().sessions.len(), 501);
+    }
+
+    #[test]
+    fn a_user_that_signs_in_again_and_again_ends_only_its_own_sessions() {
+        let sessions = Sessions::new();
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let others: Vec<String> = (0..990_u32)
+            .map(|index| sessions.create_at(&format!("user{index}"), None, None, start))
+            .collect();
+        let own: Vec<String> = (1..=10_u32)
+            .map(|index| sessions.create_at("eva", None, None, start + second * index))
+            .collect();
+        let now = start + second * 11;
+        assert!(sessions.get_at(&own[0], now).is_some(), "ten fit");
+
+        // The table is full and `eva` signs in a thousand times more.
+        let mut newest = String::new();
+        for _ in 0..1000 {
+            newest = sessions.create_at("eva", None, None, now);
+        }
+        for id in &others {
+            assert!(sessions.get_at(id, now).is_some(), "of another user");
+        }
+        assert!(sessions.get_at(&own[0], now).is_none(), "its own oldest");
+        assert!(sessions.get_at(&newest, now).is_some());
+        assert_eq!(sessions.lock().sessions.len(), 1000);
+
+        // A user below ten on a full table takes the place of the oldest.
+        let luis = sessions.create_at("luis", None, None, now);
+        assert!(sessions.get_at(&luis, now).is_some());
+        assert_eq!(sessions.lock().sessions.len(), 1000);
+        let gone = others
+            .iter()
+            .filter(|id| sessions.get_at(id, now).is_none());
+        assert_eq!(gone.count(), 1);
     }
 
     #[test]
@@ -425,6 +534,105 @@ mod tests {
             assert!(sessions.attempt_at(&format!("user{index}"), None, start));
             assert!(sessions.guess_at(None, start));
         }
+    }
+
+    #[test]
+    fn the_addresses_of_one_ipv6_network_are_one_client() {
+        let sessions = Sessions::new();
+        let start = Instant::now();
+        let host = |text: &str| Some(text.parse::<IpAddr>().unwrap());
+        // Another address of the same /64 each time.
+        for index in 0..5_u32 {
+            let address = host(&format!("2001:db8:0:1::{index:x}"));
+            assert!(
+                sessions.attempt_at("ana", address, start),
+                "five are allowed"
+            );
+        }
+        assert!(!sessions.attempt_at("ana", host("2001:db8:0:1:ffff::9"), start));
+        assert!(
+            sessions.attempt_at("ana", host("2001:db8:0:2::1"), start),
+            "another /64"
+        );
+        // Ten attempts of the network, whatever the name and the address:
+        // six were made, the refused one too.
+        for index in 0..3_u32 {
+            let address = host(&format!("2001:db8:0:1:{index:x}::1"));
+            assert!(sessions.attempt_at(&format!("user{index}"), address, start));
+        }
+        assert!(
+            sessions.guess_at(host("2001:db8:0:1::a"), start),
+            "the tenth"
+        );
+        assert!(!sessions.attempt_at("luis", host("2001:db8:0:1::b"), start));
+        assert!(!sessions.guess_at(host("2001:db8:0:1::c"), start));
+
+        // A good sign-in from one address forgets what the others failed.
+        sessions.forget("ana", host("2001:db8:0:1::77"));
+        let minute = Duration::from_secs(60);
+        for _ in 0..5 {
+            assert!(sessions.attempt_at("ana", host("2001:db8:0:1::1"), start + minute));
+        }
+
+        // An IPv4 address is the same client when it comes mapped.
+        for _ in 0..5 {
+            assert!(sessions.attempt_at("ana", host("::ffff:192.0.2.7"), start));
+        }
+        assert!(!sessions.attempt_at("ana", host("192.0.2.7"), start));
+        assert!(
+            sessions.attempt_at("ana", host("192.0.2.8"), start),
+            "not a /64"
+        );
+    }
+
+    #[test]
+    fn an_attempt_taken_back_is_not_a_failure_of_the_name() {
+        let sessions = Sessions::new();
+        let start = Instant::now();
+        let here = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
+        // Four sign-ins that never got to compare a password.
+        for _ in 0..4 {
+            assert!(sessions.attempt_at("ana", here, start));
+            sessions.uncount("ana", here);
+        }
+        // Still a failure each when not taken back, and five lock the name.
+        for _ in 0..5 {
+            assert!(sessions.attempt_at("ana", here, start));
+        }
+        assert!(!sessions.attempt_at("ana", here, start));
+        // Taking one back for a name that was never counted does nothing.
+        sessions.uncount("luis", here);
+        assert!(sessions.attempt_at("luis", here, start + LOCKOUT * 2));
+    }
+
+    #[test]
+    fn stale_entries_leave_when_a_table_grows_and_not_on_every_attempt() {
+        let start = Instant::now();
+        let later = start + LOCKOUT;
+        let address = |index: u32| Some(IpAddr::V4(Ipv4Addr::from(0xc000_0200 + index)));
+        let filled = |entries: u32| {
+            let sessions = Sessions::new();
+            for index in 0..entries {
+                assert!(sessions.attempt_at(&format!("user{index}"), address(index), start));
+            }
+            sessions
+        };
+
+        // A minute later they no longer count, and nothing looked for them.
+        let small = filled(100);
+        assert!(small.attempt_at("ana", address(5000), later));
+        assert_eq!(small.lock().failures.len(), 101);
+        assert_eq!(small.lock().attempts.len(), 101);
+
+        // Once the tables are large the stale entries go, all at once.
+        let large = filled(1024);
+        assert!(large.attempt_at("ana", address(5000), later));
+        assert_eq!(large.lock().failures.len(), 1);
+        assert_eq!(large.lock().attempts.len(), 1);
+        // And while they are live they stay, however many they are.
+        let live = filled(1500);
+        assert!(live.attempt_at("ana", address(5000), start));
+        assert_eq!(live.lock().failures.len(), 1501);
     }
 
     #[test]
