@@ -36,9 +36,13 @@
 //! addressed by `name`, else by its index.
 //!
 //! With `[admin] token` every request must carry `Authorization: Bearer
-//! <token>`. Without it, TCP requests whose `Host` or `Origin` is not a
-//! loopback name are rejected, so web pages cannot reach the API through DNS
-//! rebinding.
+//! <token>`. Without it, only local requests are served: the connection
+//! comes from this machine (see [`connection_is_local`]) and neither `Host`
+//! nor `Origin` is a name other than a loopback one, so web pages cannot
+//! reach the API through DNS rebinding.
+//!
+//! With `[admin] tls` the listener answers HTTPS, and plain HTTP to
+//! connections from this machine, on the same port.
 //!
 //! `/dashboard` is a static web UI (built from `ui/`, served with
 //! `/dashboard/app.js` and `/dashboard/app.css`) that calls the routes from
@@ -47,7 +51,7 @@
 
 use std::convert::Infallible;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -69,9 +73,9 @@ use rxh_core::pool::{BackendState, PoolError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::change::{self, Change, Section};
@@ -81,7 +85,7 @@ use crate::master::ServerInfo;
 use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
 use crate::systemd;
-use crate::tls::{self, CertificateInfo};
+use crate::tls::{self, AdminTls, CertificateInfo};
 
 /// The web UI, built from `ui/` by `bun run build` and committed, so building
 /// the crate needs no JavaScript tooling.
@@ -142,12 +146,31 @@ pub(crate) struct AdminState {
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) listen: AdminListen,
     pub(crate) token: Option<String>,
+    /// TLS of the listener, from `[admin] tls`.
+    pub(crate) tls: Option<AdminTls>,
     pub(crate) current: RwLock<Current>,
     pub(crate) control: mpsc::Sender<Control>,
     /// Held while a configuration file is saved and reloaded, so two saves
     /// do not write over each other.
     pub(crate) saving: tokio::sync::Mutex<()>,
 }
+
+/// Who is at the other end of a connection to the admin API.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Peer {
+    /// The connection comes from this machine: a unix socket, or a TCP peer
+    /// for which [`connection_is_local`] holds.
+    pub(crate) local: bool,
+    /// The connection is encrypted.
+    #[expect(dead_code, reason = "read by the session cookie, in a later change")]
+    pub(crate) tls: bool,
+    /// Address of a TCP peer.
+    #[expect(dead_code, reason = "read by the sign-in lockout, in a later change")]
+    pub(crate) address: Option<IpAddr>,
+}
+
+/// First byte of a TLS connection: the record type of a handshake.
+const TLS_HANDSHAKE: u8 = 0x16;
 
 #[derive(Deserialize)]
 struct UpstreamBody {
@@ -273,36 +296,77 @@ pub(crate) async fn serve(listener: Listener, state: Arc<AdminState>) {
     loop {
         match &listener {
             Listener::Tcp(listener) => {
-                if let Ok((stream, _)) = listener.accept().await {
-                    serve_connection(stream, &state);
+                if let Ok((stream, address)) = listener.accept().await {
+                    tokio::task::spawn(serve_tcp(stream, address.ip(), Arc::clone(&state)));
                 }
             }
             #[cfg(unix)]
             Listener::Unix(listener, _) => {
                 if let Ok((stream, _)) = listener.accept().await {
-                    serve_connection(stream, &state);
+                    let peer = Peer {
+                        local: true,
+                        tls: false,
+                        address: None,
+                    };
+                    tokio::task::spawn(serve_connection(stream, peer, Arc::clone(&state)));
                 }
             }
         }
     }
 }
 
-fn serve_connection<S>(stream: S, state: &Arc<AdminState>)
+/// True if a TCP connection from `peer`, accepted on the address `local` of
+/// this machine, comes from this machine: the peer is a loopback address, or
+/// the machine is talking to its own address. IPv4-mapped IPv6 addresses
+/// count as the IPv4 address they hold.
+fn connection_is_local(peer: IpAddr, local: IpAddr) -> bool {
+    let peer = peer.to_canonical();
+    // The unspecified address is nobody's: never equal to a local address.
+    peer.is_loopback() || (peer == local.to_canonical() && !peer.is_unspecified())
+}
+
+/// Serves one TCP connection. On a TLS listener a connection that opens
+/// with a handshake is served over TLS, one from this machine that opens
+/// with anything else as plain HTTP, and any other is closed.
+async fn serve_tcp(stream: TcpStream, address: IpAddr, state: Arc<AdminState>) {
+    // A connection whose own address cannot be read is not local.
+    let local = stream
+        .local_addr()
+        .is_ok_and(|local| connection_is_local(address, local.ip()));
+    let peer = Peer {
+        local,
+        tls: false,
+        address: Some(address),
+    };
+    let Some(acceptor) = state.tls.as_ref().map(|tls| tls.acceptor.clone()) else {
+        return serve_connection(stream, peer, state).await;
+    };
+    let mut first = [0_u8; 1];
+    match stream.peek(&mut first).await {
+        Ok(1) if first[0] == TLS_HANDSHAKE => {
+            if let Ok(stream) = acceptor.accept(stream).await {
+                serve_connection(stream, Peer { tls: true, ..peer }, state).await;
+            }
+        }
+        Ok(1) if peer.local => serve_connection(stream, peer, state).await,
+        _ => {}
+    }
+}
+
+async fn serve_connection<S>(stream: S, peer: Peer, state: Arc<AdminState>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let state = Arc::clone(state);
-    tokio::task::spawn(async move {
-        let service = service_fn(move |request| handle(request, Arc::clone(&state)));
-        let _ = hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(stream), service)
-            .await;
-    });
+    let service = service_fn(move |request| handle(request, Arc::clone(&state), peer));
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await;
 }
 
 async fn handle(
     request: Request<Incoming>,
     state: Arc<AdminState>,
+    peer: Peer,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let raw_path = request.uri().path();
     let is_dashboard = request.method() == Method::GET
@@ -326,7 +390,7 @@ async fn handle(
             );
             return Ok(response);
         }
-    } else if !is_local_request(&request, &state.listen) {
+    } else if !is_local_request(&request, &state.listen, peer) {
         return Ok(error(
             StatusCode::FORBIDDEN,
             "admin API only accepts a loopback Host and its own Origin",
@@ -593,10 +657,11 @@ fn certificates(state: &AdminState) -> Vec<ListenerCertificate> {
     certificates
 }
 
-/// Reads every certificate file again, changed or not. Files that fail
+/// Reads every certificate file again, changed or not, the one of the admin
+/// listener included. Files that fail
 /// keep their previous certificate, and make the answer an error.
 fn reload_certificates(state: &AdminState) -> Response<Full<Bytes>> {
-    let resolvers: Vec<_> = state
+    let mut resolvers: Vec<_> = state
         .current
         .read()
         .unwrap_or_else(PoisonError::into_inner)
@@ -604,6 +669,7 @@ fn reload_certificates(state: &AdminState) -> Response<Full<Bytes>> {
         .iter()
         .filter_map(|server| server.cert_resolver.clone())
         .collect();
+    resolvers.extend(state.tls.as_ref().map(|tls| Arc::clone(&tls.resolver)));
     let mut reloaded = Vec::new();
     let mut errors = Vec::new();
     for resolver in resolvers {
@@ -744,8 +810,9 @@ fn has_token<B>(request: &Request<B>, token: &str) -> bool {
         })
 }
 
-/// True if a request without a token is not one a web page of another origin
-/// can send. `Host` must name a loopback host, or the address of a TCP
+/// True if a request without a token comes from this machine and is not one
+/// a web page of another origin can send. The connection must be local, see
+/// [`Peer::local`]: headers say whatever the sender likes. `Host` must name a loopback host, or the address of a TCP
 /// listener: a page that reaches the API through DNS rebinding sends its own
 /// name. `Origin`, which browsers add to every request that can change
 /// something, must be that same `Host`: the port counts, so the page of
@@ -753,7 +820,10 @@ fn has_token<B>(request: &Request<B>, token: &str) -> bool {
 /// `Host` and not with the listen address because a tunnel to the API, or to
 /// its unix socket, can be on any local port. A request without `Host` and
 /// `Origin` passes: browsers always send `Host`.
-fn is_local_request<B>(request: &Request<B>, listen: &AdminListen) -> bool {
+fn is_local_request<B>(request: &Request<B>, listen: &AdminListen, peer: Peer) -> bool {
+    if !peer.local {
+        return false;
+    }
     // `None` for a header that is not text: refused.
     let text = |name: header::HeaderName| -> Option<Option<&str>> {
         match request.headers().get(name) {
@@ -862,6 +932,8 @@ pub(crate) fn error(status: StatusCode, message: &str) -> Response<Full<Bytes>> 
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     fn request(host: &str, origin: Option<&str>) -> Request<()> {
@@ -946,13 +1018,80 @@ mod tests {
         assert!(!has_token(&request("localhost", None), token));
     }
 
+    /// A connection from this machine.
+    const LOCAL: Peer = Peer {
+        local: true,
+        tls: false,
+        address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    };
+
+    #[test]
+    fn a_loopback_or_own_address_peer_is_local() {
+        let local = |peer: &str, local: &str| {
+            connection_is_local(peer.parse().unwrap(), local.parse().unwrap())
+        };
+        assert!(local("127.0.0.1", "127.0.0.1"));
+        assert!(local("127.0.0.1", "192.0.2.7"));
+        assert!(local("::1", "::1"));
+        assert!(local("192.0.2.7", "192.0.2.7"));
+        assert!(local("::ffff:127.0.0.1", "::"));
+        // A dual stack socket reports IPv4 peers as mapped addresses.
+        assert!(local("::ffff:192.0.2.7", "192.0.2.7"));
+        assert!(local("192.0.2.7", "::ffff:192.0.2.7"));
+    }
+
+    #[test]
+    fn another_address_is_not_local() {
+        let local = |peer: &str, local: &str| {
+            connection_is_local(peer.parse().unwrap(), local.parse().unwrap())
+        };
+        assert!(!local("192.0.2.8", "192.0.2.7"));
+        assert!(!local("::ffff:192.0.2.8", "192.0.2.7"));
+        assert!(!local("2001:db8::8", "2001:db8::7"));
+        // The peer of a listener on every address is not that address.
+        assert!(!local("192.0.2.8", "0.0.0.0"));
+        assert!(!local("0.0.0.0", "192.0.2.7"));
+    }
+
+    #[test]
+    fn a_forged_loopback_host_from_a_remote_peer_is_not_a_local_request() {
+        let remote = Peer {
+            local: false,
+            tls: true,
+            address: Some("192.0.2.8".parse().unwrap()),
+        };
+        let wide = AdminListen::Tcp("0.0.0.0:2019".parse().unwrap());
+        for host in [
+            "localhost:2019",
+            "127.0.0.1:2019",
+            "[::1]:2019",
+            "0.0.0.0:2019",
+        ] {
+            assert!(
+                is_local_request(&request(host, None), &wide, LOCAL),
+                "{host}"
+            );
+            assert!(
+                !is_local_request(&request(host, None), &wide, remote),
+                "{host}"
+            );
+        }
+        let same_origin = request("localhost:2019", Some("http://localhost:2019"));
+        assert!(!is_local_request(&same_origin, &wide, remote));
+        assert!(
+            !is_local_request(&Request::new(()), &wide, remote),
+            "no Host"
+        );
+    }
+
     #[test]
     fn only_loopback_hosts_are_allowed() {
         let tcp = AdminListen::Tcp("127.0.0.1:2019".parse().unwrap());
         let unix = AdminListen::Unix(PathBuf::from("/run/rxh/admin.sock"));
         for listen in [&tcp, &unix] {
-            let local =
-                |host: &str, origin: Option<&str>| is_local_request(&request(host, origin), listen);
+            let local = |host: &str, origin: Option<&str>| {
+                is_local_request(&request(host, origin), listen, LOCAL)
+            };
             for host in [
                 "localhost",
                 "localhost:2019",
@@ -971,14 +1110,29 @@ mod tests {
             ] {
                 assert!(!local(host, None), "{host}");
             }
-            assert!(is_local_request(&Request::new(()), listen), "no Host");
+            assert!(
+                is_local_request(&Request::new(()), listen, LOCAL),
+                "no Host"
+            );
         }
 
         // The address of a TCP listener is a name of the API, on TCP only.
         let wide = AdminListen::Tcp("10.0.0.5:2019".parse().unwrap());
-        assert!(is_local_request(&request("10.0.0.5:2019", None), &wide));
-        assert!(!is_local_request(&request("10.0.0.5:2019", None), &tcp));
-        assert!(!is_local_request(&request("10.0.0.5:2019", None), &unix));
+        assert!(is_local_request(
+            &request("10.0.0.5:2019", None),
+            &wide,
+            LOCAL
+        ));
+        assert!(!is_local_request(
+            &request("10.0.0.5:2019", None),
+            &tcp,
+            LOCAL
+        ));
+        assert!(!is_local_request(
+            &request("10.0.0.5:2019", None),
+            &unix,
+            LOCAL
+        ));
     }
 
     #[test]
@@ -986,8 +1140,9 @@ mod tests {
         let tcp = AdminListen::Tcp("127.0.0.1:2019".parse().unwrap());
         let unix = AdminListen::Unix(PathBuf::from("/run/rxh/admin.sock"));
         for listen in [&tcp, &unix] {
-            let local =
-                |host: &str, origin: &str| is_local_request(&request(host, Some(origin)), listen);
+            let local = |host: &str, origin: &str| {
+                is_local_request(&request(host, Some(origin)), listen, LOCAL)
+            };
             assert!(local("localhost:2019", "http://localhost:2019"));
             assert!(local("127.0.0.1:2019", "http://127.0.0.1:2019"));
             assert!(local("[::1]:2019", "http://[::1]:2019"));
@@ -1017,7 +1172,7 @@ mod tests {
                 header::ORIGIN,
                 header::HeaderValue::from_static("http://localhost:2019"),
             );
-            assert!(!is_local_request(&no_host, listen));
+            assert!(!is_local_request(&no_host, listen, LOCAL));
         }
     }
 }

@@ -217,6 +217,7 @@ mod tests {
             config_path: None,
             listen: AdminListen::Tcp("127.0.0.1:0".parse().unwrap()),
             token: None,
+            tls: None,
             current: std::sync::RwLock::new(Current {
                 registry: Arc::new(Registry::build(&config).unwrap()),
                 config: Arc::new(config),

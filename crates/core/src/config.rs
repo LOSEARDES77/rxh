@@ -947,7 +947,10 @@ pub struct Admin {
     pub tls: Option<Tls>,
 
     /// File holding the user accounts and roles of the admin API.
-    #[serde(default = "default::admin_users")]
+    #[serde(
+        default = "default::admin_users",
+        skip_serializing_if = "default::is_admin_users"
+    )]
     pub users: String,
 }
 
@@ -5223,6 +5226,10 @@ mod default {
         String::from("rxh-data/users.toml")
     }
 
+    pub fn is_admin_users(users: &str) -> bool {
+        users == admin_users()
+    }
+
     pub fn admin_listen() -> super::AdminListen {
         super::AdminListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 2019)))
     }
@@ -5428,7 +5435,7 @@ mod tests {
         let written = toml::to_string(&config.admin).unwrap();
         assert_eq!(
             written,
-            "enabled = true\nlisten = \"unix//run/rxh/admin.sock\"\nusers = \"rxh-data/users.toml\"\n"
+            "enabled = true\nlisten = \"unix//run/rxh/admin.sock\"\n"
         );
 
         for listen in [
@@ -5521,6 +5528,11 @@ mod tests {
         );
         let config = Config::from_toml("[admin]\nusers = \"/var/lib/rxh/users.toml\"\n").unwrap();
         assert_eq!(config.admin.users, "/var/lib/rxh/users.toml");
+        let written = toml::to_string(&config.admin).unwrap();
+        assert!(
+            written.contains("users = \"/var/lib/rxh/users.toml\""),
+            "{written}"
+        );
         let err = Config::from_toml("[admin]\nusers = \"\"\n")
             .unwrap_err()
             .to_string();

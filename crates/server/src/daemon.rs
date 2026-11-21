@@ -15,7 +15,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use rxh_core::config::{
-    AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime,
+    AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime, Tls,
 };
 use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
@@ -32,6 +32,7 @@ use crate::master::{Master, ServerInfo};
 use crate::per_core;
 use crate::registry::Registry;
 use crate::systemd;
+use crate::tls::AdminTls;
 use crate::upgrade::{self, Lease};
 
 fn read_file(path: &Path) -> Result<String, Error> {
@@ -330,6 +331,17 @@ impl Daemon {
             Source::File(path) => load_config(path)?,
         };
         let admin_settings = config.admin.clone();
+        // Before anything listens: a certificate that cannot be read stops
+        // the start.
+        let admin_tls = match &admin_settings.tls {
+            Some(Tls::Files { cert, key }) if admin_settings.enabled => {
+                let tls = AdminTls::from_files(cert, key)
+                    .map_err(|err| io::Error::new(err.kind(), format!("[admin] tls: {err}")))?;
+                Some(tls)
+            }
+            // Validation refuses `"auto"` in `[admin]`.
+            Some(_) | None => None,
+        };
         // QUIC sockets outlive generations, see `http3`.
         let endpoints = Endpoints::default();
         let mut generation =
@@ -343,6 +355,7 @@ impl Daemon {
                 .and_then(|path| std::fs::canonicalize(path).ok()),
             listen: admin_settings.listen.clone(),
             token: admin_settings.token.clone(),
+            tls: admin_tls,
             current: RwLock::new(generation.current()),
             control,
             saving: tokio::sync::Mutex::new(()),
@@ -359,6 +372,9 @@ impl Daemon {
                 )
             })?;
             match &admin_settings.listen {
+                AdminListen::Tcp(address) if admin_state.tls.is_some() => {
+                    println!("Admin => API listening on https://{address}");
+                }
                 AdminListen::Tcp(address) => println!("Admin => API listening on http://{address}"),
                 AdminListen::Unix(path) => {
                     println!("Admin => API listening on unix socket {}", path.display());
@@ -986,6 +1002,7 @@ forward = "@api"
                 config_path: None,
                 listen: "127.0.0.1:0".parse().expect("address"),
                 token: None,
+                tls: None,
                 current: RwLock::new(generation.current()),
                 control,
                 saving: tokio::sync::Mutex::new(()),

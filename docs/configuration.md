@@ -492,7 +492,7 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
 | `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token` or `tls`. Changes need a restart. |
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
-| `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files. `"auto"` is not available here. Changes need a restart. |
+| `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
 | `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API, relative to the working directory of the daemon. Must not be empty. Changes need a restart. |
 
 On a unix socket the API is reachable only by the user running the daemon
@@ -525,8 +525,26 @@ curl -H "Authorization: Bearer kq3Zp0uX7mV9cR2tLw8yHs4d" http://10.0.0.5:2019/st
 rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 ```
 
+- With `tls` the listener tells a TLS handshake from HTTP by the first byte
+  of each connection, so one port answers both. HTTPS (HTTP/1.1, TLS 1.2
+  and 1.3, the defaults of a server without `tls_options`) is for
+  everybody. Plain HTTP is answered only to a connection from the machine
+  itself; from anywhere else it is closed without an answer. So the CLI and
+  `curl` on the machine work as without `tls`:
+
+  ```sh
+  curl https://10.0.0.5:2019/status       # from anywhere: HTTPS
+  curl http://127.0.0.1:2019/status       # on the machine: plain HTTP
+  rxh status                              # on the machine: plain HTTP
+  ```
+- A connection is from the machine when it comes over the unix socket, or
+  over TCP from a loopback address or from the very address it connected to
+  (the machine calling its own address). The address is the one of the
+  connection, not one a header claims, so a reverse proxy or a port
+  forwarder in front of the API (a published Docker port) makes every
+  request remote.
 - Without a token, on TCP and on a unix socket alike, a request is refused
-  with `403` unless its `Host` is `localhost`, `127.0.0.1` or `::1` (or the
+  with `403` unless it comes from the machine and its `Host` is `localhost`, `127.0.0.1` or `::1` (or the
   `listen` address of a TCP listener) and its `Origin`, when it has one, is
   that same `Host`, port included. The first stops a page of another site
   that reaches the API through DNS rebinding; the second stops a form or a
@@ -545,9 +563,10 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 - `GET /dashboard`, `/dashboard/app.js` and `/dashboard/app.css` are the
   only routes served without the token: the page and its script and style
   hold no data. The page asks for the token and sends it on its requests.
-- The admin API speaks plain HTTP: the token is as private as the network it
-  crosses. Use a private network, a VPN or an SSH tunnel
-  (`ssh -L 2019:/run/rxh/admin.sock host`), not the open internet.
+- Without `tls` the admin API speaks plain HTTP: the token is as private as
+  the network it crosses. Set `tls`, or use a private network, a VPN or an
+  SSH tunnel (`ssh -L 2019:/run/rxh/admin.sock host`), not the open
+  internet.
 - The CLI finds the address in `--admin` / `RXH_ADMIN` (`ip:port` or
   `unix//path`), else in `[admin] listen` of its configuration file. The
   token comes from `--admin-token` / `RXH_ADMIN_TOKEN`, else from `[admin]

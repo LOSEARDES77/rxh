@@ -674,6 +674,37 @@ pub(crate) fn acceptor(
     Ok(Some((TlsAcceptor::from(Arc::new(config)), resolver)))
 }
 
+/// TLS of the admin listener: what [`acceptor`] gives a server with
+/// certificate files and no `tls_options`, HTTP/1 only.
+pub(crate) struct AdminTls {
+    pub(crate) acceptor: TlsAcceptor,
+    /// Holds the certificate, and reads its files again when asked.
+    pub(crate) resolver: Arc<CertResolver>,
+}
+
+impl AdminTls {
+    /// Loads the PEM files `cert` and `key`, served to every client.
+    ///
+    /// # Errors
+    ///
+    /// Fails, naming both files, if one cannot be read or parsed.
+    pub(crate) fn from_files(cert: &str, key: &str) -> io::Result<Self> {
+        let builder = ServerConfig::builder();
+        let resolver = Arc::new(CertResolver::new(Arc::clone(builder.crypto_provider())));
+        resolver
+            .load_files(&[], cert, key)
+            .map_err(|err| io::Error::other(format!("{cert} / {key}: {err}")))?;
+        let mut config = builder
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Self {
+            acceptor: TlsAcceptor::from(Arc::new(config)),
+            resolver,
+        })
+    }
+}
+
 /// QUIC flavour of `tcp`, a configuration [`acceptor`] built: the same
 /// provider, client verifier and resolver, ALPN `h3` only and no early data.
 /// Rustls negotiates nothing but TLS 1.3 on QUIC connections.

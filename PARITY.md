@@ -171,13 +171,13 @@ Caddy references: [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/direc
 | `caddy reverse-proxy` | `rxh reverse-proxy --from --to... [--policy] [--protocol] [--host]` | ✅ | Foreground, no file, admin disabled. `rxh service add --to` persists instead. |
 | `caddy file-server` | `rxh file-server [--listen] [--root] [--no-browse] [--encode]` | ✅ | Foreground, no file, admin disabled. `rxh service add --serve` persists instead. |
 | Admin API on `localhost:2019` | `[admin] listen` (same default) | ✅ | |
-| Admin origin / host checks | same | ✅ | Blocks DNS rebinding from browsers. |
+| Admin origin / host checks | same | ✅ | Blocks DNS rebinding from browsers. Without a token the connection must also come from the machine itself (peer address, not headers). |
 | `GET /config/` | `GET /config` | 🟡 | Read only, JSON, includes live pool members. |
 | `POST /load`, `PATCH /config/...` | `POST /load`, `PATCH /config/upstream/{name}`, `PATCH /config/server/{name or index}` | 🟡 | `/load` takes the whole configuration as TOML or JSON; `PATCH` is a JSON merge patch (RFC 7396) of one pool or server, where Caddy replaces the value at any path. Validated and swapped like a reload, rolled back on failure. In memory only: no autosave, the next reload or restart reads the file again. No `POST`/`PUT`/`DELETE` on `/config/...`, no `@id` paths. `POST /reload` reloads the file. |
 | `GET /reverse_proxy/upstreams` | same path and fields | ✅ | Plus `GET /pools` with health details. |
 | `POST /stop` | same | ✅ | |
 | Admin over a unix socket (`admin unix//path`) | `[admin] listen = "unix//run/rxh/admin.sock"` | ✅ | Mode `0600`, stale sockets replaced, removed on shutdown; no `|0660` permission suffix. The CLI takes `--admin unix//path`. |
-| Remote admin (`remote_admin` with mTLS identities) | `[admin] token` | 🟡 | Bearer token on every request, required for a non-loopback `listen`. Plain HTTP: no TLS or client certificates on the admin listener, no per-identity access rules. |
+| Remote admin (`remote_admin` with mTLS identities) | `[admin] token` | 🟡 | Bearer token on every request; a non-loopback `listen` needs it or `[admin] tls = { cert, key }`, HTTPS on the admin listener (plain HTTP stays for connections from the machine). No client certificates on the admin listener, no per-identity access rules. |
 | Live per pool traffic in the terminal (like `nginxtop`, `ctop`) | `rxh top [--interval 1s] [--count N]` | ➕ | Requests per second, errors per second and share (failed connections plus 5xx), mean time to headers, requests in flight and healthy backends of every pool, computed from two scrapes of `GET /metrics`. Plain text redrawn in place on a terminal, appended frames when piped; no sorting or keys, Ctrl-C quits. Counters reset by a reload are taken from zero. |
 | CLI to manage pools, peers and services | `rxh upstream`, `rxh pool`, `rxh service` | ➕ | Edits the TOML keeping comments, validates, applies live. |
 | Split configuration (Nginx `include`) | `include = ["conf.d/*.toml"]` | ➕ | Included files hold `upstream` and `server` only; the CLI edits the defining file; `--file PATH` on `pool add` and `service add`. |

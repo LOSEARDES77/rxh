@@ -13,7 +13,16 @@ Changed.
   rejected there), `[admin] users` naming the file of admin API accounts
   (default `"rxh-data/users.toml"`), and `groups` on a `[[server]]`, the
   groups admin API roles grant permissions on. A non-loopback admin
-  `listen` now needs `token` or `tls`.
+  `listen` now accepts `tls` in place of `token`.
+- The admin listener speaks TLS with `[admin] tls`: HTTPS and plain HTTP on
+  one port, told apart by the first byte of the connection. Plain HTTP is
+  answered only to connections from the machine itself, so the CLI works
+  unchanged. `POST /certificates/reload` reads the admin certificate again
+  too, and a certificate file that cannot be read stops the start. A request
+  without a token is local, and served, only when its connection comes from
+  the machine (unix socket, loopback peer, or the machine calling its own
+  address) besides the `Host` and `Origin` rule: headers alone no longer
+  decide.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on

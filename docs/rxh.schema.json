@@ -28,8 +28,7 @@
       ],
       "default": {
         "enabled": true,
-        "listen": "127.0.0.1:2019",
-        "users": "rxh-data/users.toml"
+        "listen": "127.0.0.1:2019"
       }
     },
     "consul": {
@@ -495,8 +494,7 @@
         },
         "users": {
           "description": "File holding the user accounts and roles of the admin API.",
-          "type": "string",
-          "default": "rxh-data/users.toml"
+          "type": "string"
         }
       },
       "additionalProperties": false
