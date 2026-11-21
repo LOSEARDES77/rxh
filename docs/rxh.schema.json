@@ -28,7 +28,8 @@
       ],
       "default": {
         "enabled": true,
-        "listen": "127.0.0.1:2019"
+        "listen": "127.0.0.1:2019",
+        "users": "rxh-data/users.toml"
       }
     },
     "consul": {
@@ -466,7 +467,7 @@
           "default": true
         },
         "listen": {
-          "description": "Address of the admin API: a TCP address, on loopback unless `token`\nis set, or a unix socket only its owner can open.",
+          "description": "Address of the admin API: a TCP address, on loopback unless `token`\nor `tls` is set, or a unix socket only its owner can open.",
           "allOf": [
             {
               "$ref": "#/definitions/AdminListen"
@@ -474,12 +475,28 @@
           ],
           "default": "127.0.0.1:2019"
         },
+        "tls": {
+          "description": "HTTPS on the admin listener, from certificate and key files.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "token": {
           "description": "Secret every request must carry as `Authorization: Bearer <token>`.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "users": {
+          "description": "File holding the user accounts and roles of the admin API.",
+          "type": "string",
+          "default": "rxh-data/users.toml"
         }
       },
       "additionalProperties": false
@@ -2341,6 +2358,13 @@
               "type": "null"
             }
           ]
+        },
+        "groups": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "handle_response": {
           "type": "array",

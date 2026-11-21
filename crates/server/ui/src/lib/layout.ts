@@ -10,7 +10,15 @@ export const layout: Record<
     groups: [
       {
         title: "Access",
-        keys: ["ip_allow", "ip_deny", "basic_auth", "forward_auth", "client_auth", "trusted_proxies"],
+        keys: [
+          "groups",
+          "ip_allow",
+          "ip_deny",
+          "basic_auth",
+          "forward_auth",
+          "client_auth",
+          "trusted_proxies",
+        ],
       },
       { title: "Routes", keys: ["match", "path", "method", "query", "uri", "remote_ip"] },
       {

@@ -9,6 +9,11 @@ Changed.
 
 ### Added
 
+- `[admin] tls = { cert, key }` for HTTPS on the admin listener (`"auto"` is
+  rejected there), `[admin] users` naming the file of admin API accounts
+  (default `"rxh-data/users.toml"`), and `groups` on a `[[server]]`, the
+  groups admin API roles grant permissions on. A non-loopback admin
+  `listen` now needs `token` or `tls`.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on

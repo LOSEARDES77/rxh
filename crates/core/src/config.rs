@@ -934,13 +934,21 @@ pub struct Admin {
     pub enabled: bool,
 
     /// Address of the admin API: a TCP address, on loopback unless `token`
-    /// is set, or a unix socket only its owner can open.
+    /// or `tls` is set, or a unix socket only its owner can open.
     #[serde(default = "default::admin_listen")]
     pub listen: AdminListen,
 
     /// Secret every request must carry as `Authorization: Bearer <token>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+
+    /// HTTPS on the admin listener, from certificate and key files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<Tls>,
+
+    /// File holding the user accounts and roles of the admin API.
+    #[serde(default = "default::admin_users")]
+    pub users: String,
 }
 
 impl Default for Admin {
@@ -949,6 +957,8 @@ impl Default for Admin {
             enabled: true,
             listen: default::admin_listen(),
             token: None,
+            tls: None,
+            users: default::admin_users(),
         }
     }
 }
@@ -973,14 +983,23 @@ impl Admin {
                 return Err(String::from("token must be printable ASCII without spaces"));
             }
         }
+        if self.tls == Some(Tls::Auto) {
+            return Err(String::from(
+                "tls = \"auto\" is not available for the admin API, set cert and key",
+            ));
+        }
+        if self.users.is_empty() {
+            return Err(String::from("users must not be empty"));
+        }
         if let AdminListen::Tcp(address) = &self.listen
             && self.enabled
             && self.token.is_none()
+            && self.tls.is_none()
             && !address.ip().is_loopback()
         {
             return Err(format!(
-                "listen = \"{address}\" is reachable from other machines, set token or use a \
-                 loopback address or a unix socket"
+                "listen = \"{address}\" is reachable from other machines, set token or tls, or \
+                 use a loopback address or a unix socket"
             ));
         }
         Ok(())
@@ -1447,6 +1466,10 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<Tls>,
 
+    /// Groups of the host, which admin API roles grant permissions on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+
     /// Client certificates asked for in the TLS handshake (mutual TLS).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_auth: Option<ClientAuth>,
@@ -1644,6 +1667,24 @@ impl Server {
     }
 }
 
+/// Longest accepted group name, in bytes.
+const MAX_GROUP_NAME_LENGTH: usize = 64;
+
+/// Whether `name` is a valid group (or role) name: `[a-z0-9][a-z0-9_-]*`, at
+/// most 64 bytes.
+#[must_use]
+pub fn is_group_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let starts_well = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    starts_well
+        && name.len() <= MAX_GROUP_NAME_LENGTH
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+}
+
 /// Flat representation of [`Server`] as written in the file.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1689,6 +1730,8 @@ struct RawServer {
     max_connections: usize,
     name: Option<String>,
     tls: Option<Tls>,
+    #[serde(default)]
+    groups: Vec<String>,
     client_auth: Option<ClientAuth>,
     tls_options: Option<TlsOptions>,
     http3: Option<bool>,
@@ -1804,6 +1847,18 @@ impl TryFrom<RawServer> for Server {
             }
         };
 
+        for (index, group) in raw.groups.iter().enumerate() {
+            if !is_group_name(group) {
+                return Err(format!(
+                    "group \"{group}\" must match [a-z0-9][a-z0-9_-]* and have at most \
+                     {MAX_GROUP_NAME_LENGTH} bytes"
+                ));
+            }
+            if raw.groups[..index].contains(group) {
+                return Err(format!("group \"{group}\" is listed more than once"));
+            }
+        }
+
         let mut trusted_proxies = Vec::new();
         for range in &raw.trusted_proxies {
             if range == "private_ranges" {
@@ -1821,6 +1876,7 @@ impl TryFrom<RawServer> for Server {
             max_connections: raw.max_connections,
             name: raw.name,
             tls: raw.tls,
+            groups: raw.groups,
             client_auth: raw.client_auth,
             tls_options: raw.tls_options,
             http3: raw.http3,
@@ -5163,6 +5219,10 @@ mod default {
         302
     }
 
+    pub fn admin_users() -> String {
+        String::from("rxh-data/users.toml")
+    }
+
     pub fn admin_listen() -> super::AdminListen {
         super::AdminListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 2019)))
     }
@@ -5368,7 +5428,7 @@ mod tests {
         let written = toml::to_string(&config.admin).unwrap();
         assert_eq!(
             written,
-            "enabled = true\nlisten = \"unix//run/rxh/admin.sock\"\n"
+            "enabled = true\nlisten = \"unix//run/rxh/admin.sock\"\nusers = \"rxh-data/users.toml\"\n"
         );
 
         for listen in [
@@ -5424,6 +5484,122 @@ mod tests {
         let mut admin = config.admin;
         admin.redact();
         assert_eq!(admin.token.as_deref(), Some("***"));
+    }
+
+    #[test]
+    fn admin_tls_files_parse() {
+        let config =
+            Config::from_toml("[admin]\ntls = { cert = \"admin.pem\", key = \"admin.key\" }\n")
+                .unwrap();
+        let expected = Tls::Files {
+            cert: String::from("admin.pem"),
+            key: String::from("admin.key"),
+        };
+        assert_eq!(config.admin.tls, Some(expected));
+        let written = toml::to_string(&config.admin).unwrap();
+        let reparsed: Admin = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.tls, config.admin.tls);
+        assert_eq!(Config::from_toml("").unwrap().admin.tls, None);
+    }
+
+    #[test]
+    fn admin_tls_auto_is_rejected() {
+        let err = Config::from_toml("[admin]\ntls = \"auto\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tls = \"auto\" is not available for the admin API, set cert and key"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn admin_users_defaults_and_rejects_empty() {
+        assert_eq!(
+            Config::from_toml("").unwrap().admin.users,
+            "rxh-data/users.toml"
+        );
+        let config = Config::from_toml("[admin]\nusers = \"/var/lib/rxh/users.toml\"\n").unwrap();
+        assert_eq!(config.admin.users, "/var/lib/rxh/users.toml");
+        let err = Config::from_toml("[admin]\nusers = \"\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("admin: ") && err.contains("users"), "{err}");
+    }
+
+    #[test]
+    fn non_loopback_admin_accepts_tls_instead_of_token() {
+        let config = Config::from_toml(
+            "[admin]\nlisten = \"0.0.0.0:2019\"\ntls = { cert = \"a.pem\", key = \"a.key\" }\n",
+        )
+        .unwrap();
+        assert_eq!(config.admin.token, None);
+        assert!(config.admin.tls.is_some());
+    }
+
+    #[test]
+    fn non_loopback_admin_without_token_or_tls_is_rejected() {
+        let err = Config::from_toml("[admin]\nlisten = \"0.0.0.0:2019\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("reachable from other machines")
+                && err.contains("token")
+                && err.contains("tls"),
+            "{err}"
+        );
+    }
+
+    fn server_with_groups(groups: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!(
+            "[[server]]\nlisten = \"127.0.0.1:8000\"\nforward = \"127.0.0.1:8080\"\n\
+             groups = {groups}\n"
+        ))
+    }
+
+    #[test]
+    fn server_groups_parse() {
+        let config = server_with_groups("[\"web\", \"customers_2\", \"a-b\"]").unwrap();
+        assert_eq!(config.servers[0].groups, ["web", "customers_2", "a-b"]);
+        let at_limit = format!("[\"{}\"]", "a".repeat(64));
+        assert_eq!(
+            server_with_groups(&at_limit).unwrap().servers[0].groups[0].len(),
+            64
+        );
+    }
+
+    #[test]
+    fn server_groups_reject_bad_names() {
+        let too_long = "a".repeat(65);
+        for name in ["Web", "", "-a", "a b", too_long.as_str()] {
+            let err = server_with_groups(&format!("[\"{name}\"]"))
+                .expect_err(name)
+                .to_string();
+            assert!(err.contains("group"), "{name}: {err}");
+        }
+        assert!(is_group_name("web"));
+        assert!(!is_group_name("_web"));
+    }
+
+    #[test]
+    fn server_groups_reject_duplicates() {
+        let err = server_with_groups("[\"web\", \"api\", \"web\"]")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("web") && err.contains("more than once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn server_without_groups_serializes_without_the_key() {
+        let config = server_with_groups("[]").unwrap();
+        let written = toml::to_string(&config.servers[0]).unwrap();
+        assert!(!written.contains("groups"), "{written}");
+        let config = server_with_groups("[\"web\"]").unwrap();
+        let written = toml::to_string(&config.servers[0]).unwrap();
+        assert!(written.contains("groups = [\"web\"]"), "{written}");
     }
 
     #[test]

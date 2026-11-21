@@ -490,8 +490,10 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
-| `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token`. Changes need a restart. |
+| `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token` or `tls`. Changes need a restart. |
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
+| `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files. `"auto"` is not available here. Changes need a restart. |
+| `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API, relative to the working directory of the daemon. Must not be empty. Changes need a restart. |
 
 On a unix socket the API is reachable only by the user running the daemon
 (and root): the file is created with mode `0600`, a socket left behind by a
@@ -502,13 +504,20 @@ dead daemon is replaced, and the file is removed on shutdown.
 listen = "unix//run/rxh/admin.sock"
 ```
 
-For remote administration, listen on a reachable address and set a token.
-RXH refuses to start with a non-loopback `listen` and no token.
+For remote administration, listen on a reachable address and set a token
+or `tls`. RXH refuses to start with a non-loopback `listen` and neither.
 
 ```toml
 [admin]
 listen = "10.0.0.5:2019"
 token = "kq3Zp0uX7mV9cR2tLw8yHs4d"   # for instance: openssl rand -base64 24
+```
+
+```toml
+[admin]
+listen = "0.0.0.0:2019"
+tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+users = "/var/lib/rxh/users.toml"
 ```
 
 ```sh
@@ -2008,6 +2017,7 @@ socket, except that `http` servers listing the same address share one socket
 | `match` | | List of patterns instead of `forward`/`serve`/`redirect`/`uri`: HTTP routes on `http` servers, layer 4 routes on `tcp` servers, see below. |
 | `max_connections` | `1024` | Concurrent connections (or UDP sessions). Extra clients wait in the backlog; a QUIC connection over the limit is refused, see [HTTP/3](#http3). The old `connections` is deprecated, see [migration](migration.md). |
 | `tls` | | `{ cert = "cert.pem", key = "key.pem" }`: TLS termination for `http` (with h2 via ALPN) and `tcp`. `"auto"` (http only): certificates from an ACME CA for every name in `host`, see [Automatic HTTPS](#acme-automatic-https). Servers sharing an address pick their certificate by SNI. |
+| `groups` | | Groups of this host, like `["web", "customers"]`; admin API roles grant permissions on groups. Each name matches `[a-z0-9][a-z0-9_-]*`, at most 64 bytes, listed once. |
 | `client_auth` | | `{ mode, ca, header }`: ask clients for a certificate in the TLS handshake, see [Client certificates (mTLS)](#client-certificates-mtls) (servers with `tls` only). |
 | `tls_options` | | `{ min_version, cipher_suites, curves, ocsp_stapling }`: what the TLS handshake accepts, and OCSP stapling, see [TLS options](#tls-options) (servers with `tls` only). |
 | `https_redirect` | `true` with `tls = "auto"`, else `false` | Redirect plain HTTP requests for this TLS server to HTTPS, see [HTTP to HTTPS redirect](#http-to-https-redirect) (http servers with `tls` only). |
