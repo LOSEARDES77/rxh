@@ -26,6 +26,7 @@ use std::sync::Arc;
 use rxh_core::config::{Config, Protocol};
 use tokio::sync::{broadcast, watch};
 
+use crate::access::Host;
 use crate::error::Error;
 use crate::http3;
 use crate::registry::Registry;
@@ -53,6 +54,10 @@ pub struct ServerInfo {
 
     /// What the listener serves over HTTP/3, if it does.
     pub(crate) http3: Option<Arc<http3::Listener>>,
+
+    /// Name and groups of each server sharing the socket, which decide who
+    /// sees the listener in the admin API. Empty for a replica.
+    pub(crate) hosts: Vec<Host>,
 }
 
 /// Owner of all [`Server`]s of one configuration.
@@ -103,6 +108,10 @@ impl Master {
 
         for (address, members) in listeners(config) {
             let server = Server::init(config, &registry, address, &members)?;
+            let hosts: Vec<Host> = members
+                .iter()
+                .map(|&member| Host::from(&config.servers[member]))
+                .collect();
             if let Some(resolver) = server.cert_resolver() {
                 resolvers.push((members, Arc::clone(resolver)));
             }
@@ -113,6 +122,7 @@ impl Master {
                 state: server.subscribe(),
                 cert_resolver: server.cert_resolver().cloned(),
                 http3: server.http3().cloned(),
+                hosts,
             });
             servers.push(server);
         }
@@ -149,6 +159,7 @@ impl Master {
                 state: server.subscribe(),
                 cert_resolver: None,
                 http3: None,
+                hosts: Vec::new(),
             });
             servers.push(server);
         }

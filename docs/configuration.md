@@ -611,7 +611,9 @@ request is the first of these that holds:
 Only an administrator (the token, a request from the machine without a
 token, or a user with the `admin` role) is answered by the routes of the
 admin API; any other signed-in user gets `403 {"error": "this needs the
-admin role"}` on them. `[admin] users`, like `listen`, `token` and `tls`, is
+admin role"}` on them, except on the routes that read and change hosts, which
+answer as far as the roles of the user allow: see
+[Permissions](#permissions). `[admin] users`, like `listen`, `token` and `tls`, is
 read when the daemon starts.
 
 ```toml
@@ -776,6 +778,112 @@ curl -H "$H" -X DELETE $API/roles/web-editors
 Admin => Role web-editors created by token
 Admin => User luis created by token
 Admin => User luis changed by ana
+```
+
+#### Permissions
+
+A role grants permissions on hosts: on every `[[server]]` whose `groups` has
+a group, or on the one whose `name` is the `host` of the grant. The
+permissions of a user on a host add up over its roles and over the groups
+of the host; none implies another, so `modify` without `view` changes
+nothing.
+
+```toml
+# rxh.toml
+[[server]]
+name = "shop"
+listen = "0.0.0.0:8080"
+groups = ["web"]
+forward = "@api"
+```
+
+```toml
+# users.toml
+[[role]]
+name = "web-editors"
+grant = [
+  { group = "web", allow = ["view", "modify", "create", "delete"] },
+  { host = "intranet", allow = ["view"] },
+]
+```
+
+| Action | Needs |
+|---|---|
+| See a host in lists, its statistics and its form | `view` |
+| Change a host (form or the TOML of its table) | `view` and `modify` |
+| Add a group to a host | `modify` on the host and `create` on the added group |
+| Remove a group from a host | `modify` on the host, and still `modify` on it after the change |
+| Change the `name` of a host, give it one or take it away | the `admin` role |
+| Create a host whose `name` a `host` grant of any role names, or whose `name` has an `{env.NAME}` or `{file.PATH}` placeholder | the `admin` role |
+| Create a host | `create` on every group in its `groups`, which must not be empty |
+| Delete a host | `view` and `delete` |
+| Anything else: pools, sections, whole files, certificates, `GET /config`, `/metrics`, reload, load, patch, upgrade, stop, users and roles | the `admin` role |
+
+What a signed-in user without the `admin` role gets from each route
+(`401` when signed out, as on every route):
+
+| Route | Answer |
+|---|---|
+| `GET /config/files` | `files` as `{"index", "revision"}` only (no path, no text); of the entities the servers with `view`, whole, and the pools as `{"kind": "upstream", "key": NAME}`; no section. |
+| `POST /config/entities/server` | `201` with `create` on every group of the new host. `403` otherwise, for a host without groups, and `403 {"error": "this name is reserved"}` for a name a `host` grant names. |
+| `PUT /config/entities/server/{key}` | `200` with `view` and `modify`, when the change keeps the name, adds only groups with `create` and leaves the host one the user may change. `403` otherwise. |
+| `DELETE /config/entities/server/{key}` | `200` with `view` and `delete`, `403` with `view` only. |
+| the three routes above, on a host without `view` or a key that names no host | `404 {"error": "no such host"}`, the same for both. |
+| the three routes above, for `upstream` and `section` | `403`. |
+| `PUT /config/files/{index}` | `403`. |
+| `GET /status` | `version`, `uptime_seconds`, the `servers` with `view` and an empty `pools`. A listener shared with servers the user does not view is listed under the names of the viewed ones. |
+| `GET /stats/history` | The samples with the series of the servers with `view` and an empty `pools`. |
+| `GET /schema` | The schema, as for everybody. |
+| every other route | `403 {"error": "this needs the admin role"}`. |
+
+- Every server entity of `GET /config/files` has `permissions`, what the
+  caller may do with it, in this order: `["view", "modify", "create",
+  "delete"]` for an administrator. `create` is there when the user may
+  create in one of the groups of the host.
+- The entity keys (`FILE:POSITION`) and the revision of each file are the
+  ones an administrator gets. They tell that the file has other tables and
+  that something changed, and nothing else: a save with another revision
+  than the one of the file is `409 {"error": "the configuration changed,
+  read it again"}`, whatever the key.
+- The grants are checked against the `name` and the `groups` the table has
+  in the file, and for a change against the ones it would have, secrets put
+  back: the form and the TOML text are checked the same. A `name` or a
+  group written as a placeholder is not the name or the group it expands
+  to, so no grant reaches it.
+- A validation error of a save is passed on as it is: a clash with the name
+  or the address of a host the user does not view shows there.
+- `GET /status` and `GET /stats/history` go by the `name` and the `groups`
+  of the running configuration, hosts made by a provider (Docker, Consul,
+  Kubernetes...) included. A series is shown only when every running
+  server that counts under it is viewed: two servers with the same name, or
+  the requests that match no server of a shared listener, are shown to who
+  views them all. Series of servers that no longer run are for
+  administrators.
+- A user with `modify` or `create` can point a host at any address the
+  daemon can reach and serve any directory the daemon can read: give them
+  to people you trust.
+
+```sh
+API=https://rxh.example.com:2019
+ORIGIN="Origin: $API"
+curl -c jar -d '{"name": "luis", "password": "luis-password"}' $API/auth/login
+curl -b jar $API/config/files      # the hosts of luis, each with "permissions"
+curl -b jar $API/status            # their listeners
+curl -b jar -H "$ORIGIN" -d '{"value": {"listen": "0.0.0.0:8081", "groups": ["web"], "forward": "@api"}}' \
+  $API/config/entities/server      # 201 {"key": "0:4"}
+curl -b jar -H "$ORIGIN" -X DELETE "$API/config/entities/server/0:4?revision=$REVISION"
+curl -b jar -H "$ORIGIN" -X PUT -d '{"value": {}, "revision": "..."}' $API/config/entities/upstream/api   # 403
+```
+
+```json
+{
+  "kind": "server",
+  "key": "0:0",
+  "file": 0,
+  "value": { "name": "shop", "listen": "0.0.0.0:8080", "groups": ["web"], "forward": "@api" },
+  "toml": "name = \"shop\"\nlisten = \"0.0.0.0:8080\"\ngroups = [\"web\"]\nforward = \"@api\"\n",
+  "permissions": ["view", "modify", "create", "delete"]
+}
 ```
 
 ### Dashboard

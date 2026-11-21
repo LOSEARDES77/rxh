@@ -47,6 +47,18 @@ Changed.
   its reason, an unknown name `404`. Removing a user or setting its
   password ends its sessions, a role change applies to the next request,
   and every change is logged with who made it.
+- Grants on hosts: a signed-in user without the `admin` role now reads and
+  changes the hosts its roles reach. `GET /config/files` gives it the
+  servers it has `view` on, the names of the pools and the revision of each
+  file (no text, no path, no section); `POST`, `PUT` and `DELETE
+  /config/entities/server` need `create` on every group of a new host,
+  `modify` or `delete` on an existing one, and the `admin` role to change a
+  name or take one a grant names; `GET /status` and `GET /stats/history`
+  show only the servers with `view` and no pool; `GET /schema` answers every
+  signed-in user. A host without `view` answers `404` like one that does not
+  exist, a stale revision `409` with a fixed text, and pools, sections and
+  whole files stay for administrators. Each server entity of
+  `GET /config/files` has `permissions`, what the caller may do with it.
 - Documentation site (mdBook, `mdbook build docs`) with a guide per use
   case: HTTP load balancer, TLS gateway, Docker and layer 4 (TCP and UDP),
   next to the configuration reference. The `Docs` workflow builds it on

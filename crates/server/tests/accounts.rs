@@ -430,7 +430,7 @@ async fn a_session_cookie_identifies_the_user() {
             "oidc": false,
         })
     );
-    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/pools", "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(json["error"], NEEDS_ADMIN);
 
@@ -646,7 +646,7 @@ async fn a_local_request_still_is_administrator_when_users_exist() {
     // A session comes before the local rule: the browser of a user without
     // the role, on the machine, gets what the user may do.
     let cookie = cookie_of(admin, "luis", "password-luis").await;
-    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/status", "").await;
+    let (status, _, json) = call_with_cookie(admin, &cookie, Method::GET, "/pools", "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(json["error"], NEEDS_ADMIN);
     // A session of a user that was removed is nobody's, also here. Signing
@@ -1243,7 +1243,7 @@ async fn a_demoted_administrator_is_refused_at_once() {
     let (status, _, json) =
         call_with_cookie(admin, &ana, Method::PUT, "/users/luis", &demoted).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
-    for (method, uri) in [(Method::GET, "/users"), (Method::GET, "/status")] {
+    for (method, uri) in [(Method::GET, "/users"), (Method::GET, "/pools")] {
         let (status, _, json) = call_with_cookie(admin, &luis, method, uri, "").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
         assert_eq!(json["error"], NEEDS_ADMIN, "{uri}");

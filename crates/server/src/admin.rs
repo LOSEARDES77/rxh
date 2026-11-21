@@ -43,6 +43,11 @@
 //! leaves the file as it was. `/load` without a body reloads the file. A server is
 //! addressed by `name`, else by its index.
 //!
+//! A signed-in user without the `admin` role is answered by the routes
+//! that read and change hosts (`/status`, `/stats/history`, `/schema`,
+//! `/config/files`, `/config/entities`), as far as its roles allow on each
+//! host: see [`Scope::allowed`].
+//!
 //! Every request goes through one gate, which first works out who sends it
 //! (see [`Caller`]): the holder of `[admin] token`, a signed-in user, a
 //! local request when no token is set, or nobody. A request is local when
@@ -60,6 +65,7 @@
 //! the browser. It holds no data, so those three paths are served without
 //! the token, which the page asks for and sends on its requests.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -91,11 +97,12 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
-use crate::access::{Access, Scope, Store};
+use crate::access::{Access, Host, Scope, Store};
 use crate::auth_api;
 use crate::change::{self, Change, Section};
 use crate::config_api;
 use crate::files;
+use crate::history::Sample;
 use crate::master::ServerInfo;
 use crate::registry::Registry;
 use crate::server::{ShutdownState, State};
@@ -136,10 +143,10 @@ pub enum Audience {
 /// the audience here, and what is not here is for administrators: a route
 /// answers anybody else only because this table says so.
 pub const ROUTES: &[(&str, &str, Audience)] = &[
-    ("GET", "", Audience::Admin),
-    ("GET", "status", Audience::Admin),
+    ("GET", "", Audience::Caller),
+    ("GET", "status", Audience::Caller),
     ("GET", "metrics", Audience::Admin),
-    ("GET", "stats/history", Audience::Admin),
+    ("GET", "stats/history", Audience::Caller),
     ("GET", "dashboard", Audience::Anyone),
     ("GET", "dashboard/app.js", Audience::Anyone),
     ("GET", "dashboard/app.css", Audience::Anyone),
@@ -157,12 +164,12 @@ pub const ROUTES: &[(&str, &str, Audience)] = &[
     ("PUT", "roles/{}", Audience::Admin),
     ("DELETE", "roles/{}", Audience::Admin),
     ("GET", "config", Audience::Admin),
-    ("GET", "config/files", Audience::Admin),
-    ("GET", "schema", Audience::Admin),
+    ("GET", "config/files", Audience::Caller),
+    ("GET", "schema", Audience::Caller),
     ("PUT", "config/files/{}", Audience::Admin),
-    ("POST", "config/entities/{}", Audience::Admin),
-    ("PUT", "config/entities/{}/{}", Audience::Admin),
-    ("DELETE", "config/entities/{}/{}", Audience::Admin),
+    ("POST", "config/entities/{}", Audience::Caller),
+    ("PUT", "config/entities/{}/{}", Audience::Caller),
+    ("DELETE", "config/entities/{}/{}", Audience::Caller),
     ("GET", "pools", Audience::Admin),
     ("GET", "pools/{}", Audience::Admin),
     ("GET", "reverse_proxy/upstreams", Audience::Admin),
@@ -544,7 +551,9 @@ async fn handle(
     let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
 
     let response = match (&method, segments.as_slice()) {
-        (&Method::GET, [] | ["status"]) => json_response(StatusCode::OK, &status(&state)),
+        (&Method::GET, [] | ["status"]) => {
+            json_response(StatusCode::OK, &status(&state, &caller.scope()))
+        }
         (&Method::GET, ["metrics"]) => {
             let mut response = Response::new(Full::new(Bytes::from(
                 crate::metrics::global().render(&registry(&state)),
@@ -570,7 +579,7 @@ async fn handle(
                     serde_json::to_vec(&json!({
                         "interval_seconds": crate::history::INTERVAL.as_secs(),
                         "buckets": crate::metrics::BUCKETS,
-                        "samples": crate::history::global().samples(since),
+                        "samples": samples(&state, &caller.scope(), since),
                     })),
                 ),
                 Err(_) => error(
@@ -588,20 +597,20 @@ async fn handle(
         }
         (&Method::GET, ["dashboard", "app.css"]) => dashboard(UI_STYLE, "text/css; charset=utf-8"),
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
-        (&Method::GET, ["config", "files"]) => config_api::files(&state).await,
+        (&Method::GET, ["config", "files"]) => config_api::files(&state, &caller).await,
         (&Method::GET, ["schema"]) => config_api::schema(),
         (&Method::PUT, ["config", "files", index]) => {
-            config_api::put_file(&state, index, request).await
+            config_api::put_file(&state, &caller, index, request).await
         }
         (&Method::POST, ["config", "entities", kind]) => {
-            config_api::create(&state, kind, request).await
+            config_api::create(&state, &caller, kind, request).await
         }
         (&Method::PUT, ["config", "entities", kind, key]) => {
-            config_api::replace(&state, kind, key, request).await
+            config_api::replace(&state, &caller, kind, key, request).await
         }
         (&Method::DELETE, ["config", "entities", kind, key]) => {
             let query = request.uri().query();
-            config_api::remove(&state, kind, key, query).await
+            config_api::remove(&state, &caller, kind, key, query).await
         }
         (&Method::GET, ["pools"]) => {
             let registry = registry(&state);
@@ -847,7 +856,7 @@ fn gate<B>(
         Caller::Token | Caller::Local => None,
         Caller::User { scope, .. } => {
             if audience == Audience::Admin && !scope.is_admin() {
-                return Some(error(StatusCode::FORBIDDEN, "this needs the admin role"));
+                return Some(error(StatusCode::FORBIDDEN, NEEDS_ADMIN));
             }
             None
         }
@@ -881,6 +890,9 @@ fn gate<B>(
         }
     }
 }
+
+/// Answer to a signed-in user who asks for what only administrators get.
+pub(crate) const NEEDS_ADMIN: &str = "this needs the admin role";
 
 /// Answer to a request that changes something with a session cookie and
 /// without the `Origin` of a page of this API.
@@ -1098,18 +1110,45 @@ fn remove_upstream(state: &AdminState, name: &str, address: &str) -> Response<Fu
     }
 }
 
-fn status(state: &AdminState) -> serde_json::Value {
+/// `GET /status`. A caller without the `admin` role gets the listeners of
+/// the servers it views, under the names of those servers only, and nothing
+/// about the pools, the process or its files.
+fn status(state: &AdminState, scope: &Scope) -> serde_json::Value {
     let current = state.current.read().unwrap_or_else(PoisonError::into_inner);
-    let servers: Vec<ServerStatus> = current
-        .servers
-        .iter()
-        .map(|server| ServerStatus {
+    let mut servers: Vec<ServerStatus> = Vec::new();
+    for server in &current.servers {
+        let name = if scope.is_admin() {
+            server.name.clone()
+        } else {
+            let viewed: Vec<&Host> = server
+                .hosts
+                .iter()
+                .filter(|host| scope.views(host))
+                .collect();
+            if viewed.is_empty() {
+                continue;
+            }
+            let names: Vec<&str> = viewed
+                .iter()
+                .filter_map(|host| host.name.as_deref())
+                .collect();
+            (!names.is_empty()).then(|| names.join(", "))
+        };
+        servers.push(ServerStatus {
             listen: server.address,
             protocol: server.protocol.to_string(),
-            name: server.name.clone(),
+            name,
             state: state_name(*server.state.borrow()),
-        })
-        .collect();
+        });
+    }
+    if !scope.is_admin() {
+        return json!({
+            "version": crate::VERSION,
+            "uptime_seconds": state.started.elapsed().as_secs(),
+            "servers": servers,
+            "pools": [],
+        });
+    }
     let pools: Vec<_> = current
         .registry
         .groups()
@@ -1125,6 +1164,49 @@ fn status(state: &AdminState) -> serde_json::Value {
         "servers": servers,
         "pools": pools,
     })
+}
+
+/// The samples of `GET /stats/history`. A caller without the `admin` role
+/// gets the series of the servers it views and no pool.
+fn samples(state: &AdminState, scope: &Scope, since: Option<u64>) -> Vec<Sample> {
+    let mut samples = crate::history::global().samples(since);
+    if !scope.is_admin() {
+        let current = state.current.read().unwrap_or_else(PoisonError::into_inner);
+        let viewed = viewed_series(&current.servers, scope);
+        for sample in &mut samples {
+            sample.keep_servers(&viewed);
+        }
+    }
+    samples
+}
+
+/// The series of the history that count only servers `scope` views. A
+/// series is named after what the metrics count under: the `name` of a
+/// server, the address of the listener for a server without a name, and the
+/// log name of the listener (`address (names)`) for the requests that match
+/// none of its servers. A name or a listener shared with a server that is
+/// not viewed is left out, and so is a series of no running server.
+fn viewed_series(servers: &[ServerInfo], scope: &Scope) -> BTreeSet<String> {
+    let mut series: BTreeMap<String, bool> = BTreeMap::new();
+    let mut count = |key: String, viewed: bool| *series.entry(key).or_insert(true) &= viewed;
+    for server in servers {
+        let address = server.address.to_string();
+        let mut all = !server.hosts.is_empty();
+        for host in &server.hosts {
+            let viewed = scope.views(host);
+            all &= viewed;
+            count(host.name.clone().unwrap_or_else(|| address.clone()), viewed);
+        }
+        let listener = match &server.name {
+            Some(names) => format!("{address} ({names})"),
+            None => address,
+        };
+        count(listener, all);
+    }
+    series
+        .into_iter()
+        .filter_map(|(key, viewed)| viewed.then_some(key))
+        .collect()
 }
 
 /// Running configuration with live pool membership and without the secrets
@@ -1307,6 +1389,62 @@ pub(crate) mod tests {
             builder = builder.header(header::ORIGIN, origin);
         }
         builder.body(()).unwrap()
+    }
+
+    fn listener(address: &str, hosts: &[(Option<&str>, &str)]) -> ServerInfo {
+        let names: Vec<&str> = hosts.iter().filter_map(|(name, _)| *name).collect();
+        ServerInfo {
+            address: address.parse().unwrap(),
+            protocol: rxh_core::config::Protocol::Http,
+            name: (!names.is_empty()).then(|| names.join(", ")),
+            state: tokio::sync::watch::channel(State::Listening).1,
+            cert_resolver: None,
+            http3: None,
+            hosts: hosts
+                .iter()
+                .map(|(name, group)| Host {
+                    name: name.map(str::to_owned),
+                    groups: vec![(*group).to_owned()],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_series_is_viewed_only_when_every_server_under_it_is() {
+        use crate::access::{Grant, Permission, Target};
+
+        let scope = Scope::Grants(vec![Grant {
+            target: Target::Group("web".to_owned()),
+            allow: vec![Permission::View],
+        }]);
+        let servers = [
+            // Shared with a server that is not viewed.
+            listener(
+                "127.0.0.1:80",
+                &[(Some("shop"), "web"), (Some("intra"), "internal")],
+            ),
+            listener("127.0.0.1:81", &[(None, "web")]),
+            listener("127.0.0.1:82", &[(None, "web"), (None, "internal")]),
+            // A name two servers have.
+            listener("127.0.0.1:83", &[(Some("blog"), "web")]),
+            listener("127.0.0.1:84", &[(Some("blog"), "internal")]),
+            listener("127.0.0.1:85", &[(Some("news"), "web")]),
+            // A replica says nothing of its servers.
+            listener("127.0.0.1:86", &[]),
+        ];
+        let viewed: Vec<String> = viewed_series(&servers, &scope).into_iter().collect();
+        assert_eq!(
+            viewed,
+            [
+                "127.0.0.1:81",
+                "127.0.0.1:83 (blog)",
+                "127.0.0.1:85 (news)",
+                "news",
+                "shop"
+            ]
+        );
+        assert!(viewed_series(&servers, &Scope::Grants(Vec::new())).is_empty());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! [`CAPACITY`]. Like the metrics, the history is process wide: it outlives
 //! configuration reloads and the runtimes that serve the admin API.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -41,6 +41,15 @@ pub(crate) struct Sample {
     time: u64,
     servers: BTreeMap<String, ServerCounters>,
     pools: BTreeMap<String, PoolCounters>,
+}
+
+impl Sample {
+    /// Leaves the series of `servers` only, and no pool: what a caller
+    /// without the `admin` role gets.
+    pub(crate) fn keep_servers(&mut self, servers: &BTreeSet<String>) {
+        self.servers.retain(|server, _| servers.contains(server));
+        self.pools.clear();
+    }
 }
 
 /// The last [`CAPACITY`] samples, oldest first.

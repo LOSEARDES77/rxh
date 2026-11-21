@@ -436,6 +436,25 @@ fn hash(password: &str) -> Result<String, String> {
     bcrypt::hash(password, COST).map_err(|err| err.to_string())
 }
 
+/// What grants look at in a `[[server]]`: its `name` and its `groups`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Host {
+    /// The `name`, which `host` grants target.
+    pub name: Option<String>,
+    /// The `groups`, which `group` grants target.
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+impl From<&config::Server> for Host {
+    fn from(server: &config::Server) -> Self {
+        Self {
+            name: server.name.clone(),
+            groups: server.groups.clone(),
+        }
+    }
+}
+
 /// What a set of roles may do with hosts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -466,6 +485,24 @@ impl Scope {
                     }
             }),
         }
+    }
+
+    /// Everything this allows on `host`, in the order of [`Permission`]. The
+    /// one answer to "what may this caller do with this server": the routes
+    /// of the admin API that list, change or count a host all ask here.
+    #[must_use]
+    pub fn allowed(&self, host: &Host) -> Vec<Permission> {
+        use Permission::{Create, Delete, Modify, View};
+
+        let mut allowed = vec![View, Modify, Create, Delete];
+        allowed.retain(|permission| self.permits(*permission, host.name.as_deref(), &host.groups));
+        allowed
+    }
+
+    /// Whether `host` is seen at all.
+    #[must_use]
+    pub fn views(&self, host: &Host) -> bool {
+        self.allowed(host).contains(&Permission::View)
     }
 
     /// Whether a host with `groups` may be created: `groups` is not empty and
