@@ -776,7 +776,13 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   `grants` and `creatable_groups` are what the roles of a user without
   `admin` allow, and empty for an administrator, who may do everything.
 - `setup` is `true` while the users file has no user. `setup_needs_code`
-  says that this caller can create the first one only with the setup code.
+  says that this caller can create the first one only with the setup code
+  (no token is set and the caller is not an administrator). It says so on
+  plain HTTP too, where the code is refused: the page then asks for HTTPS.
+- `oidc` says whether `[admin.oidc]` is set, and `oidc_issuer` is the host
+  of its `issuer`, to name it. `local` is `true` for a user of the users
+  file and `false` for one signed in through the provider, which has no
+  password here.
 - `password_login` says whether `POST /auth/login` works on this
   connection: over HTTPS, or from the machine on a loopback or unix socket
   `listen`. A password does not travel in clear text over the network, so
@@ -1448,13 +1454,25 @@ The page and [accounts](#accounts):
   password, or the token where `password_login` is `false`. The password
   is sent to `POST /auth/login` and kept nowhere; signing in with a
   password drops a token kept for the tab, which would outrank the session.
+  Opened over plain HTTP where `password_login` is `false`, the form says
+  "Open this page over https to sign in." with the same address in
+  `https://`, and "Use the admin token" stays.
+- With `[admin.oidc]`, the form starts with "Sign in with" and the host of
+  the `issuer`: a link to `auth/oidc/login`. It is there where
+  `password_login` is `true`, while no user exists too (an administrator
+  of the provider needs no local user), and the password form stays under
+  it. After the provider the browser comes back to the dashboard signed
+  in; a refused sign-in is a page of the daemon with a link back.
 - While no user exists (`setup`), a caller that may create the first one
   gets the form for it, with a "Setup code" field when `setup_needs_code`
   says so. An administrator (the machine without a token, or the token)
   can answer "Not now": the choice is kept in the `localStorage` of the
-  browser and the API works without accounts as before.
+  browser and the API works without accounts as before. A user of the
+  provider does not get it: it creates local users in the Users tab.
 - A signed-in user has its name, "Change password" (`PUT /auth/password`)
-  and "Sign out" in the header. A caller that is an administrator without
+  and "Sign out" in the header; a user of the provider has no "Change
+  password". Under the users list, the Users tab says that users of the
+  provider are not listed and get their roles from `[admin.oidc.roles]`. A caller that is an administrator without
   being a user, as a browser of the machine is by default, has none of
   them and sees no form.
 - Without the `admin` role the page has the Overview and Hosts tabs. The

@@ -255,3 +255,20 @@ test("focus_follows_adding_and_removing", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Remove web-editors" }));
   await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "New role" })));
 });
+
+test("the_users_tab_explains_provider_users", async () => {
+  session.set(who({ user: "ana", admin: true, roles: ["admin"], oidc: true, oidc_issuer: "id.example.com" }));
+  serve(ANSWERS);
+  const on = render(Users);
+  await screen.findByRole("rowheader", { name: "luis" });
+  const note = screen.getByText(/People who sign in through id\.example\.com are not listed here/);
+  expect(note.textContent).toBe(
+    "People who sign in through id.example.com are not listed here; their roles come from [admin.oidc.roles] in the configuration.",
+  );
+  on.unmount();
+
+  session.set(who({ user: "ana", admin: true, roles: ["admin"] }));
+  render(Users);
+  await screen.findByRole("rowheader", { name: "luis" });
+  expect(screen.queryByText(/People who sign in through/)).toBeNull();
+});

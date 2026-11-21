@@ -67,11 +67,50 @@ test("the_token_entry_is_still_reachable", async () => {
   expect(screen.getByLabelText("Password")).toBeTruthy();
 });
 
-test("without_password_sign_in_only_the_token_is_asked", () => {
-  session.set(who({ password_login: false }));
+test("over_plain_http_without_password_sign_in_the_page_points_to_https", async () => {
+  // jsdom serves the page over http:, as a plain HTTP admin listener would.
+  session.set(who({ password_login: false, oidc: true, oidc_issuer: "id.example.com" }));
   render(SignIn, { form: "sign-in" });
+  expect(screen.getByText("Open this page over https to sign in.")).toBeTruthy();
+  const https = location.href.replace(/^http:/, "https:");
+  const link = screen.getByRole("link", { name: https });
+  expect(link.getAttribute("href")).toBe(https);
+  expect(screen.queryByLabelText("Password")).toBeNull();
+  // The provider takes no sign-in where no session can be.
+  expect(screen.queryByRole("link", { name: "Sign in with id.example.com" })).toBeNull();
+
+  await fireEvent.click(screen.getByRole("button", { name: "Use the admin token" }));
   expect(screen.getByLabelText("Token")).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Sign in with a password" })).toBeNull();
+  expect(screen.queryByText("Open this page over https to sign in.")).toBeNull();
+});
+
+test("the_provider_button_shows_when_oidc_is_on", () => {
+  session.set(who({ oidc: true, oidc_issuer: "id.example.com" }));
+  const on = render(SignIn, { form: "sign-in" });
+  expect(screen.getByRole("link", { name: "Sign in with id.example.com" })).toBeTruthy();
+  // The password form stays under it.
+  expect(screen.getByLabelText("Password")).toBeTruthy();
+  on.unmount();
+
+  session.set(who());
+  render(SignIn, { form: "sign-in" });
+  expect(screen.queryByRole("link", { name: /Sign in with/ })).toBeNull();
+});
+
+test("it_links_to_the_login_route", () => {
+  session.set(who({ oidc: true, oidc_issuer: "id.example.com" }));
+  render(SignIn, { form: "sign-in" });
+  const link = screen.getByRole("link", { name: "Sign in with id.example.com" });
+  expect(link.getAttribute("href")).toBe("auth/oidc/login");
+  expect(link.className).toContain("primary");
+});
+
+test("the_provider_is_offered_while_no_user_exists", () => {
+  // An administrator of the provider needs no local user to sign in.
+  session.set(who({ setup: true, setup_needs_code: true, oidc: true, oidc_issuer: "id.example.com" }));
+  render(SignIn, { form: "setup" });
+  expect(screen.getByRole("link", { name: "Sign in with id.example.com" })).toBeTruthy();
+  expect(screen.getByLabelText("Setup code")).toBeTruthy();
 });
 
 test("no_password_is_offered_while_no_user_exists", () => {

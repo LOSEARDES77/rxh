@@ -276,6 +276,30 @@ test("sign_out_returns_to_the_sign_in_form", async () => {
   expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
 });
 
+test("an_oidc_user_has_no_change_password", async () => {
+  daemon(who({ user: "ana", admin: true, roles: ["admin"], local: false, oidc: true, oidc_issuer: "id.example.com" }));
+  render(App);
+  await screen.findByRole("button", { name: "Sign out" });
+  expect(screen.queryByRole("button", { name: "Change password" })).toBeNull();
+});
+
+test("a_provider_administrator_gets_no_first_run_form", async () => {
+  // No user in the users file: the Users tab is where this administrator makes one.
+  daemon(who({ user: "ana", admin: true, roles: ["admin"], local: false, setup: true, oidc: true }));
+  render(App);
+  await screen.findByRole("tablist");
+  expect(tabs()).toHaveLength(6);
+  expect(screen.queryByRole("heading", { name: "Create the first user" })).toBeNull();
+});
+
+test("over_plain_http_setup_points_to_https", async () => {
+  daemon(who({ setup: true, setup_needs_code: true, password_login: false }));
+  render(App);
+  expect(await screen.findByText("Open this page over https to sign in.")).toBeTruthy();
+  expect(screen.queryByLabelText("Setup code")).toBeNull();
+  expect(screen.getByRole("button", { name: "Use the admin token" })).toBeTruthy();
+});
+
 test("change_password_opens_a_form_that_can_be_closed", async () => {
   daemon(ANA);
   render(App);

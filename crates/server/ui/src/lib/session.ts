@@ -17,10 +17,16 @@ export type Session = {
   creatable_groups: string[];
   /** No user exists yet. */
   setup: boolean;
+  /** The first user needs the setup code from this caller, which only HTTPS takes. */
   setup_needs_code: boolean;
   /** Whether `POST auth/login` works on this connection. */
   password_login: boolean;
+  /** Whether `auth/oidc/login` signs in through a provider. */
   oidc: boolean;
+  /** The host of the provider, to name it. */
+  oidc_issuer: string | null;
+  /** A user of the users file, who has a password here; false for one of the provider. */
+  local: boolean;
 };
 
 /** Undefined until the daemon answered. Passwords never get here. */

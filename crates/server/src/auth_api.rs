@@ -104,8 +104,9 @@ pub(crate) fn session(state: &AdminState, caller: &Caller, peer: Peer) -> Respon
         Scope::Grants(grants) => grants.as_slice(),
         Scope::Admin => &[],
     };
-    let needs_code =
-        setup && !caller.is_admin() && admin::code_opens_setup(peer, state.token.is_some());
+    // Said on plain HTTP too, where the code is refused: the page asks for HTTPS there. With a
+    // token, its holder creates the first user, never the code.
+    let needs_code = setup && !caller.is_admin() && state.token.is_none();
     let issuer = state.oidc.as_ref().map(oidc::Client::issuer_host);
     admin::json_response(
         StatusCode::OK,
@@ -874,14 +875,15 @@ mod tests {
         // Every client looks like this machine there, and is nobody.
         let plain = admin::tests::forwarded();
         let over_tls = Peer { tls: true, ..plain };
-        for (peer, password_login, needs_code) in [(plain, false, false), (over_tls, true, true)] {
+        // The code is needed on both; plain HTTP refuses it, and the page then asks for HTTPS.
+        for (peer, password_login) in [(plain, false), (over_tls, true)] {
             let response = session(&open, &Caller::Nobody, peer);
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["setup"], true);
             assert_eq!(json["admin"], false);
             assert_eq!(json["password_login"], password_login);
-            assert_eq!(json["setup_needs_code"], needs_code);
+            assert_eq!(json["setup_needs_code"], true);
         }
         for (peer, given) in [
             (plain, None),

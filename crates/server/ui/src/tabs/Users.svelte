@@ -392,6 +392,12 @@
       </tbody>
     </table>
   </div>
+  {#if $session?.oidc}
+    <p class="muted">
+      People who sign in through {$session.oidc_issuer} are not listed here; their roles come from
+      <code>[admin.oidc.roles]</code> in the configuration.
+    </p>
+  {/if}
 </section>
 
 <section aria-labelledby="roles-title">

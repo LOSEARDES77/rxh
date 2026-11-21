@@ -36,11 +36,14 @@
   let dialog: HTMLDialogElement;
 
   // The first user can be created by this caller. An administrator may have
-  // said "not now"; who needs the code has no other way in.
+  // said "not now"; who needs the code has no other way in, but only where the
+  // code is taken (the sign-in form says to use HTTPS elsewhere). A user of the
+  // provider makes local users in the Users tab.
   const firstRun = $derived(
     $session !== undefined &&
       $session.setup &&
-      ($session.admin ? !skipped : $session.setup_needs_code),
+      ($session.user === null || $session.local) &&
+      ($session.admin ? !skipped : $session.setup_needs_code && $session.password_login),
   );
   // The form the page asks for, over whatever is open: a 401 comes at any time.
   const form = $derived.by(() => {
@@ -154,7 +157,9 @@
   {#if $session?.user && !$needsToken}
     <div class="user">
       <span>{$session.user}</span>
-      <button type="button" class="button" onclick={() => (changing = true)}>Change password</button>
+      {#if $session.local}
+        <button type="button" class="button" onclick={() => (changing = true)}>Change password</button>
+      {/if}
       <button type="button" class="button" onclick={leave}>Sign out</button>
     </div>
   {/if}

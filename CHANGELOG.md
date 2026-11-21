@@ -571,6 +571,12 @@ Changed.
   it has only its mapped roles and no password here (`PUT /auth/password`
   answers `403`). `GET /auth/session` gains `oidc_issuer` and `local`. See
   [Signing in through a provider](docs/configuration.md#signing-in-through-a-provider).
+- The dashboard offers the provider: "Sign in with" the host of the
+  issuer on the sign-in form, no "Change password" for a user of the
+  provider, and a note in the Users tab that those users are not listed.
+  Over plain HTTP where no password is taken, the sign-in form says to
+  open the page over https, with the link, instead of a form that would be
+  refused; `GET /auth/session` says `setup_needs_code: true` there too.
 
 ### Deprecated
 

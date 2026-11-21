@@ -19,6 +19,7 @@
 
   const TITLES = {
     "sign-in": "Sign in",
+    https: "Sign in",
     token: "Admin token",
     setup: "Create the first user",
     password: "Change password",
@@ -26,8 +27,21 @@
 
   // Where no password is taken, or no user exists to have one, the token is the only way in.
   const byPassword = $derived($session !== undefined && $session.password_login && !$session.setup);
-  let byToken = $state(untrack(() => !byPassword));
-  const view = $derived(form === "sign-in" && byToken ? "token" : form);
+  // No session is given on plain HTTP off this machine: the same page over HTTPS can have one.
+  const overHttp = $derived(
+    $session !== undefined && !$session.password_login && location.protocol === "http:",
+  );
+  const httpsUrl = $derived(overHttp ? location.href.replace(/^http:/, "https:") : "");
+  let byToken = $state(untrack(() => !byPassword && !overHttp));
+  const view = $derived.by(() => {
+    if (form === "sign-in" && byToken) return "token";
+    if (form === "sign-in" && overHttp) return "https";
+    return form;
+  });
+  // The provider's sign-in needs a session cookie, which this connection takes.
+  const byProvider = $derived(
+    $session?.oidc === true && $session.password_login && !signedIn($session) && view !== "password",
+  );
 
   // Kept here only: they go away with the form.
   let name = $state("");
@@ -81,7 +95,14 @@
 <form onsubmit={submit}>
   <h2 id="sign-in-title">{TITLES[view]}</h2>
 
-  {#if view === "token"}
+  {#if byProvider}
+    <a class="primary" href="auth/oidc/login">Sign in with {$session?.oidc_issuer}</a>
+  {/if}
+
+  {#if view === "https"}
+    <p>Open this page over https to sign in.</p>
+    <p><a href={httpsUrl}>{httpsUrl}</a></p>
+  {:else if view === "token"}
     <p>This admin API asks for the <code>[admin] token</code> of the configuration.</p>
     <label>
       Token
@@ -152,7 +173,7 @@
   {/if}
 
   <div class="actions">
-    {#if form === "sign-in" && (!byToken || byPassword)}
+    {#if form === "sign-in" && (!byToken || byPassword || overHttp)}
       <button type="button" class="link" onclick={swap}>
         {byToken ? "Sign in with a password" : "Use the admin token"}
       </button>
@@ -160,9 +181,11 @@
     {#if oncancel}
       <button type="button" onclick={oncancel}>{form === "setup" ? "Not now" : "Cancel"}</button>
     {/if}
-    <button type="submit" class="primary" disabled={busy}>
-      {{ "sign-in": "Sign in", token: "Use token", setup: "Create user", password: "Save password" }[view]}
-    </button>
+    {#if view !== "https"}
+      <button type="submit" class="primary" disabled={busy}>
+        {{ "sign-in": "Sign in", token: "Use token", setup: "Create user", password: "Save password" }[view]}
+      </button>
+    {/if}
   </div>
 </form>
 
@@ -224,6 +247,18 @@
     border-color: var(--accent);
     background: var(--accent);
     color: var(--background);
+  }
+
+  a.primary {
+    padding: 0.4rem 0.9rem;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    text-align: center;
+    text-decoration: none;
+  }
+
+  p a {
+    overflow-wrap: anywhere;
   }
 
   .link {
