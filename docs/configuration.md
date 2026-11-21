@@ -1694,7 +1694,7 @@ Labels of a container:
 | `rxh.tcp.port` | Container port of the TCP route, with the same default as `rxh.http.port`. |
 | `rxh.pool` | Name of the pool. Containers with the same pool are load balanced. Defaults to `PROJECT-SERVICE` for Docker Compose containers, so the replicas of a service share a pool, else to the container name. Letters, digits, `-`, `_` and `.`. |
 | `rxh.policy` | Load balancing policy of the pool, see [Policies](#policies). Default `weighted_round_robin`. |
-| `rxh.groups` | `groups` of the server, comma separated: the admin API users whose roles grant View on one of them see it in `rxh status` and the dashboard (see [Permissions](#permissions)). Each name matches `[a-z0-9][a-z0-9_-]*`, 64 bytes at most. The server stays read only for them: it is not in a file. |
+| `rxh.groups` | `groups` of the server, comma separated: the admin API users whose roles grant View on one of them see it in `rxh status` and the dashboard (see [Permissions](#permissions)). Each name matches `[a-z0-9][a-z0-9_-]*`, 64 bytes at most, a repeat counted once. The groups of a pool are those of all its replicas: any container that joins the pool adds its groups to the server. The server stays read only for them: it is not in a file. |
 
 ```yaml
 # compose.yaml

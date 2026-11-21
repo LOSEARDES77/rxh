@@ -451,11 +451,13 @@ impl Container {
                     }
                 }
                 "groups" => {
-                    groups = value
-                        .split(',')
-                        .map(|group| group.trim().to_owned())
-                        .filter(|group| !group.is_empty())
-                        .collect();
+                    groups.clear();
+                    // Deduplicated here: a repeat would make the pool's server invalid.
+                    for group in value.split(',').map(str::trim) {
+                        if !group.is_empty() && !groups.iter().any(|known| known == group) {
+                            groups.push(group.to_owned());
+                        }
+                    }
                     if let Some(group) = groups.iter().find(|group| !is_group_name(group)) {
                         return Err(format!(
                             "{key} has {group:?}, a group must match [a-z0-9][a-z0-9_-]* \
@@ -1090,22 +1092,28 @@ mod tests {
             assert_eq!(names, [Some("docker-good")], "{value}");
         }
 
-        // A group listed twice makes the whole pool invalid, like any
-        // invalid server.
-        let twice = container(
-            "twice",
-            "10.0.0.1",
-            &[80],
-            &[("rxh.http.host", "twice.test"), ("rxh.groups", "web,web")],
-        );
-        let (effective, planned) = plan(&config(""), &[twice]);
-        assert!(effective.servers.is_empty());
-        assert_eq!(planned.ignored.len(), 1, "{:?}", planned.ignored);
-        assert!(
-            planned.ignored[0].contains("listed more than once"),
-            "{:?}",
-            planned.ignored
-        );
+        // A group repeated in a label counts once, and does not take down the
+        // pool it shares with others, whichever replica is planned first.
+        let replica = |name: &str, address: &str, groups: &str| {
+            container(
+                name,
+                address,
+                &[80],
+                &[
+                    ("rxh.http.host", "twice.test"),
+                    ("rxh.pool", "twice"),
+                    ("rxh.groups", groups),
+                ],
+            )
+        };
+        let containers = [
+            replica("b", "10.0.0.2", "ops"),
+            replica("a", "10.0.0.1", "web, web,ops"),
+        ];
+        let (effective, planned) = plan(&config(""), &containers);
+        assert_eq!(planned.ignored, [""; 0]);
+        assert_eq!(effective.servers[0].groups, ["web", "ops"]);
+        assert_eq!(members(&planned, "twice"), ["10.0.0.1:80", "10.0.0.2:80"]);
     }
 
     #[test]
