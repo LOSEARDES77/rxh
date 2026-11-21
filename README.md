@@ -86,7 +86,8 @@ pool web (least_conn)
 - **Admin API** on `127.0.0.1:2019` (JSON), with Caddy compatible
   `/reverse_proxy/upstreams`, optional HTTPS, and a web dashboard with
   accounts: first-run setup, roles with View, Modify, Create and Delete on
-  groups of hosts, and `rxh user` for the way back in.
+  groups of hosts, sign-in through an OpenID Connect provider, and
+  `rxh user` for the way back in.
 - **HTTP done right**: keep-alive pools to backends, h2/h2c, WebSocket
   tunnels, hop-by-hop header stripping, `X-Forwarded-*` with
   `trusted_proxies`, RFC 7239 `Forwarded`, `Via`, header rules (`set`, `add`,
@@ -265,9 +266,10 @@ the machine itself (by the address of its connection, with a loopback
 else sends `Authorization: Bearer <token>`, or signs in with an account of
 `[admin] users`: roles grant View, Modify, Create and Delete on groups of
 hosts (`groups` on a `[[server]]`), and the first administrator is created
-on first use. A reachable `listen` needs `token` or `tls`. See
-[Accounts](docs/configuration.md#accounts); sign-in through OIDC is not
-there yet.
+on first use. People can also sign in through one OpenID Connect provider
+(`[admin.oidc]`), whose groups give them roles. A reachable `listen` needs
+`token` or `tls`. See [Accounts](docs/configuration.md#accounts) and
+[OpenID Connect](docs/configuration.md#openid-connect).
 
 | Method | Path | Action |
 |---|---|---|
@@ -295,6 +297,7 @@ there yet.
 | `POST` | `/stop` | Graceful shutdown |
 | `GET` | `/auth/session` | Who the caller is |
 | `POST` | `/auth/login`, `/auth/logout`, `/auth/setup` | Sign in and out (session cookie), create the first user |
+| `GET` | `/auth/oidc/login`, `/auth/oidc/callback` | Sign in through the OpenID Connect provider of `[admin.oidc]` |
 | `PUT` | `/auth/password` | Change one's own password |
 | `GET`, `POST`, `PUT`, `DELETE` | `/users`, `/users/{name}`, `/roles`, `/roles/{name}` | Accounts and roles, for administrators |
 

@@ -229,6 +229,13 @@ written against an older snapshot: their line numbers and percentages are stale,
     hand), the admin guard on the `forward_auth`, health webhook and tracing dialers (only the forward,
     health check and TCP paths have tests), and restoring the terminal echo of `rxh user` after `Ctrl-C`
     (checked by hand).
+    Sign-in through a provider: `server/tests/oidc.rs` against the stand-in provider of
+    `util/src/oidc_provider.rs` (plain HTTP and HTTPS with `ca`: the flow, every claim check, the binding
+    cookie, limits, timeouts, oversized and redirected answers, no secret in answers or `GET /config`; the log was checked by hand),
+    unit tests in `oidc.rs` and `config.rs`, the page in Vitest (`SignIn.test.ts`, `Users.test.ts`). Not
+    tested by automation: a real provider (none was used, by hand either), and the `Secure` attribute of
+    the binding cookie (unit test only); the flow in a browser over a `tls` admin listener was checked by
+    hand.
 
 ## 4. Structural recommendations
 

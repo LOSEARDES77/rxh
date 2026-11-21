@@ -437,8 +437,8 @@ impl Daemon {
                 !admin_state.access.read().user.is_empty(),
             ) {
                 println!(
-                    "Admin => no user exists yet; to create the first one from another machine \
-                     use the setup code {}",
+                    "Admin => no user exists yet; to create the first one over HTTPS use the \
+                     setup code {}",
                     admin_state.sessions.setup_code()
                 );
             }

@@ -38,8 +38,8 @@ not a promise. An item moves to [CHANGELOG.md](CHANGELOG.md) when it ships.
 - Daemon with zero downtime reloads, admin API, `include` files and a CLI
   that edits the configuration file and applies changes live, plus
   `rxh file-server` and `rxh reverse-proxy` quick commands.
-- A web dashboard on the admin API with local accounts, first-run setup
-  and roles per group of hosts; OIDC sign-in is next.
+- A web dashboard on the admin API with local accounts, first-run setup,
+  roles per group of hosts and sign-in through an OIDC provider.
 - In the benchmark (measured with 0.2.0) RXH passes every scenario and is
   faster than Caddy, but clearly slower than NGINX. See docs/benchmarks.md
   for the numbers.
@@ -181,7 +181,7 @@ goal of this milestone is to close most of that gap and to keep it closed.
       View, Modify, Create and Delete on groups of hosts and on single
       hosts, HTTPS on the admin listener (`[admin] tls`), the Users tab and
       `rxh user`. The bearer token and the CLI keep working.
-- [ ] Sign-in through one OIDC provider (`[admin.oidc]`), roles from a
+- [x] Sign-in through one OIDC provider (`[admin.oidc]`), roles from a
       claim of the provider.
 
 ## 1.0: stable

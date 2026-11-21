@@ -577,6 +577,14 @@ Changed.
   Over plain HTTP where no password is taken, the sign-in form says to
   open the page over https, with the link, instead of a form that would be
   refused; `GET /auth/session` says `setup_needs_code: true` there too.
+- Documentation of sign-in through a provider: a worked example for a
+  self-hosted provider (confidential client, redirect URI, a `groups`
+  claim, `ca` for a private authority) and what is not there (one
+  provider, no check of the ID token's signature and why, no single
+  sign-out, no refresh, roles of sign-in time for 12 hours). The admin
+  section says that `kubectl port-forward` reaches a loopback listener
+  without a token as an administrator, and that a token sent to `http://`
+  through a forwarder travels in clear.
 
 ### Deprecated
 
@@ -586,6 +594,9 @@ Changed.
 
 ### Changed
 
+- The daemon's log line with the setup code says `to create the first one
+  over HTTPS use the setup code`, no longer "from another machine": on a
+  listener that is not loopback the machine itself needs the code too.
 - On an admin listener with `tls` and without `token`, a request from
   another machine is no longer refused with `403` on every route: the
   dashboard and the `/auth` routes answer it, so that people can sign in,

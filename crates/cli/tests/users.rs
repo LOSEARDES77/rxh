@@ -387,13 +387,16 @@ async fn on_a_listener_of_every_address_this_machine_is_nobody() {
             .spawn()
             .unwrap(),
     );
-    // The setup code, from the line of the log that announces it. The rest
-    // of the log is read too, so the daemon never waits on a full pipe.
+    // The setup code, from the line of the log that announces it: the line
+    // says HTTPS, since the machine itself needs the code here. The rest of
+    // the log is read too, so the daemon never waits on a full pipe.
     let log = BufReader::new(daemon.0.stdout.take().unwrap());
     let (found, code) = mpsc::channel();
     std::thread::spawn(move || {
         for line in log.lines().map_while(Result::ok) {
-            if let Some((_, code)) = line.split_once("use the setup code ") {
+            if let Some((_, code)) =
+                line.split_once("to create the first one over HTTPS use the setup code ")
+            {
                 let _ = found.send(code.trim().to_owned());
             }
         }

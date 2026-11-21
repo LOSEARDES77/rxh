@@ -606,14 +606,20 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   and 1.3, the defaults of a server without `tls_options`) is for
   everybody. Plain HTTP is answered only to a connection from the machine
   itself; from anywhere else it is closed without an answer. So the CLI and
-  `curl` on the machine reach the API as without `tls` (with the token,
-  when `listen` is not a loopback address):
+  `curl` on the machine reach the API as without `tls`. On `listen =
+  "10.0.0.5:2019"`, not a loopback address, every caller sends the token or
+  a session, the machine included:
 
   ```sh
-  curl https://10.0.0.5:2019/status       # from anywhere: HTTPS
-  curl http://127.0.0.1:2019/status       # on the machine: plain HTTP
-  rxh status                              # on the machine: plain HTTP
+  H='Authorization: Bearer kq3Zp0uX7mV9cR2tLw8yHs4d'
+  curl -H "$H" https://10.0.0.5:2019/status   # from anywhere: HTTPS
+  curl -b jar https://10.0.0.5:2019/status    # or a session, see Accounts
+  curl -H "$H" http://10.0.0.5:2019/status    # on the machine: plain HTTP
+  rxh status                                  # on the machine: plain HTTP, token of the file
   ```
+
+  On `listen = "127.0.0.1:2019"` without a token, the machine needs
+  neither: `curl http://127.0.0.1:2019/status`.
 - A connection is from the machine when it comes over the unix socket, or
   over TCP from a loopback address or from the very address it connected to
   (the machine calling its own address). The address is the one of the
@@ -687,12 +693,23 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
   served without the token: the page and its script and style
   hold no data. The page asks who it is, shows a sign-in form to nobody, and
   sends the cookie of the session or the token on its requests.
-  So are `GET /auth/session`, `POST /auth/login`, `POST /auth/logout` and
-  `POST /auth/setup`, the way in and out for [accounts](#accounts).
+  So are `GET /auth/session`, `POST /auth/login`, `POST /auth/logout`,
+  `POST /auth/setup`, `GET /auth/oidc/login` and `GET /auth/oidc/callback`,
+  the way in and out for [accounts](#accounts).
 - Without `tls` the admin API speaks plain HTTP: the token is as private as
   the network it crosses. Set `tls`, or use a private network, a VPN or an
   SSH tunnel (`ssh -L 2019:/run/rxh/admin.sock host`), not the open
   internet.
+  - A tunnel or a port forwarder whose far end connects from loopback
+    makes every caller a request from the machine. `ssh -L` to a loopback
+    or unix socket `listen`, and `kubectl port-forward` (it connects from
+    loopback inside the pod's network namespace) to a loopback `listen`,
+    reach a daemon without a token as an administrator: whoever can open
+    the forward is one. Set `token` when other people can.
+  - A token sent to an `http://` address through a forwarder that crosses
+    the network (a published container port, a forward on another
+    machine) travels in clear on the way. Set `tls` and send it to
+    `https://` there.
 - The CLI finds the address in `--admin` / `RXH_ADMIN` (`ip:port` or
   `unix//path`), else in `[admin] listen` of its configuration file. The
   token comes from `--admin-token` / `RXH_ADMIN_TOKEN`, else from `[admin]
@@ -782,8 +799,9 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   plain HTTP too, where the code is refused: the page then asks for HTTPS.
 - `oidc` says whether `[admin.oidc]` is set, and `oidc_issuer` is the host
   of its `issuer`, to name it. `local` is `true` for a user of the users
-  file and `false` for one signed in through the provider, which has no
-  password here.
+  file, who has a password to change, and `false` for one signed in
+  through the provider, which has no password here, and for a caller that
+  is not signed in.
 - `tls` says whether the admin listener has `[admin] tls`, whatever this
   request came over. On plain HTTP to such a listener the page links to
   the same address over HTTPS; without it, it asks for the token.
@@ -814,10 +832,6 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   turn, and gets `429` when none came within 5 seconds. A sign-in that
   waited and was refused is not a failed one for its name, whose password
   was never compared; it is one of the attempts of its address.
-- `oidc` is `true` with `[admin.oidc]`, and `oidc_issuer` is then the host
-  of the provider, for the page to name it. `local` is `true` for a user of
-  the users file, who has a password to change, and `false` for a user of
-  the provider and for a caller that is not signed in.
 - After 5 failed sign-ins for a name from one client address, that name is
   refused from that address for a minute (`429`), with the right password
   too. For both limits an IPv6 client is its /64 network, not one address
@@ -856,12 +870,12 @@ answered:
   ```sh
   curl -d '{"name": "ana", "password": "correct horse"}' http://127.0.0.1:2019/auth/setup
   ```
-- to anyone who sends the setup code, on a `tls` listener without a
-  `token`. The code is 10 characters, new at every start, and written to
-  the log of the daemon while no user exists:
+- to anyone who sends the setup code over HTTPS, on a `tls` listener
+  without a `token`. The code is 10 characters, new at every start, and
+  written to the log of the daemon while no user exists:
 
   ```text
-  Admin => no user exists yet; to create the first one from another machine use the setup code k7m2xq9hpd
+  Admin => no user exists yet; to create the first one over HTTPS use the setup code k7m2xq9hpd
   ```
 
   ```sh
@@ -1194,6 +1208,47 @@ manages its own hosts and nothing else.
    is the way back in when a password is lost, and ends the sessions of
    that user.
 
+6. **Through a provider, if you have one.** People can sign in with the
+   accounts of an OpenID Connect provider instead of, or next to, the users
+   file; their groups at the provider give them roles. Take a self-hosted
+   provider at `https://id.example.com/realms/ops` whose certificate comes
+   from the company's own authority. At the provider (the menus differ from
+   one product to another; these are the settings to look for):
+   - a client `rxh`, confidential (with a secret), for the authorization
+     code flow, whose secret is sent with HTTP Basic
+     (`client_secret_basic`);
+   - the redirect URI `https://rxh.example.com:2019/auth/oidc/callback`,
+     that is `{public_url}/auth/oidc/callback`, exactly;
+   - the groups of the user in the ID token, as a claim named `groups`
+     (often a "groups" mapper or scope of the client to switch on).
+
+   Then in rxh, with the secret in an environment variable of the service
+   and the authority's certificate in a file:
+
+   ```toml
+   [admin]
+   listen = "0.0.0.0:2019"
+   tls = { cert = "/etc/rxh/admin.pem", key = "/etc/rxh/admin.key" }
+   users = "/var/lib/rxh/users.toml"
+   public_url = "https://rxh.example.com:2019"
+
+   [admin.oidc]
+   issuer = "https://id.example.com/realms/ops"   # as the provider publishes it
+   client_id = "rxh"
+   client_secret = "{env.RXH_OIDC_SECRET}"
+   ca = "/etc/rxh/company-ca.pem"   # added to the public roots, not instead
+   roles = { ops = ["admin"], web = ["web-editors"] }
+   ```
+
+   After a restart the sign-in form has a "Sign in with id.example.com"
+   button. A member of `web` gets the role `web-editors` of step 4; a
+   member of `ops` is an administrator; a person in neither group is
+   refused by a page that names the person and the groups received, and
+   the log says the same. `web-editors` is a role of the users file: one
+   that is not defined there gives nothing, and a member of `web` would be
+   signed in with no permission at all. The flow is described in
+   [Signing in through a provider](#signing-in-through-a-provider).
+
 What is not there:
 
 - **More than a password, here.** No two-factor codes, no passkeys, no
@@ -1214,6 +1269,24 @@ What is not there:
 - **Groups on Kubernetes hosts.** Docker, Podman, Swarm, Consul, Nomad
   and etcd hosts take `rxh.groups`; Kubernetes Ingresses and routes carry
   no such option, so their hosts are for administrators.
+- **More than one provider.** `[admin.oidc]` names one issuer.
+- **A check of the ID token's signature.** The token is read only from
+  the token endpoint's answer, over TLS to the provider, which OpenID
+  Connect Core 3.1.3.7 allows in place of the signature: the TLS
+  connection already proves where it comes from. A token from anywhere
+  else (a query parameter, a fragment) is never accepted.
+- **Single sign-out.** Signing out of rxh ends the rxh session only, not
+  the one at the provider; signing out at the provider leaves the rxh
+  session until its 12 hours are over.
+- **Refresh.** No refresh token is kept and nothing is asked of the
+  provider after the sign-in. The groups, and so the roles, of a provider
+  user are those of the sign-in for the 12 hours of the session; taking
+  someone out of a group at the provider takes effect at their next
+  sign-in. What a role grants is read from the users file on every
+  request, so a role edited or removed there applies at once.
+- **Provider users in the users file.** They are not stored: not listed
+  in `GET /users` or the Users tab, no password here, at most 10 sessions
+  each like everybody.
 
 Known limits:
 
@@ -1254,7 +1327,10 @@ Known limits:
 
 `[admin.oidc]` lets users sign in through an OpenID Connect provider
 (Keycloak, Authentik, Dex, Auth0, ...), next to the users of the users file
-or instead of them.
+or instead of them. The flow is the standard authorization code flow; it
+is tested against a stand-in provider, not against any of these products.
+A worked example is step 6 of
+[Accounts and permissions, step by step](#accounts-and-permissions-step-by-step).
 
 | Key | Default | Description |
 |---|---|---|
@@ -1348,7 +1424,10 @@ A user of the provider is not a user of the users file, even under the same
 name: it has only the roles its groups give, it is not listed in
 `GET /users`, it has no password here (`PUT /auth/password` answers `403`),
 and what ends the sessions of the local user of that name leaves its own.
-In the log it is `name (oidc)`. A user keeps at most 10 sessions.
+Its sign-in is logged as `"name" signed in through the provider`, with its
+roles and groups, and the changes it makes as made by `name (oidc)`. A user
+keeps at most 10 sessions. Provider users are not stored anywhere: the
+session is all rxh knows of them.
 
 A sign-in that does not happen answers with a small page that says why in
 one sentence, and starts no session:
