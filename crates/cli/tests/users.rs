@@ -2,10 +2,11 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,7 +15,11 @@ use hyper::{Method, Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use rxh_server::access::Access;
 use rxh_test_util::free_address;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 const RXH: &str = env!("CARGO_BIN_EXE_rxh");
 
@@ -156,6 +161,50 @@ fn a_short_password_is_rejected() {
     assert!(users(dir).verify("ana", "password-ana"));
 }
 
+#[test]
+fn user_commands_need_nothing_but_the_users_key_of_the_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    // Secrets that only the environment of the service holds, and a key
+    // that is not valid: `rxh run` would not start from this shell.
+    let config = |users: &str| {
+        let text = format!(
+            "[admin]\ntoken = \"{{env.RXH_TEST_NO_SUCH_TOKEN}}\"\n{users}\n\
+             [[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"{{env.RXH_TEST_NO_SUCH_HOST}}:80\"\n\
+             rate_limit = \"not a rate\"\n"
+        );
+        std::fs::write(dir.join("rxh.toml"), text).unwrap();
+    };
+    config("users = \"accounts/users.toml\"");
+    succeeds(&user(dir, &["add", "ana"], "password-ana\n"));
+    assert_eq!(succeeds(&user(dir, &["list"], "")), "ana admin\n");
+    let saved = Access::load(&dir.join("accounts/users.toml")).unwrap();
+    assert!(saved.verify("ana", "password-ana"));
+
+    // Without the key, the default place.
+    config("");
+    succeeds(&user(dir, &["add", "luis"], "password-luis\n"));
+    assert!(users(dir).verify("luis", "password-luis"));
+
+    // A placeholder in the key itself is not replaced, and is not a path.
+    config("users = \"{env.RXH_TEST_NO_SUCH_DIRECTORY}/users.toml\"");
+    let stderr = fails(&user(dir, &["add", "eva"], "password-eva\n"));
+    assert!(
+        stderr.contains("[admin] users holds a placeholder"),
+        "{stderr}"
+    );
+    assert!(!dir.join("{env.RXH_TEST_NO_SUCH_DIRECTORY}").exists());
+    config("users = 7");
+    let stderr = fails(&user(dir, &["list"], ""));
+    assert!(
+        stderr.contains("[admin] users must be the path"),
+        "{stderr}"
+    );
+    std::fs::write(dir.join("rxh.toml"), "[admin\n").unwrap();
+    let stderr = fails(&user(dir, &["list"], ""));
+    assert!(stderr.contains("rxh.toml"), "{stderr}");
+}
+
 struct Daemon(Child);
 
 impl Drop for Daemon {
@@ -200,6 +249,21 @@ async fn call(
     cookie: Option<&str>,
 ) -> (StatusCode, Option<String>) {
     let stream = TcpStream::connect(admin).await.unwrap();
+    call_on(stream, admin, method, uri, body, cookie).await
+}
+
+/// [`call`] on a connection that is already open.
+async fn call_on<S>(
+    stream: S,
+    admin: SocketAddr,
+    method: Method,
+    uri: &str,
+    body: String,
+    cookie: Option<&str>,
+) -> (StatusCode, Option<String>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .unwrap();
@@ -293,4 +357,98 @@ async fn the_users_file_is_next_to_the_configuration_whatever_the_working_direct
     let (status, _) = sign_in(admin, "ana", "password-ana").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(!daemon_cwd.path().join("rxh-data").exists());
+}
+
+/// On `[admin] listen = "0.0.0.0:<port>"` with `tls` and no token, what a
+/// port forwarder can make of every remote client: a connection from this
+/// machine. It is nobody until it signs in, and the first user needs the
+/// setup code of the log.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_a_listener_of_every_address_this_machine_is_nobody() {
+    let admin = free_address();
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    let generated = rcgen::generate_simple_self_signed(vec![String::from("localhost")]).unwrap();
+    std::fs::write(dir.join("admin.pem"), generated.cert.pem()).unwrap();
+    std::fs::write(dir.join("admin.key"), generated.signing_key.serialize_pem()).unwrap();
+    let config = format!(
+        "[admin]\nlisten = \"0.0.0.0:{}\"\ntls = {{ cert = \"admin.pem\", key = \"admin.key\" }}\n\n\
+         [[server]]\nlisten = \"127.0.0.1:0\"\nforward = \"127.0.0.1:1\"\n",
+        admin.port()
+    );
+    std::fs::write(dir.join("rxh.toml"), config).unwrap();
+
+    let mut daemon = Daemon(
+        Command::new(RXH)
+            .current_dir(dir)
+            .arg("run")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // The setup code, from the line of the log that announces it. The rest
+    // of the log is read too, so the daemon never waits on a full pipe.
+    let log = BufReader::new(daemon.0.stdout.take().unwrap());
+    let (found, code) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in log.lines().map_while(Result::ok) {
+            if let Some((_, code)) = line.split_once("use the setup code ") {
+                let _ = found.send(code.trim().to_owned());
+            }
+        }
+    });
+    let code: String = code
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the log announces the setup code");
+
+    let mut roots = RootCertStore::empty();
+    roots.add(generated.cert.der().clone()).unwrap();
+    let client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client));
+    let over_tls = async |method: Method, uri: &str, body: String, cookie: Option<&str>| {
+        let stream = TcpStream::connect(admin).await.unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = connector.connect(name, stream).await.unwrap();
+        call_on(stream, admin, method, uri, body, cookie).await
+    };
+    let setup = |code: Option<&str>| {
+        serde_json::json!({ "name": "ana", "password": "password-ana", "code": code }).to_string()
+    };
+
+    // Without credentials: nobody, over TLS and over plain HTTP.
+    let (status, _) = over_tls(Method::GET, "/config", String::new(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(admin, Method::GET, "/config", String::new(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let status = Command::new(RXH).current_dir(dir).arg("status").output();
+    let stderr = fails(&status.unwrap());
+    assert!(stderr.contains("[admin] token"), "{stderr}");
+
+    // The first user needs the code, and the code needs TLS.
+    let (status, _) = over_tls(Method::POST, "/auth/setup", setup(None), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(admin, Method::POST, "/auth/setup", setup(None), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, cookie) = call(admin, Method::POST, "/auth/setup", setup(Some(&code)), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the code in clear text");
+    assert_eq!(cookie, None);
+    assert!(!dir.join("rxh-data/users.toml").exists());
+    let (status, cookie) = over_tls(Method::POST, "/auth/setup", setup(Some(&code)), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let cookie = cookie.expect("a session cookie");
+    assert!(users(dir).verify("ana", "password-ana"));
+
+    // The session works over TLS and not in clear text, where signing in
+    // is refused too.
+    let (status, _) = over_tls(Method::GET, "/config", String::new(), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(admin, Method::GET, "/config", String::new(), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = sign_in(admin, "ana", "password-ana").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // `rxh user` edits the file and needs no token.
+    assert_eq!(succeeds(&user(dir, &["list"], "")), "ana admin\n");
 }

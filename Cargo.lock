@@ -2298,6 +2298,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "rcgen",
  "rxh-core",
  "rxh-server",
  "rxh-test-util",
@@ -2305,6 +2306,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "toml_edit",
 ]

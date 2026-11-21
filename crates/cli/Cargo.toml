@@ -36,6 +36,8 @@ libc.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true
 rxh-test-util = { path = "../util" }
 tempfile.workspace = true
 serde_json.workspace = true

@@ -1,9 +1,12 @@
 //! `rxh user`: edits the users file of the admin API directly, without the
 //! daemon. The way back in when every password is lost.
 
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read};
+use std::path::Path;
 use std::process;
 
+use rxh_core::config::Admin;
 use rxh_server::access::{self, ADMIN_ROLE, Store};
 
 use crate::cli::{Cli, UserCommand};
@@ -12,8 +15,7 @@ use crate::commands;
 /// Runs one `rxh user` command on `[admin] users` of the configuration file.
 pub(crate) fn execute(cli: &Cli, command: UserCommand) -> Result<(), String> {
     let path = commands::config_path(cli);
-    let config = rxh_server::load_config(&path).map_err(|err| err.to_string())?;
-    let store = Store::open(access::users_file(Some(&path), &config.admin.users));
+    let store = Store::open(access::users_file(Some(&path), &users_setting(&path)?));
     match command {
         UserCommand::List => {
             for user in store.read().user {
@@ -42,6 +44,28 @@ pub(crate) fn execute(cli: &Cli, command: UserCommand) -> Result<(), String> {
         }
         UserCommand::Remove { name } => store.change(|access| access.remove_user(&name)),
     }
+}
+
+/// `[admin] users` of the configuration file at `path`, which only the main
+/// file can set. Nothing else of the file is checked and no placeholder is
+/// replaced: the secrets a configuration takes from the environment of the
+/// service are not in the shell of whoever lost a password.
+fn users_setting(path: &Path) -> Result<String, String> {
+    let invalid = |reason: &dyn std::fmt::Display| format!("{}: {reason}", path.display());
+    let text = fs::read_to_string(path).map_err(|err| invalid(&err))?;
+    let document: toml::Table = text.parse().map_err(|err| invalid(&err))?;
+    let users = match document.get("admin").and_then(|admin| admin.get("users")) {
+        None => return Ok(Admin::default().users),
+        Some(toml::Value::String(users)) if !users.is_empty() => users,
+        Some(_) => return Err(invalid(&"[admin] users must be the path of a file")),
+    };
+    if users.contains("{env.") || users.contains("{file.") {
+        return Err(invalid(
+            &"[admin] users holds a placeholder, which rxh user does not replace; \
+              write the path of the users file there",
+        ));
+    }
+    Ok(users.clone())
 }
 
 /// The new password: asked twice without echo on a terminal, else the first
