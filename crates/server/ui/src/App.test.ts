@@ -102,6 +102,23 @@ test("the_first_run_form_cannot_be_skipped_by_who_needs_the_code", async () => {
   expect(screen.queryByLabelText("Setup code")).toBeNull();
 });
 
+test("not_now_does_not_hide_the_form_from_who_needs_the_code", async () => {
+  localStorage.setItem("rxh-setup-skipped", "1");
+  daemon(who({ setup: true, setup_needs_code: true }));
+  render(App);
+  expect(await screen.findByLabelText("Setup code")).toBeTruthy();
+});
+
+test("the_page_starts_where_storage_is_blocked", async () => {
+  const blocked = new Proxy({}, { get: () => () => { throw new DOMException("blocked", "SecurityError"); } });
+  vi.stubGlobal("localStorage", blocked);
+  vi.stubGlobal("sessionStorage", blocked);
+  daemon(who({ admin: true, setup: true }));
+  render(App);
+  await fireEvent.click(await screen.findByRole("button", { name: "Not now" }));
+  expect(tabs()).toHaveLength(5);
+});
+
 test("no_form_and_no_user_menu_for_a_local_administrator", async () => {
   daemon(who({ admin: true }));
   render(App);
@@ -124,6 +141,13 @@ test("a_401_shows_sign_in_and_keeps_the_open_form", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
   expect(await screen.findByRole("heading", { name: "Sign in" })).toBeTruthy();
   expect((screen.getByLabelText("TOML of the table") as HTMLTextAreaElement).value).toBe('listen = "127.0.0.1:8080"');
+  // Signed out: no user menu, no refusal in the header, and the polls wait.
+  expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
+  const before = fetch.mock.calls.length;
+  document.dispatchEvent(new Event("visibilitychange"));
+  await new Promise((done) => setTimeout(done, 20));
+  expect(fetch.mock.calls.length).toBe(before);
+  expect(document.querySelector('header [role="alert"]')).toBeNull();
 
   await type("Name", "ana");
   await type("Password", "correct horse");
@@ -132,6 +156,58 @@ test("a_401_shows_sign_in_and_keeps_the_open_form", async () => {
   expect((screen.getByLabelText("TOML of the table") as HTMLTextAreaElement).value).toBe('listen = "127.0.0.1:8080"');
   await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
   await waitFor(() => expect(asked(fetch, "config/entities/server")).toBe(2));
+});
+
+test("another_user_signing_in_after_a_401_gets_nothing_of_the_one_before", async () => {
+  location.hash = "hosts";
+  const { fetch, state } = daemon(ANA, LUIS);
+  render(App);
+  await fireEvent.click(await screen.findByRole("button", { name: "New host" }));
+  await fireEvent.click(screen.getByRole("radio", { name: "TOML" }));
+  await type("TOML of the table", 'listen = "127.0.0.1:8080"');
+  state.caller = who();
+  await fireEvent.click(screen.getByRole("button", { name: "Save and reload" }));
+  await screen.findByRole("heading", { name: "Sign in" });
+  const read = asked(fetch, "config/files");
+
+  await type("Name", "luis");
+  await type("Password", "correct horse");
+  await fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  expect(await screen.findByText("luis")).toBeTruthy();
+  // The tabs start again for luis: the form of ana is gone and the list is read anew.
+  await waitFor(() => expect(screen.queryByLabelText("TOML of the table")).toBeNull());
+  expect(tabs()).toEqual(["Overview", "Hosts"]);
+  await waitFor(() => expect(asked(fetch, "config/files")).toBeGreaterThan(read));
+  expect(await screen.findByRole("button", { name: "New host" })).toBeTruthy();
+});
+
+test("a_refused_sign_out_still_asks_who_the_page_is_for", async () => {
+  const { fetch, state } = daemon(ANA);
+  render(App);
+  const out = await screen.findByRole("button", { name: "Sign out" });
+  // The cookie expired: the daemon refuses the sign-out itself.
+  state.caller = who();
+  fetch.mockImplementationOnce(async () => Response.json({ error: "sign in first" }, { status: 401 }));
+  await fireEvent.click(out);
+  expect(await screen.findByRole("heading", { name: "Sign in" })).toBeTruthy();
+  await waitFor(() => expect(screen.queryByRole("tablist")).toBeNull());
+});
+
+test("a_401_closes_the_password_form_for_good", async () => {
+  const { state } = daemon(ANA);
+  render(App);
+  await fireEvent.click(await screen.findByRole("button", { name: "Change password" }));
+  await type("Current password", "correct horse");
+  state.caller = who();
+  document.dispatchEvent(new Event("visibilitychange"));
+  expect(await screen.findByRole("heading", { name: "Sign in" })).toBeTruthy();
+  await type("Name", "ana");
+  await type("Password", "correct horse");
+  await fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  await screen.findByRole("button", { name: "Sign out" });
+  // It does not come back empty: it is opened again by who wants it.
+  expect(screen.queryByRole("heading", { name: "Change password" })).toBeNull();
+  expect(screen.queryByLabelText("Current password")).toBeNull();
 });
 
 test("signing_in_reloads_the_data", async () => {

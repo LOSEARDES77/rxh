@@ -74,6 +74,22 @@ test("without_password_sign_in_only_the_token_is_asked", () => {
   expect(screen.queryByRole("button", { name: "Sign in with a password" })).toBeNull();
 });
 
+test("no_password_is_offered_while_no_user_exists", () => {
+  session.set(who({ setup: true }));
+  render(SignIn, { form: "sign-in" });
+  expect(screen.getByLabelText("Token")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Sign in with a password" })).toBeNull();
+});
+
+test("the_password_form_names_the_user_for_password_managers", () => {
+  session.set(who({ user: "ana", admin: true }));
+  const { container } = render(SignIn, { form: "password" });
+  const name = container.querySelector('input[autocomplete="username"]') as HTMLInputElement;
+  expect(name.value).toBe("ana");
+  expect(name.className).toContain("visually-hidden");
+  expect(name.hasAttribute("style")).toBe(false);
+});
+
 test("a_refused_sign_in_shows_the_message_of_the_daemon", async () => {
   session.set(who());
   serve({ "auth/session": who() }, { status: 429, body: { error: "too many attempts, wait a minute" } });

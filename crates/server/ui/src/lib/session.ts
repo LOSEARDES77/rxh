@@ -44,8 +44,12 @@ export async function signIn(name: string, password: string): Promise<void> {
 }
 
 export async function signOut(): Promise<void> {
-  await api("auth/logout", { method: "POST" });
-  await refresh();
+  try {
+    await api("auth/logout", { method: "POST" });
+  } finally {
+    // Refused or not, who the page is for is asked again.
+    await refresh();
+  }
 }
 
 /** Creates the first user, and signs it in where the daemon gives a session. */

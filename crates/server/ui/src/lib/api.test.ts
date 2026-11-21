@@ -1,6 +1,6 @@
 import { get } from "svelte/store";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { ApiError, api, needsToken, setToken } from "./api";
+import { ApiError, api, authorized, needsToken, setToken } from "./api";
 
 function answer(status: number, body: unknown) {
   const fetch = vi.fn(
@@ -61,6 +61,21 @@ test("a_401_asks_for_the_token_and_rejects", async () => {
 
   setToken("fresh");
   expect(get(needsToken)).toBe(false);
+});
+
+test("after_a_401_only_the_way_in_is_asked", async () => {
+  const fetch = answer(401, { error: "sign in first" });
+  await expect(api("status")).rejects.toMatchObject({ status: 401 });
+  await expect(api("stats/history")).rejects.toMatchObject({ status: 401 });
+  expect(fetch).toHaveBeenCalledTimes(1);
+  await api("auth/session").catch(() => undefined);
+  expect(fetch).toHaveBeenCalledTimes(2);
+
+  // Somebody signed in: the page asks again.
+  authorized();
+  await api("status").catch(() => undefined);
+  expect(fetch).toHaveBeenCalledTimes(3);
+  authorized();
 });
 
 test("an_answer_without_a_body_is_not_parsed", async () => {

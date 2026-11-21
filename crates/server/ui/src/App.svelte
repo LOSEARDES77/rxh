@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, loadWithToken, needsToken, stopped } from "./lib/api";
+  import { ApiError, api, keep, kept, loadWithToken, needsToken, stopped } from "./lib/api";
   import { refresh as readSession, session, signedIn, signOut } from "./lib/session";
   import SignIn from "./lib/SignIn.svelte";
   import Certificates from "./tabs/Certificates.svelte";
@@ -30,12 +30,15 @@
   let status: Status | undefined = $state();
   let failure = $state("");
   let changing = $state(false);
-  let skipped = $state(localStorage.getItem(SKIPPED_KEY) !== null);
+  let skipped = $state(kept(() => localStorage, SKIPPED_KEY) !== null);
   let dialog: HTMLDialogElement;
 
-  // The first user can be created by this caller, who has not said "not now".
+  // The first user can be created by this caller. An administrator may have
+  // said "not now"; who needs the code has no other way in.
   const firstRun = $derived(
-    $session !== undefined && $session.setup && ($session.admin || $session.setup_needs_code) && !skipped,
+    $session !== undefined &&
+      $session.setup &&
+      ($session.admin ? !skipped : $session.setup_needs_code),
   );
   // The form the page asks for, over whatever is open: a 401 comes at any time.
   const form = $derived.by(() => {
@@ -46,14 +49,21 @@
   // The API answers an administrator without accounts, and a password can stay as it is.
   const leavable = $derived(form === "password" || (form === "setup" && $session?.admin));
 
+  // The sign-in form says what a 401 means: it is no failure to report.
+  function report(err: unknown) {
+    const expected = err instanceof ApiError && err.status === 401;
+    failure = expected ? "" : err instanceof Error ? err.message : String(err);
+  }
+
   async function refresh() {
-    if ($stopped) return;
+    // Signed out, nothing is asked until `loadWithToken` says somebody signed in.
+    if ($stopped || $needsToken) return;
     try {
       if (!$session) await readSession();
       status = signedIn($session) ? await api<Status>("status") : undefined;
       failure = "";
     } catch (err) {
-      failure = err instanceof Error ? err.message : String(err);
+      report(err);
     }
   }
 
@@ -61,7 +71,7 @@
     try {
       await signOut();
     } catch (err) {
-      failure = err instanceof Error ? err.message : String(err);
+      report(err);
     }
     refresh();
   }
@@ -70,7 +80,7 @@
     if (!leavable) return;
     if (form === "setup") {
       skipped = true;
-      localStorage.setItem(SKIPPED_KEY, "1");
+      keep(() => localStorage, SKIPPED_KEY, "1");
     }
     changing = false;
   }
@@ -101,6 +111,11 @@
     select(next);
     document.getElementById(`tab-${tabs[next].id}`)?.focus();
   }
+
+  // A 401 takes the place of the password form, which does not come back by itself.
+  $effect(() => {
+    if ($needsToken) changing = false;
+  });
 
   $effect(() => {
     if (form && !dialog.open) dialog.showModal();
@@ -134,7 +149,7 @@
   {#if failure && !$stopped}
     <p class="failure" role="alert">{failure}</p>
   {/if}
-  {#if $session?.user}
+  {#if $session?.user && !$needsToken}
     <div class="user">
       <span>{$session.user}</span>
       <button type="button" class="button" onclick={() => (changing = true)}>Change password</button>
@@ -152,26 +167,29 @@
     </p>
   </main>
 {:else if signedIn($session)}
-  <div class="tabs" role="tablist" aria-label="Sections">
-    {#each tabs as tab, index (tab.id)}
-      <button
-        type="button"
-        role="tab"
-        id="tab-{tab.id}"
-        aria-selected={index === selected}
-        aria-controls="panel"
-        tabindex={index === selected ? 0 : -1}
-        onclick={() => select(index)}
-        onkeydown={onTabKey}>{tab.label}</button
-      >
-    {/each}
-  </div>
-
-  <main>
-    <div id="panel" role="tabpanel" aria-labelledby="tab-{tabs[selected].id}">
-      <Current />
+  <!-- Another caller gets nothing of what the one before had on screen, an open form included. -->
+  {#key $session?.user}
+    <div class="tabs" role="tablist" aria-label="Sections">
+      {#each tabs as tab, index (tab.id)}
+        <button
+          type="button"
+          role="tab"
+          id="tab-{tab.id}"
+          aria-selected={index === selected}
+          aria-controls="panel"
+          tabindex={index === selected ? 0 : -1}
+          onclick={() => select(index)}
+          onkeydown={onTabKey}>{tab.label}</button
+        >
+      {/each}
     </div>
-  </main>
+
+    <main>
+      <div id="panel" role="tabpanel" aria-labelledby="tab-{tabs[selected].id}">
+        <Current />
+      </div>
+    </main>
+  {/key}
 {/if}
 
 <!--

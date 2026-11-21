@@ -1094,7 +1094,9 @@ The page and [accounts](#accounts):
 - A session ends after 12 hours, or when the password of the user changes:
   the next call is answered `401` and the sign-in form comes over the
   page. An open form stays behind it with what was typed, to be saved
-  after signing in.
+  after signing in. Until then the page asks the daemon nothing. When
+  somebody else signs in, or the token is given, the tabs start again:
+  nothing the user before had on screen is kept, an open form included.
 
 Differences from the design of the page
 ([`docs/superpowers/specs/2026-11-20-webui-design.md`](superpowers/specs/2026-11-20-webui-design.md)):

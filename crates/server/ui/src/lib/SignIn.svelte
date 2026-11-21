@@ -24,8 +24,9 @@
     password: "Change password",
   };
 
-  // Where no password is taken, or no user exists to have one, the token is the way in.
-  let byToken = $state(untrack(() => !$session?.password_login || $session.setup));
+  // Where no password is taken, or no user exists to have one, the token is the only way in.
+  const byPassword = $derived($session !== undefined && $session.password_login && !$session.setup);
+  let byToken = $state(untrack(() => !byPassword));
   const view = $derived(form === "sign-in" && byToken ? "token" : form);
 
   // Kept here only: they go away with the form.
@@ -92,6 +93,16 @@
       <p>No user exists yet. The first one is an administrator.</p>
     {/if}
     {#if view === "password"}
+      <!-- For password managers: whose password this is. -->
+      <input
+        class="visually-hidden"
+        type="text"
+        autocomplete="username"
+        value={$session?.user ?? ""}
+        tabindex="-1"
+        aria-hidden="true"
+        readonly
+      />
       <label>
         Current password
         <!-- svelte-ignore a11y_autofocus -->
@@ -141,7 +152,7 @@
   {/if}
 
   <div class="actions">
-    {#if form === "sign-in" && (!byToken || $session?.password_login)}
+    {#if form === "sign-in" && (!byToken || byPassword)}
       <button type="button" class="link" onclick={swap}>
         {byToken ? "Sign in with a password" : "Use the admin token"}
       </button>
