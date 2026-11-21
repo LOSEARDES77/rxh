@@ -1,5 +1,6 @@
 import { render, screen } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
+import { api, authorized } from "../lib/api";
 import { session } from "../lib/session";
 import type { History, Sample } from "../lib/stats";
 import Overview from "./Overview.svelte";
@@ -142,4 +143,16 @@ test("without_admin_no_pool_is_drawn_and_no_certificate_is_asked", async () => {
   expect(screen.queryByText(/pool/i)).toBeNull();
   // `GET certificates` is an administrator's: asking would only show a refusal.
   expect(fetch.mock.calls.map(([url]) => url)).toEqual(["stats/history"]);
+});
+
+test("a_poll_refused_while_signed_out_is_no_failure", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "sign in first" }, { status: 401 })));
+  await expect(api("status")).rejects.toMatchObject({ status: 401 });
+  const fetch = serve();
+  render(Overview);
+  await new Promise((done) => setTimeout(done, 20));
+  // The sign-in form says it; the poll asked nothing.
+  expect(fetch).not.toHaveBeenCalled();
+  expect(screen.queryByRole("alert")).toBeNull();
+  authorized();
 });

@@ -74,6 +74,16 @@ Changed.
   read-only form. The hosts list has a Groups column. A `401` at any time
   brings the sign-in form over the page and keeps what is typed in an open
   form; a refused key of a save shows its path next to the form.
+- The dashboard has a Users tab, for administrators: the users with a
+  checkbox per role, "Set password" and "Remove", "New user"; the roles with
+  their grants, "New role", "Edit" (a row per grant on a group or a host,
+  whose name is offered from the servers of the files or typed, and View,
+  Modify, Create, Delete: ticking one of the last three ticks View, Create
+  is disabled on a host) and "Remove". A refusal of the daemon is shown next
+  to its row or form, which keeps what was typed; removing, and taking
+  `admin` from oneself, ask first. A local administrator whose cookie
+  expired no longer keeps a sign-in form it cannot close, and the Overview
+  no longer reports "Signed out." while the sign-in form is up.
 - Grants on hosts: a signed-in user without the `admin` role now reads and
   changes the hosts its roles reach. `GET /config/files` gives it the
   servers it has `view` on, the names of the pools and the revision of each

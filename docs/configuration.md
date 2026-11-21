@@ -1012,7 +1012,7 @@ is. `/dashboard/` redirects to `/dashboard`.
 listen = "127.0.0.1:2019"   # then open http://127.0.0.1:2019/dashboard
 ```
 
-Five tabs:
+Six tabs (Users only for an administrator, see [Accounts](#accounts)):
 
 | Tab | Shows | Changes |
 |---|---|---|
@@ -1021,6 +1021,7 @@ Five tabs:
 | Pools | Every pool with its backends: health, state, weight, requests in flight, total requests, failures. | New pool, Edit (backends are part of the pool form), and Ready, Drain, Maintenance on each backend. |
 | Certificates | The certificates served, soonest expiry first, with listener, source, issuer and OCSP staple. | "Reload certificates" (`POST /certificates/reload`), and the `[acme]` form. |
 | Settings | The other sections (`top` level keys, `[admin]`, `[log]`, `[tracing]`, `[docker]`, `[consul]`, `[etcd]`, `[nomad]`, `[kubernetes]`), set or not, and every configuration file as text. | A form per section ("Set up" for one that is not in the file), "Save and reload" of a file edited as text, and the daemon controls: Reload, Upgrade, Stop. |
+| Users | The users of `[admin] users` with their roles, and the roles with their grants; `admin` is built in. | New user, the roles of a user (ticked, then Save), Set password, Remove; New role, Edit (a row per grant: group or host, its name chosen from the groups and host names of the servers or typed, View, Modify, Create, Delete) and Remove. |
 
 - Every key of the configuration has a field, drawn from the JSON schema
   (`GET /schema`), with the description of the key as help. The common keys
@@ -1042,6 +1043,12 @@ Five tabs:
 - Ready, Drain and Maintenance are the runtime states of
   [Draining backends and maintenance](#draining-backends-and-maintenance):
   they last "until restart" and do not change the file.
+- In Users, ticking Modify, Create or Delete on a grant ticks View, which
+  the others need; Create cannot be ticked on a host grant. A refusal of the
+  daemon (a name that is not valid, the last administrator, a role some
+  user has) is shown next to its row or form, which keeps what was typed.
+  Remove asks first, and so does an administrator taking `admin` from
+  itself: either one takes the Users tab away at once.
 - Upgrade and Stop ask to type the word `upgrade` or `stop`. After Upgrade
   the page keeps working with the new process, whose history starts empty.
   After Stop the page says the daemon was stopped and asks nothing more.

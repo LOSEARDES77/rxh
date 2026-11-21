@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "../lib/api";
+  import { ApiError, api } from "../lib/api";
   import Chart from "../lib/Chart.svelte";
   import { session } from "../lib/session";
   import Sparkline from "../lib/Sparkline.svelte";
@@ -152,7 +152,9 @@
       certificates = served;
       failure = "";
     } catch (err) {
-      failure = err instanceof Error ? err.message : String(err);
+      // Refused because signed out: the sign-in form says so, it is no failure.
+      const signedOut = err instanceof ApiError && err.status === 401;
+      failure = signedOut ? "" : err instanceof Error ? err.message : String(err);
     }
   }
 

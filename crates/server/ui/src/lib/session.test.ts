@@ -1,6 +1,7 @@
 import { get } from "svelte/store";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { serve, who, writes } from "../tabs/serve";
+import { api, authorized, needsToken } from "./api";
 import { can, changePassword, refresh, session, setup, signIn, signOut, signedIn } from "./session";
 
 beforeEach(() => {
@@ -59,4 +60,19 @@ test("can_reads_the_permissions_the_daemon_gave", () => {
   expect(can({ permissions: [] }, "view")).toBe(false);
   // Pools and sections carry none: only an administrator gets them whole.
   expect(can({}, "delete")).toBe(true);
+});
+
+test("a_session_read_that_is_somebody_clears_a_standing_401", async () => {
+  // The cookie expired: the API said 401, but the page is on the machine.
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "sign in first" }, { status: 401 })));
+  await expect(api("status")).rejects.toMatchObject({ status: 401 });
+  expect(get(needsToken)).toBe(true);
+  serve({ "auth/session": who() });
+  await refresh();
+  // Still nobody: the sign-in form stays.
+  expect(get(needsToken)).toBe(true);
+  serve({ "auth/session": who({ admin: true }) });
+  await refresh();
+  expect(get(needsToken)).toBe(false);
+  authorized();
 });

@@ -1,5 +1,5 @@
-import { writable } from "svelte/store";
-import { api, authorized, forgetToken } from "./api";
+import { get, writable } from "svelte/store";
+import { api, authorized, forgetToken, needsToken } from "./api";
 
 export type Permission = "view" | "modify" | "create" | "delete";
 
@@ -32,7 +32,10 @@ export function signedIn(who: Session | undefined): boolean {
 }
 
 export async function refresh(): Promise<void> {
-  session.set(await api<Session>("auth/session"));
+  const who = await api<Session>("auth/session");
+  session.set(who);
+  // A local administrator whose cookie expired is somebody all the same: the 401 is over.
+  if (signedIn(who) && get(needsToken)) authorized();
 }
 
 export async function signIn(name: string, password: string): Promise<void> {

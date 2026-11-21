@@ -75,7 +75,7 @@ test("the_first_run_form_shows_when_setup_is_true", async () => {
   // The API answers a local administrator without accounts: the form can wait.
   await fireEvent.click(screen.getByRole("button", { name: "Not now" }));
   expect(screen.queryByRole("heading", { name: "Create the first user" })).toBeNull();
-  expect(tabs()).toHaveLength(5);
+  expect(tabs()).toHaveLength(6);
   first.unmount();
 
   // It stays away in this browser, and nothing was created.
@@ -116,14 +116,14 @@ test("the_page_starts_where_storage_is_blocked", async () => {
   daemon(who({ admin: true, setup: true }));
   render(App);
   await fireEvent.click(await screen.findByRole("button", { name: "Not now" }));
-  expect(tabs()).toHaveLength(5);
+  expect(tabs()).toHaveLength(6);
 });
 
 test("no_form_and_no_user_menu_for_a_local_administrator", async () => {
   daemon(who({ admin: true }));
   render(App);
   await screen.findByRole("tablist");
-  expect(tabs()).toHaveLength(5);
+  expect(tabs()).toHaveLength(6);
   expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
   expect(screen.queryByRole("heading", { name: "Sign in" })).toBeNull();
 });
@@ -246,6 +246,23 @@ test("a_user_without_admin_sees_two_tabs", async () => {
   await waitFor(() => expect(asked(fetch, "stats/history")).toBe(1));
   // Nothing an administrator alone is answered.
   expect(asked(fetch, "certificates")).toBe(0);
+});
+
+test("the_tab_is_absent_without_admin", async () => {
+  location.hash = "users";
+  const { fetch } = daemon(LUIS);
+  const page = render(App);
+  await screen.findByRole("tablist");
+  expect(tabs()).not.toContain("Users");
+  expect(asked(fetch, "users")).toBe(0);
+  page.unmount();
+
+  session.set(undefined);
+  daemon(ANA);
+  render(App);
+  await screen.findByRole("tablist");
+  expect(tabs()).toContain("Users");
+  expect(screen.getByRole("tab", { name: "Users" }).getAttribute("aria-selected")).toBe("true");
 });
 
 test("sign_out_returns_to_the_sign_in_form", async () => {

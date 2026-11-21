@@ -8,6 +8,7 @@
   import Overview from "./tabs/Overview.svelte";
   import Pools from "./tabs/Pools.svelte";
   import Settings from "./tabs/Settings.svelte";
+  import Users from "./tabs/Users.svelte";
 
   // Without the `admin` role the daemon does not say where its configuration is.
   type Status = { version: string; uptime_seconds: number; config_path?: string | null };
@@ -20,6 +21,7 @@
     { id: "pools", label: "Pools", component: Pools },
     { id: "certificates", label: "Certificates", component: Certificates },
     { id: "settings", label: "Settings", component: Settings },
+    { id: "users", label: "Users", component: Users },
   ];
 
   // The other tabs read what only an administrator is answered.
