@@ -159,8 +159,7 @@ impl Access {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(format!("{}: {err}", path.display())),
         };
-        let access: Self =
-            toml::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+        let access: Self = toml::from_str(&text).map_err(|err| parse_error(path, &text, &err))?;
         access
             .validate()
             .map_err(|err| format!("{}: {err}", path.display()))?;
@@ -405,6 +404,22 @@ impl Access {
     }
 }
 
+/// Where and why the users file does not parse. Never the source line, which
+/// can hold a password hash.
+fn parse_error(path: &Path, text: &str, err: &toml::de::Error) -> String {
+    let Some(span) = err.span() else {
+        return format!("{}: {}", path.display(), err.message());
+    };
+    let before = &text[..span.start];
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |last| last.chars().count())
+        + 1;
+    format!("{}:{line}:{column}: {}", path.display(), err.message())
+}
+
 /// Whether `name` is a valid user name: a role name that may also have `.`
 /// and `@` after its first byte.
 fn is_user_name(name: &str) -> bool {
@@ -503,6 +518,9 @@ impl Scope {
 pub struct Store {
     path: PathBuf,
     cache: Mutex<Cache>,
+    /// Held through a whole change, so that changes do not interleave while
+    /// `read` never waits on a hash.
+    changes: Mutex<()>,
 }
 
 /// The last good content and the modification time last read.
@@ -523,6 +541,7 @@ impl Store {
         let store = Self {
             path,
             cache: Mutex::new(cache),
+            changes: Mutex::new(()),
         };
         store.refresh(&mut store.lock(), /* force= */ true);
         store
@@ -544,11 +563,15 @@ impl Store {
         &self,
         edit: impl FnOnce(&mut Access) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut cache = self.lock();
+        let _change = self
+            .changes
+            .lock()
+            .expect("no code panics while holding the users change lock");
         let mut access = Access::load(&self.path)?;
         let result = edit(&mut access)?;
         access.validate()?;
         access.save(&self.path)?;
+        let mut cache = self.lock();
         cache.modified = modified(&self.path);
         cache.access = access;
         Ok(result)
@@ -698,6 +721,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TempDir::new().unwrap();
+        let created = directory.path().join("created.toml");
+        sample().save(&created).unwrap();
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let path = directory.path().join("users.toml");
         fs::write(&path, "").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -706,6 +735,60 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn a_parse_error_does_not_show_the_hash() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("users.toml");
+        let hash = "$2b$04$abcdefghijklmnopqrstuuWv0tTFLmu4BUQ4ZxWXdhwPQx6a4ZJ.";
+        let broken = [
+            (
+                3,
+                format!("[[user]]\nname = \"ana\"\npassword = \"{hash}\" stray\n"),
+            ),
+            (
+                4,
+                format!("[[user]]\nname = \"ana\"\npassword = \"{hash}\"\npassword = \"{hash}\"\n"),
+            ),
+        ];
+        for (line, text) in broken {
+            fs::write(&path, text).unwrap();
+            let error = Access::load(&path).unwrap_err();
+            assert!(!error.contains("$2b$"), "{error}");
+            assert!(error.contains(&format!("users.toml:{line}:")), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_read_does_not_wait_for_a_change() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("users.toml");
+        sample().save(&path).unwrap();
+        let store = &Store::open(path);
+        let (started, has_started) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                store
+                    .change(|_| {
+                        started.send(()).unwrap();
+                        released.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            has_started.recv().unwrap();
+            let (done, read) = mpsc::channel();
+            scope.spawn(move || done.send(store.read().user.len()).unwrap());
+            let users = read.recv_timeout(Duration::from_secs(5));
+            release.send(()).unwrap();
+            assert_eq!(users, Ok(2), "the read waited for the change");
+        });
     }
 
     #[test]
