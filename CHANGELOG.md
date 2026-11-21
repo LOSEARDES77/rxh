@@ -30,7 +30,12 @@ Changed.
   without a token is local, and served, only when its connection comes from
   the machine (unix socket, loopback peer, or the machine calling its own
   address) besides the `Host` and `Origin` rule: headers alone no longer
-  decide.
+  decide. On a `listen` that is not a loopback address nobody is trusted
+  for where it connects from, since a port forwarder can make every client
+  look like the machine: every caller needs the token or a session, the
+  first user needs the setup code, the token or `rxh user add`, and the
+  `rxh` commands need `token`. A connection to the admin API has 30
+  seconds to send the head of each request.
 - Accounts on the admin API: `POST /auth/login` signs a user of the users
   file in with a session cookie (`rxh_session`, `HttpOnly`,
   `SameSite=Strict`, `Secure` over HTTPS; 12 hours, in memory),
@@ -40,8 +45,10 @@ Changed.
   for a request from the machine, or on a `tls` listener without a token
   with the setup code the daemon logs at start. Five failed sign-ins for a
   name from one address lock that pair for a minute and an address gets 10
-  attempts a minute whatever the names (`429`), at most 4 passwords are
-  checked at a time (the others wait up to 5 seconds), a cookie request that
+  attempts a minute whatever the names (`429`; an IPv6 client is its /64),
+  at most 4 passwords are checked at a time (the others wait up to 5
+  seconds, and a wait that runs out is not a failure of the name), a user
+  keeps at most 10 sessions, a cookie request that
   changes something needs an `Origin` equal to its `Host`, and sign-in,
   sign-out and setup refuse an `Origin` that is not their `Host`.
   The token and a request from the machine without a token stay
@@ -59,7 +66,11 @@ Changed.
   password is lost. The first user added gets the `admin` role; passwords
   are asked twice without echo on a terminal, or read from standard input.
   A password changed outside the daemon (`rxh user passwd`, a hand edit)
-  now ends the sessions of that user too.
+  now ends the sessions of that user too. `rxh user` reads only `[admin]
+  users` of the configuration file and replaces no placeholder, so it
+  works without the environment of the service.
+- A reload that changes any key of `[admin]` (not only `listen` and
+  `token`) says in the log that the change waits for a restart.
 - The dashboard signs in. It reads `GET /auth/session` first: where the
   caller is nobody it shows a sign-in form (name and password, or the admin
   token behind "Use the admin token"), and while no user exists the form

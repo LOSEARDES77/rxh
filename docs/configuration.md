@@ -423,9 +423,9 @@ with `ProtectSystem=strict` and no `WorkingDirectory` or `StateDirectory`:
 the daemon can write nowhere. `/etc/rxh` is readable and not writable, so
 the files that are relative to the directory of the configuration by
 default, the users file (`rxh-data/users.toml`) and the ACME storage
-(`rxh-data/certificates`), cannot be created there: creating the first user
-answers `400` with `Permission denied`, and ACME cannot keep its
-certificates. Give the service a state directory with a drop-in and put
+(`rxh-data/certificates`), cannot be created there: the file system is
+read-only for the service, so creating the first user fails (`400` with the
+error of the system) and ACME cannot keep its certificates. Give the service a state directory with a drop-in and put
 both there:
 
 ```ini
@@ -503,9 +503,10 @@ because Docker allows them in the container network namespace (not with
 applies).
 
 The images ship no configuration. Relative paths of the configuration are
-taken from its directory, `/etc/rxh`, which is mounted read-only: the
-default ACME storage (`/etc/rxh/rxh-data/certificates`) and users file
-(`/etc/rxh/rxh-data/users.toml`) cannot be written there. Point both at
+taken from its directory, `/etc/rxh`, which belongs to root in the image
+(only the configuration file is mounted into it): the user of the image
+cannot create the default ACME storage (`/etc/rxh/rxh-data/certificates`)
+and users file (`/etc/rxh/rxh-data/users.toml`) there. Point both at
 `/var/lib/rxh`, which belongs to UID 65532, and keep it on a volume:
 
 ```toml
@@ -526,11 +527,15 @@ docker kill -s HUP rxh       # reload
 ```
 
 To open the dashboard from outside the container, the admin API must listen
-on `0.0.0.0` and be published. A published port reaches the container from
-another address, so every request is remote, the host's own browser
-included: the listener needs `token` or `tls`. With `tls` and no `token`,
-the first user is created with the setup code of the log (`docker logs
-rxh`) or with `docker exec -it rxh rxh user add ana`; see
+on `0.0.0.0` and be published: the listener needs `token` or `tls`. On
+such a listener nobody is an administrator for where it connects from, not
+even a command inside the container, because some port forwarders (rootless
+Podman, `kubectl port-forward`) make every outside client arrive from the
+container's own address or from loopback. Every caller needs the token or a
+session. With `tls` and no `token`, the first user is created with the
+setup code of the log (`docker logs rxh`) or with
+`docker exec -it rxh rxh user add ana`, and `rxh status` and the other
+commands that talk to the daemon need a `token` to be set as well; see
 [Docker](guides/docker.md#the-dashboard-from-outside-the-container).
 
 The Docker provider needs the socket mounted and readable by UID 65532
@@ -541,7 +546,7 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
-| `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token` or `tls`. Changes need a restart. |
+| `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token` or `tls`, and there nobody is an administrator for where it connects from: every caller, the `rxh` commands on the machine included, needs the token or a session. Port 0 is for tests: RXH tells its own admin API from a backend by the configured port. Changes need a restart. |
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
 | `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
 | `users` | `"rxh-data/users.toml"` | File holding the user accounts and roles of the admin API. A relative path is relative to the directory of the configuration file, like `[acme] storage`, so the daemon and `rxh user` find the same file wherever they run. Must not be empty. Changes need a restart. In the container images the configuration directory is not writable: set an absolute path on the volume, `users = "/var/lib/rxh/users.toml"`. |
@@ -578,12 +583,27 @@ curl -H "Authorization: Bearer kq3Zp0uX7mV9cR2tLw8yHs4d" http://10.0.0.5:2019/st
 rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 ```
 
+- On a `listen` that is not a loopback address (`0.0.0.0` and `::`
+  included) nobody is an administrator for where it connects from. A port
+  forwarder in front of a container can connect from the container's own
+  address (rootless Podman) or from loopback (`kubectl port-forward`) for
+  every outside client, so the address of a connection proves nothing
+  there. Every caller needs the token or a session, a session needs HTTPS,
+  and the first user is created with the setup code, with the token or
+  with `rxh user add`. With `tls` and no `token`, `rxh status`, `rxh
+  reload` and the other commands that talk to the daemon get `401`: set a
+  `token` as well to use them (the CLI reads it from the configuration
+  file). `rxh user` needs none, it edits the users file. Only a listener
+  on a loopback address or a unix socket trusts the machine as described
+  below.
+
 - With `tls` the listener tells a TLS handshake from HTTP by the first byte
   of each connection, so one port answers both. HTTPS (HTTP/1.1, TLS 1.2
   and 1.3, the defaults of a server without `tls_options`) is for
   everybody. Plain HTTP is answered only to a connection from the machine
   itself; from anywhere else it is closed without an answer. So the CLI and
-  `curl` on the machine work as without `tls`:
+  `curl` on the machine reach the API as without `tls` (with the token,
+  when `listen` is not a loopback address):
 
   ```sh
   curl https://10.0.0.5:2019/status       # from anywhere: HTTPS
@@ -593,16 +613,24 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
 - A connection is from the machine when it comes over the unix socket, or
   over TCP from a loopback address or from the very address it connected to
   (the machine calling its own address). The address is the one of the
-  connection, not one a header claims. So what stands in front of the API
-  decides, not the caller behind it:
+  connection, not one a header claims. That decides whether plain HTTP is
+  answered on a `tls` listener. It makes the caller an administrator
+  without a token, lets it hold a session on plain HTTP and create the
+  first user without the setup code only when `listen` is a unix socket or
+  a loopback address. So what stands in front of the API decides, not the
+  caller behind it:
   - A reverse proxy or a tunnel on the same machine connects from loopback,
     which makes every request it forwards a request from the machine,
     wherever the caller is; most proxies also send the address they
     connect to as `Host`. Without a token that is administrator access for
     everybody who reaches the proxy: set `token` whenever a proxy on the
     machine forwards to the API.
-  - A proxy on another machine, or a port forwarder that connects from
-    another address (a published Docker port), makes every request remote.
+  - A proxy on another machine makes every request remote. A port
+    forwarder may not: a published Docker port usually arrives from the
+    bridge gateway or from the client, but rootless Podman and `kubectl
+    port-forward` connect from the container's own address or from
+    loopback. A published port needs a `listen` that is not loopback,
+    where that gives nobody anything.
   - RXH itself is such a proxy, so without a `token` it does not connect to
     its own admin API for anybody: a `forward`, pool member, health check,
     mirror, `forward_auth`, webhook or tracing endpoint that leads there is
@@ -628,7 +656,8 @@ rxh --admin 10.0.0.5:2019 --admin-token kq3Zp0uX7mV9cR2tLw8yHs4d status
     forward = "127.0.0.1:2019"
     ```
 - On a `tls` listener a connection has 10 seconds to send its first byte
-  and finish the TLS handshake, then it is closed.
+  and finish the TLS handshake, then it is closed. On every admin
+  listener a connection has 30 seconds to send the head of each request.
 - Without a token, on TCP and on a unix socket alike, a request from the
   machine is refused
   with `403` unless its `Host` is
@@ -677,13 +706,15 @@ request is the first of these that holds:
 
 1. `Authorization: Bearer <token>` equal to `[admin] token`: an
    administrator.
-2. The cookie of a session, over HTTPS or from the machine: that user,
+2. The cookie of a session, over HTTPS or from the machine on a loopback
+   or unix socket `listen`: that user,
    with the roles the users file gives the user at that moment. A user that
    was removed from the file, or whose password in the file is not the one
    it signed in with, is nobody, and the session ends.
-3. No `token` configured and a request from the machine (the rule above):
-   an administrator. This is what `rxh status` and `curl` on the machine
-   are.
+3. No `token` configured, a `listen` that is a loopback address or a unix
+   socket, and a request from the machine (the rule above): an
+   administrator. This is what `rxh status` and `curl` on the machine are.
+   On any other `listen` nobody is an administrator this way.
 4. Otherwise nobody: `401`, with `WWW-Authenticate: Bearer` when a token is
    configured.
 
@@ -692,8 +723,10 @@ token, or a user with the `admin` role) is answered by the routes of the
 admin API; any other signed-in user gets `403 {"error": "this needs the
 admin role"}` on them, except on the routes that read and change hosts, which
 answer as far as the roles of the user allow: see
-[Permissions](#permissions). `[admin] users`, like `listen`, `token` and `tls`, is
-read when the daemon starts.
+[Permissions](#permissions). `[admin] users`, like every other `[admin]`
+key, is read when the daemon starts: a reload that changes one keeps
+the running value and says `[admin] changes take effect after a restart`
+in the log.
 
 ```toml
 [admin]
@@ -738,13 +771,15 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
 - `setup` is `true` while the users file has no user. `setup_needs_code`
   says that this caller can create the first one only with the setup code.
 - `password_login` says whether `POST /auth/login` works on this
-  connection: over HTTPS, or from the machine. A password does not travel
-  in clear text over the network, so a listener without `tls` reached from
-  another machine only takes the token.
+  connection: over HTTPS, or from the machine on a loopback or unix socket
+  `listen`. A password does not travel in clear text over the network, so
+  plain HTTP to any other listener only takes the token.
 - A session is a cookie, `rxh_session`, with `HttpOnly; SameSite=Strict;
   Path=/` and, over HTTPS, `Secure`. It lasts 12 hours from the sign-in,
-  used or not. Sessions are kept in memory, at most 1000 (the oldest goes
-  first): a restart or a hot upgrade of the daemon signs everybody out.
+  used or not. Sessions are kept in memory, at most 10 for a user (its
+  own oldest goes when it signs in once more) and 1000 in all (then the
+  oldest goes): a restart or a hot upgrade of the daemon signs everybody
+  out.
 - A request with a session cookie that is not a `GET` or a `HEAD` must
   carry an `Origin` equal to its `Host`, port included, as a page of the
   dashboard does: `403` otherwise. `curl` needs `-H 'Origin: ...'` for
@@ -753,17 +788,20 @@ curl -b jar -X POST -H 'Origin: https://rxh.example.com:2019' https://rxh.exampl
   `Origin` that is not their `Host`, with or without a token, so the page
   of another site cannot sign a browser in as an account of its choice.
   Without an `Origin`, as `curl` sends them, they are answered.
-- A session exists only over HTTPS or on a connection from the machine. On
-  plain HTTP from another machine a cookie is ignored and none is given:
-  `POST /auth/setup` with the token creates the user there and signs
-  nobody in.
+- A session exists only over HTTPS, or on a connection from the machine
+  to a loopback or unix socket `listen`. On any other plain HTTP a cookie
+  is ignored and none is given: `POST /auth/setup` with the token creates
+  the user there and signs nobody in.
 - At most 4 passwords are hashed or compared at a time. A sign-in, a
   password change or a setup that comes while 4 are at it waits for its
   turn, and gets `429` when none came within 5 seconds. A sign-in that
-  waited and was refused counts as a failed one for its name.
+  waited and was refused is not a failed one for its name, whose password
+  was never compared; it is one of the attempts of its address.
 - After 5 failed sign-ins for a name from one client address, that name is
   refused from that address for a minute (`429`), with the right password
-  too. A wrong `current` in `PUT /auth/password` counts as one. A sign-in
+  too. For both limits an IPv6 client is its /64 network, not one address
+  of it, and an IPv4 address is the same client when it comes mapped in
+  IPv6. A wrong `current` in `PUT /auth/password` counts as one. A sign-in
   counts as failed until its password is found right, so more than five at
   the same time under one name from one address are refused as well.
 - One client address gets 10 sign-in attempts a minute, right or wrong and
@@ -790,7 +828,8 @@ While the users file has no user the API works as without accounts, and
 answered:
 
 - to an administrator: the holder of the token, or a request from the
-  machine when no token is set;
+  machine when no token is set and `listen` is a loopback address or a
+  unix socket;
 
   ```sh
   curl -d '{"name": "ana", "password": "correct horse"}' http://127.0.0.1:2019/auth/setup
@@ -808,7 +847,10 @@ answered:
   ```
 
 Anybody else gets `403`, and once a user exists everybody gets `409`: the
-code is of no use any more. There are no default credentials.
+code is of no use any more. There are no default credentials. On a
+`listen` that is not loopback, with `tls` and no `token`, the code is the
+only way through the API, from the machine too; `rxh user add` creates the
+first user without the API.
 
 #### From the command line
 
@@ -817,6 +859,10 @@ daemon, so it is also the way back in when every password is lost. It
 reads `[admin] users` from the configuration file (`-c`, default
 `rxh.toml`) and, like the daemon, takes a relative path from the directory
 of that file: give it the `-c` the daemon runs with, from any directory.
+It reads nothing else of the file and replaces no `{env.NAME}` or
+`{file.PATH}` placeholder, so it works from a shell that has none of the
+secrets of the service; a placeholder in `users` itself is an error, write
+the path there.
 The rules are the ones of the routes below, and their refusals are printed
 as they are.
 
@@ -928,6 +974,13 @@ A forward target is free text, so a user with `modify` may write the address
 of the admin API itself. Without `[admin] token` RXH refuses to connect
 there (see [`[admin]`](#admin)): such a host answers `502` and gives nobody
 the rights of a request from the machine.
+
+`modify` is trust over the host, not a subset of harmless keys: a user
+with it can change the matchers around an entry an administrator
+protected, so that other requests reach it or none do, and the
+verification of the upstream certificate and the health check port of a
+host whose other keys it cannot touch. Give it to people who may decide
+where the traffic of that host goes.
 
 What a signed-in user without the `admin` role gets from each route
 (`401` when signed out, as on every route):
@@ -1069,11 +1122,13 @@ manages its own hosts and nothing else.
      -keyout /etc/rxh/admin.key -out /etc/rxh/admin.pem
    ```
 
-2. **The configuration.** Without a `token`, the machine itself stays an
-   administrator (the CLI, `curl` on the machine) and everybody else signs
-   in. Put the users file where the daemon can write: next to the
-   configuration by default, which is read-only under the shipped systemd
-   unit and in the container images (see
+2. **The configuration.** On a `listen` that is not a loopback address
+   nobody is an administrator for where it connects from: everybody signs
+   in, and `rxh status`, `rxh reload` and the other commands that talk to
+   the daemon need a `token` in `[admin]` as well (leave it out if the
+   dashboard is all you use). Put the users file where the daemon can
+   write: next to the configuration by default, where it cannot under the
+   shipped systemd unit and in the container images (see
    [Running under systemd](#running-under-systemd) and
    [Running in a container](#running-in-a-container)). Give the hosts
    groups.
@@ -1095,12 +1150,11 @@ manages its own hosts and nothing else.
 
 3. **The first administrator.** At start, while the users file has no
    user, the daemon writes a setup code to its log. Open
-   `https://rxh.example.com:2019/dashboard`: from another machine the page
-   asks for a name, a password and that code; from the machine itself it
-   needs no code. Or, on the machine:
+   `https://rxh.example.com:2019/dashboard`: the page asks for a name, a
+   password and that code, from the machine too. Or, on the machine:
 
    ```sh
-   curl -k -d '{"name": "ana", "password": "correct horse"}' https://127.0.0.1:2019/auth/setup
+   curl -k -d '{"name": "ana", "password": "correct horse", "code": "k7m2xq9hpd"}' https://127.0.0.1:2019/auth/setup
    rxh -c /etc/rxh/rxh.toml user add ana     # or this, with the daemon running or not
    ```
 
@@ -1112,8 +1166,9 @@ manages its own hosts and nothing else.
    nothing else.
 
 5. **Every day.** People sign in at `/dashboard`; a session lasts 12
-   hours. `rxh status`, `rxh reload` and the other commands keep working
-   on the machine over plain HTTP on the same port. `rxh user passwd`
+   hours. With a `token` set, `rxh status`, `rxh reload` and the other
+   commands keep working on the machine over plain HTTP on the same port;
+   without one they get `401` on this listener. `rxh user passwd`
    is the way back in when a password is lost, and ends the sessions of
    that user.
 
@@ -1130,10 +1185,9 @@ What is not there:
 - **ACME or client certificates on the admin listener.** `tls` in
   `[admin]` takes files only (`"auto"` is refused); renew them with
   your own tool and `rxh cert reload`.
-- **Live changes of `[admin]`.** `listen`, `token`, `tls` and `users`
-  are read at start; a reload keeps the ones the daemon started with
-  (it says so for `listen` and `token`, and says nothing for `tls` and
-  `users`). Restart to apply them.
+- **Live changes of `[admin]`.** Every key of `[admin]` is read at
+  start; a reload keeps the ones the daemon started with and says so in
+  the log when any of them changed. Restart to apply them.
 - **Permissions on anything but hosts.** Pools, certificates, the other
   sections, whole files, reload and stop are for administrators.
 - **Groups on Kubernetes hosts.** Docker, Podman, Swarm, Consul, Nomad

@@ -293,7 +293,8 @@ there yet.
 | `PATCH` | `/config/server/{name or index}` | Merge the body into one server |
 | `POST` | `/upgrade` | Hand the listening sockets to a new process running the binary on disk (Linux) |
 | `POST` | `/stop` | Graceful shutdown |
-| `GET`, `POST` | `/auth/session`, `/auth/login`, `/auth/logout`, `/auth/setup` | Who the caller is, sign in and out (session cookie), create the first user |
+| `GET` | `/auth/session` | Who the caller is |
+| `POST` | `/auth/login`, `/auth/logout`, `/auth/setup` | Sign in and out (session cookie), create the first user |
 | `PUT` | `/auth/password` | Change one's own password |
 | `GET`, `POST`, `PUT`, `DELETE` | `/users`, `/users/{name}`, `/roles`, `/roles/{name}` | Accounts and roles, for administrators |
 
