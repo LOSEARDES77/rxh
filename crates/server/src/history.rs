@@ -225,6 +225,7 @@ mod tests {
             started: Instant::now(),
             config_path: None,
             listen: AdminListen::Tcp("127.0.0.1:0".parse().unwrap()),
+            socket: None,
             token: None,
             tls: None,
             current: std::sync::RwLock::new(Current {

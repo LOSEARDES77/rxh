@@ -24,6 +24,9 @@ pub(crate) enum ClientError {
     /// No daemon answered on the admin address.
     Unreachable(io::Error),
 
+    /// The admin socket exists but this user may not open it.
+    Denied(io::Error),
+
     /// The daemon answered with an error status.
     Api { status: StatusCode, message: String },
 
@@ -35,6 +38,11 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientError::Unreachable(err) => write!(f, "daemon is not reachable: {err}"),
+            ClientError::Denied(err) => write!(
+                f,
+                "cannot open the admin socket: {err}; add your user to its group (`sudo \
+                 usermod -aG rxh $USER`, then log in again) or use sudo"
+            ),
             ClientError::Api { status, message } => write!(f, "{message} ({status})"),
             ClientError::Protocol(message) => write!(f, "bad answer from daemon: {message}"),
         }
@@ -66,6 +74,10 @@ impl AdminClient {
         self.request(Method::POST, path, body).await
     }
 
+    pub(crate) async fn put(&self, path: &str, body: Value) -> Result<Value, ClientError> {
+        self.request(Method::PUT, path, Some(body)).await
+    }
+
     pub(crate) async fn delete(&self, path: &str, body: Value) -> Result<Value, ClientError> {
         self.request(Method::DELETE, path, Some(body)).await
     }
@@ -90,6 +102,10 @@ impl AdminClient {
         let (status, bytes) = self.timed(method, path, body).await?;
         if !status.is_success() {
             return Err(api_error(status, &bytes));
+        }
+        // `204 No Content` and the like.
+        if bytes.is_empty() {
+            return Ok(Value::Null);
         }
         serde_json::from_slice(&bytes)
             .map_err(|err| ClientError::Protocol(format!("invalid JSON: {err}")))
@@ -122,9 +138,13 @@ impl AdminClient {
             }
             #[cfg(unix)]
             AdminListen::Unix(socket) => {
-                let stream = tokio::net::UnixStream::connect(socket)
-                    .await
-                    .map_err(ClientError::Unreachable)?;
+                let stream =
+                    tokio::net::UnixStream::connect(socket)
+                        .await
+                        .map_err(|err| match err.kind() {
+                            io::ErrorKind::PermissionDenied => ClientError::Denied(err),
+                            _ => ClientError::Unreachable(err),
+                        })?;
                 self.exchange(stream, "localhost", method, path, body).await
             }
             #[cfg(not(unix))]

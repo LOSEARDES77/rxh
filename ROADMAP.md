@@ -183,6 +183,9 @@ goal of this milestone is to close most of that gap and to keep it closed.
       `rxh user`. The bearer token and the CLI keep working.
 - [x] Sign-in through one OIDC provider (`[admin.oidc]`), roles from a
       claim of the provider.
+- [x] The packaged service writes its own configuration: root in a systemd
+      sandbox, the dashboard on port 81, and `rxh` commands of the group
+      `rxh` sent to the daemon over `[admin] socket`.
 
 ## 1.0: stable
 

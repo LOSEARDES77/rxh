@@ -1,10 +1,19 @@
 # Configuration of the rxh service installed by the packages. With no
-# [[server]] the daemon only runs the admin API on http://127.0.0.1:2019,
-# where `rxh status` and `rxh upstream` reach it.
+# [[server]] the daemon only runs the admin API: the dashboard on
+# http://127.0.0.1:81/dashboard, and the socket `rxh status`, `rxh upstream`
+# and the other commands reach it on.
 #
-# Add servers here and apply them with `systemctl reload rxh`. Reference:
+# Add servers here, or with `rxh service add`, and apply them with
+# `systemctl reload rxh`. Reference:
 # https://github.com/LOSEARDES77/rxh/blob/main/docs/configuration.md
-#
+
+# The members of the group rxh manage the daemon through the socket, without
+# a password: like the docker group, that is as good as root. Anybody else
+# signs in to the dashboard. The Homebrew formula removes this table.
+[admin]
+listen = "127.0.0.1:81"
+socket = "/run/rxh/admin.sock"
+
 # [[server]]
 # name = "app"
 # listen = "0.0.0.0:80"

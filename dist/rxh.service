@@ -1,9 +1,19 @@
 # systemd unit. Install with:
 #   sudo install -Dm755 target/release/rxh /usr/local/bin/rxh
 #   sudo install -Dm644 dist/rxh.service /etc/systemd/system/rxh.service
-#   sudo install -Dm644 rxh.toml /etc/rxh/rxh.toml
-#   sudo systemctl enable --now rxh
-# Manage it with `rxh status`, `rxh upstream add ...` and `systemctl reload rxh`.
+#   sudo install -Dm644 dist/rxh.sysusers /etc/sysusers.d/rxh.conf
+#   sudo install -Dm644 dist/rxh.toml /etc/rxh/rxh.toml
+#   sudo systemd-sysusers && sudo systemctl enable --now rxh
+#   sudo usermod -aG rxh $USER   # rxh commands without sudo; log in again
+# Manage it with `rxh status`, `rxh service add ...` and the dashboard on
+# http://127.0.0.1:81/dashboard.
+#
+# The daemon runs as root, like the master process of nginx, so that it
+# writes its configuration (dashboard, `rxh service add`) and reads
+# certificates that belong to root. The sandbox keeps the rest away: it has
+# no capability but binding ports below 1024, so root can only read and
+# write files that root owns, and it writes /etc/rxh alone. The admin socket
+# belongs to the group rxh (dist/rxh.sysusers).
 #
 # rxh tells systemd when it is ready and when a reload starts and ends
 # (sd_notify), so `systemctl start` and `systemctl reload` return once the
@@ -23,9 +33,12 @@ Wants=network-online.target
 Type=notify-reload
 ExecStart=/usr/local/bin/rxh run --config /etc/rxh/rxh.toml
 Restart=on-failure
-DynamicUser=yes
+Group=rxh
 ConfigurationDirectory=rxh
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+RuntimeDirectory=rxh
+RuntimeDirectoryMode=0750
+ReadWritePaths=/etc/rxh
+InaccessiblePaths=-/etc/shadow -/etc/gshadow -/etc/sudoers -/etc/sudoers.d -/etc/ssh -/root
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict

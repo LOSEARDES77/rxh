@@ -610,6 +610,10 @@ async fn status_and_listings_render_tables() {
     );
     assert!(status.contains(&format!("admin {admin}")), "{status}");
     assert!(
+        status.contains(&format!("dashboard http://{admin}/dashboard")),
+        "{status}"
+    );
+    assert!(
         status.contains("config ") && status.contains("rxh.toml"),
         "{status}"
     );
@@ -2463,4 +2467,123 @@ async fn upgrade_of_a_background_daemon_keeps_its_pid_file_and_admin_socket() {
 
     assert_success(&cli(&["stop"]));
     wait_for_exit(second).await;
+}
+
+/// With `[admin] socket`, the CLI reaches the daemon there, and the daemon
+/// writes the configuration and the users file: the CLI never needs to
+/// write them itself.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_go_through_the_daemon_over_the_admin_socket() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::mpsc;
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let dir = directory.path();
+    let admin = free_address();
+    let socket = dir.join("rxh.sock");
+    std::fs::write(
+        dir.join("rxh.toml"),
+        format!(
+            "[admin]\nlisten = \"{admin}\"\nsocket = \"{}\"\n",
+            socket.display()
+        ),
+    )
+    .expect("write config");
+    let mut daemon = Daemon(
+        Command::new(RXH)
+            .current_dir(dir)
+            .env_remove("RXH_ADMIN")
+            .env_remove("RXH_ADMIN_TOKEN")
+            .env_remove("RXH_CONFIG")
+            .args(["run", "--config", "rxh.toml"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon starts"),
+    );
+    let (lines, log) = mpsc::channel();
+    let output = BufReader::new(daemon.0.stdout.take().expect("stdout"));
+    std::thread::spawn(move || {
+        for line in output.lines().map_while(Result::ok) {
+            let _ = lines.send(line);
+        }
+    });
+    let mut seen: Vec<String> = Vec::new();
+    let mut wait_for = |text: &str| {
+        while !seen.iter().any(|line| line.contains(text)) {
+            let line = log
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("the log says {text:?}, it said {seen:#?}"));
+            seen.push(line);
+        }
+    };
+    wait_for("API listening on unix socket");
+    wait_for(&format!("Dashboard on http://{admin}/dashboard"));
+
+    // No `--admin`: the CLI finds the socket in the configuration file.
+    let status = assert_success(&rxh_bare(dir, &["status"]));
+    assert!(status.contains(&format!("admin {admin}")), "{status}");
+
+    let output = rxh_bare(dir, &["pool", "add", "api", "--backend", "127.0.0.1:9"]);
+    let printed = assert_success(&output);
+    assert!(printed.contains("Created pool api in "), "{printed}");
+    wait_for("Admin => Created pool api in ");
+    let config = std::fs::read_to_string(dir.join("rxh.toml")).expect("read");
+    assert!(config.contains("[upstream.api]"), "{config}");
+
+    let mut add = Command::new(RXH)
+        .current_dir(dir)
+        .env_remove("RXH_ADMIN")
+        .env_remove("RXH_ADMIN_TOKEN")
+        .env_remove("RXH_CONFIG")
+        .args(["user", "add", "ana"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("rxh runs");
+    add.stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"password-ana\n")
+        .expect("write");
+    assert_success(&add.wait_with_output().expect("rxh ends"));
+    wait_for("Admin => User ana created by local");
+    let users = assert_success(&rxh_bare(dir, &["user", "list"]));
+    assert_eq!(users, "ana admin\n");
+}
+
+/// A user who may not open the admin socket is told how to get access,
+/// instead of a failed write of the files.
+#[cfg(unix)]
+#[test]
+fn a_socket_this_user_may_not_open_says_how_to_get_access() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let socket = directory.path().join("rxh.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        eprintln!("skipped: this user opens any socket (root)");
+        return;
+    }
+    let admin = format!("unix/{}", socket.display());
+    let output = rxh_bare(
+        directory.path(),
+        &[
+            "--admin",
+            &admin,
+            "pool",
+            "add",
+            "api",
+            "--backend",
+            "127.0.0.1:9",
+        ],
+    );
+    let stderr = assert_failure(&output);
+    assert!(stderr.contains("cannot open the admin socket"), "{stderr}");
+    assert!(stderr.contains("usermod -aG rxh"), "{stderr}");
+    assert!(!directory.path().join("rxh.toml").exists(), "{stderr}");
 }

@@ -89,6 +89,8 @@ fn stage_lays_out_the_archive() {
         "README.md",
         "systemd/rxh.service",
         "systemd/rxh.socket",
+        "systemd/rxh.sysusers",
+        "postinstall.sh",
         "man/rxh.1",
         "man/rxh-run.1",
         "man/rxh-upstream-add.1",
@@ -109,6 +111,44 @@ fn stage_lays_out_the_archive() {
     let service = fs::read_to_string(stage.join("systemd/rxh.service")).unwrap();
     assert!(service.contains("\nExecStart=/usr/bin/rxh run --config /etc/rxh/rxh.toml\n"));
     assert!(!service.contains("/usr/local"));
+}
+
+/// The service runs as root in a sandbox where it writes /etc/rxh alone,
+/// with the group rxh that the packages create and the admin socket uses.
+#[test]
+fn the_service_writes_its_configuration_and_shares_the_socket_with_a_group() {
+    let service = fs::read_to_string(dist("rxh.service")).unwrap();
+    for line in [
+        "Group=rxh",
+        "RuntimeDirectory=rxh",
+        "RuntimeDirectoryMode=0750",
+        "ReadWritePaths=/etc/rxh",
+        "ProtectSystem=strict",
+        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+        "NoNewPrivileges=yes",
+    ] {
+        assert!(service.contains(&format!("\n{line}\n")), "{line}");
+    }
+    assert!(
+        !service.contains("DynamicUser"),
+        "a dynamic user cannot write /etc/rxh"
+    );
+    assert!(
+        service.contains("\nInaccessiblePaths=-/etc/shadow "),
+        "{service}"
+    );
+    let sysusers = fs::read_to_string(dist("rxh.sysusers")).unwrap();
+    assert!(sysusers.lines().any(|line| line == "g rxh -"), "{sysusers}");
+
+    // The socket of the package configuration is in the runtime directory.
+    let config =
+        rxh_core::config::Config::from_toml(&fs::read_to_string(dist("rxh.toml")).unwrap())
+            .expect("valid");
+    assert_eq!(config.admin.listen.to_string(), "127.0.0.1:81");
+    assert_eq!(
+        config.admin.socket.as_deref(),
+        Some(Path::new("/run/rxh/admin.sock"))
+    );
 }
 
 #[test]
@@ -213,6 +253,7 @@ fn pkgbuild_installs_the_archive() {
         "etc/rxh/rxh.toml",
         "usr/lib/systemd/system/rxh.service",
         "usr/lib/systemd/system/rxh.socket",
+        "usr/lib/sysusers.d/rxh.conf",
         "usr/share/man/man1/rxh.1",
         "usr/share/man/man1/rxh-run.1",
         "usr/share/bash-completion/completions/rxh",
@@ -256,6 +297,24 @@ fn homebrew_formula_has_every_target() {
     let (macos, linux) = formula.split_once("on_linux do").unwrap();
     assert!(macos.contains("apple-darwin") && !macos.contains("linux-musl"));
     assert!(linux.contains("linux-musl") && !linux.contains("apple-darwin"));
+
+    // The formula removes the [admin] table of the systemd service: the
+    // text its pattern starts and ends at is in the package configuration.
+    assert!(
+        formula.contains(
+            "inreplace \"rxh.toml\", /^# The members of the group rxh.*?^socket = \"[^\"]*\"\\n\\n/m, \"\""
+        ),
+        "{formula}"
+    );
+    let config = fs::read_to_string(dist("rxh.toml")).unwrap();
+    let (_, table) = config
+        .split_once("\n# The members of the group rxh")
+        .expect("the comment the pattern starts at");
+    let (table, rest) = table
+        .split_once("\nsocket = \"/run/rxh/admin.sock\"\n\n")
+        .expect("the line the pattern ends at");
+    assert!(table.contains("\n[admin]\n"), "{table}");
+    assert!(!rest.contains("[admin]"), "{rest}");
 }
 
 #[test]

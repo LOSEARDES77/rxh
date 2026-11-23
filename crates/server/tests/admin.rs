@@ -60,6 +60,7 @@ async fn routes_answer_with_status_codes_and_json() {
         assert_eq!(json["version"], rxh_server::VERSION);
         assert_eq!(json["pid"], std::process::id());
         assert_eq!(json["admin"], admin.to_string());
+        assert_eq!(json["dashboard"], format!("http://{admin}/dashboard"));
         assert!(
             json["config_path"]
                 .as_str()
@@ -709,6 +710,16 @@ async fn dashboard_is_a_page_served_to_local_browsers_only() {
         assert_eq!(status, StatusCode::OK, "{route}");
     }
 
+    // A browser opening the address lands on the page; the CLI and `curl`
+    // still get the status there.
+    let browser = [(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")];
+    let (status, headers, _) = call(admin, Method::GET, "/", "", &browser).await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(headers[header::LOCATION], "/dashboard");
+    let (status, json) = get(admin, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["version"], rxh_server::VERSION);
+
     // The page is read only, and so is its route.
     let (status, _) = send(admin, Method::POST, "/dashboard", "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -973,6 +984,57 @@ mod unix_socket {
             (header::ORIGIN, "https://other.example.com"),
         ];
         let (status, _) = call_unix(&socket, Method::GET, "/status", &remote).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_a_socket_only_the_socket_is_an_administrator() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let socket = directory.path().join("rxh.sock");
+        let admin = free_address();
+        let config = Config::from_toml(&format!(
+            "[admin]\nlisten = \"{admin}\"\nsocket = \"{}\"\nusers = \"{}\"\n",
+            socket.display(),
+            directory.path().join("users.toml").display(),
+        ))
+        .expect("valid");
+        let _daemon = tokio::task::spawn(Daemon::from_config(config).run());
+        util::eventually(async || UnixStream::connect(&socket).await.is_ok()).await;
+
+        // The group of the daemon may open it.
+        let metadata = fs::metadata(&socket).expect("socket file");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+
+        // Any user of the machine reaches the TCP port: it signs in.
+        let (status, json) = get(admin, "/config").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        let (status, _) = call_unix(&socket, Method::GET, "/config", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The first user needs the setup code over TCP, which the daemon
+        // logs; over the socket an administrator creates it.
+        let body = r#"{"name": "admin", "password": "correct horse"}"#;
+        let (status, json) = send(admin, Method::POST, "/auth/setup", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        let (status, json) = send(
+            admin,
+            Method::POST,
+            "/auth/setup",
+            r#"{"name": "admin", "password": "correct horse", "code": "wrong"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        let stream = UnixStream::connect(&socket).await.expect("socket accepts");
+        let (status, _, json) =
+            call_on(stream, "localhost", Method::POST, "/auth/setup", body, &[]).await;
+        assert!(status.is_success(), "{status}: {json}");
+
+        // The user signs in on the TCP port and is an administrator there.
+        let (status, headers, _) = util::admin::sign_in(admin, "admin", "correct horse").await;
+        assert!(status.is_success(), "{status}");
+        let cookie = util::admin::session_cookie(&headers);
+        let (status, _, _) =
+            util::admin::call_with_cookie(admin, &cookie, Method::GET, "/config", "").await;
         assert_eq!(status, StatusCode::OK);
     }
 

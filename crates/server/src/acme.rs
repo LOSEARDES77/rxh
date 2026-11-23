@@ -999,7 +999,9 @@ fn bind_exclusive(address: SocketAddr) -> io::Result<TcpListener> {
     // Only lets the port be rebound while old connections are in TIME_WAIT.
     #[cfg(not(windows))]
     socket.set_reuseaddr(true)?;
-    socket.bind(address)?;
+    socket
+        .bind(address)
+        .map_err(|err| crate::server::listen_error(address, err))?;
     socket.listen(128)
 }
 

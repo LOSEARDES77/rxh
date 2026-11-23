@@ -399,6 +399,7 @@ impl Daemon {
                 .config_path()
                 .and_then(|path| std::fs::canonicalize(path).ok()),
             listen: admin_settings.listen.clone(),
+            socket: admin_settings.socket.clone(),
             token: admin_settings.token.clone(),
             tls: admin_tls,
             current: RwLock::new(generation.current()),
@@ -421,10 +422,15 @@ impl Daemon {
                 )
             })?;
             match &admin_settings.listen {
-                AdminListen::Tcp(address) if admin_state.tls.is_some() => {
-                    println!("Admin => API listening on https://{address}");
+                AdminListen::Tcp(address) => {
+                    let scheme = if admin_state.tls.is_some() {
+                        "https"
+                    } else {
+                        "http"
+                    };
+                    println!("Admin => API listening on {scheme}://{address}");
+                    println!("Admin => Dashboard on {scheme}://{address}/dashboard");
                 }
-                AdminListen::Tcp(address) => println!("Admin => API listening on http://{address}"),
                 AdminListen::Unix(path) => {
                     println!("Admin => API listening on unix socket {}", path.display());
                 }
@@ -432,10 +438,16 @@ impl Daemon {
             if admin::announces_setup_code(
                 admin_state.tls.is_some(),
                 admin_state.token.is_some(),
+                admin_state.socket.is_some(),
                 !admin_state.access.read().user.is_empty(),
             ) {
+                let over = if admin_state.tls.is_some() {
+                    "HTTPS"
+                } else {
+                    "the dashboard"
+                };
                 println!(
-                    "Admin => no user exists yet; to create the first one over HTTPS use the \
+                    "Admin => no user exists yet; to create the first one over {over} use the \
                      setup code {}",
                     admin_state.sessions.setup_code()
                 );
@@ -445,6 +457,23 @@ impl Daemon {
             Some((AbortOnDrop(tokio::task::spawn(task)), lease))
         } else {
             None
+        };
+
+        // Served by the same state: only who may open the file connects.
+        let admin_socket: Option<(AbortOnDrop, Lease)> = match &admin_settings.socket {
+            Some(path) if admin_settings.enabled => {
+                let listener = admin::Listener::bind_socket(path).await.map_err(|err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!("admin socket {}: {err}", path.display()),
+                    )
+                })?;
+                println!("Admin => API listening on unix socket {}", path.display());
+                let lease = listener.lease()?;
+                let task = admin::serve(listener, Arc::clone(&admin_state));
+                Some((AbortOnDrop(tokio::task::spawn(task)), lease))
+            }
+            Some(_) | None => None,
         };
 
         systemd::warn_unused();
@@ -570,6 +599,7 @@ impl Daemon {
                             // to the new process alone while this one
                             // drains. Requests in flight still get answers.
                             drop(admin_listener);
+                            drop(admin_socket);
                             // The UDP sockets are not handed over: requests
                             // in flight over HTTP/3 fail and clients retry.
                             endpoints.close();
@@ -1106,6 +1136,7 @@ forward = "@api"
                 started: Instant::now(),
                 config_path: None,
                 listen: "127.0.0.1:0".parse().expect("address"),
+                socket: None,
                 token: None,
                 tls: None,
                 current: RwLock::new(generation.current()),

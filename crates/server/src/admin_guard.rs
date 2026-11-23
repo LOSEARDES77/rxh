@@ -8,24 +8,29 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rxh_core::config::{Admin, AdminListen};
 
-/// The admin listener upstream connections must not reach, if there is one.
+/// The admin listeners upstream connections must not reach, if there are
+/// any.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AdminGuard {
     listen: Option<AdminListen>,
+    /// `[admin] socket`.
+    socket: Option<PathBuf>,
 }
 
 impl AdminGuard {
-    /// Guard for the `[admin]` table in force: its listener when the API is
+    /// Guard for the `[admin]` table in force: its listeners when the API is
     /// enabled without a token, nothing otherwise.
     pub(crate) fn new(admin: &Admin) -> Self {
+        let guarded = admin.enabled && admin.token.is_none();
         Self {
-            listen: (admin.enabled && admin.token.is_none()).then(|| admin.listen.clone()),
+            listen: guarded.then(|| admin.listen.clone()),
+            socket: admin.socket.clone().filter(|_| guarded),
         }
     }
 
@@ -38,13 +43,18 @@ impl AdminGuard {
         }
     }
 
-    /// True if `path` is the guarded unix socket, under this or another
-    /// name (symbolic or hard link).
+    /// True if `path` is a guarded unix socket, under this or another name
+    /// (symbolic or hard link).
     pub(crate) fn is_socket(&self, path: &Path) -> bool {
-        let Some(AdminListen::Unix(admin)) = &self.listen else {
-            return false;
+        let listen = match &self.listen {
+            Some(AdminListen::Unix(admin)) => Some(admin),
+            Some(AdminListen::Tcp(_)) | None => None,
         };
-        path == admin || same_file(path, admin)
+        let sockets = [listen, self.socket.as_ref()];
+        sockets
+            .into_iter()
+            .flatten()
+            .any(|admin| path == admin || same_file(path, admin))
     }
 }
 
@@ -258,5 +268,20 @@ mod tests {
         assert!(guard.is_socket(&link));
         assert!(!guard.is_socket(&other));
         assert!(!AdminGuard::default().is_socket(&socket));
+
+        // `[admin] socket` is guarded beside a TCP listen, unless a token
+        // is the check.
+        let beside = Admin {
+            socket: Some(socket.clone()),
+            ..Admin::default()
+        };
+        assert!(AdminGuard::new(&beside).is_socket(&socket));
+        assert!(AdminGuard::new(&beside).is_socket(&link));
+        assert!(!AdminGuard::new(&beside).is_socket(&other));
+        let with_token = Admin {
+            token: Some("0123456789abcdef".to_owned()),
+            ..beside
+        };
+        assert!(!AdminGuard::new(&with_token).is_socket(&socket));
     }
 }

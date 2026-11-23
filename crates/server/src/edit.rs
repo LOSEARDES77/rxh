@@ -7,10 +7,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use rxh_core::config::{Config, Policy};
+use serde::{Deserialize, Serialize};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
 /// New pool definition.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolSpec {
     /// Load balancing policy, as written in `policy`.
     pub policy: String,
@@ -29,12 +31,13 @@ pub struct PoolSpec {
 }
 
 /// New service definition.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceSpec {
     /// Listen addresses.
     pub listen: Vec<SocketAddr>,
     /// `http`, `tcp` or `udp`; `http` is left implicit.
-    pub protocol: &'static str,
+    pub protocol: String,
     /// Forward targets: addresses or `@pool`.
     pub to: Vec<String>,
     /// Directory served as static files instead of forwarding.
@@ -287,7 +290,7 @@ impl ConfigFile {
         let listen: Vec<String> = spec.listen.iter().map(ToString::to_string).collect();
         server.insert("listen", strings(&listen));
         if spec.protocol != "http" {
-            server.insert("protocol", value(spec.protocol));
+            server.insert("protocol", value(&spec.protocol));
         }
         match spec.host.as_slice() {
             [] => {}
@@ -547,6 +550,220 @@ fn service_matches(server: &Table, service: &str) -> bool {
     }
 }
 
+/// A change of `rxh pool`, `rxh service` or `rxh upstream`. The CLI sends it
+/// to the daemon (`POST /config/edit`), which may write files the user of
+/// the CLI cannot, or applies it itself when no daemon runs.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Edit {
+    /// Adds a backend to the pool, in the file that defines it.
+    AddBackend {
+        /// Name of the pool.
+        pool: String,
+        /// Address of the backend.
+        address: String,
+        /// Weight of the backend.
+        weight: u32,
+    },
+    /// Removes a backend from the pool, in the file that defines it.
+    RemoveBackend {
+        /// Name of the pool.
+        pool: String,
+        /// Address of the backend.
+        address: String,
+    },
+    /// Adds a pool to the main file, or to `file`.
+    AddPool {
+        /// Name of the pool.
+        name: String,
+        /// The pool.
+        spec: PoolSpec,
+        /// File to write instead of the main one, see [`WriteTarget`].
+        #[serde(default)]
+        file: Option<PathBuf>,
+    },
+    /// Removes a pool from the file that defines it.
+    RemovePool {
+        /// Name of the pool.
+        name: String,
+    },
+    /// Adds a service to the main file, or to `file`.
+    AddService {
+        /// The service.
+        spec: ServiceSpec,
+        /// File to write instead of the main one, see [`WriteTarget`].
+        #[serde(default)]
+        file: Option<PathBuf>,
+    },
+    /// Removes the services named or listening on `service`, from the first
+    /// file that has some.
+    RemoveService {
+        /// Name or listen address.
+        service: String,
+    },
+}
+
+impl Edit {
+    /// Applies the change to the configuration that starts at `main` and
+    /// saves it, validated as a whole. Answers what was done, for the user.
+    pub fn apply(&self, main: &Path) -> Result<String, SaveError> {
+        let invalid = SaveError::Invalid;
+        match self {
+            Self::AddBackend {
+                pool,
+                address,
+                weight,
+            } => {
+                let mut file = file_defining_pool(main, pool).map_err(invalid)?;
+                file.add_backend(pool, address, *weight).map_err(invalid)?;
+                try_save_all(&[&file], main)?;
+                Ok(format!(
+                    "Saved {address} to pool {pool} in {}",
+                    file.path().display()
+                ))
+            }
+            Self::RemoveBackend { pool, address } => {
+                let mut file = file_defining_pool(main, pool).map_err(invalid)?;
+                file.remove_backend(pool, address).map_err(invalid)?;
+                try_save_all(&[&file], main)?;
+                Ok(format!(
+                    "Removed {address} from pool {pool} in {}",
+                    file.path().display()
+                ))
+            }
+            Self::AddPool { name, spec, file } => {
+                let mut write = WriteTarget::open(main, file.as_deref()).map_err(invalid)?;
+                write.target.add_pool(name, spec).map_err(invalid)?;
+                write.save()?;
+                Ok(format!(
+                    "Created pool {name} in {}. Use it with `forward = \"@{name}\"`",
+                    write.target.path().display()
+                ))
+            }
+            Self::RemovePool { name } => {
+                let mut file = file_defining_pool(main, name).map_err(invalid)?;
+                file.remove_pool(name).map_err(invalid)?;
+                try_save_all(&[&file], main)?;
+                Ok(format!(
+                    "Deleted pool {name} from {}",
+                    file.path().display()
+                ))
+            }
+            Self::AddService { spec, file } => {
+                let mut write = WriteTarget::open(main, file.as_deref()).map_err(invalid)?;
+                write.target.add_service(spec).map_err(invalid)?;
+                write.save()?;
+                Ok(format!(
+                    "Added service to {}",
+                    write.target.path().display()
+                ))
+            }
+            Self::RemoveService { service } => {
+                for path in config_files(main).map_err(invalid)? {
+                    let mut file = ConfigFile::open(&path).map_err(invalid)?;
+                    let Ok(removed) = file.remove_service(service) else {
+                        continue;
+                    };
+                    try_save_all(&[&file], main)?;
+                    return Ok(format!(
+                        "Removed {removed} service(s) from {}",
+                        file.path().display()
+                    ));
+                }
+                Err(invalid(format!(
+                    "no service named or listening on {service}"
+                )))
+            }
+        }
+    }
+}
+
+/// The main file followed by the files it includes. Just the main file when
+/// it does not exist yet.
+pub fn config_files(main: &Path) -> Result<Vec<PathBuf>, String> {
+    if !main.exists() {
+        return Ok(vec![main.to_owned()]);
+    }
+    crate::config_files(main).map_err(|err| err.to_string())
+}
+
+/// The file that defines pool `name`.
+fn file_defining_pool(main: &Path, name: &str) -> Result<ConfigFile, String> {
+    for path in config_files(main)? {
+        let file = ConfigFile::open(&path)?;
+        if file.defines_pool(name) {
+            return Ok(file);
+        }
+    }
+    Err(format!(
+        "pool {name} is not defined in {} or its included files; create it with `rxh pool add {name}`",
+        main.display()
+    ))
+}
+
+/// Where a new pool or service is written: the main file, or another file
+/// (`--file`), relative to the directory of the main one, which is added to
+/// its `include` when no entry covers it yet.
+struct WriteTarget {
+    main: PathBuf,
+    target: ConfigFile,
+    /// The main file with a new `include` entry, when `file` is not
+    /// covered by it yet.
+    main_file: Option<ConfigFile>,
+}
+
+impl WriteTarget {
+    fn open(main: &Path, file: Option<&Path>) -> Result<Self, String> {
+        let Some(file) = file else {
+            return Ok(Self {
+                main: main.to_owned(),
+                target: ConfigFile::open(main)?,
+                main_file: None,
+            });
+        };
+        let directory = main.parent().unwrap_or(Path::new(""));
+        let path = directory.join(file);
+        let canonical = |path: &Path| fs::canonicalize(path).unwrap_or(path.to_owned());
+        let target = canonical(&path);
+        if target == canonical(main) {
+            return Self::open(main, None);
+        }
+
+        let mut main_file = None;
+        let patterns = ConfigFile::open(main)?.includes();
+        let covered = crate::include_covers(main, &patterns, &path)
+            || config_files(main)?
+                .iter()
+                .any(|existing| canonical(existing) == target);
+        if !covered {
+            let base = canonical(if directory.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                directory
+            });
+            let entry = if file.is_absolute() {
+                target.strip_prefix(&base).unwrap_or(file)
+            } else {
+                file
+            };
+            let mut main_edit = ConfigFile::open(main)?;
+            main_edit.add_include(&entry.to_string_lossy())?;
+            main_file = Some(main_edit);
+        }
+        Ok(Self {
+            main: main.to_owned(),
+            target: ConfigFile::open(&path)?,
+            main_file,
+        })
+    }
+
+    fn save(&self) -> Result<(), SaveError> {
+        let mut files = vec![&self.target];
+        files.extend(self.main_file.as_ref());
+        try_save_all(&files, &self.main).map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,7 +838,7 @@ forward = "@api"
 
         file.add_service(&ServiceSpec {
             listen: vec!["127.0.0.1:5432".parse().unwrap()],
-            protocol: "tcp",
+            protocol: String::from("tcp"),
             to: vec![String::from("@db")],
             name: Some(String::from("postgres")),
             ..ServiceSpec::default()
@@ -656,7 +873,7 @@ forward = "@api"
         .unwrap();
         file.add_service(&ServiceSpec {
             listen: vec!["127.0.0.1:9000".parse().unwrap()],
-            protocol: "http",
+            protocol: String::from("http"),
             to: vec![String::from("@api")],
             ..ServiceSpec::default()
         })
@@ -809,7 +1026,7 @@ forward = "@api"
         let mut file = ConfigFile::from_text("");
         file.add_service(&ServiceSpec {
             listen: vec!["127.0.0.1:9000".parse().unwrap()],
-            protocol: "http",
+            protocol: String::from("http"),
             to: vec![String::from("a:1")],
             host: vec![String::from("a.test"), String::from("*.b.test")],
             ..ServiceSpec::default()
@@ -818,5 +1035,161 @@ forward = "@api"
         let text = file.document.to_string();
         let config = Config::from_toml(&text).unwrap_or_else(|err| panic!("{err}\n{text}"));
         assert_eq!(config.servers[0].host, ["a.test", "*.b.test"]);
+    }
+
+    fn pool_spec(backend: &str) -> PoolSpec {
+        PoolSpec {
+            policy: String::from("random"),
+            backends: vec![backend.to_owned()],
+            ..PoolSpec::default()
+        }
+    }
+
+    fn saved_message(err: SaveError) -> String {
+        match err {
+            SaveError::Invalid(message) | SaveError::Io(message) => message,
+        }
+    }
+
+    #[test]
+    fn file_covered_by_a_glob_is_not_added_to_include() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("rxh.toml");
+        fs::write(&main, "include = [\"conf.d/*.toml\"]\n").expect("write");
+
+        let mut write =
+            WriteTarget::open(&main, Some(Path::new("conf.d/new.toml"))).expect("opens");
+        assert!(write.main_file.is_none(), "covered by the glob");
+        write
+            .target
+            .add_pool("api", &pool_spec("127.0.0.1:1"))
+            .expect("adds");
+        write.save().map_err(saved_message).expect("saves");
+        assert_eq!(
+            fs::read_to_string(&main).expect("read"),
+            "include = [\"conf.d/*.toml\"]\n"
+        );
+
+        let write = WriteTarget::open(&main, Some(Path::new("other/new.toml"))).expect("opens");
+        assert!(write.main_file.is_some(), "not covered");
+    }
+
+    #[test]
+    fn failed_validation_restores_every_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("rxh.toml");
+        let main_text = "# keep me\ninclude = [\"conf.d/*.toml\"]\n";
+        let api_text = "[upstream.api]\nbackends = [\"127.0.0.1:1\"]\n";
+        fs::write(&main, main_text).expect("write");
+        fs::create_dir(dir.path().join("conf.d")).expect("mkdir");
+        fs::write(dir.path().join("conf.d/api.toml"), api_text).expect("write");
+
+        // `api` is already defined in conf.d/api.toml, so the merge fails.
+        let change = Edit::AddPool {
+            name: String::from("api"),
+            spec: pool_spec("127.0.0.1:2"),
+            file: Some(PathBuf::from("extra/dup.toml")),
+        };
+        let err = change.apply(&main).expect_err("duplicate pool");
+        assert!(matches!(err, SaveError::Invalid(_)), "{err:?}");
+        let err = saved_message(err);
+        assert!(err.contains("pool api"), "{err}");
+        assert!(!err.contains("rollback failed"), "{err}");
+
+        assert_eq!(fs::read_to_string(&main).expect("read"), main_text);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("conf.d/api.toml")).expect("read"),
+            api_text
+        );
+        assert!(
+            !dir.path().join("extra").exists(),
+            "created directory removed"
+        );
+    }
+
+    #[test]
+    fn missing_main_file_is_its_own_only_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("absent.toml");
+        assert_eq!(config_files(&main).expect("no error"), [main.as_path()]);
+
+        let Err(err) = file_defining_pool(&main, "api") else {
+            panic!("no file defines pool api");
+        };
+        assert!(err.contains("pool api is not defined"), "{err}");
+        assert!(err.contains("rxh pool add api"), "{err}");
+    }
+
+    #[test]
+    fn file_pointing_at_the_main_file_needs_no_include() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("rxh.toml");
+        fs::write(&main, "").expect("write");
+
+        let write = WriteTarget::open(&main, Some(Path::new("rxh.toml"))).expect("opens");
+        assert!(write.main_file.is_none());
+        assert_eq!(write.target.path(), main);
+    }
+
+    #[test]
+    fn edits_travel_as_json_and_apply_to_the_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("rxh.toml");
+        fs::write(&main, "# kept\n").expect("write");
+
+        // What the CLI sends is what the daemon reads.
+        let sent = Edit::AddPool {
+            name: String::from("api"),
+            spec: pool_spec("127.0.0.1:1"),
+            file: None,
+        };
+        let json = serde_json::to_value(&sent).expect("serializes");
+        assert_eq!(json["op"], "add_pool");
+        let received: Edit = serde_json::from_value(json).expect("deserializes");
+        let message = received.apply(&main).map_err(saved_message).expect("saves");
+        assert!(message.starts_with("Created pool api in "), "{message}");
+
+        let service = Edit::AddService {
+            spec: ServiceSpec {
+                listen: vec!["127.0.0.1:8080".parse().unwrap()],
+                protocol: String::from("http"),
+                to: vec![String::from("@api")],
+                name: Some(String::from("web")),
+                ..ServiceSpec::default()
+            },
+            file: None,
+        };
+        service.apply(&main).map_err(saved_message).expect("saves");
+        let backend = Edit::AddBackend {
+            pool: String::from("api"),
+            address: String::from("127.0.0.1:2"),
+            weight: 3,
+        };
+        backend.apply(&main).map_err(saved_message).expect("saves");
+
+        let config = crate::load_config(&main).expect("valid");
+        assert_eq!(config.upstreams["api"].backends.len(), 2);
+        assert_eq!(config.servers[0].name.as_deref(), Some("web"));
+        assert!(
+            fs::read_to_string(&main).unwrap().contains("# kept\n"),
+            "comments are kept"
+        );
+
+        let gone = Edit::RemoveService {
+            service: String::from("web"),
+        };
+        let message = gone.apply(&main).map_err(saved_message).expect("saves");
+        assert!(
+            message.starts_with("Removed 1 service(s) from "),
+            "{message}"
+        );
+        let err = gone.apply(&main).expect_err("nothing left to remove");
+        assert!(saved_message(err).contains("no service named or listening on web"));
+
+        // An unknown operation or field is refused, not ignored.
+        let unknown = serde_json::json!({ "op": "drop_everything" });
+        assert!(serde_json::from_value::<Edit>(unknown).is_err());
+        let extra = serde_json::json!({ "op": "remove_pool", "name": "api", "force": true });
+        assert!(serde_json::from_value::<Edit>(extra).is_err());
     }
 }

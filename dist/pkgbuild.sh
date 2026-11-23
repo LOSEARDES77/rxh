@@ -49,6 +49,7 @@ package() {
   install -Dm644 rxh.toml "\$pkgdir/etc/rxh/rxh.toml"
   install -Dm644 systemd/rxh.service "\$pkgdir/usr/lib/systemd/system/rxh.service"
   install -Dm644 systemd/rxh.socket "\$pkgdir/usr/lib/systemd/system/rxh.socket"
+  install -Dm644 systemd/rxh.sysusers "\$pkgdir/usr/lib/sysusers.d/rxh.conf"
   install -Dm644 -t "\$pkgdir/usr/share/man/man1" man/*.1
   install -Dm644 completions/rxh.bash "\$pkgdir/usr/share/bash-completion/completions/rxh"
   install -Dm644 completions/_rxh "\$pkgdir/usr/share/zsh/site-functions/_rxh"

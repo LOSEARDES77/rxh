@@ -231,7 +231,7 @@ async fn create_first_user(
         );
         return too_many_attempts();
     }
-    let has_code = admin::code_opens_setup(peer, state.token.is_some())
+    let has_code = admin::code_opens_setup(peer, state.token.is_some(), state.socket.is_some())
         && body.code.as_deref().is_some_and(|code| {
             aws_lc_rs::constant_time::verify_slices_are_equal(
                 code.as_bytes(),

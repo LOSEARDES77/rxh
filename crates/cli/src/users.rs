@@ -1,5 +1,7 @@
-//! `rxh user`: edits the users file of the admin API directly, without the
-//! daemon. The way back in when every password is lost.
+//! `rxh user`: manages the users of the admin API. Through the daemon when
+//! it runs on this configuration, so it writes a users file the user of the
+//! CLI may not; else on the users file directly, the way back in when every
+//! password is lost.
 
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read};
@@ -8,12 +10,88 @@ use std::process;
 
 use rxh_core::config::Admin;
 use rxh_server::access::{self, ADMIN_ROLE, Store};
+use serde_json::{Value, json};
 
 use crate::cli::{Cli, UserCommand};
+use crate::client::AdminClient;
 use crate::commands;
 
-/// Runs one `rxh user` command on `[admin] users` of the configuration file.
+/// Runs one `rxh user` command, through the daemon or on `[admin] users` of
+/// the configuration file.
 pub(crate) fn execute(cli: &Cli, command: UserCommand) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    let client = commands::admin_client(cli);
+    if let Some(daemon) = runtime.block_on(commands::daemon_config(&client))?
+        && commands::runs_on(cli, &daemon)
+    {
+        return runtime.block_on(through_daemon(&client, command));
+    }
+    on_file(cli, command)
+}
+
+/// Runs one `rxh user` command through the admin API.
+async fn through_daemon(client: &AdminClient, command: UserCommand) -> Result<(), String> {
+    let path = |name: &str| format!("/users/{}", commands::encode(name));
+    let users = async || -> Result<Vec<Value>, String> {
+        let users = client.get("/users").await.map_err(|err| err.to_string())?;
+        Ok(users.as_array().cloned().unwrap_or_default())
+    };
+    match command {
+        UserCommand::List => {
+            for user in users().await? {
+                let roles: Vec<&str> = user["roles"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                let name = user["name"].as_str().unwrap_or("?");
+                if roles.is_empty() {
+                    println!("{name}");
+                } else {
+                    println!("{name} {}", roles.join(","));
+                }
+            }
+            Ok(())
+        }
+        UserCommand::Add { name, roles } => {
+            let roles = if roles.is_empty() && users().await?.is_empty() {
+                vec![ADMIN_ROLE.to_owned()]
+            } else {
+                roles
+            };
+            let password = read_password()?;
+            let body = json!({ "name": name, "password": password, "roles": roles });
+            client
+                .post("/users", Some(body))
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        }
+        UserCommand::Passwd { name } => {
+            let password = read_password()?;
+            let body = json!({ "password": password });
+            client
+                .put(&path(&name), body)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        }
+        UserCommand::Remove { name } => {
+            client
+                .delete(&path(&name), Value::Null)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        }
+    }
+}
+
+/// Runs one `rxh user` command on `[admin] users` of the configuration file.
+fn on_file(cli: &Cli, command: UserCommand) -> Result<(), String> {
     let path = commands::config_path(cli);
     let store = Store::open(access::users_file(Some(&path), &users_setting(&path)?));
     match command {

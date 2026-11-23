@@ -175,6 +175,7 @@ pub const ROUTES: &[(&str, &str, Audience)] = &[
     ("GET", "config/files", Audience::Caller),
     ("GET", "schema", Audience::Caller),
     ("PUT", "config/files/{}", Audience::Admin),
+    ("POST", "config/edit", Audience::Admin),
     ("POST", "config/entities/{}", Audience::Caller),
     ("PUT", "config/entities/{}/{}", Audience::Caller),
     ("DELETE", "config/entities/{}/{}", Audience::Caller),
@@ -237,6 +238,8 @@ pub(crate) struct AdminState {
     pub(crate) started: Instant,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) listen: AdminListen,
+    /// The unix socket of `[admin] socket`, served besides `listen`.
+    pub(crate) socket: Option<PathBuf>,
     pub(crate) token: Option<String>,
     /// TLS of the listener, from `[admin] tls`.
     pub(crate) tls: Option<AdminTls>,
@@ -411,13 +414,28 @@ impl Listener {
                 None => TcpListener::bind(address).await.map(Self::Tcp),
             },
             #[cfg(unix)]
-            AdminListen::Unix(path) => bind_unix(path).await,
+            AdminListen::Unix(path) => bind_unix(path, 0o600).await,
             #[cfg(not(unix))]
             AdminListen::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "unix sockets are not available on this system",
             )),
         }
+    }
+
+    /// Binds the unix socket of `[admin] socket` with mode `0660`: the group
+    /// of the daemon may open it.
+    pub(crate) async fn bind_socket(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        return bind_unix(path, 0o660).await;
+        #[cfg(not(unix))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{}: unix sockets are not available on this system",
+                path.display()
+            ),
+        ));
     }
 }
 
@@ -434,7 +452,7 @@ impl Drop for Listener {
 }
 
 #[cfg(unix)]
-async fn bind_unix(path: &Path) -> io::Result<Listener> {
+async fn bind_unix(path: &Path, mode: u32) -> io::Result<Listener> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     if let Some(listener) = systemd::unix_listener(path)? {
@@ -458,15 +476,15 @@ async fn bind_unix(path: &Path) -> io::Result<Listener> {
         Ok(_) | Err(_) => {}
     }
 
-    // Bound under another name and renamed once it is private, so the socket
-    // never accepts a connection from another user, not even between `bind`
-    // and `chmod`. The rename also replaces a stale socket.
+    // Bound under another name and renamed once it has its mode, so the
+    // socket never accepts a connection from another user, not even between
+    // `bind` and `chmod`. The rename also replaces a stale socket.
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(format!(".{}", std::process::id()));
     let temporary = PathBuf::from(temporary);
     let _ = std::fs::remove_file(&temporary);
     let listener = UnixListener::bind(&temporary)?;
-    let private = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+    let private = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode))
         .and_then(|()| std::fs::rename(&temporary, path));
     if let Err(err) = private {
         let _ = std::fs::remove_file(&temporary);
@@ -587,6 +605,12 @@ async fn handle(
     let method = request.method().clone();
     let path = request.uri().path().trim_matches('/').to_owned();
 
+    // A browser opening the address gets the page, not the JSON of `rxh
+    // status`: nothing is said before the page signs in.
+    if method == Method::GET && path.is_empty() && accepts_html(&request) {
+        return Ok(dashboard_redirect());
+    }
+
     let caller = caller(&request, &state, peer);
     if let Some(refused) = gate(&request, &state, peer, &caller, audience(&method, &path)) {
         return Ok(refused);
@@ -648,6 +672,7 @@ async fn handle(
         (&Method::GET, ["config"]) => json_response(StatusCode::OK, &live_config(&state)),
         (&Method::GET, ["config", "files"]) => config_api::files(&state, &caller).await,
         (&Method::GET, ["schema"]) => config_api::schema(),
+        (&Method::POST, ["config", "edit"]) => config_api::edit(&state, &caller, request).await,
         (&Method::PUT, ["config", "files", index]) => {
             config_api::put_file(&state, &caller, index, request).await
         }
@@ -868,7 +893,10 @@ fn caller<B>(request: &Request<B>, state: &AdminState, peer: Peer) -> Caller {
             }
         };
     }
-    if state.token.is_none() && is_local_request(request, &state.listen, peer) {
+    if state.token.is_none()
+        && trusts_as_administrator(state, peer)
+        && is_local_request(request, &state.listen, peer)
+    {
         return Caller::Local;
     }
     Caller::Nobody
@@ -1003,18 +1031,34 @@ pub(crate) fn origin_is_host<B>(request: &Request<B>) -> bool {
         .is_some_and(|((_, authority), host)| authority.eq_ignore_ascii_case(host))
 }
 
+/// Whether a connection for which [`Peer::local`] holds is an administrator
+/// for that alone. With `[admin] socket`, only a unix socket is: who may open
+/// one is decided by its mode, while any user of this machine reaches a TCP
+/// port.
+fn trusts_as_administrator(state: &AdminState, peer: Peer) -> bool {
+    peer.local && (state.socket.is_none() || peer.address.is_none())
+}
+
 /// Whether the setup code may create the first user on this connection:
-/// only over TLS, since the code and the new password travel with it, and
-/// only without a token, whose holder is the one to create the user.
-pub(crate) fn code_opens_setup(peer: Peer, has_token: bool) -> bool {
-    peer.tls && !has_token
+/// over TLS, since the code and the new password travel with it, or over a
+/// TCP connection from this machine that `[admin] socket` keeps from being
+/// an administrator; and only without a token, whose holder is the one to
+/// create the user.
+pub(crate) fn code_opens_setup(peer: Peer, has_token: bool, has_socket: bool) -> bool {
+    let local_tcp = peer.local && peer.address.is_some();
+    (peer.tls || (has_socket && local_tcp)) && !has_token
 }
 
 /// Whether the daemon writes the setup code to its log when it starts: on
 /// a listener where the code can be used, see [`code_opens_setup`], and
 /// while there is no user.
-pub(crate) fn announces_setup_code(has_tls: bool, has_token: bool, has_user: bool) -> bool {
-    has_tls && !has_token && !has_user
+pub(crate) fn announces_setup_code(
+    has_tls: bool,
+    has_token: bool,
+    has_socket: bool,
+    has_user: bool,
+) -> bool {
+    (has_tls || has_socket) && !has_token && !has_user
 }
 
 /// Sends a request to the daemon loop and answers with its outcome:
@@ -1250,9 +1294,19 @@ fn status(state: &AdminState, scope: &Scope) -> serde_json::Value {
         "uptime_seconds": state.started.elapsed().as_secs(),
         "config_path": state.config_path,
         "admin": state.listen.to_string(),
+        "dashboard": dashboard_url(state),
         "servers": servers,
         "pools": pools,
     })
+}
+
+/// Where a browser opens the dashboard, `None` on a unix socket.
+fn dashboard_url(state: &AdminState) -> Option<String> {
+    let AdminListen::Tcp(address) = &state.listen else {
+        return None;
+    };
+    let scheme = if state.tls.is_some() { "https" } else { "http" };
+    Some(format!("{scheme}://{address}/dashboard"))
 }
 
 /// The samples of `GET /stats/history`. A caller without the `admin` role
@@ -1451,7 +1505,18 @@ fn dashboard(body: &'static str, content_type: &'static str) -> Response<Full<By
     response
 }
 
-/// Sends `/dashboard/` and the like to the one path the page works from.
+/// True if `request` comes from a browser opening a page: its `Accept`
+/// names HTML. The CLI and `curl` do not.
+fn accepts_html<B>(request: &Request<B>) -> bool {
+    request
+        .headers()
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|accept| accept.contains("text/html"))
+}
+
+/// Sends `/`, `/dashboard/` and the like to the one path the page works from.
 fn dashboard_redirect() -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::new()));
     *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
@@ -1741,7 +1806,9 @@ pub(crate) mod tests {
                 caller(&request("localhost:2019", None), &open, over_tls),
                 Caller::Nobody
             ));
-            assert!(code_opens_setup(over_tls, /* has_token= */ false));
+            assert!(code_opens_setup(
+                over_tls, /* has_token= */ false, /* has_socket= */ false
+            ));
         }
     }
 
@@ -1833,6 +1900,7 @@ pub(crate) mod tests {
             started: Instant::now(),
             config_path: None,
             listen: AdminListen::Tcp("0.0.0.0:2019".parse().unwrap()),
+            socket: None,
             token: token.map(str::to_owned),
             tls: None,
             current: RwLock::new(Current {
@@ -2054,38 +2122,47 @@ pub(crate) mod tests {
 
     #[test]
     fn the_setup_code_is_logged_only_where_it_works_and_while_no_user_exists() {
-        // TLS, a token, a user: is the code written to the log?
-        for (has_tls, has_token, has_user, logged) in [
-            (true, false, false, true),
-            (true, false, true, false),
-            (true, true, false, false),
-            (true, true, true, false),
-            (false, false, false, false),
-            (false, false, true, false),
-            (false, true, false, false),
-            (false, true, true, false),
+        // TLS, a token, a socket, a user: is the code written to the log?
+        for (has_tls, has_token, has_socket, has_user, logged) in [
+            (true, false, false, false, true),
+            (true, false, false, true, false),
+            (true, true, false, false, false),
+            (true, true, false, true, false),
+            (false, false, false, false, false),
+            (false, false, false, true, false),
+            (false, true, false, false, false),
+            (false, true, false, true, false),
+            (false, false, true, false, true),
+            (false, false, true, true, false),
+            (false, true, true, false, false),
         ] {
             assert_eq!(
-                announces_setup_code(has_tls, has_token, has_user),
+                announces_setup_code(has_tls, has_token, has_socket, has_user),
                 logged,
-                "tls {has_tls}, token {has_token}, user {has_user}"
+                "tls {has_tls}, token {has_token}, socket {has_socket}, user {has_user}"
             );
         }
     }
 
     #[test]
-    fn setup_with_code_needs_tls_and_no_token() {
+    fn setup_with_code_needs_tls_or_a_socket_and_no_token() {
         let plain = Peer {
             tls: false,
             ..REMOTE
         };
-        assert!(code_opens_setup(REMOTE, /* has_token= */ false));
-        assert!(!code_opens_setup(REMOTE, /* has_token= */ true));
-        assert!(!code_opens_setup(plain, /* has_token= */ false));
+        let open = |peer, has_token, has_socket| code_opens_setup(peer, has_token, has_socket);
+        assert!(open(REMOTE, false, false));
+        assert!(!open(REMOTE, true, false));
+        assert!(!open(plain, false, false));
         // Plain HTTP on the machine: a local request needs no code, and one
         // that is not local (a page of another site) must not use it.
-        assert!(!code_opens_setup(LOCAL, /* has_token= */ false));
-        assert!(!code_opens_setup(LOCAL, /* has_token= */ true));
+        assert!(!open(LOCAL, false, false));
+        assert!(!open(LOCAL, true, false));
+        // With `[admin] socket` a local TCP request is no administrator: the
+        // code opens setup there, never from another machine over plain HTTP.
+        assert!(open(LOCAL, false, true));
+        assert!(!open(LOCAL, true, true));
+        assert!(!open(plain, false, true));
     }
 
     #[test]

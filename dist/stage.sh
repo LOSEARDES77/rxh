@@ -10,7 +10,8 @@
 #   DIR/rxh
 #   DIR/rxh.toml                  default /etc/rxh/rxh.toml of the packages
 #   DIR/LICENSE  DIR/README.md
-#   DIR/systemd/rxh.service  DIR/systemd/rxh.socket
+#   DIR/systemd/rxh.service  DIR/systemd/rxh.socket  DIR/systemd/rxh.sysusers
+#   DIR/postinstall.sh            creates the group rxh (.deb and .rpm)
 #   DIR/man/*.1
 #   DIR/completions/rxh.bash  DIR/completions/_rxh  DIR/completions/rxh.fish
 set -eu
@@ -40,6 +41,8 @@ cp "$dist/rxh.toml" "$root/LICENSE" "$root/README.md" "$dir/"
 for unit in rxh.service rxh.socket; do
     sed 's|/usr/local/bin/rxh|/usr/bin/rxh|g' "$dist/$unit" > "$dir/systemd/$unit"
 done
+cp "$dist/rxh.sysusers" "$dir/systemd/rxh.sysusers"
+cp "$dist/postinstall.sh" "$dir/postinstall.sh"
 "$dir/rxh" man --dir "$dir/man"
 "$dir/rxh" completions bash > "$dir/completions/rxh.bash"
 "$dir/rxh" completions zsh > "$dir/completions/_rxh"

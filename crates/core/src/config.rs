@@ -938,6 +938,13 @@ pub struct Admin {
     #[serde(default = "default::admin_listen")]
     pub listen: AdminListen,
 
+    /// Unix socket served besides `listen`, absolute, with mode `0660` and
+    /// the group of the daemon: whoever may open it is an administrator.
+    /// With it, a TCP connection from this machine is no administrator for
+    /// that alone and signs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
+
     /// Secret every request must carry as `Authorization: Bearer <token>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -972,6 +979,7 @@ impl Default for Admin {
         Self {
             enabled: true,
             listen: default::admin_listen(),
+            socket: None,
             token: None,
             tls: None,
             users: default::admin_users(),
@@ -1012,6 +1020,17 @@ impl Admin {
         }
         if self.users.is_empty() {
             return Err(String::from("users must not be empty"));
+        }
+        if let Some(socket) = &self.socket {
+            if !socket.is_absolute() {
+                return Err(format!(
+                    "socket = {:?} must be an absolute path, like \"/run/rxh/admin.sock\"",
+                    socket.display().to_string()
+                ));
+            }
+            if self.listen == AdminListen::Unix(socket.clone()) {
+                return Err(String::from("socket must not be the unix socket of listen"));
+            }
         }
         if let AdminListen::Tcp(address) = &self.listen
             && self.enabled
@@ -5646,6 +5665,37 @@ mod tests {
                 .expect_err(listen)
                 .to_string();
             assert!(err.contains("invalid admin address"), "{err}");
+        }
+    }
+
+    #[test]
+    fn admin_socket_is_an_absolute_path_other_than_listen() {
+        assert_eq!(Config::from_toml("").unwrap().admin.socket, None);
+        let config = Config::from_toml("[admin]\nsocket = \"/run/rxh/admin.sock\"\n").unwrap();
+        assert_eq!(
+            config.admin.socket,
+            Some(PathBuf::from("/run/rxh/admin.sock"))
+        );
+        // Serialized for `GET /config` and parsed back.
+        let written = toml::to_string(&config.admin).unwrap();
+        assert!(
+            written.contains("socket = \"/run/rxh/admin.sock\""),
+            "{written}"
+        );
+
+        let rejected = [
+            ("socket = \"admin.sock\"", "must be an absolute path"),
+            ("socket = \"\"", "must be an absolute path"),
+            (
+                "listen = \"unix//run/rxh/admin.sock\"\nsocket = \"/run/rxh/admin.sock\"",
+                "must not be the unix socket of listen",
+            ),
+        ];
+        for (admin, expected) in rejected {
+            let err = Config::from_toml(&format!("[admin]\n{admin}\n"))
+                .expect_err(admin)
+                .to_string();
+            assert!(err.contains(expected), "{admin}: {err}");
         }
     }
 

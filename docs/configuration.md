@@ -422,35 +422,56 @@ then `READY=1` around every reload (`SIGHUP`, `rxh reload`, `watch`), with
 `STATUS=Reload failed: ...` when the new configuration is rejected (the
 previous one keeps running), and `STOPPING=1` on shutdown. No watchdog.
 
-The unit runs the daemon as a user systemd makes for it (`DynamicUser=yes`)
-with `ProtectSystem=strict` and no `WorkingDirectory` or `StateDirectory`:
-the daemon can write nowhere. `/etc/rxh` is readable and not writable, so
-the files that are relative to the directory of the configuration by
-default, the users file (`rxh-data/users.toml`) and the ACME storage
-(`rxh-data/certificates`), cannot be created there: the file system is
-read-only for the service, so creating the first user fails (`400` with the
-error of the system) and ACME cannot keep its certificates. Give the service a state directory with a drop-in and put
-both there:
+The unit runs the daemon as root, like the master process of nginx, so
+that it writes its own configuration (the dashboard, `rxh service add` and
+the other commands that edit it) and reads certificates that belong to
+root. A sandbox keeps the rest away: `CapabilityBoundingSet=` leaves only
+`CAP_NET_BIND_SERVICE`, so root reads and writes the files root owns and
+no other, `ProtectSystem=strict` with `ReadWritePaths=/etc/rxh` lets it
+write `/etc/rxh` alone, and `InaccessiblePaths=` hides `/etc/shadow`,
+`/etc/ssh`, `/root` and the like. The users file (`rxh-data/users.toml`) and
+the ACME storage (`rxh-data/certificates`) are kept in `/etc/rxh` by
+default.
 
-```ini
-# systemctl edit rxh
-[Service]
-StateDirectory=rxh
-```
+The unit runs with `Group=rxh`, the group that
+[`dist/rxh.sysusers`](../dist/rxh.sysusers) creates (the packages install
+it), and the configuration the packages install
+([`dist/rxh.toml`](../dist/rxh.toml)) serves the admin API twice:
 
 ```toml
 [admin]
-users = "/var/lib/rxh/users.toml"
-
-[acme]
-storage = "/var/lib/rxh/certificates"
+listen = "127.0.0.1:81"          # the dashboard: http://127.0.0.1:81/dashboard
+socket = "/run/rxh/admin.sock"   # rxh commands, mode 0660, group rxh
 ```
 
-Create the first user through the daemon (the page, or `curl` on the
-machine to `POST /auth/setup`), so that the file belongs to the user of
-the service. `sudo rxh -c /etc/rxh/rxh.toml user ...` then works on it: a
-file it replaces keeps its owner. A users file that `rxh user` run as root
-creates belongs to root, mode `0600`, and the service cannot read it.
+`rxh status`, `rxh service add` and the other commands find the socket in
+`/etc/rxh/rxh.toml` (the file they read when the current directory has no
+`rxh.toml`) and send their changes to the daemon, which writes the files.
+Members of the group run them without `sudo`, like the members of the
+`docker` group, which makes them as powerful as root:
+
+```sh
+sudo usermod -aG rxh "$USER"   # then log in again
+rxh service add --listen 0.0.0.0:80 --to 127.0.0.1:3000 --host app.example.com
+```
+
+On the TCP port nobody is an administrator for connecting from the machine,
+since every user of the machine reaches it: the dashboard asks to sign in.
+The first user is created with `rxh user add NAME` (the first one is an
+administrator), or on the page with the setup code the daemon writes to its
+log (`journalctl -u rxh`) while no user exists.
+
+A unit installed from 0.3.0 or earlier runs with `DynamicUser=yes` and
+cannot write `/etc/rxh`: creating the first user fails with
+`/etc/rxh/rxh-data: Permission denied`, and so does every save of the
+dashboard. Install the new unit, `dist/rxh.sysusers` and the `[admin]`
+table above:
+
+```sh
+sudo install -Dm644 dist/rxh.service /etc/systemd/system/rxh.service
+sudo install -Dm644 dist/rxh.sysusers /etc/sysusers.d/rxh.conf
+sudo systemd-sysusers && sudo systemctl daemon-reload && sudo systemctl restart rxh
+```
 
 With socket activation ([`dist/rxh.socket`](../dist/rxh.socket)), systemd
 binds the sockets and passes them in `LISTEN_FDS`. A listener whose `listen`
@@ -550,6 +571,7 @@ The Docker provider needs the socket mounted and readable by UID 65532
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Serve the admin API. The CLI needs it for live changes; without it, `stop` and `reload` fall back to signals and the PID file. |
+| `socket` | none | Absolute path of a unix socket served besides `listen`, with mode `0660` and the group of the daemon: whoever may open it is an administrator (or needs the token, when `token` is set), and the CLI uses it when the file exists. With it, a TCP connection from the machine is no administrator for that alone and signs in, and the setup code opens the creation of the first user over plain HTTP from the machine. Must not be the socket of `listen`. Changes need a restart. |
 | `listen` | `"127.0.0.1:2019"` | Where the admin API listens: `ip:port`, or `unix//absolute/path.sock` for a unix socket. A TCP address outside loopback needs `token` or `tls`, and there nobody is an administrator for where it connects from: every caller, the `rxh` commands on the machine included, needs the token or a session. Port 0 is for tests: RXH tells its own admin API from a backend by the configured port. Changes need a restart. |
 | `token` | none | Secret every request must send as `Authorization: Bearer <token>`; `401` otherwise. At least 16 printable ASCII characters, no spaces. Changes need a restart. |
 | `tls` | none | `{ cert = "admin.pem", key = "admin.key" }`: HTTPS on the admin listener, from PEM files; plain HTTP is still answered on the same port, to connections from the machine only. `"auto"` is not available here. A file that cannot be read stops the start. `POST /certificates/reload` (`rxh certs reload`) reads the files again; setting or removing `tls` needs a restart. |
@@ -564,6 +586,16 @@ dead daemon is replaced, and the file is removed on shutdown.
 ```toml
 [admin]
 listen = "unix//run/rxh/admin.sock"
+```
+
+`socket` shares the API with a group instead: the commands of its members
+reach the daemon there, while the dashboard on the TCP port asks everybody
+to sign in. Run the daemon with that group (`Group=rxh` in systemd).
+
+```toml
+[admin]
+listen = "127.0.0.1:81"
+socket = "/run/rxh/admin.sock"
 ```
 
 For remote administration, listen on a reachable address and set a token
@@ -1510,7 +1542,11 @@ Known limits:
 `GET /dashboard` on the admin API is a web page that shows what the daemon
 does and changes its configuration. It is embedded in the binary, loads
 nothing from other sites, and has no key: it is there whenever the admin API
-is. `/dashboard/` redirects to `/dashboard`.
+is. `/dashboard/` redirects to `/dashboard`, and so does `/` for a browser
+(a request whose `Accept` names `text/html`); the CLI and `curl` still get
+the status there. The daemon writes the address to its log when it starts
+(`Admin => Dashboard on http://127.0.0.1:2019/dashboard`), and `rxh status`
+prints it on its `dashboard` line.
 
 ```toml
 [admin]
@@ -1689,6 +1725,7 @@ the token like every other route, and answer `{"error": "..."}` on failure.
 | Method | Path | Body | Success | Failure |
 |---|---|---|---|---|
 | `GET` | `/schema` | | `200`: the JSON schema `rxh schema` prints | |
+| `POST` | `/config/edit` | `{"op": ...}`, a change of `rxh pool`, `rxh service` or `rxh upstream` (below) | `200` `{"message"}`: what was written where | `400` unknown operation or field, pool or service not found, not valid; `409` no configuration file. Writes the files and does not reload: the CLI reloads, or changes the running pool itself. For administrators |
 | `GET` | `/stats/history[?since=...]` | | `200`, see [Statistics history](#statistics-history) | `400` `since` is not a number |
 | `GET` | `/config/files` | | `200`: `editable`, `files`, `entities` | `500` a file cannot be read or parsed (the answer gives the file, line and column, not its text) |
 | `PUT` | `/config/files/{index}` | `{"text", "revision"}` | `200` `{"saved": true}` | `400` not valid TOML, not a valid configuration, reload refused; `404` no such file; `409` |
@@ -1700,6 +1737,20 @@ the token like every other route, and answer `{"error": "..."}` on failure.
 file changed, read it again"), and by every write route when the daemon runs
 without a configuration file. `500` means a file could not be written or
 put back; the message names it. Bodies are JSON, limited to 4 MiB.
+
+The operations of `POST /config/edit`, which the CLI sends when the daemon
+runs on the file it is pointed at: `add_backend` (`pool`, `address`,
+`weight`), `remove_backend` (`pool`, `address`), `add_pool` (`name`, `spec`
+with `policy`, `backends` and the options of `rxh pool add`, `file`),
+`remove_pool` (`name`), `add_service` (`spec` with `listen`, `protocol`,
+`to`, `serve`, `name`, `uri`, `host`, and `file`), `remove_service`
+(`service`, a name or a listen address). `file` is the `--file` of the
+command, relative to the directory of the main file.
+
+```sh
+curl -X POST localhost:2019/config/edit \
+  -d '{"op": "add_backend", "pool": "api", "address": "10.0.0.3:8080", "weight": 1}'
+```
 
 ```sh
 # The files: the main one first, then the included ones.

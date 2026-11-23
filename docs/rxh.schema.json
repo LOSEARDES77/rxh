@@ -492,6 +492,13 @@
             "null"
           ]
         },
+        "socket": {
+          "description": "Unix socket served besides `listen`, absolute, with mode `0660` and\nthe group of the daemon: whoever may open it is an administrator.\nWith it, a TCP connection from this machine is no administrator for\nthat alone and signs in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "tls": {
           "description": "HTTPS on the admin listener, from certificate and key files.",
           "anyOf": [

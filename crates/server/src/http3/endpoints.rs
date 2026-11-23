@@ -222,7 +222,9 @@ fn bind(listener: &Listener) -> io::Result<(Endpoint, Weak<dyn AsyncUdpSocket>)>
             socket.set_reuse_port(true)?;
             // IPv6 only or not as the OS decides, like the TCP listener on
             // the address: `[::]` serves IPv4 clients too where TCP does.
-            socket.bind(&address.into())?;
+            socket
+                .bind(&address.into())
+                .map_err(|err| crate::server::listen_error(address, err))?;
             socket.into()
         }
     };

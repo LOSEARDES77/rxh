@@ -32,6 +32,8 @@ contents:
     dst: /usr/lib/systemd/system/rxh.service
   - src: ./systemd/rxh.socket
     dst: /usr/lib/systemd/system/rxh.socket
+  - src: ./systemd/rxh.sysusers
+    dst: /usr/lib/sysusers.d/rxh.conf
   - src: ./man/*.1
     dst: /usr/share/man/man1/
   - src: ./completions/rxh.bash
@@ -48,3 +50,5 @@ contents:
     dst: /usr/share/doc/rxh/LICENSE
   - src: ./README.md
     dst: /usr/share/doc/rxh/README.md
+scripts:
+  postinstall: ./postinstall.sh

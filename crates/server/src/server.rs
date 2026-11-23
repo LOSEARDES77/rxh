@@ -277,7 +277,8 @@ impl Server {
             Protocol::Udp => {
                 let socket = match systemd::udp_socket(requested)? {
                     Some(socket) => socket,
-                    None => std::net::UdpSocket::bind(requested)?,
+                    None => std::net::UdpSocket::bind(requested)
+                        .map_err(|err| listen_error(requested, err))?,
                 };
                 socket.set_nonblocking(true)?;
                 let socket = UdpSocket::from_std(socket)?;
@@ -711,8 +712,25 @@ fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
     #[cfg(unix)]
     socket.set_reuseport(true)?;
 
-    socket.bind(address)?;
+    socket
+        .bind(address)
+        .map_err(|err| listen_error(address, err))?;
     socket.listen(1024)
+}
+
+/// `err` of binding `address`, naming the address, with the usual cause of
+/// a refused privileged port.
+pub(crate) fn listen_error(address: SocketAddr, err: io::Error) -> io::Error {
+    let hint =
+        if err.kind() == io::ErrorKind::PermissionDenied && (1..1024).contains(&address.port()) {
+            " (ports below 1024 need root or the CAP_NET_BIND_SERVICE capability)"
+        } else {
+            ""
+        };
+    io::Error::new(
+        err.kind(),
+        format!("cannot listen on {address}: {err}{hint}"),
+    )
 }
 
 async fn drain(connections: &mut JoinSet<()>) {
@@ -1043,4 +1061,52 @@ where
 
     connection.as_mut().begin_graceful_shutdown();
     connection.await.map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_listen_error_names_the_address_and_why_a_low_port_is_refused() {
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let err = listen_error("127.0.0.1:80".parse().unwrap(), denied());
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let text = err.to_string();
+        assert!(
+            text.starts_with("cannot listen on 127.0.0.1:80: "),
+            "{text}"
+        );
+        assert!(
+            text.contains("need root or the CAP_NET_BIND_SERVICE"),
+            "{text}"
+        );
+
+        // A high port refused for another reason gets no hint about ports.
+        let text = listen_error("127.0.0.1:8080".parse().unwrap(), denied()).to_string();
+        assert!(!text.contains("CAP_NET_BIND_SERVICE"), "{text}");
+        let in_use = io::Error::from(io::ErrorKind::AddrInUse);
+        let text = listen_error("[::1]:443".parse().unwrap(), in_use).to_string();
+        assert!(text.starts_with("cannot listen on [::1]:443: "), "{text}");
+        assert!(!text.contains("CAP_NET_BIND_SERVICE"), "{text}");
+    }
+
+    #[test]
+    fn a_taken_port_is_named_in_the_error() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = taken.local_addr().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Without SO_REUSEPORT on the first socket, the second bind fails.
+        let err = runtime
+            .block_on(async { bind_tcp(address) })
+            .expect_err("the port is taken");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("cannot listen on {address}: ")),
+            "{err}"
+        );
+    }
 }

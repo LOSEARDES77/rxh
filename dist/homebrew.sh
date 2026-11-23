@@ -64,6 +64,9 @@ $linux_intel
     bash_completion.install "completions/rxh.bash" => "rxh"
     zsh_completion.install "completions/_rxh"
     fish_completion.install "completions/rxh.fish"
+    # The [admin] table of the archive is for the systemd service: port 81
+    # and a socket in /run, which a service of this user cannot have.
+    inreplace "rxh.toml", /^# The members of the group rxh.*?^socket = "[^"]*"\n\n/m, ""
     # Homebrew keeps an edited etc file on upgrade and writes the new one as .default.
     pkgetc.install "rxh.toml"
   end

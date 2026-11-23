@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `[admin] socket = "/run/rxh/admin.sock"`: a unix socket served besides
+  `listen`, mode `0660` with the group of the daemon, whose callers are
+  administrators. With it, a TCP connection from the machine is no
+  administrator for that alone: the dashboard asks to sign in, and the
+  setup code (written to the log) creates the first user over plain HTTP
+  from the machine.
+- `POST /config/edit` applies a change of `rxh pool`, `rxh service` or
+  `rxh upstream` to the configuration files. The CLI sends its edits there
+  when the daemon runs on the file it is pointed at, and `rxh user` uses
+  `/users`, so the daemon writes files the user of the CLI cannot. Without a
+  daemon, or when it refuses the caller, the CLI edits the files as before.
+- The CLI reads `/etc/rxh/rxh.toml` when the current directory has no
+  `rxh.toml` and no `--config` is given, and reaches the daemon over
+  `[admin] socket` when that file exists.
+- The dashboard is easier to find: the daemon logs `Admin => Dashboard on
+  http://.../dashboard`, `rxh status` prints a `dashboard` line (`"dashboard"`
+  in `GET /status`), and a browser opening `/` is redirected to
+  `/dashboard`.
+
+### Changed
+
+- `dist/rxh.service` runs the daemon as root instead of `DynamicUser=yes`,
+  with `Group=rxh`, `RuntimeDirectory=rxh`, `ReadWritePaths=/etc/rxh` and
+  `InaccessiblePaths=` for `/etc/shadow`, `/etc/ssh`, `/root` and the like;
+  the bounding set still holds `CAP_NET_BIND_SERVICE` alone. The packages
+  install `dist/rxh.sysusers` (group `rxh`), the `.deb` and `.rpm` create
+  the group after install, and the packaged `rxh.toml` sets `[admin] listen
+  = "127.0.0.1:81"` and `socket = "/run/rxh/admin.sock"` (the Homebrew
+  formula removes that table).
+- An `rxh` command that may not open the admin socket says how to get
+  access (the group `rxh`, or `sudo`) instead of editing the files.
+
+### Fixed
+
+- The systemd service could not create the first user (`/auth/setup`
+  failed with `/etc/rxh/rxh-data: Permission denied`), save from the
+  dashboard (`/etc/rxh/rxh.toml.tmp: Permission denied`) or keep ACME
+  certificates: `/etc/rxh` was read-only for its dynamic user.
+- A listener that cannot bind names its address: `cannot listen on
+  127.0.0.1:80: Permission denied`, with a hint about root and
+  `CAP_NET_BIND_SERVICE` for ports below 1024, instead of `IO error:
+  Permission denied`.
+
 ## 0.3.0 (2026-11-23)
 
 Caddy parity for HTTP routing, upstream transports, timeouts, observability,

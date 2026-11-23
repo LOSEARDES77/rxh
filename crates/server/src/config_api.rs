@@ -34,7 +34,7 @@ use toml_edit::DocumentMut;
 
 use crate::access::{Host, Permission, Scope};
 use crate::admin::{self, AdminState, Caller, Control};
-use crate::edit::{self, ConfigFile, SaveError};
+use crate::edit::{self, ConfigFile, Edit, SaveError};
 use crate::entity::{self, Body, Entity, Kind};
 use crate::host_keys;
 use crate::secret;
@@ -430,6 +430,38 @@ impl Content {
             Self::Value(value) => Body::Value(value),
             Self::Toml(toml) => Body::Toml(toml),
         }
+    }
+}
+
+/// `POST /config/edit`: applies an [`Edit`] of the CLI to the files and
+/// answers `{"message"}`, what was done. Does not reload: the CLI does, or
+/// changes the running pool itself. For administrators.
+pub(crate) async fn edit(
+    state: &Arc<AdminState>,
+    caller: &Caller,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let edited = async {
+        if !caller.is_admin() {
+            return Err(forbidden(admin::NEEDS_ADMIN));
+        }
+        let change: Edit = json_body(request).await?;
+        let main: PathBuf = main_path(state)?;
+        let _saving = state.saving.lock().await;
+        blocking(move || {
+            change.apply(&main).map_err(|err| match err {
+                SaveError::Invalid(message) => (StatusCode::BAD_REQUEST, without_source(&message)),
+                SaveError::Io(message) => internal(without_source(&message)),
+            })
+        })
+        .await
+    };
+    match edited.await {
+        Ok(message) => {
+            println!("Admin => {message}");
+            admin::json_response(StatusCode::OK, &json!({ "message": message }))
+        }
+        Err((status, message)) => admin::error(status, &message),
     }
 }
 

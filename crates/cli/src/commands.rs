@@ -4,10 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rxh_core::config::{Action, Admin, Forward, Policy};
+use rxh_core::config::{Action, Admin, AdminListen, Forward, Policy};
 use rxh_core::deprecation;
 use rxh_core::pool::BackendState;
-use rxh_server::edit::{self, ConfigFile, PoolSpec, ServiceSpec};
+use rxh_server::edit::{Edit, PoolSpec, SaveError, ServiceSpec};
 use serde_json::{Value, json};
 
 use crate::cli::{
@@ -20,25 +20,52 @@ use crate::process::{self, DaemonSignal};
 /// Default configuration file.
 pub(crate) const DEFAULT_CONFIG: &str = "rxh.toml";
 
-/// Config path for `run`, `start` and `validate`.
+/// Configuration file of the service the packages install, used when the
+/// current directory has no [`DEFAULT_CONFIG`].
+#[cfg(unix)]
+const SYSTEM_CONFIG: &str = "/etc/rxh/rxh.toml";
+
+/// The configuration file: `--config`, else `rxh.toml` of the current
+/// directory, else the one of the installed service when it exists.
 pub(crate) fn config_path(cli: &Cli) -> PathBuf {
-    cli.config
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG))
+    #[cfg(unix)]
+    let system = Some(Path::new(SYSTEM_CONFIG));
+    #[cfg(not(unix))]
+    let system = None;
+    config_path_in(cli.config.as_deref(), Path::new(DEFAULT_CONFIG), system)
 }
 
-/// Client of the daemon. Address: `--admin`, else `[admin] listen` of the
-/// config file, else the default. Token: `--admin-token`, else `[admin]
-/// token` of the config file, which is never sent to another address.
-fn admin_client(cli: &Cli) -> AdminClient {
+/// [`config_path`] with the file of the current directory, `local`, and the
+/// one of the service, `system`, given.
+fn config_path_in(config: Option<&Path>, local: &Path, system: Option<&Path>) -> PathBuf {
+    if let Some(path) = config {
+        return path.to_owned();
+    }
+    match system {
+        Some(system) if !local.exists() && system.exists() => system.to_owned(),
+        Some(_) | None => local.to_owned(),
+    }
+}
+
+/// Client of the daemon. Address: `--admin`, else `[admin] socket` of the
+/// config file when the socket exists, else `[admin] listen`, else the
+/// default. Token: `--admin-token`, else `[admin] token` of the config file,
+/// which is never sent to another daemon.
+pub(crate) fn admin_client(cli: &Cli) -> AdminClient {
     let admin: Admin = rxh_server::load_config(&config_path(cli))
         .map(|config| config.admin)
         .unwrap_or_default();
-    let address = cli.admin.clone().unwrap_or_else(|| admin.listen.clone());
-    let token = cli
-        .admin_token
-        .clone()
-        .or_else(|| admin.token.filter(|_| address == admin.listen));
+    let socket = admin
+        .socket
+        .as_ref()
+        .filter(|socket| socket.exists())
+        .map(|socket| AdminListen::Unix(socket.clone()));
+    let own = socket.clone().unwrap_or_else(|| admin.listen.clone());
+    let address = cli.admin.clone().unwrap_or(own);
+    let token = cli.admin_token.clone().or_else(|| {
+        let same_daemon = address == admin.listen || Some(&address) == socket.as_ref();
+        admin.token.filter(|_| same_daemon)
+    });
     AdminClient::new(address, token)
 }
 
@@ -189,6 +216,9 @@ async fn status(client: &AdminClient, raw: bool) -> Result<(), String> {
     );
     if let Some(path) = status["config_path"].as_str() {
         println!("config {path}");
+    }
+    if let Some(dashboard) = status["dashboard"].as_str() {
+        println!("dashboard {dashboard}");
     }
 
     println!("\n{:<24} {:<6} {:<16} STATE", "LISTEN", "PROTO", "NAME");
@@ -396,101 +426,61 @@ fn policies() {
     }
 }
 
-/// File to edit: `--config`, else the daemon's file, else the default.
+/// File to edit: `--config`, else the daemon's file, else
+/// [`config_path`].
 async fn editable_config(cli: &Cli, client: &AdminClient) -> PathBuf {
     if let Some(path) = &cli.config {
         return path.clone();
     }
+    match daemon_config(client).await {
+        Ok(Some(path)) => path,
+        Ok(None) | Err(_) => config_path(cli),
+    }
+}
+
+/// The configuration file of the running daemon, `None` when no daemon
+/// answers, it refuses this caller (the files are edited then, the way back
+/// in without a password) or it runs without one. An error when the admin
+/// socket exists and this user may not open it.
+pub(crate) async fn daemon_config(client: &AdminClient) -> Result<Option<PathBuf>, String> {
     match client.get("/status").await {
-        Ok(status) => status["config_path"]
-            .as_str()
-            .map_or_else(|| PathBuf::from(DEFAULT_CONFIG), PathBuf::from),
-        Err(_) => PathBuf::from(DEFAULT_CONFIG),
+        Ok(status) => Ok(status["config_path"].as_str().map(PathBuf::from)),
+        Err(err @ ClientError::Denied(_)) => Err(err.to_string()),
+        Err(_) => Ok(None),
     }
 }
 
-/// The main file followed by the files it includes. Just the main file when
-/// it does not exist yet.
-fn config_files(main: &Path) -> Result<Vec<PathBuf>, String> {
-    if !main.exists() {
-        return Ok(vec![main.to_owned()]);
-    }
-    rxh_server::config_files(main).map_err(|err| err.to_string())
+/// True if the daemon runs on the configuration the CLI is pointed at: the
+/// file of [`config_path`], or any file when no `--config` is given and that
+/// file does not exist.
+pub(crate) fn runs_on(cli: &Cli, daemon: &Path) -> bool {
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or(path.to_owned());
+    let ours = config_path(cli);
+    canonical(&ours) == canonical(daemon) || (cli.config.is_none() && !ours.exists())
 }
 
-/// The file that defines pool `name`.
-fn file_defining_pool(main: &Path, name: &str) -> Result<ConfigFile, String> {
-    for path in config_files(main)? {
-        let file = ConfigFile::open(&path)?;
-        if file.defines_pool(name) {
-            return Ok(file);
+/// Saves `change`: through the daemon when it runs on this configuration,
+/// so it writes files the user of the CLI may not, else on the files.
+/// Prints what was done.
+async fn save(cli: &Cli, client: &AdminClient, change: &Edit) -> Result<(), String> {
+    let message = match daemon_config(client).await? {
+        Some(daemon) if runs_on(cli, &daemon) => {
+            let body = serde_json::to_value(change).map_err(|err| err.to_string())?;
+            let answer = client
+                .post("/config/edit", Some(body))
+                .await
+                .map_err(|err| err.to_string())?;
+            answer["message"].as_str().unwrap_or("Saved").to_owned()
         }
-    }
-    Err(format!(
-        "pool {name} is not defined in {} or its included files; create it with `rxh pool add {name}`",
-        main.display()
-    ))
-}
-
-/// Where a new pool or service is written: the main file, or `--file`.
-struct WriteTarget {
-    main: PathBuf,
-    target: ConfigFile,
-    /// The main file with a new `include` entry, when `--file` is not
-    /// covered by it yet.
-    main_file: Option<ConfigFile>,
-}
-
-impl WriteTarget {
-    fn open(main: &Path, file: Option<&Path>) -> Result<Self, String> {
-        let Some(file) = file else {
-            return Ok(Self {
-                main: main.to_owned(),
-                target: ConfigFile::open(main)?,
-                main_file: None,
-            });
-        };
-        let directory = main.parent().unwrap_or(Path::new(""));
-        let path = directory.join(file);
-        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or(path.to_owned());
-        let target = canonical(&path);
-        if target == canonical(main) {
-            return Self::open(main, None);
+        Some(_) | None => {
+            let main = config_path(cli);
+            change.apply(&main).map_err(|err| match err {
+                SaveError::Invalid(message) | SaveError::Io(message) => message,
+            })?
         }
-
-        let mut main_file = None;
-        let patterns = ConfigFile::open(main)?.includes();
-        let covered = rxh_server::include_covers(main, &patterns, &path)
-            || config_files(main)?
-                .iter()
-                .any(|existing| canonical(existing) == target);
-        if !covered {
-            let base = canonical(if directory.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                directory
-            });
-            let entry = if file.is_absolute() {
-                target.strip_prefix(&base).unwrap_or(file)
-            } else {
-                file
-            };
-            let mut main_edit = ConfigFile::open(main)?;
-            main_edit.add_include(&entry.to_string_lossy())?;
-            main_file = Some(main_edit);
-        }
-        Ok(Self {
-            main: main.to_owned(),
-            target: ConfigFile::open(&path)?,
-            main_file,
-        })
-    }
-
-    fn save(&self) -> Result<(), String> {
-        let mut files = vec![&self.target];
-        files.extend(self.main_file.as_ref());
-        edit::save_all(&files, &self.main).map(|_| ())
-    }
+    };
+    println!("{message}");
+    Ok(())
 }
 
 /// Prints the effective configuration.
@@ -579,14 +569,12 @@ async fn upstream(cli: &Cli, client: &AdminClient, command: UpstreamCommand) -> 
             persistence,
         } => {
             if !persistence.no_save {
-                let main = editable_config(cli, client).await;
-                let mut file = file_defining_pool(&main, &pool)?;
-                file.add_backend(&pool, &address, weight)?;
-                edit::save_all(&[&file], &main)?;
-                println!(
-                    "Saved {address} to pool {pool} in {}",
-                    file.path().display()
-                );
+                let change = Edit::AddBackend {
+                    pool: pool.clone(),
+                    address: address.clone(),
+                    weight,
+                };
+                save(cli, client, &change).await?;
             }
             let body = json!({ "address": address, "weight": weight });
             match client
@@ -607,14 +595,11 @@ async fn upstream(cli: &Cli, client: &AdminClient, command: UpstreamCommand) -> 
             persistence,
         } => {
             if !persistence.no_save {
-                let main = editable_config(cli, client).await;
-                let mut file = file_defining_pool(&main, &pool)?;
-                file.remove_backend(&pool, &address)?;
-                edit::save_all(&[&file], &main)?;
-                println!(
-                    "Removed {address} from pool {pool} in {}",
-                    file.path().display()
-                );
+                let change = Edit::RemoveBackend {
+                    pool: pool.clone(),
+                    address: address.clone(),
+                };
+                save(cli, client, &change).await?;
             }
             let body = json!({ "address": address });
             match client
@@ -710,8 +695,6 @@ async fn pool(cli: &Cli, client: &AdminClient, command: PoolCommand) -> Result<(
             fail_duration,
             file,
         } => {
-            let mut write =
-                WriteTarget::open(&editable_config(cli, client).await, file.as_deref())?;
             let spec = PoolSpec {
                 policy,
                 backends,
@@ -721,20 +704,11 @@ async fn pool(cli: &Cli, client: &AdminClient, command: PoolCommand) -> Result<(
                 health_interval,
                 fail_duration,
             };
-            write.target.add_pool(&name, &spec)?;
-            write.save()?;
-            println!(
-                "Created pool {name} in {}. Use it with `forward = \"@{name}\"`",
-                write.target.path().display()
-            );
+            save(cli, client, &Edit::AddPool { name, spec, file }).await?;
             apply(client).await
         }
         PoolCommand::Remove { name } => {
-            let main = editable_config(cli, client).await;
-            let mut file = file_defining_pool(&main, &name)?;
-            file.remove_pool(&name)?;
-            edit::save_all(&[&file], &main)?;
-            println!("Deleted pool {name} from {}", file.path().display());
+            save(cli, client, &Edit::RemovePool { name }).await?;
             apply(client).await
         }
     }
@@ -769,8 +743,6 @@ async fn service(cli: &Cli, client: &AdminClient, command: ServiceCommand) -> Re
             host,
             file,
         } => {
-            let mut write =
-                WriteTarget::open(&editable_config(cli, client).await, file.as_deref())?;
             let protocol = match protocol {
                 ServiceProtocol::Http => "http",
                 ServiceProtocol::Tcp => "tcp",
@@ -787,33 +759,19 @@ async fn service(cli: &Cli, client: &AdminClient, command: ServiceCommand) -> Re
             };
             let spec = ServiceSpec {
                 listen,
-                protocol,
+                protocol: protocol.to_owned(),
                 to,
                 serve,
                 name,
                 uri,
                 host,
             };
-            write.target.add_service(&spec)?;
-            write.save()?;
-            println!("Added service to {}", write.target.path().display());
+            save(cli, client, &Edit::AddService { spec, file }).await?;
             apply(client).await
         }
         ServiceCommand::Remove { service } => {
-            let main = editable_config(cli, client).await;
-            for path in config_files(&main)? {
-                let mut file = ConfigFile::open(&path)?;
-                let Ok(removed) = file.remove_service(&service) else {
-                    continue;
-                };
-                edit::save_all(&[&file], &main)?;
-                println!(
-                    "Removed {removed} service(s) from {}",
-                    file.path().display()
-                );
-                return apply(client).await;
-            }
-            Err(format!("no service named or listening on {service}"))
+            save(cli, client, &Edit::RemoveService { service }).await?;
+            apply(client).await
         }
     }
 }
@@ -847,7 +805,7 @@ fn describe_target(pattern: &rxh_core::config::Pattern) -> String {
 }
 
 /// Percent-encodes a path segment.
-fn encode(segment: &str) -> String {
+pub(crate) fn encode(segment: &str) -> String {
     segment
         .bytes()
         .map(|byte| {
@@ -863,14 +821,6 @@ fn encode(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pool_spec(backend: &str) -> PoolSpec {
-        PoolSpec {
-            policy: String::from("random"),
-            backends: vec![backend.to_owned()],
-            ..PoolSpec::default()
-        }
-    }
 
     #[test]
     fn split_targets_show_pools_and_weights() {
@@ -909,61 +859,6 @@ mod tests {
                 "yes",
                 "acme"
             ]
-        );
-    }
-
-    #[test]
-    fn file_covered_by_a_glob_is_not_added_to_include() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let main = dir.path().join("rxh.toml");
-        std::fs::write(&main, "include = [\"conf.d/*.toml\"]\n").expect("write");
-
-        let mut write =
-            WriteTarget::open(&main, Some(Path::new("conf.d/new.toml"))).expect("opens");
-        assert!(write.main_file.is_none(), "covered by the glob");
-        write
-            .target
-            .add_pool("api", &pool_spec("127.0.0.1:1"))
-            .expect("adds");
-        write.save().expect("saves");
-        assert_eq!(
-            std::fs::read_to_string(&main).expect("read"),
-            "include = [\"conf.d/*.toml\"]\n"
-        );
-
-        let write = WriteTarget::open(&main, Some(Path::new("other/new.toml"))).expect("opens");
-        assert!(write.main_file.is_some(), "not covered");
-    }
-
-    #[test]
-    fn failed_validation_restores_every_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let main = dir.path().join("rxh.toml");
-        let main_text = "# keep me\ninclude = [\"conf.d/*.toml\"]\n";
-        let api_text = "[upstream.api]\nbackends = [\"127.0.0.1:1\"]\n";
-        std::fs::write(&main, main_text).expect("write");
-        std::fs::create_dir(dir.path().join("conf.d")).expect("mkdir");
-        std::fs::write(dir.path().join("conf.d/api.toml"), api_text).expect("write");
-
-        // `api` is already defined in conf.d/api.toml, so the merge fails.
-        let mut write = WriteTarget::open(&main, Some(Path::new("extra/dup.toml"))).expect("opens");
-        assert!(write.main_file.is_some());
-        write
-            .target
-            .add_pool("api", &pool_spec("127.0.0.1:2"))
-            .expect("adds");
-        let err = write.save().expect_err("duplicate pool");
-        assert!(err.contains("pool api"), "{err}");
-        assert!(!err.contains("rollback failed"), "{err}");
-
-        assert_eq!(std::fs::read_to_string(&main).expect("read"), main_text);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("conf.d/api.toml")).expect("read"),
-            api_text
-        );
-        assert!(
-            !dir.path().join("extra").exists(),
-            "created directory removed"
         );
     }
 
@@ -1031,34 +926,29 @@ serve = "/srv/www"
     }
 
     #[test]
-    fn missing_main_file_is_its_own_only_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let main = dir.path().join("absent.toml");
-        assert_eq!(config_files(&main).expect("no error"), [main.as_path()]);
-
-        let Err(err) = file_defining_pool(&main, "api") else {
-            panic!("no file defines pool api");
-        };
-        assert!(err.contains("pool api is not defined"), "{err}");
-        assert!(err.contains("rxh pool add api"), "{err}");
-    }
-
-    #[test]
-    fn file_pointing_at_the_main_file_needs_no_include() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let main = dir.path().join("rxh.toml");
-        std::fs::write(&main, "").expect("write");
-
-        let write = WriteTarget::open(&main, Some(Path::new("rxh.toml"))).expect("opens");
-        assert!(write.main_file.is_none());
-        assert_eq!(write.target.path(), main);
-    }
-
-    #[test]
     fn validate_rejects_a_missing_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = validate(&dir.path().join("absent.toml")).expect_err("missing");
         assert!(err.contains("absent.toml"), "{err}");
+    }
+
+    #[test]
+    fn the_file_of_the_service_is_used_when_the_directory_has_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("rxh.toml");
+        let system = dir.path().join("etc-rxh.toml");
+        let given = Path::new("given.toml");
+        let path = |config| config_path_in(config, &local, Some(&system));
+
+        // Neither exists: the local file, to be created.
+        assert_eq!(path(None), local);
+        std::fs::write(&system, "").expect("write");
+        assert_eq!(path(None), system);
+        std::fs::write(&local, "").expect("write");
+        assert_eq!(path(None), local, "the directory wins");
+        assert_eq!(path(Some(given)), given, "--config wins");
+        std::fs::remove_file(&local).expect("remove");
+        assert_eq!(config_path_in(None, &local, None), local);
     }
 
     #[test]

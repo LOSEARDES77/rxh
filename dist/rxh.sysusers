@@ -1,0 +1,3 @@
+# sysusers.d(5): the group of the admin socket of rxh.service. Its members
+# run `rxh` commands without sudo, which makes them as powerful as root.
+g rxh -
