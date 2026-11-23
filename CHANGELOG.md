@@ -4,6 +4,11 @@
 
 ### Added
 
+- `crates/server/build.rs` rebuilds the web UI (`bun run build` in
+  `crates/server/ui`) when its sources change, so `cargo build` embeds the
+  current dashboard. It runs `bun install --frozen-lockfile` first when
+  `node_modules` is missing. Without `bun`, or with `RXH_SKIP_UI_BUILD` set,
+  the committed `ui/dist` is embedded as before.
 - `[admin] socket = "/run/rxh/admin.sock"`: a unix socket served besides
   `listen`, mode `0660` with the group of the daemon, whose callers are
   administrators. With it, a TCP connection from the machine is no

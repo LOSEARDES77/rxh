@@ -116,8 +116,8 @@ use crate::session::{self, Session, Sessions};
 use crate::systemd;
 use crate::tls::{self, AdminTls, CertificateInfo};
 
-/// The web UI, built from `ui/` by `bun run build` and committed, so building
-/// the crate needs no JavaScript tooling.
+/// The web UI, built from `ui/` by `build.rs` when its sources change. The
+/// build is committed, so building the crate without `bun` still works.
 const UI_INDEX: &str = include_str!("../ui/dist/index.html");
 const UI_SCRIPT: &str = include_str!("../ui/dist/app.js");
 const UI_STYLE: &str = include_str!("../ui/dist/app.css");
