@@ -63,7 +63,9 @@ jobs:
           file out/rxh | tee /dev/stderr | grep -q 'static'
       - name: Build (macOS)
         if: ${{ !matrix.arch }}
+        # The runner image ships an older stable; rust-version needs the current one.
         run: |
+          rustup update stable --no-self-update
           cargo build --release --locked -p rxh-cli
           mkdir out && cp target/release/rxh out/rxh
       - name: Archive
