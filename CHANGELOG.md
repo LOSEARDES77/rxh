@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-23)
 
 Caddy parity for HTTP routing, upstream transports, timeouts, observability,
 the file server and automatic HTTPS, plus layer 4 routing. Configuration
