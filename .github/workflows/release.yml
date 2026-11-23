@@ -45,7 +45,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check the tag against the crate version
         shell: bash
         run: |
@@ -85,7 +85,7 @@ jobs:
           for packager in deb rpm; do
             "$RUNNER_TEMP/nfpm" package -f ../dist/nfpm.yaml -p "$packager" -t ../packages/
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.target }}
           path: packages/*
@@ -100,8 +100,8 @@ jobs:
     outputs:
       prerelease: ${{ steps.publish.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: packages
           pattern: packages-*
@@ -125,7 +125,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" packages/* \
             --title "rxh ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag \
             $([ "$prerelease" = true ] && echo --prerelease)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: recipes
           path: |
@@ -140,11 +140,11 @@ jobs:
     env:
       AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: recipes
       - if: env.AUR_SSH_PRIVATE_KEY != ''
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: rxh-bin
           pkgbuild: ./PKGBUILD
@@ -160,11 +160,11 @@ jobs:
     env:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: env.HOMEBREW_TAP_TOKEN != ''
         with:
           name: recipes
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: env.HOMEBREW_TAP_TOKEN != ''
         with:
           repository: ${{ vars.HOMEBREW_TAP }}
