@@ -130,7 +130,7 @@ and restoring secrets, the mode of a saved file, the history ring), `server/test
 back, included file edited in place, revision conflict, no configuration file, token, a directory
 that cannot be written)
 and `server/tests/history.rs` (`GET /stats/history`). The page itself has Vitest unit tests in
-`crates/server/ui/src` (`bun run test`: the schema renderer, rates and percentiles, the API client,
+`crates/server/ui/src` (`npm test` with Node.js 24: the schema renderer, rates and percentiles, the API client,
 each tab), run by the CI job `ui`; they are outside the Rust line coverage. No test drives a real
 browser: that check is made by hand against a running `rxh`.
 
