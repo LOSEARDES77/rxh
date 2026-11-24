@@ -234,7 +234,7 @@ async fn sighup_and_reload_swap_configuration_without_downtime() {
 
     std::fs::write(dir.join("rxh.toml"), config(second)).expect("write");
     let pid = daemon.0.id().to_string();
-    let killed = Command::new("kill")
+    let killed = kill_command()
         .args(["-HUP", &pid])
         .status()
         .expect("kill runs");
@@ -864,16 +864,22 @@ struct Background(Option<u32>);
 impl Drop for Background {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            let _ = kill_command().args(["-KILL", &pid.to_string()]).status();
         }
     }
 }
 
 #[cfg(unix)]
+fn kill_command() -> Command {
+    // The POSIX shell provides kill even in images without procps.
+    let mut command = Command::new("sh");
+    command.args(["-c", "kill \"$@\"", "kill"]);
+    command
+}
+
+#[cfg(unix)]
 fn is_alive(pid: u32) -> bool {
-    Command::new("kill")
+    kill_command()
         .args(["-0", &pid.to_string()])
         .stderr(Stdio::null())
         .status()
@@ -1479,7 +1485,7 @@ async fn sd_notify_reports_readiness_reloads_and_stopping() {
 
     let pid = daemon.0.id().to_string();
     let signal = |name: &str| {
-        let killed = Command::new("kill")
+        let killed = kill_command()
             .args([name, &pid])
             .status()
             .expect("kill runs");
@@ -2387,7 +2393,7 @@ async fn upgrade_hands_the_listening_sockets_to_a_new_process() {
     wait_for_exit(first).await;
 
     // The new process can be upgraded in turn, by signal.
-    let killed = Command::new("kill")
+    let killed = kill_command()
         .args(["-USR2", &second.to_string()])
         .status()
         .expect("kill runs");
