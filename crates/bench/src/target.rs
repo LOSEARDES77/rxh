@@ -5,6 +5,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::fs::File;
+use std::io;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -189,6 +190,12 @@ impl Target {
                 command
                     .args(["run", "--rm", "--name", &name, "--network", "host", "-v"])
                     .arg(format!("{host_dir}:{CONTAINER_DIR}:ro"));
+                if let Some(max) = spec.max_connections {
+                    // A proxied connection can hold a downstream and an
+                    // upstream socket. Leave room for listeners and runtime FDs.
+                    let files = max.saturating_mul(2).saturating_add(64);
+                    command.args(["--ulimit", &format!("nofile={files}:{files}")]);
+                }
                 if let Some(binary) = binary {
                     command
                         .arg("-v")
@@ -252,6 +259,11 @@ impl Running {
     /// Resident memory of the proxy and all its descendants (NGINX workers),
     /// in bytes. Linux only.
     pub async fn rss(&self) -> Result<u64, Problem> {
+        if !cfg!(target_os = "linux") {
+            return Err(Problem::Unsupported(String::from(
+                "RSS measurement requires Linux",
+            )));
+        }
         let pid = match &self.container {
             None => self.child.id(),
             Some(name) => Command::new("docker")
@@ -263,9 +275,8 @@ impl Running {
                 .and_then(|pid| pid.trim().parse().ok()),
         };
         let pid = pid.ok_or_else(|| Problem::Failed(String::from("proxy pid unknown")))?;
-        tree_rss(pid).ok_or_else(|| {
-            Problem::Unsupported(String::from("memory needs /proc (Linux) to read RSS"))
-        })
+        tree_rss(pid)
+            .map_err(|err| Problem::Failed(format!("read RSS from /proc for PID {pid}: {err}")))
     }
 
     async fn wait_ready(
@@ -349,9 +360,9 @@ async fn udp_echoes(address: SocketAddr) -> bool {
 }
 
 /// Sum of `VmRSS` over `root` and its descendants, in bytes.
-fn tree_rss(root: u32) -> Option<u64> {
+fn tree_rss(root: u32) -> io::Result<u64> {
     let mut parents: Vec<(u32, u32)> = Vec::new();
-    for entry in fs::read_dir("/proc").ok()?.flatten() {
+    for entry in fs::read_dir("/proc")?.flatten() {
         let pid: Option<u32> = entry
             .file_name()
             .to_str()
@@ -386,18 +397,27 @@ fn tree_rss(root: u32) -> Option<u64> {
 
     let mut total = 0;
     for pid in tree {
-        let status = fs::read_to_string(format!("/proc/{pid}/status")).ok();
-        let kib: Option<u64> = status.as_deref().and_then(|status| {
-            let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
-            line.split_whitespace().nth(1)?.parse().ok()
+        let status = match fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(status) => status,
+            Err(err) if pid != root && err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        let kib = status.lines().find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
         });
-        // A process that exited meanwhile, or the root's kernel threads.
         if pid == root && kib.is_none() {
-            return None;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VmRSS is missing",
+            ));
         }
         total += kib.unwrap_or_default() * 1024;
     }
-    Some(total)
+    Ok(total)
 }
 
 /// Protocol of the listener under test.
@@ -996,7 +1016,10 @@ mod tests {
             with_child > alone,
             "the parent's own pages come on top of its child's"
         );
-        assert_eq!(tree_rss(u32::MAX), None, "no such process");
+        assert_eq!(
+            tree_rss(u32::MAX).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[tokio::test]

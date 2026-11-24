@@ -74,6 +74,12 @@ into an rxh TOML file and an equivalent Caddyfile.
 | `idle` | `round_robin` over 2 backends. `--idle-connections` keep-alive connections are opened (one `GET` each) and stay open while the normal load runs. | Every idle connection opens, still answers a `GET` after the load, and the load has no errors. |
 | `memory` | Same setup. The proxy's resident memory (RSS, summed over its processes) is read from `/proc` after 100 warm-up connections, then after `--idle-connections` more. | Every connection opens. The notes give the memory per idle connection; this is a measurement, not a verdict. The Req/s and latency columns are those of the first request on each connection. Linux only: elsewhere the scenario shows `n/a`. |
 
+The load generator and native proxies inherit the shell's file descriptor
+limit. Run `ulimit -n` before the idle and memory scenarios. For example,
+`ulimit -n 8192` is enough for the quick run on a shell whose hard limit
+permits it. The benchmark sets a per-container limit for Docker proxies
+in these scenarios.
+
 rxh's `max_connections` defaults to 1024, so `idle` and `memory` set it to
 the number of connections they open (plus the load). NGINX gets
 `worker_connections` to match.
