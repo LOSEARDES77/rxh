@@ -100,7 +100,7 @@ enum Handler {
 }
 
 enum Socket {
-    Tcp(TcpListener),
+    Tcp(Arc<TcpListener>),
     Udp(Arc<UdpSocket>, UdpSettings),
 }
 
@@ -209,7 +209,7 @@ impl Drop for PerIpSlot<'_> {
 /// replicate: its address, its routes with their state, and its limits.
 #[derive(Clone)]
 pub struct Replica {
-    address: SocketAddr,
+    pub(crate) address: SocketAddr,
     protocol: Protocol,
     name: Option<String>,
     log_name: Arc<str>,
@@ -266,6 +266,16 @@ impl Server {
         requested: SocketAddr,
         members: &[usize],
     ) -> Result<Self, Error> {
+        Self::init_with_tcp(config, registry, requested, members, None)
+    }
+
+    pub(crate) fn init_with_tcp(
+        config: &Config,
+        registry: &Registry,
+        requested: SocketAddr,
+        members: &[usize],
+        previous: Option<&Weak<TcpListener>>,
+    ) -> Result<Self, Error> {
         let server_index = members[0];
         let server = &config.servers[server_index];
         let servers: Vec<_> = members
@@ -287,7 +297,7 @@ impl Server {
                 (SocketKind::Udp(Arc::new(socket)), lease, address)
             }
             Protocol::Http | Protocol::Tcp => {
-                let listener = bind_tcp(requested)?;
+                let listener = bind_tcp_or_reuse(requested, previous)?;
                 let address = listener.local_addr()?;
                 let lease = upgrade::lease(&listener)?;
                 (SocketKind::Tcp(listener), lease, address)
@@ -451,7 +461,7 @@ impl Server {
                     }
                     _ => None,
                 };
-                (Socket::Tcp(listener), Some(context), http3)
+                (Socket::Tcp(Arc::new(listener)), Some(context), http3)
             }
         };
 
@@ -501,12 +511,19 @@ impl Server {
     /// routes and count their connections against the same
     /// `max_connections`.
     pub fn from_replica(replica: &Replica) -> Result<Self, Error> {
+        Self::from_replica_with_tcp(replica, None)
+    }
+
+    pub(crate) fn from_replica_with_tcp(
+        replica: &Replica,
+        previous: Option<&Weak<TcpListener>>,
+    ) -> Result<Self, Error> {
         let replica = replica.clone();
-        let listener = bind_tcp(replica.address)?;
+        let listener = bind_tcp_or_reuse(replica.address, previous)?;
         Ok(Self {
             state: watch::channel(State::Starting).0,
             lease: upgrade::lease(&listener)?,
-            socket: Socket::Tcp(listener),
+            socket: Socket::Tcp(Arc::new(listener)),
             address: replica.address,
             protocol: replica.protocol,
             name: replica.name,
@@ -522,6 +539,13 @@ impl Server {
             http3: None,
             shutdown: Box::pin(std::future::pending()),
         })
+    }
+
+    pub(crate) fn tcp_listener(&self) -> Option<Weak<TcpListener>> {
+        match &self.socket {
+            Socket::Tcp(listener) => Some(Arc::downgrade(listener)),
+            Socket::Udp(..) => None,
+        }
     }
 
     /// Starts the graceful shutdown when `future` completes.
@@ -692,6 +716,22 @@ enum SocketKind {
     Udp(Arc<UdpSocket>),
 }
 
+/// Duplicate the live socket, including its accept queue, and register the
+/// new descriptor with the current runtime. The previous runtime can drain
+/// and exit independently.
+fn bind_tcp_or_reuse(
+    address: SocketAddr,
+    previous: Option<&Weak<TcpListener>>,
+) -> io::Result<TcpListener> {
+    match previous.and_then(Weak::upgrade) {
+        Some(listener) => {
+            let socket = socket2::SockRef::from(listener.as_ref()).try_clone()?;
+            TcpListener::from_std(socket.into())
+        }
+        None => bind_tcp(address),
+    }
+}
+
 fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
     if let Some(listener) = systemd::tcp_listener(address)? {
         listener.set_nonblocking(true)?;
@@ -707,8 +747,7 @@ fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
     #[cfg(not(windows))]
     socket.set_reuseaddr(true)?;
 
-    // Lets a reloaded configuration bind the same ports before the old
-    // listeners close, so reloads drop no connections.
+    // Distributes connections across the per-core listeners on this port.
     #[cfg(unix)]
     socket.set_reuseport(true)?;
 

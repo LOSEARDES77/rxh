@@ -18,12 +18,14 @@
 //!         conn    conn    conn    conn   one task per connection
 //! ```
 
+use std::collections::BTreeMap;
 use std::future::{self, Future};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use rxh_core::config::{Config, Protocol};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
 use crate::access::Host;
@@ -59,6 +61,9 @@ pub struct ServerInfo {
     /// sees the listener in the admin API. Empty for a replica.
     pub(crate) hosts: Vec<Host>,
 }
+
+/// Live TCP sockets whose accept queues can be carried into another generation.
+pub(crate) type TcpListeners = BTreeMap<SocketAddr, Weak<TcpListener>>;
 
 /// Owner of all [`Server`]s of one configuration.
 pub struct Master {
@@ -102,12 +107,28 @@ fn listeners(config: &Config) -> Vec<(SocketAddr, Vec<usize>)> {
 impl Master {
     /// Binds every listener of `config`, using the pools of `registry`.
     pub fn init(config: &Config, registry: Arc<Registry>) -> Result<Self, Error> {
+        Self::init_with_tcp(config, registry, &[])
+    }
+
+    pub(crate) fn init_with_tcp(
+        config: &Config,
+        registry: Arc<Registry>,
+        previous: &[TcpListeners],
+    ) -> Result<Self, Error> {
         let mut servers = Vec::new();
         let mut infos = Vec::new();
         let mut resolvers = Vec::new();
 
         for (address, members) in listeners(config) {
-            let server = Server::init(config, &registry, address, &members)?;
+            let server = Server::init_with_tcp(
+                config,
+                &registry,
+                address,
+                &members,
+                previous
+                    .first()
+                    .and_then(|listeners| listeners.get(&address)),
+            )?;
             let hosts: Vec<Host> = members
                 .iter()
                 .map(|&member| Host::from(&config.servers[member]))
@@ -127,6 +148,18 @@ impl Master {
             servers.push(server);
         }
 
+        // Joining per-core listeners onto the shared runtime must keep
+        // their accept queues too. They serve the primary listener's routes
+        // and count against its connection limit.
+        let replicas: Vec<_> = servers.iter().filter_map(Server::replica).collect();
+        for listeners in previous.iter().skip(1) {
+            for replica in &replicas {
+                if let Some(listener) = listeners.get(&replica.address) {
+                    servers.push(Server::from_replica_with_tcp(replica, Some(listener))?);
+                }
+            }
+        }
+
         Ok(Self {
             servers,
             infos,
@@ -138,20 +171,53 @@ impl Master {
         })
     }
 
+    pub(crate) fn tcp_listeners(&self) -> Vec<TcpListeners> {
+        let mut listeners = vec![TcpListeners::new()];
+        for server in &self.servers {
+            let Some(listener) = server.tcp_listener() else {
+                continue;
+            };
+            let address = server.socket_address();
+            if let Some(group) = listeners
+                .iter_mut()
+                .find(|group| !group.contains_key(&address))
+            {
+                group.insert(address, listener);
+            } else {
+                listeners.push(TcpListeners::from([(address, listener)]));
+            }
+        }
+        listeners
+    }
+
     /// What [`Master::from_replicas`] needs to run the same listeners in
     /// another runtime. UDP listeners are left out: they keep one socket.
     #[must_use]
     pub fn replicas(&self) -> Vec<Replica> {
-        self.servers.iter().filter_map(Server::replica).collect()
+        self.servers[..self.infos.len()]
+            .iter()
+            .filter_map(Server::replica)
+            .collect()
     }
 
     /// Binds one more listener per entry of `replicas`, in the current
     /// runtime, next to the ones of the [`Master`] they come from.
     pub fn from_replicas(replicas: &[Replica], registry: Arc<Registry>) -> Result<Self, Error> {
+        Self::from_replicas_with_tcp(replicas, registry, None)
+    }
+
+    pub(crate) fn from_replicas_with_tcp(
+        replicas: &[Replica],
+        registry: Arc<Registry>,
+        previous: Option<&TcpListeners>,
+    ) -> Result<Self, Error> {
         let mut servers = Vec::new();
         let mut infos = Vec::new();
         for replica in replicas {
-            let server = Server::from_replica(replica)?;
+            let server = Server::from_replica_with_tcp(
+                replica,
+                previous.and_then(|listeners| listeners.get(&replica.address)),
+            )?;
             infos.push(ServerInfo {
                 address: server.socket_address(),
                 protocol: server.protocol(),
@@ -268,5 +334,62 @@ impl Master {
         }
 
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn replacement_keeps_queued_connections_from_every_listener() {
+        let config = |address, location| {
+            Config::from_toml(&format!(
+                "[[server]]\nlisten = \"{address}\"\nredirect = \"{location}\"\n"
+            ))
+            .expect("valid configuration")
+        };
+
+        let initial = Master::from_config(&config("127.0.0.1:0", "/old")).expect("first listener");
+        let replica = Master::from_replicas(&initial.replicas(), Arc::clone(initial.registry()))
+            .expect("replica listener");
+        let address = initial.sockets()[0];
+
+        // These connect before a replacement can bind. Neither old acceptor
+        // has started, so the requests remain queued on the original sockets.
+        let mut clients = Vec::new();
+        for _ in 0..32 {
+            let mut client = TcpStream::connect(address)
+                .await
+                .expect("queued connection");
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write queued request");
+            clients.push(client);
+        }
+
+        let previous = [initial.tcp_listeners(), replica.tcp_listeners()].concat();
+        let replacement = config(&address.to_string(), "/new");
+        let registry = Arc::new(Registry::build(&replacement).expect("new registry"));
+        let master = Master::init_with_tcp(&replacement, registry, &previous).expect("handoff");
+        drop(initial);
+        drop(replica);
+
+        let running = tokio::spawn(master.run());
+        for mut client in clients {
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+                .await
+                .expect("replacement answered")
+                .expect("connection survived");
+            assert!(response.contains("location: /new\r\n"), "{response}");
+        }
+        running.abort();
     }
 }

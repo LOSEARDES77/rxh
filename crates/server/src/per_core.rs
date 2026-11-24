@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::acme;
 use crate::error::Error;
-use crate::master::{Master, ServerInfo};
+use crate::master::{Master, ServerInfo, TcpListeners};
 use crate::registry::Registry;
 use crate::server::Replica;
 
@@ -55,6 +55,8 @@ pub(crate) fn count(runtime: Runtime) -> usize {
 
 /// A configuration running on per core runtimes.
 pub(crate) struct Started {
+    pub(crate) tcp_listeners: Vec<TcpListeners>,
+
     /// Listeners of the first runtime, which stand for their replicas in
     /// status reports.
     pub(crate) servers: Vec<ServerInfo>,
@@ -73,6 +75,11 @@ struct First {
     replicas: Vec<Replica>,
 }
 
+struct Ready {
+    first: Option<First>,
+    listeners: Vec<TcpListeners>,
+}
+
 struct Worker {
     index: usize,
     config: Arc<Config>,
@@ -81,7 +88,8 @@ struct Worker {
     /// Listeners to replicate, `None` in the first runtime.
     replicas: Option<Vec<Replica>>,
     stop: watch::Receiver<bool>,
-    ready: oneshot::Sender<Result<Option<First>, Error>>,
+    previous: Vec<TcpListeners>,
+    ready: oneshot::Sender<Result<Ready, Error>>,
     done: mpsc::UnboundedSender<Result<(), Error>>,
 }
 
@@ -103,8 +111,10 @@ impl Worker {
 
         runtime.block_on(async move {
             let master = match &self.replicas {
-                None => Master::init(&self.config, self.registry),
-                Some(replicas) => Master::from_replicas(replicas, self.registry),
+                None => Master::init_with_tcp(&self.config, self.registry, &self.previous),
+                Some(replicas) => {
+                    Master::from_replicas_with_tcp(replicas, self.registry, self.previous.first())
+                }
             };
             let master = match master {
                 Ok(master) => master,
@@ -118,7 +128,10 @@ impl Worker {
                 acme: acme::Manager::new(&self.config, &master, &self.base),
                 replicas: master.replicas(),
             });
-            let _ = self.ready.send(Ok(first));
+            let _ = self.ready.send(Ok(Ready {
+                first,
+                listeners: master.tcp_listeners(),
+            }));
 
             let mut stop = self.stop;
             let master = master.shutdown_on(async move {
@@ -138,6 +151,7 @@ pub(crate) async fn start(
     registry: &Arc<Registry>,
     base: &Path,
     stopped: oneshot::Receiver<()>,
+    previous: &[TcpListeners],
 ) -> Result<Started, Error> {
     let count = count(config.runtime);
     let config = Arc::new(config);
@@ -146,8 +160,14 @@ pub(crate) async fn start(
     let (done, mut finished) = mpsc::unbounded_channel();
 
     let mut first: Option<First> = None;
+    let mut tcp_listeners = Vec::with_capacity(count);
+    let mut extra_listeners = Vec::new();
     for index in 0..count {
         let (ready, started) = oneshot::channel();
+        let mut reuse: Vec<_> = previous.get(index).cloned().into_iter().collect();
+        if index == 0 && previous.len() > count {
+            reuse.extend_from_slice(&previous[count..]);
+        }
         let worker = Worker {
             index,
             config: Arc::clone(&config),
@@ -155,6 +175,7 @@ pub(crate) async fn start(
             base: base.to_owned(),
             replicas: first.as_ref().map(|first| first.replicas.clone()),
             stop: stop.subscribe(),
+            previous: reuse,
             ready,
             done: done.clone(),
         };
@@ -162,8 +183,17 @@ pub(crate) async fn start(
             .name(format!("rxh-core-{index}"))
             .spawn(move || worker.run())?;
         match started.await {
-            Ok(Ok(Some(report))) => first = Some(report),
-            Ok(Ok(None)) => {}
+            Ok(Ok(Ready {
+                first: report,
+                listeners,
+            })) => {
+                if report.is_some() {
+                    first = report;
+                }
+                let mut listeners = listeners.into_iter();
+                tcp_listeners.push(listeners.next().unwrap_or_default());
+                extra_listeners.extend(listeners);
+            }
             Ok(Err(err)) => return Err(err),
             Err(_) => return Err(io::Error::other("a per core runtime died on start").into()),
         }
@@ -190,7 +220,9 @@ pub(crate) async fn start(
         first_error.map_or(Ok(()), Err)
     });
 
+    tcp_listeners.extend(extra_listeners);
     Ok(Started {
+        tcp_listeners,
         servers: first.servers,
         acme: first.acme,
         task,

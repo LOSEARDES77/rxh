@@ -52,7 +52,7 @@ forward = "@api"
 
 | Value | Meaning |
 |---|---|
-| `"shared"` | One work-stealing runtime with a thread per CPU. Every address has one listener, and the tasks of a connection may run on any thread. The default. |
+| `"shared"` | One work-stealing runtime with a thread per CPU. The tasks of a connection may run on any thread. The default. |
 | `"per_core"` | One single-threaded runtime per CPU the process may use. Each one has its own `SO_REUSEPORT` listener on every `http` and `tcp` address and its own upstream connections, so a request stays on one thread from accept to response. |
 
 `per_core` served 3% to 96% more requests per second than `shared` in the
@@ -82,7 +82,9 @@ What is counted per runtime and what stays global:
 
 The number of runtimes is the number of CPUs the process may run on
 (`taskset` and container CPU limits count). The key is not allowed in
-included files, and a reload may change it.
+included files, and a reload may change it. Switching to `shared` keeps
+any existing per-core TCP sockets on the shared runtime so their queues
+can still be served.
 
 ## Includes
 
@@ -4239,7 +4241,8 @@ upgrade (WebSocket) needs.
 ## Reloads
 
 `rxh reload`, `SIGHUP` or `POST /reload` re-read the file. The new
-configuration starts next to the old one (listeners use `SO_REUSEPORT`), then
-the old one stops accepting and drains. If the new file is invalid, the reload
+configuration starts next to the old one and reuses the sockets for unchanged
+TCP addresses, preserving their queued connections. The old configuration then
+stops accepting and drains. If the new file is invalid, the reload
 fails and nothing changes. Backends added with `--no-save` are lost on reload;
 the default `rxh upstream add` saves them to the file first.

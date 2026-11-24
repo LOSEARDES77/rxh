@@ -2,12 +2,12 @@
 //! API and reloads without dropping connections.
 //!
 //! A reload builds a complete new generation (pools, listeners, health
-//! checks) next to the running one. Listeners use `SO_REUSEPORT`, so the new
-//! generation binds the same ports, then the old one stops accepting and
+//! checks) next to the running one. The new generation duplicates unchanged
+//! TCP listeners, then the old one stops accepting and
 //! drains its connections in the background. If the configuration is invalid
 //! the old generation keeps running untouched.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use rxh_core::config::{
-    Admin, AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig, Runtime,
-    Tls,
+    Admin, AdminListen, Catalog, CatalogKind, Config, ConfigError, Docker, IncludedConfig,
+    Protocol, Runtime, Tls,
 };
 use rxh_core::placeholder::{self, Lookup};
 use tokio::sync::{mpsc, oneshot};
@@ -31,7 +31,7 @@ use crate::docker::{self, Container, Provider, Route};
 use crate::error::Error;
 use crate::http3::{self, Endpoints};
 use crate::include;
-use crate::master::{Master, ServerInfo};
+use crate::master::{Master, ServerInfo, TcpListeners};
 use crate::oidc;
 use crate::per_core;
 use crate::registry::Registry;
@@ -125,6 +125,7 @@ enum Source {
 
 /// One running configuration.
 struct Generation {
+    tcp_listeners: Vec<TcpListeners>,
     config: Arc<Config>,
     registry: Arc<Registry>,
     servers: Vec<ServerInfo>,
@@ -155,6 +156,7 @@ impl Generation {
         containers: Vec<Container>,
         endpoints: &Endpoints,
         admin: &Admin,
+        previous_tcp: &[TcpListeners],
     ) -> Result<Self, Error> {
         // What runs has the implicit HTTP to HTTPS redirect servers and the
         // Docker routes; what the admin API shows and edits is the
@@ -178,23 +180,36 @@ impl Generation {
         // running one.
         let install = |servers: &[ServerInfo]| endpoints.install(&http3_listeners(servers));
         let (stop, stopped) = oneshot::channel::<()>();
-        let (servers, acme, task) = match effective.runtime {
+        let (servers, tcp_listeners, acme, task) = match effective.runtime {
             Runtime::Shared => {
                 let master =
-                    Master::init(&effective, Arc::clone(&registry))?.shutdown_on(async move {
-                        let _ = stopped.await;
-                    });
+                    Master::init_with_tcp(&effective, Arc::clone(&registry), previous_tcp)?
+                        .shutdown_on(async move {
+                            let _ = stopped.await;
+                        });
                 let acme = acme::Manager::new(&effective, &master, base);
                 let servers = master.servers();
+                let tcp_listeners = master.tcp_listeners();
                 install(&servers)?;
-                (servers, acme, tokio::task::spawn(master.run()))
+                (
+                    servers,
+                    tcp_listeners,
+                    acme,
+                    tokio::task::spawn(master.run()),
+                )
             }
             Runtime::PerCore => {
                 // Its listeners already serve; on error, dropping `stop`
                 // stops them.
-                let started = per_core::start(effective, &registry, base, stopped).await?;
+                let started =
+                    per_core::start(effective, &registry, base, stopped, previous_tcp).await?;
                 install(&started.servers)?;
-                (started.servers, started.acme, started.task)
+                (
+                    started.servers,
+                    started.tcp_listeners,
+                    started.acme,
+                    started.task,
+                )
             }
         };
         // Health checks, the admin API and ACME stay on the calling runtime.
@@ -204,6 +219,7 @@ impl Generation {
         }
 
         Ok(Self {
+            tcp_listeners,
             config: Arc::new(config),
             registry,
             servers,
@@ -389,6 +405,7 @@ impl Daemon {
             Vec::new(),
             &endpoints,
             &admin_settings,
+            &[],
         )
         .await?;
 
@@ -783,6 +800,7 @@ impl Daemon {
             containers.clone(),
             endpoints,
             &in_force,
+            &generation.tcp_listeners,
         )
         .await;
         let next = match started {
@@ -793,6 +811,23 @@ impl Daemon {
                 // configuration if the new one still fails.
                 let previous = Config::clone(&generation.config);
                 let previous_containers = generation.containers.clone();
+                // A UDP bind can require the old generation to stop first.
+                // Keep the unchanged TCP sockets alive across that gap, but
+                // release removed addresses that might conflict with new binds.
+                let (effective, _) = docker::plan(&config.with_https_redirects(), &containers);
+                let tcp_addresses: BTreeSet<_> = effective
+                    .servers
+                    .iter()
+                    .filter(|server| server.protocol != Protocol::Udp)
+                    .flat_map(|server| &server.listen)
+                    .collect();
+                let tcp_listeners = generation.tcp_listeners.clone();
+                let held_tcp: Vec<_> = tcp_listeners
+                    .iter()
+                    .flat_map(|listeners| listeners.iter())
+                    .filter(|(address, _)| tcp_addresses.contains(address))
+                    .filter_map(|(_, listener)| listener.upgrade())
+                    .collect();
                 let old = std::mem::replace(generation, placeholder(endpoints, &in_force).await?);
                 old.stop().await.map_err(|err| err.to_string())?;
                 let base = self.base_dir();
@@ -803,9 +838,10 @@ impl Daemon {
                     containers,
                     endpoints,
                     &in_force,
+                    &tcp_listeners,
                 )
                 .await;
-                match started {
+                let next = match started {
                     Ok(next) => next,
                     Err(err) => {
                         *generation = Generation::start(
@@ -815,6 +851,7 @@ impl Daemon {
                             previous_containers,
                             endpoints,
                             &in_force,
+                            &tcp_listeners,
                         )
                         .await
                         .map_err(|err| err.to_string())?;
@@ -824,7 +861,9 @@ impl Daemon {
                             .unwrap_or_else(PoisonError::into_inner) = generation.current();
                         return Err(err.to_string());
                     }
-                }
+                };
+                drop(held_tcp);
+                next
             }
             Err(err) => {
                 generation.restore_http3(endpoints);
@@ -867,6 +906,7 @@ async fn placeholder(endpoints: &Endpoints, admin: &Admin) -> Result<Generation,
         Vec::new(),
         endpoints,
         admin,
+        &[],
     )
     .await
     .map_err(|err| err.to_string())
