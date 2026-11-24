@@ -35,12 +35,12 @@ docker kill -s HUP rxh         # reload after editing rxh.toml
 - Host names in `backends` are resolved on every connection, so the names
   of other containers on the same Docker network work, and follow the
   containers when they are recreated.
-- The image ships no configuration, and relative paths of yours are taken
-  from `/etc/rxh`, which belongs to root in the image: only the
-  configuration file is mounted into it, and the user of the image cannot
-  create anything there. Put what the daemon writes,
-  the ACME certificates and the admin accounts, in `/var/lib/rxh` (it
-  belongs to the user of the image) and keep that on a volume, as
+- The image ships no configuration. Relative listener TLS paths and static
+  roots start at the working directory, `/var/lib/rxh`. Use absolute paths
+  for assets mounted under `/etc/rxh`. Includes, ACME storage, and the
+  admin users file use the configuration directory. The image user cannot
+  write under `/etc/rxh`. Store ACME certificates and admin accounts in
+  `/var/lib/rxh` and persist that directory with a volume, as
   `-v rxh-data:/var/lib/rxh` does above:
 
   ```toml

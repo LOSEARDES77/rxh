@@ -527,11 +527,12 @@ because Docker allows them in the container network namespace (not with
 `--network host`, where the host's `net.ipv4.ip_unprivileged_port_start`
 applies).
 
-The images ship no configuration. Relative paths of the configuration are
-taken from its directory, `/etc/rxh`, which belongs to root in the image
-(only the configuration file is mounted into it): the user of the image
-cannot create the default ACME storage (`/etc/rxh/rxh-data/certificates`)
-and users file (`/etc/rxh/rxh-data/users.toml`) there. Point both at
+The images ship no configuration. Listener TLS certificates and keys, and
+static file roots, use the working directory, `/var/lib/rxh`, for relative
+paths. Use absolute paths for these files when mounting them under
+`/etc/rxh`. Includes, ACME storage and the admin users file use the
+configuration directory. The image user cannot write under `/etc/rxh`.
+Point the ACME storage and users file at
 `/var/lib/rxh`, which belongs to UID 65532, and keep it on a volume:
 
 ```toml

@@ -12,8 +12,8 @@
 #
 # Every variant runs as UID 65532 with the configuration at /etc/rxh/rxh.toml
 # (RXH_CONFIG) and /var/lib/rxh, owned by that user, as working directory.
-# Relative paths of the configuration are taken from /etc/rxh, read-only when
-# mounted: set `[acme] storage = "/var/lib/rxh/certificates"` and `[admin]
+# Relative listener TLS files and static roots use the working directory.
+# ACME storage and users paths use /etc/rxh when relative: set `[acme] storage = "/var/lib/rxh/certificates"` and `[admin]
 # users = "/var/lib/rxh/users.toml"`, and mount a volume on /var/lib/rxh to
 # keep them. The arguments are an `rxh` command, `run` by default.
 
