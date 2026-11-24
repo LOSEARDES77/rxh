@@ -94,15 +94,25 @@ configs:
       <title>RXH example</title>
       <h1>Web server</h1>
       <p>This page comes from nginx. The list comes from the API at /api/todos.</p>
+      <p id="todos-status" role="status">Loading todos…</p>
       <ul id="todos"></ul>
       <script>
         fetch("/api/todos")
-          .then((response) => response.json())
+          .then((response) => {
+            if (!response.ok) throw new Error("HTTP " + response.status);
+            return response.json();
+          })
           .then((todos) => {
+            if (!Array.isArray(todos)) throw new Error("Invalid todo list");
+            const status = document.getElementById("todos-status");
+            status.textContent = todos.length ? "" : "No todos.";
             for (const todo of todos) {
               const item = document.createElement("li");
               item.textContent = (todo.done ? "[x] " : "[ ] ") + todo.title;
               document.getElementById("todos").append(item);
             }
+          })
+          .catch(() => {
+            document.getElementById("todos-status").textContent = "Could not load todos.";
           });
       </script>
