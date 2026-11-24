@@ -1717,9 +1717,8 @@ cd crates/server/ui && bun install && bun run build   # then commit dist/
 bun run check && npm test                             # types and unit tests
 ```
 
-UI tests require Node.js 24. Bun installs the locked dependencies. Run
-Vitest with Node.js because its fork workers require Node IPC support.
-
+Bun installs the locked dependencies. Run Vitest with Node.js because its
+fork workers require Node IPC support. CI uses Node.js 24.
 
 The CI job `ui` runs the same commands and fails when the committed `dist/`
 differs from a fresh build.

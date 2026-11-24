@@ -76,7 +76,7 @@ into an rxh TOML file and an equivalent Caddyfile.
 
 The load generator and native proxies inherit the shell's file descriptor
 limit. Run `ulimit -n` before the idle and memory scenarios. For example,
-`ulimit -n 8192` is enough for the quick run on a shell whose hard limit
+`ulimit -Sn 8192` is enough for the quick run on a shell whose hard limit
 permits it. The benchmark sets a per-container limit for Docker proxies
 in these scenarios.
 
