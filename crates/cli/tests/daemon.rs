@@ -2587,3 +2587,77 @@ fn a_socket_this_user_may_not_open_says_how_to_get_access() {
     assert!(stderr.contains("usermod -aG rxh"), "{stderr}");
     assert!(!directory.path().join("rxh.toml").exists(), "{stderr}");
 }
+
+/// The layout of the service: the socket of `[admin] socket` is in
+/// `/run/rxh`, which only the group `rxh` may search. Somebody outside the
+/// group cannot see the socket, is still sent to it rather than to the TCP
+/// port (where nobody local is an administrator), and is told how to get
+/// access instead of failing to write the files the daemon owns.
+#[cfg(unix)]
+#[test]
+fn a_socket_in_a_directory_this_user_may_not_search_says_how_to_get_access() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let run = directory.path().join("run");
+    std::fs::create_dir(&run).expect("mkdir");
+    let socket = run.join("admin.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let admin = free_address();
+    let config = format!(
+        "[admin]\nlisten = \"{admin}\"\nsocket = \"{}\"\n",
+        socket.display()
+    );
+    std::fs::write(directory.path().join("rxh.toml"), &config).expect("write");
+    // A TCP listener that answers like the daemon does on it: no
+    // administrator without a session.
+    let tcp = std::net::TcpListener::bind(admin).expect("bind");
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut stream in tcp.incoming().map_while(Result::ok) {
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"error":"sign in to use the admin API"}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let restore = || std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700));
+    if socket.try_exists().is_ok() {
+        restore().expect("chmod");
+        eprintln!("skipped: this user searches any directory (root)");
+        return;
+    }
+
+    for args in [
+        &["status"][..],
+        &["pool", "add", "api", "--backend", "127.0.0.1:9"],
+        &[
+            "service",
+            "add",
+            "--listen",
+            "127.0.0.1:0",
+            "--to",
+            "127.0.0.1:9",
+        ],
+    ] {
+        let output = rxh_bare(directory.path(), args);
+        let stderr = assert_failure(&output);
+        assert!(
+            stderr.contains("cannot open the admin socket"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("usermod -aG rxh"), "{args:?}: {stderr}");
+    }
+    restore().expect("chmod");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("rxh.toml")).expect("read"),
+        config,
+        "the files are not edited"
+    );
+}

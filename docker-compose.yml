@@ -1,3 +1,108 @@
+# Example: a web server and an API behind RXH, with a PostgreSQL database.
+#
+#   docker compose up -d
+#   curl http://localhost:8080/            # the page, from nginx
+#   curl http://localhost:8080/api/todos   # the API, from PostgREST
+#   curl 'http://localhost:8080/api/todos?done=is.false'
+#
+# Only RXH publishes a port. The web server, the API and the database are on
+# the network of the project and reach each other by service name.
+#
+# RXH does not strip a path prefix, so each table of the API gets its own
+# route: `/api/todos` is sent to PostgREST as `/todos`, with its query. Add a
+# route like it for every new table.
+
 services:
-  my-webapp:
-    image: nginx
+  rxh:
+    image: ghcr.io/loseardes77/rxh:0.3
+    ports:
+      - "8080:80"
+    configs:
+      - source: rxh
+        target: /etc/rxh/rxh.toml
+    depends_on:
+      - web
+      - api
+
+  web:
+    image: nginx:1.27-alpine
+    configs:
+      - source: index
+        target: /usr/share/nginx/html/index.html
+
+  api:
+    image: postgrest/postgrest:v12.2.3
+    environment:
+      PGRST_DB_URI: postgres://app:app@db:5432/app
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: web_anon
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app   # example only: use a secret for anything real
+      POSTGRES_DB: app
+    configs:
+      - source: schema
+        target: /docker-entrypoint-initdb.d/schema.sql
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app", "-d", "app"]
+      interval: 2s
+      retries: 15
+
+volumes:
+  db-data:
+
+configs:
+  rxh:
+    content: |
+      [[server]]
+      name = "site"
+      listen = "0.0.0.0:80"
+      match = [
+          # The API: one route per table, without the /api prefix.
+          { path = "/api/todos", rewrite = "/todos", forward = "api:3000" },
+          # Everything else: the web server.
+          { forward = "web:80" },
+      ]
+
+  # Runs once, when the volume of the database is empty.
+  schema:
+    content: |
+      create table todos (
+          id serial primary key,
+          title text not null,
+          done boolean not null default false
+      );
+      insert into todos (title) values ('Probar rxh'), ('Conectar la API');
+
+      -- The role PostgREST answers anonymous requests with: read only.
+      create role web_anon nologin;
+      grant usage on schema public to web_anon;
+      grant select on todos to web_anon;
+
+  index:
+    content: |
+      <!doctype html>
+      <meta charset="utf-8">
+      <title>RXH example</title>
+      <h1>Web server</h1>
+      <p>This page comes from nginx. The list comes from the API at /api/todos.</p>
+      <ul id="todos"></ul>
+      <script>
+        fetch("/api/todos")
+          .then((response) => response.json())
+          .then((todos) => {
+            for (const todo of todos) {
+              const item = document.createElement("li");
+              item.textContent = (todo.done ? "[x] " : "[ ] ") + todo.title;
+              document.getElementById("todos").append(item);
+            }
+          });
+      </script>

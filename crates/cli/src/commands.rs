@@ -58,7 +58,11 @@ pub(crate) fn admin_client(cli: &Cli) -> AdminClient {
     let socket = admin
         .socket
         .as_ref()
-        .filter(|socket| socket.exists())
+        // A socket in a directory this user may not search, `/run/rxh` of
+        // the group `rxh`, cannot be told to exist: it is tried, so that its
+        // refusal says how to get access instead of a failed write of the
+        // files.
+        .filter(|socket| !matches!(socket.try_exists(), Ok(false)))
         .map(|socket| AdminListen::Unix(socket.clone()));
     let own = socket.clone().unwrap_or_else(|| admin.listen.clone());
     let address = cli.admin.clone().unwrap_or(own);
